@@ -283,7 +283,7 @@ async fn the_live_numbers_match_a_cold_rebuild_from_the_log() {
             .models
             .iter()
             .map(|row| {
-                let column = |c: &Option<roundhouse_core::metrics::TurnElapsed>| {
+                let column = |c: &Option<roundhouse_core::metrics::IntervalMetric>| {
                     c.as_ref()
                         .map(|c| (c.mean_ms, c.samples, c.rejected, c.basis))
                 };

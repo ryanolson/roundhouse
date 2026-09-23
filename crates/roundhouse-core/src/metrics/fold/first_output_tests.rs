@@ -35,9 +35,9 @@ fn a_turns_first_text_is_measured_from_its_start_on_the_row_that_served_it() {
     fold.extend(log.events());
 
     let claude = row(&fold, &claude());
-    assert_eq!(claude.first_output_samples, 1);
-    assert_eq!(claude.first_output_ms_total, 20);
-    assert_eq!(claude.first_output_rejected, 0);
+    assert_eq!(claude.first_output.samples, 1);
+    assert_eq!(claude.first_output.ms_total, 20);
+    assert_eq!(claude.first_output.rejected, 0);
 }
 
 /// An empty delta carries no text, so it does not close the interval.
@@ -59,9 +59,9 @@ fn an_empty_delta_does_not_stop_the_clock_and_a_later_one_does_not_move_it() {
     fold.extend(log.events());
 
     let claude = row(&fold, &claude());
-    assert_eq!(claude.first_output_samples, 1, "one turn, one sample");
+    assert_eq!(claude.first_output.samples, 1, "one turn, one sample");
     assert_eq!(
-        claude.first_output_ms_total, 30,
+        claude.first_output.ms_total, 30,
         "the empty delta at +20 is skipped and the first real text at +30 \
          is the measurement; a later delta must not move it"
     );
@@ -85,7 +85,7 @@ fn a_turn_that_never_speaks_leaves_no_sample_and_no_zero() {
     let claude = row(&fold, &claude());
     assert_eq!(claude.calls, 1, "the turn itself still booked");
     assert_eq!(
-        (claude.first_output_samples, claude.first_output_ms_total),
+        (claude.first_output.samples, claude.first_output.ms_total),
         (0, 0),
         "a turn with nothing to time contributes no sample, and a zero \
          here would read as an instant answer"
@@ -123,7 +123,7 @@ fn a_delta_with_no_turn_start_in_view_is_not_a_sample() {
 
     let claude = row(&fold, &claude());
     assert_eq!(
-        (claude.first_output_samples, claude.first_output_rejected),
+        (claude.first_output.samples, claude.first_output.rejected),
         (0, 0),
         "no start is not a rejection either; there was nothing to measure"
     );
@@ -159,9 +159,9 @@ fn a_delta_before_its_own_turn_start_is_rejected_rather_than_folded() {
     fold.extend(log.events());
 
     let claude = row(&fold, &claude());
-    assert_eq!(claude.first_output_rejected, 1);
+    assert_eq!(claude.first_output.rejected, 1);
     assert_eq!(
-        (claude.first_output_samples, claude.first_output_ms_total),
+        (claude.first_output.samples, claude.first_output.ms_total),
         (0, 0),
         "a refused timing must not reach the mean in either term"
     );
@@ -196,8 +196,8 @@ fn a_turn_that_billed_nothing_still_reports_the_wait_it_delivered() {
         claude.calls, 0,
         "nothing billed, so nothing booked as a call"
     );
-    assert_eq!(claude.first_output_samples, 1);
-    assert_eq!(claude.first_output_ms_total, 20);
+    assert_eq!(claude.first_output.samples, 1);
+    assert_eq!(claude.first_output.ms_total, 20);
 }
 
 /// A retried turn's abandoned response contributes nothing.
@@ -251,11 +251,11 @@ fn a_superseded_response_contributes_no_latency_sample() {
 
     let claude = row(&fold, &claude());
     assert_eq!(
-        claude.first_output_samples, 1,
+        claude.first_output.samples, 1,
         "only the response that finished is a sample"
     );
     assert_eq!(
-        claude.first_output_ms_total, 20,
+        claude.first_output.ms_total, 20,
         "measured from the retry's own start, not from the abandoned one"
     );
     // The abandoned response never terminates. Its clock must drain at
@@ -312,18 +312,18 @@ fn a_fell_forward_turn_books_its_wait_on_the_target_that_answered() {
         model: "kimi".into(),
     };
     assert_eq!(
-        row(&fold, &claude()).first_output_samples,
+        row(&fold, &claude()).first_output.samples,
         1,
         "the target that spoke owns the sample"
     );
     assert_eq!(
-        row(&fold, &claude()).first_output_ms_total,
+        row(&fold, &claude()).first_output.ms_total,
         30,
         "measured from the turn's start, so the failed attempt's time is \
          inside it -- which is what the basis says"
     );
     assert_eq!(
-        row(&fold, &kimi).first_output_samples,
+        row(&fold, &kimi).first_output.samples,
         0,
         "the target that never spoke has no latency to report"
     );
@@ -400,7 +400,7 @@ fn one_turn_id_in_two_sessions_supersedes_neither() {
 
     let both = row(&fold, &claude());
     assert_eq!(
-        both.first_output_samples, 2,
+        both.first_output.samples, 2,
         "both sessions spoke, so both timings are real"
     );
     assert_eq!(
@@ -415,7 +415,7 @@ fn one_turn_id_in_two_sessions_supersedes_neither() {
         let scoped =
             fold.summed_rows(Scope::Principal(&PrincipalKey::from(who)))[&claude()].clone();
         assert_eq!(
-            (scoped.first_output_samples, scoped.calls),
+            (scoped.first_output.samples, scoped.calls),
             (1, 1),
             "{who:?} served exactly one turn"
         );
@@ -471,7 +471,7 @@ fn a_started_turn_that_never_spoke_books_its_interval_without_booking_a_call() {
          whole of what it reports"
     );
     assert_eq!(
-        claude.first_output_samples, 0,
+        claude.first_output.samples, 0,
         "the response never spoke, so no first-output sample rides along"
     );
     assert!(
@@ -508,15 +508,15 @@ fn a_turn_folded_in_two_batches_measures_what_it_measures_whole() {
     batched.extend(tail);
 
     assert_eq!(
-        row(&batched, &claude()).first_output_samples,
-        row(&whole, &claude()).first_output_samples,
+        row(&batched, &claude()).first_output.samples,
+        row(&whole, &claude()).first_output.samples,
     );
     assert_eq!(
-        row(&batched, &claude()).first_output_ms_total,
-        row(&whole, &claude()).first_output_ms_total,
+        row(&batched, &claude()).first_output.ms_total,
+        row(&whole, &claude()).first_output.ms_total,
     );
     assert_eq!(
-        row(&batched, &claude()).first_output_ms_total,
+        row(&batched, &claude()).first_output.ms_total,
         20,
         "and the shared answer is the real one, not two matching zeros"
     );
@@ -557,10 +557,10 @@ fn a_project_view_sums_its_members_latency_samples() {
     fold.extend(eve.events());
 
     let acme = fold.summed_rows(Scope::Project(&ProjectId::from("acme")))[&claude()].clone();
-    assert_eq!(acme.first_output_samples, 2, "ada and bo, never eve");
-    assert_eq!(acme.first_output_ms_total, 20 + 30);
+    assert_eq!(acme.first_output.samples, 2, "ada and bo, never eve");
+    assert_eq!(acme.first_output.ms_total, 20 + 30);
     assert_eq!(
-        row(&fold, &claude()).first_output_samples,
+        row(&fold, &claude()).first_output.samples,
         3,
         "the deployment sums every principal's"
     );

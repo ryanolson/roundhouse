@@ -29,7 +29,7 @@ fn claude_row(fold: &MetricsFold) -> ModelMetrics {
 }
 
 /// The published shape of one column, flattened for comparison.
-fn seen(column: Option<TurnElapsed>) -> Option<(Option<f64>, u64, u64)> {
+fn seen(column: Option<IntervalMetric>) -> Option<(Option<f64>, u64, u64)> {
     column.map(|c| (c.mean_ms, c.samples, c.rejected))
 }
 

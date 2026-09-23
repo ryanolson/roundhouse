@@ -111,7 +111,7 @@ fn a_turn_that_never_spoke_still_has_a_terminal_interval() {
     fold.extend(log.events());
 
     let claude = row(&fold, &claude());
-    assert_eq!(claude.first_output_samples, 0, "nothing was ever said");
+    assert_eq!(claude.first_output.samples, 0, "nothing was ever said");
     assert_eq!(
         (
             claude.completed_elapsed.samples,
@@ -190,7 +190,7 @@ fn a_failover_books_the_whole_interval_on_the_target_that_transmitted() {
         (
             abandoned.completed_elapsed,
             abandoned.incomplete_elapsed,
-            abandoned.first_output_samples
+            abandoned.first_output.samples
         ),
         (Elapsed::default(), Elapsed::default(), 0),
         "the target that never transmitted gets no interval, in either outcome \
@@ -536,6 +536,45 @@ fn a_refusal_with_no_dispatch_is_counted_as_unrouted_and_makes_no_row() {
          principal can see it"
     );
     assert!(fold.clocks.is_empty(), "and the clock drains anyway");
+}
+
+/// A dispatch with no clock, no reported cost and no consumption mints no
+/// row either — the other half of core-metrics-3's unified guard from the
+/// test above, which covers a clock with no dispatch.
+///
+/// `Routed` with no preceding `TurnStarted` is not a shape the engine writes
+/// today, but the fold must not invent a zero-call row for it: the guard is
+/// stated once, over `provider_cost`, `clock` and `consumed` together, and
+/// this is the one combination where all three are absent while `pending`
+/// is not.
+#[test]
+fn a_dispatch_with_no_clock_and_no_consumption_makes_no_row() {
+    let mut log = LogBuilder::new("s1");
+    log.created(Some(principal("acme", "ada")));
+    log.route(
+        "r1",
+        frontier("anthropic", "claude"),
+        1_000,
+        Billing::Billed,
+    );
+    log.push(SessionEventKind::ResponseIncomplete {
+        response_id: ResponseId::new("r1"),
+        reason: IncompleteReason::PolicyRefused,
+        usage: Usage::default(),
+        terminal_attempt: None,
+    });
+
+    let mut fold = MetricsFold::new();
+    fold.extend(log.events());
+
+    assert!(
+        fold.summed_rows(Scope::Deployment).is_empty(),
+        "no clock, no reported cost and no consumed usage: nothing to book, \
+         so no row: {:?}",
+        fold.summed_rows(Scope::Deployment)
+            .keys()
+            .collect::<Vec<_>>()
+    );
 }
 
 /// A completion with no dispatch counts too.

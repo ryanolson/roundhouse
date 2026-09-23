@@ -308,7 +308,19 @@ impl<'a> Admitted<'a> {
     /// invent a `max_load` — the calling policy's own tuning, which this type
     /// has already applied and does not carry — and would miss the overflow
     /// valve's pool entirely.
-    pub fn decide(&self, target: Target, rationale: String) -> Decision {
+    ///
+    /// **`selector` is required, not a struct-update override the caller adds
+    /// afterward.** Every builtin policy has one to give — the vocabulary in
+    /// [`selection`] has a branch for each — and a required argument is what
+    /// makes [`Decision::selector`] being `None` unreachable from this
+    /// constructor. The field stays an `Option` on the wire for records
+    /// written before it existed; no in-tree path produces `None` today.
+    pub fn decide(
+        &self,
+        target: Target,
+        rationale: String,
+        selector: SelectorSnapshot,
+    ) -> Decision {
         Decision {
             target,
             rationale: self.annotate(rationale),
@@ -316,16 +328,16 @@ impl<'a> Admitted<'a> {
             fallbacks: Vec::new(),
             source: None,
             admitted: Some(self.pool.iter().map(|c| c.target.clone()).collect()),
-            selector: None,
+            selector: Some(selector),
         }
     }
 
-    /// [`Self::decide`] for a policy that picked a *tier*: the same three
-    /// coupled fields, plus the ordered second choices and the typed reason the
-    /// tier was picked.
+    /// [`Self::decide`] for a policy that picked a *tier*: the same coupled
+    /// fields, plus the ordered second choices and the typed reason the tier
+    /// was picked.
     ///
     /// A second constructor rather than two more arguments on `decide`, because
-    /// the two existing policies have neither answer to give — an
+    /// the two non-staged policies have neither answer to give — an
     /// `EscalationPolicy` audit turn has no ordered runner-up and no
     /// [`DecisionSource`], and making them pass `Vec::new()` and `None` would
     /// be asking two callers to disclaim a concept they do not have.
@@ -341,11 +353,12 @@ impl<'a> Admitted<'a> {
         fallbacks: Vec<Target>,
         source: DecisionSource,
         rationale: String,
+        selector: SelectorSnapshot,
     ) -> Decision {
         Decision {
             fallbacks,
             source: Some(source),
-            ..self.decide(target, rationale)
+            ..self.decide(target, rationale, selector)
         }
     }
 

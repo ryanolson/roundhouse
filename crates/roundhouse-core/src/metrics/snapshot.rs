@@ -14,15 +14,26 @@
 //! to be local *and* to have been billed is a row that can lie about the one
 //! number this whole feature exists to report.
 
+mod columns;
+mod cost;
+
+pub use columns::{
+    CacheReuseEvidence, FIRST_OUTPUT_BASIS, IntervalMetric, OBSERVED_CACHE_BASIS,
+    PREDICTED_CACHE_BASIS, TURN_ELAPSED_BASIS,
+};
+pub use cost::{
+    EVALUATION_PRICE_BASIS, EvaluationMetrics, EvaluationModelMetrics, EvaluationSettlement,
+    EvaluationTokens, EvaluationUnbooked, OBSERVED_COST_SCOPE, ObservedCost, SERVING_PRICE_BASIS,
+    ServingCostGaps,
+};
+
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
 use crate::event::Usage;
 use crate::metrics::ServingMode;
-use crate::metrics::cache_evidence::CacheEvidence;
-use crate::metrics::evaluation::EvaluationCounters;
-use crate::metrics::fold::{Elapsed, MetricsFold, Scope};
+use crate::metrics::fold::{MetricsFold, Scope};
 use crate::metrics::pricing::{Correlary, ReferenceModel, ShadowPricing, TokenShape};
 
 /// Token counts for one grouping, split the way a reader asks about them.
@@ -193,180 +204,6 @@ pub enum ModelAccounting {
     },
 }
 
-/// What [`FirstOutputLatency`] measures, published beside the number.
-///
-/// On the wire because the figure is unreadable without it. The interval is
-/// the `TurnStarted` append stamp to the first non-empty `OutputTextDelta`
-/// append stamp, attributed to the target that served; it includes any routing
-/// and failover in between, and excludes work before `TurnStarted` and delivery
-/// after the append. It is not the provider's service latency.
-pub const FIRST_OUTPUT_BASIS: &str = "turn_start_to_first_output";
-
-/// The interval [`FIRST_OUTPUT_BASIS`] names, per target.
-#[derive(Debug, Clone, Serialize)]
-pub struct FirstOutputLatency {
-    /// Mean milliseconds over [`Self::samples`].
-    ///
-    /// `None` when there are no samples, which is the whole point of the column
-    /// being optional twice over: a row that measured nothing publishes no
-    /// number rather than a zero that reads as instant.
-    pub mean_ms: Option<f64>,
-    pub samples: u64,
-    /// Timings refused because the first delta's stamp preceded the start's.
-    pub rejected: u64,
-    pub basis: &'static str,
-}
-
-/// What the two [`TurnElapsed`] columns measure, published beside each number.
-///
-/// The interval is the `TurnStarted` append stamp to the `ResponseCompleted` or
-/// `ResponseIncomplete` append stamp, attributed to the turn's last routed
-/// target. It includes routing and any failover in between, and excludes
-/// admission work before `TurnStarted` and delivery after the terminal append.
-///
-/// It is not provider latency, not task success, and not time to solution — it
-/// is how long this deployment took to finish with a turn, one way or another.
-pub const TURN_ELAPSED_BASIS: &str = "turn_start_to_terminal";
-
-/// The interval [`TURN_ELAPSED_BASIS`] names, for one outcome class.
-///
-/// The basis names the *interval*, which is why both columns carry the same
-/// string; the field name names the *class*. Two fields with one basis is the
-/// design rather than a copy-paste — what differs between them is how the turn
-/// ended, not what was measured.
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnElapsed {
-    /// Mean milliseconds over [`Self::samples`].
-    ///
-    /// `None` when there are no samples: a class that measured nothing
-    /// publishes no number rather than a zero that reads as instant.
-    pub mean_ms: Option<f64>,
-    pub samples: u64,
-    /// Terminals refused because their stamp preceded their turn's start.
-    pub rejected: u64,
-    pub basis: &'static str,
-}
-
-impl TurnElapsed {
-    /// One class's column, or `None` when that class measured nothing.
-    ///
-    /// Published when there is either a timing or a refusal to report, which is
-    /// [`FirstOutputLatency`]'s rule and holds for its reason: a class with only
-    /// refusals keeps the column and loses the mean, because dropping it would
-    /// hide a clock that moved behind "not measured".
-    fn publish(elapsed: &Elapsed) -> Option<Self> {
-        (elapsed.samples > 0 || elapsed.rejected > 0).then(|| Self {
-            mean_ms: (elapsed.samples > 0)
-                .then(|| elapsed.ms_total as f64 / elapsed.samples as f64),
-            samples: elapsed.samples,
-            rejected: elapsed.rejected,
-            basis: TURN_ELAPSED_BASIS,
-        })
-    }
-}
-
-/// The denominator [`CacheReuseEvidence::predicted_mean_ratio`] is stated over.
-///
-/// The decision's own `isl_tokens` minus its `expected_prefill_tokens`, over
-/// that same `isl_tokens` — our tokenizer's count of the prompt we were about
-/// to send, including a toolbox the client re-declares every turn. It is the
-/// router's belief at the moment it chose, read off the persisted
-/// `DecisionRecord` and never recomputed from a live quote.
-///
-/// **The two numbers share that basis only because a tool-declaring turn cannot
-/// go local**, and that is worth stating because it is contingent rather than
-/// structural. A hosted quote is priced over the same request `isl_tokens` the
-/// record carries, so a hosted row subtracts like with like. A local quote is
-/// priced over the conversation buffer alone, which has no toolbox in it — and
-/// the engine excludes every local candidate from a turn that declares tools,
-/// so a local row's `isl_tokens` has no toolbox in it either. A later rung that
-/// lets a tool-declaring turn reach a local worker would silently make the
-/// whole toolbox render read as predicted cache reuse on that row.
-pub const PREDICTED_CACHE_BASIS: &str = "routed_isl_minus_expected_prefill";
-
-/// The denominator [`CacheReuseEvidence::observed_mean_ratio`] is stated over.
-///
-/// The provider's own `cached_input_tokens` over its own `input_tokens`, and
-/// only where `Usage::cache_read_source` says the provider actually stated the
-/// read. A stated zero counts; an omitted, null or unparseable field does not,
-/// because both decoders fill it in with a zero that would otherwise divide as
-/// a measured miss.
-pub const OBSERVED_CACHE_BASIS: &str = "stated_cached_input_over_input";
-
-/// What the router expected of a target's cache against what it got.
-///
-/// **An observation, not a verdict.** A gap in either direction says the
-/// router's expectation and the provider's accounting disagree on this row. It
-/// is not by itself evidence of cache pressure, of a routing mistake, or of
-/// anything about answer quality, and nothing downstream may read it as a
-/// reward.
-///
-/// The two means are over [`Self::samples`] — terminals where a usable
-/// prediction met a *stated* cache read. The counts beside them say how much of
-/// the row never got that far, which is what keeps a small sample from reading
-/// as a whole population. A local row contributes counts and no samples by
-/// construction: its cache credit is the router's own quote handed back, so
-/// pairing it would check a number against itself.
-#[derive(Debug, Clone, Serialize)]
-pub struct CacheReuseEvidence {
-    /// Mean predicted reuse over [`Self::samples`], on
-    /// [`PREDICTED_CACHE_BASIS`].
-    pub predicted_mean_ratio: Option<f64>,
-    pub predicted_basis: &'static str,
-    /// Mean observed reuse over the same samples, on [`OBSERVED_CACHE_BASIS`].
-    pub observed_mean_ratio: Option<f64>,
-    pub observed_basis: &'static str,
-    /// Terminals where a usable prediction met a stated cache read.
-    pub samples: u64,
-    /// Mean of observed minus predicted. Negative where the router expected
-    /// more reuse than the provider reported.
-    ///
-    /// Derived from the two totals rather than accumulated beside them, so it
-    /// cannot come to disagree with the means published next to it.
-    pub mean_signed_error: Option<f64>,
-    /// Terminals whose decision carried a prediction that can be divided.
-    pub predictions: u64,
-    /// Terminals whose decision predicted nothing that can be divided.
-    pub unusable_prediction: u64,
-    /// Terminals where the provider stated its cache read, zero included.
-    pub measured_cache_reads: u64,
-    /// Terminals where nobody stated one — an omitted, null or unparseable
-    /// field, or a locally derived credit.
-    pub unverifiable_cache_read: u64,
-    /// Terminals reporting more cached input than input.
-    pub invalid_usage: u64,
-    /// Terminals whose provider count could not be read at all.
-    pub unusable_usage: u64,
-}
-
-impl CacheReuseEvidence {
-    /// One row's column, or `None` when it observed no terminal at all.
-    ///
-    /// Published as soon as there is anything to report — including a row that
-    /// paired nothing — on [`TurnElapsed::publish`]'s rule and for its reason:
-    /// dropping the column would hide "nothing about this provider's cache is
-    /// checkable" behind the same absence as "nothing ran here".
-    fn publish(evidence: &CacheEvidence) -> Option<Self> {
-        (evidence.observed_terminals() > 0).then(|| {
-            let mean = |total: f64| (evidence.paired > 0).then(|| total / evidence.paired as f64);
-            Self {
-                predicted_mean_ratio: mean(evidence.predicted_total),
-                predicted_basis: PREDICTED_CACHE_BASIS,
-                observed_mean_ratio: mean(evidence.observed_total),
-                observed_basis: OBSERVED_CACHE_BASIS,
-                samples: evidence.paired,
-                mean_signed_error: mean(evidence.observed_total - evidence.predicted_total),
-                predictions: evidence.predictions,
-                unusable_prediction: evidence.unusable_prediction,
-                measured_cache_reads: evidence.measured_cache_reads,
-                unverifiable_cache_read: evidence.unverifiable_cache_read,
-                invalid_usage: evidence.invalid_usage,
-                unusable_usage: evidence.unusable_usage,
-            }
-        })
-    }
-}
-
 /// One model's row.
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelMetrics {
@@ -378,17 +215,17 @@ pub struct ModelMetrics {
     /// Absent when this row has neither a usable timing nor a refused one, so
     /// every row written before this column existed serializes as it did.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub first_output: Option<FirstOutputLatency>,
+    pub first_output: Option<IntervalMetric>,
     /// Turn start to terminal, over the turns this row completed.
     ///
     /// Absent on the same rule `first_output` uses, and never added to
     /// [`Self::incomplete_turn_elapsed`]: see `Counters::completed_elapsed`
     /// in the fold module for why one pot would reward failing faster.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_turn_elapsed: Option<TurnElapsed>,
+    pub completed_turn_elapsed: Option<IntervalMetric>,
     /// The same interval over the turns this row did not complete.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub incomplete_turn_elapsed: Option<TurnElapsed>,
+    pub incomplete_turn_elapsed: Option<IntervalMetric>,
     /// Predicted against observed cache reuse, absent on the rule above.
     ///
     /// **Never summed across serving modes**, which [`ModelKey`]'s `mode` field
@@ -548,382 +385,6 @@ pub struct ServingModeMetrics {
     pub totals: Rollup,
 }
 
-/// What every serving dollar on this document was priced by.
-///
-/// The catalog as loaded *now*, applied to token counts the fold established
-/// when the turn ran. Correcting a rate card reprices this history, which is the
-/// whole reason the fold holds no serving dollars.
-pub const SERVING_PRICE_BASIS: &str = "current_catalog_rate_card";
-
-/// What every evaluation dollar on this document was priced by.
-///
-/// The rate card each classifier call recorded on its own reservation, applied
-/// once, at the call. Nothing here is repriced by a later catalog edit — the
-/// record *is* the pricing authority for a settled call, and a second one would
-/// let the ledger and the log disagree about a finished turn with no reader able
-/// to say which was right.
-///
-/// **Not a provider-reported dollar figure**, which is a different claim living
-/// in [`Savings::provider_reported_usd`]: this is our own arithmetic over usage
-/// a service reported, not a bill anybody issued.
-pub const EVALUATION_PRICE_BASIS: &str = "rate_card_recorded_with_each_call";
-
-/// Tokens one set of classifier calls billed, as the services reported them.
-///
-/// Separate from [`TokenBreakdown`] and never added into it. A classifier call
-/// is not a turn: it has no cache accounting, no seat, and no model row, and a
-/// figure that mixed the two would put tokens nobody served into the volume the
-/// serving rates are computed over.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct EvaluationTokens {
-    pub input: u64,
-    pub output: u64,
-    pub total: u64,
-}
-
-/// What became of the settles behind one set of evaluation calls.
-///
-/// **Beside the cost and never instead of it.** A settle nobody acknowledged
-/// does not erase the usage that was billed, so `unconfirmed_usd` is money this
-/// deployment knows it owes and cannot yet prove it committed —
-/// `committed_usd + unconfirmed_usd` is always
-/// [`EvaluationMetrics::measured_usd`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
-pub struct EvaluationSettlement {
-    /// Calls that reached a service and whose settle the ledger answered for,
-    /// at the call or through a later repair.
-    pub acknowledged_calls: u64,
-    /// The measured share of those calls, in dollars.
-    pub committed_usd: f64,
-    /// Calls whose settle nobody has answered for. See
-    /// [`SettlementAck::Unconfirmed`](crate::classify::SettlementAck::Unconfirmed):
-    /// absence of an acknowledgement, never proof the charge is not there.
-    pub unconfirmed_calls: u64,
-    pub unconfirmed_usd: f64,
-    /// Acknowledgements that arrived as a repair rather than with the result.
-    ///
-    /// A subset of `acknowledged_calls`, not an addition to it, and never a
-    /// second cost: a repair re-drives the amount the record already holds.
-    pub repaired_calls: u64,
-}
-
-/// Classification events this projection refused to book.
-///
-/// Published rather than dropped, because each one is a silent failure
-/// otherwise: a redelivery loop, a worker answering about the wrong turn, or a
-/// repair driving a settlement no result stands behind all look identical to a
-/// quiet deployment from the outside.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct EvaluationUnbooked {
-    /// A result delivered again for an identity already settled.
-    pub duplicate_results: u64,
-    /// A result naming no outstanding intent of its session, or naming one it
-    /// does not answer.
-    pub unattributed_results: u64,
-    /// A repair resolving no open settlement.
-    pub unmatched_repairs: u64,
-}
-
-/// One `(requested, reported)` classifier identity's calls.
-///
-/// Two names and not one, because they answer different questions: `model` on
-/// the intent is what this deployment asked for, and `reported_model` is what
-/// the service said answered. `reported_model` is `null` where nothing usable
-/// was reported — an absent field, an empty one, or a call that reached no
-/// service at all — and `refused_calls` is what keeps that last case from
-/// reading as a service that answered anonymously.
-#[derive(Debug, Clone, Serialize)]
-pub struct EvaluationModelMetrics {
-    pub requested_model: String,
-    pub reported_model: Option<String>,
-    /// Every accepted result on this identity: measured, unknown and refused.
-    pub calls: u64,
-    pub measured_calls: u64,
-    /// On [`EVALUATION_PRICE_BASIS`], like every evaluation dollar here.
-    pub measured_usd: f64,
-    pub unknown_usage_calls: u64,
-    pub refused_calls: u64,
-    pub tokens: EvaluationTokens,
-}
-
-/// What this deployment spent classifying turns, on its own axis.
-///
-/// **Never merged into [`Savings`], and the separation is the point.** Every
-/// figure in `Savings` is priced from the current catalog over tokens the fold
-/// counted; every figure here was priced once by the call that incurred it. One
-/// total over both would be a number with two price bases and no reader able to
-/// say which half moved — see [`ObservedCost`], which adds them *and says so*.
-///
-/// The four call classes are a partition of what the log knows:
-/// `results == measured_calls + unknown_usage_calls + refused_calls`, and
-/// `intents == results + pending`. A pending intent and an unreported usage are
-/// both cost this deployment cannot state, which is what `cost_incomplete`
-/// says; a refusal is genuinely free, because nothing was sent.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct EvaluationMetrics {
-    /// Calls committed to, by durable call identity within a session.
-    pub intents: u64,
-    /// Intents whose result landed and answered them.
-    pub results: u64,
-    /// Intents with no accepted result. Their cost is unknown, not zero.
-    pub pending: u64,
-    pub measured_calls: u64,
-    /// Summed over `measured_calls`, each at the rate card it recorded.
-    ///
-    /// **An observation, not an invoice.** Usage a service reported, priced by
-    /// this deployment; no provider stated this figure.
-    pub measured_usd: f64,
-    pub price_basis: &'static str,
-    pub tokens: EvaluationTokens,
-    /// Results whose usage nobody reported. The call billed an amount that
-    /// cannot be named, and zero is the wrong guess.
-    pub unknown_usage_calls: u64,
-    /// Results established before any HTTP — a refused budget, an unreachable
-    /// ledger, an expired call. Nothing was sent, so nothing was billed.
-    pub refused_calls: u64,
-    pub settlement: EvaluationSettlement,
-    /// Whether some in-scope evaluation cost cannot be stated, which makes
-    /// `measured_usd` a floor rather than a total.
-    pub cost_incomplete: bool,
-    pub unbooked: EvaluationUnbooked,
-    /// One row per identity pair, ordered by requested then reported name.
-    pub models: Vec<EvaluationModelMetrics>,
-}
-
-impl EvaluationMetrics {
-    fn build(counters: &EvaluationCounters) -> Self {
-        Self {
-            intents: counters.intents,
-            results: counters.results,
-            pending: counters.pending(),
-            measured_calls: counters.measured_calls,
-            measured_usd: counters.measured_usd,
-            price_basis: EVALUATION_PRICE_BASIS,
-            tokens: EvaluationTokens {
-                input: counters.input_tokens,
-                output: counters.output_tokens,
-                total: counters.input_tokens + counters.output_tokens,
-            },
-            unknown_usage_calls: counters.unknown_usage_calls,
-            refused_calls: counters.refused_calls,
-            settlement: EvaluationSettlement {
-                acknowledged_calls: counters.acknowledged_calls(),
-                committed_usd: counters.committed_usd(),
-                unconfirmed_calls: counters.unconfirmed_calls(),
-                unconfirmed_usd: counters.unconfirmed_usd(),
-                repaired_calls: counters.repaired_calls,
-            },
-            cost_incomplete: counters.cost_incomplete(),
-            unbooked: EvaluationUnbooked {
-                duplicate_results: counters.duplicate_results,
-                unattributed_results: counters.unattributed_results,
-                unmatched_repairs: counters.unmatched_repairs,
-            },
-            models: counters
-                .by_model
-                .iter()
-                .map(|(key, row)| EvaluationModelMetrics {
-                    requested_model: key.requested.clone(),
-                    reported_model: key.reported.clone(),
-                    calls: row.calls,
-                    measured_calls: row.measured_calls,
-                    measured_usd: row.measured_usd,
-                    unknown_usage_calls: row.unknown_usage_calls,
-                    refused_calls: row.refused_calls,
-                    tokens: EvaluationTokens {
-                        input: row.input_tokens,
-                        output: row.output_tokens,
-                        total: row.input_tokens + row.output_tokens,
-                    },
-                })
-                .collect(),
-        }
-    }
-}
-
-/// Why the serving half of a combined total is not the whole of what serving
-/// cost.
-///
-/// **Three different facts, counted apart, because the reader does different
-/// things about them.** An estimated call is *priced* and uncertain — the
-/// dollars are there, computed over token counts a silent provider left us to
-/// make — and the error cuts either way, because a tokenizer mismatch is not a
-/// bias. An unpriced model is *not priced at all*: real tokens billed by a real
-/// provider, published as zero dollars because the catalog holds no rate for
-/// that row, so the total understates by an amount nobody can name, and the
-/// remedy is a rate card. A local call is *not an invoice at all*: our own fleet
-/// bills nobody, and what it cost is GPU time, which a catalog of per-token
-/// prices has no basis to put a number on and this projection will not invent
-/// one for.
-///
-/// The three overlap and are deliberately not additive — a local call whose
-/// usage nobody reported is in two of them — because each answers a different
-/// question about the same traffic.
-///
-/// **A forwarded seat is not one of these, and the contrast with the local
-/// count is the reason rather than a placement preference.** Both are traffic
-/// this deployment served and priced nowhere, so the two look alike. They are
-/// not: GPU time is *this deployment's* cost, paid in hardware instead of in
-/// invoices, so a total that omits it is short — while a seat's tokens were
-/// charged to the caller's own subscription, so they are not this deployment's
-/// cost at all and a total that omits them is exact. A gap counter for a seat
-/// would report an incomplete total that is in fact complete.
-///
-/// The exclusion is still stated, on [`OBSERVED_COST_SCOPE`], because it is a
-/// statement about what the total is *of*. The volume is published as
-/// [`MetricsSnapshot::seat_tokens`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-pub struct ServingCostGaps {
-    /// Calls no provider accounted for, priced from our own tokenizer.
-    pub estimated_calls: u64,
-    /// Hosted rows that served priceable tokens and that the catalog holds no
-    /// rate for.
-    ///
-    /// Configured zero rates, including zero cache-read rates, are priced.
-    pub unpriced_models: u64,
-    /// Calls our own fleet served, whose hardware cost this document does not
-    /// price.
-    ///
-    /// **Not a defect and not a missing rate card**, which is why it is counted
-    /// rather than warned about: a local row correctly bills nothing, and the
-    /// GPU time behind it is a capital cost no per-token catalog can state. It
-    /// is here because without it a deployment that routed everything to its own
-    /// workers would publish a near-zero total and call it complete — the one
-    /// deployment this whole projection exists to describe, reporting its
-    /// strongest claim as a fact about money it never spent.
-    pub local_calls: u64,
-}
-
-impl ServingCostGaps {
-    /// Whether anything about the serving half is unmeasured, unpriced, or
-    /// priced in hardware this document cannot value.
-    pub fn any(&self) -> bool {
-        self.estimated_calls > 0 || self.unpriced_models > 0 || self.local_calls > 0
-    }
-
-    /// The gaps in one scope's already-priced rows.
-    ///
-    /// `coverage` is handed in rather than re-summed off the rows, because the
-    /// document already publishes that sum through [`Rollup::absorb`] and a
-    /// second walk would be a second definition of one number — the duplication
-    /// `Rollup` exists to have removed.
-    ///
-    /// Catalog coverage comes from each row's
-    /// [`ModelAccounting::Frontier::priced_by_catalog`], because a zero amount
-    /// does not establish missing pricing.
-    fn of(models: &[ModelMetrics], coverage: &Coverage) -> Self {
-        Self {
-            estimated_calls: coverage.estimated_calls,
-            unpriced_models: models
-                .iter()
-                .filter(|row| {
-                    matches!(
-                        row.accounting,
-                        ModelAccounting::Frontier {
-                            priced_by_catalog: false,
-                            ..
-                        }
-                    )
-                })
-                .filter(|row| row.tokens.total > row.seat_tokens().total)
-                .count() as u64,
-            // Calls rather than rows, unlike the count above: "which rate card
-            // is missing" is a question about a model, and "how much of this
-            // deployment's work is not in the total" is a question about
-            // traffic.
-            local_calls: models
-                .iter()
-                .filter(|row| row.mode() == ServingMode::Local)
-                .map(|row| row.calls)
-                .sum(),
-        }
-    }
-}
-
-/// What [`ObservedCost::total_usd`] is a total *of*.
-///
-/// On the wire beside the number, because the number cannot say it: hosted
-/// serving this deployment paid for, plus the classifier calls it made. Two
-/// kinds of traffic are counted everywhere else on this document and priced
-/// nowhere, so the total passes over both — a turn our own fleet answered, whose
-/// cost is GPU time, and a turn on a forwarded subscription seat, whose cost was
-/// somebody else's. Neither has a per-token price this projection could state
-/// without inventing one. Only the first makes the total *incomplete*; see
-/// [`ServingCostGaps`].
-pub const OBSERVED_COST_SCOPE: &str = "hosted_serving_and_classifier_calls";
-
-/// Serving and evaluation added up, with both price bases named.
-///
-/// **The one field on this document that mixes two pricing authorities, and it
-/// says so in its own payload.** A reader wants to know what the deployment
-/// spent; the honest answer has a catalog-priced half and a log-priced half, and
-/// publishing the sum without the two labels beside it would make a corrected
-/// rate card look like a changed bill.
-///
-/// `serving_usd` is [`Savings::frontier_spend_usd`] — which already carries this
-/// deployment's judge side calls, on the model rows that billed them — so an
-/// evaluation call must never also be counted as a side call, or the judge would
-/// be charged here twice. It excludes traffic on a forwarded seat, which this
-/// deployment holds no rate card for.
-///
-/// **It is not all economic cost, and [`Self::covers`] says which one it is.**
-/// A locally served turn bills nobody and costs GPU time; this document prices
-/// what left the building, so the fleet's own cost is outside it. Reporting a
-/// total that excluded it *silently* would put the most misleading number on the
-/// most local deployment — the one whose whole argument is that it serves its
-/// own traffic.
-///
-/// **Not a savings figure and not an invoice.** [`Savings::total_usd`] is what
-/// was saved; this is what was observed to be spent, and neither is the other.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
-pub struct ObservedCost {
-    pub serving_usd: f64,
-    pub serving_basis: &'static str,
-    pub evaluation_usd: f64,
-    pub evaluation_basis: &'static str,
-    /// `serving_usd + evaluation_usd`.
-    pub total_usd: f64,
-    /// What this total is a total of. See [`OBSERVED_COST_SCOPE`].
-    pub covers: &'static str,
-    /// What the serving half does not know. See [`ServingCostGaps`].
-    pub serving_gaps: ServingCostGaps,
-    /// Whether the evaluation half could not state some of its cost — a pending
-    /// intent, or usage nobody reported. The same value as
-    /// [`EvaluationMetrics::cost_incomplete`], read from it rather than
-    /// recomputed.
-    pub evaluation_incomplete: bool,
-    /// Whether *either* half is incomplete, so `total_usd` is not a complete
-    /// statement of what was spent.
-    ///
-    /// **Not the classifier's answer on its own**, which is the trap: a
-    /// deployment whose every classifier call is measured and settled can still
-    /// be serving traffic through a model the catalog has no rate for, or on its
-    /// own GPUs, and a combined figure that called itself complete on the
-    /// strength of the evaluation half would be at its most confident exactly
-    /// where the serving side is least knowable.
-    ///
-    /// `serving_gaps` and `evaluation_incomplete` say which half, so a reader
-    /// who has to act on it knows whether the answer is a rate card to write or
-    /// a classifier to go and look at.
-    pub incomplete: bool,
-}
-
-impl ObservedCost {
-    fn build(serving_usd: f64, gaps: ServingCostGaps, evaluation: &EvaluationMetrics) -> Self {
-        Self {
-            serving_usd,
-            serving_basis: SERVING_PRICE_BASIS,
-            evaluation_usd: evaluation.measured_usd,
-            evaluation_basis: EVALUATION_PRICE_BASIS,
-            total_usd: serving_usd + evaluation.measured_usd,
-            covers: OBSERVED_COST_SCOPE,
-            serving_gaps: gaps,
-            evaluation_incomplete: evaluation.cost_incomplete,
-            incomplete: gaps.any() || evaluation.cost_incomplete,
-        }
-    }
-}
-
 /// The headline, decomposed by how much each part can be trusted.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Savings {
@@ -1007,12 +468,13 @@ pub struct MetricsSnapshot {
     pub turns: u64,
     /// Terminals with a clock and no model row to carry it.
     ///
-    /// Marks what the two [`TurnElapsed`] columns exclude — most often a turn
-    /// refused before any dispatch, which stamps `TurnStarted` and a terminal
-    /// but never reaches routing — rather than folding a correction back into
-    /// either mean. Counts a terminal of either outcome class, whether or not
-    /// its interval was itself measurable. Scoped like every other figure
-    /// here: a tenant sees its own.
+    /// Marks what the two `*_turn_elapsed` [`IntervalMetric`] columns
+    /// exclude — most often a turn refused before any dispatch, which stamps
+    /// `TurnStarted` and a terminal but never reaches routing — rather than
+    /// folding a correction back into either mean. Counts a terminal of
+    /// either outcome class, whether or not its interval was itself
+    /// measurable. Scoped like every other figure here: a tenant sees its
+    /// own.
     pub unrouted_terminals: u64,
     /// Dispatches that reached a provider and were accounted for.
     pub calls: u64,
@@ -1261,29 +723,21 @@ impl MetricsSnapshot {
                 }
             };
 
-            // Published when there is either a timing or a refusal to report.
-            // A row with only refusals keeps the column and loses the mean:
-            // dropping it would hide a skewed clock behind "not measured".
-            let first_output = (counters.first_output_samples > 0
-                || counters.first_output_rejected > 0)
-                .then(|| FirstOutputLatency {
-                    mean_ms: (counters.first_output_samples > 0).then(|| {
-                        counters.first_output_ms_total as f64 / counters.first_output_samples as f64
-                    }),
-                    samples: counters.first_output_samples,
-                    rejected: counters.first_output_rejected,
-                    basis: FIRST_OUTPUT_BASIS,
-                });
-
             models.push(ModelMetrics {
                 provider: key.provider.clone(),
                 model: key.model.clone(),
                 calls: counters.calls,
                 tokens,
                 coverage,
-                first_output,
-                completed_turn_elapsed: TurnElapsed::publish(&counters.completed_elapsed),
-                incomplete_turn_elapsed: TurnElapsed::publish(&counters.incomplete_elapsed),
+                first_output: IntervalMetric::publish(&counters.first_output, FIRST_OUTPUT_BASIS),
+                completed_turn_elapsed: IntervalMetric::publish(
+                    &counters.completed_elapsed,
+                    TURN_ELAPSED_BASIS,
+                ),
+                incomplete_turn_elapsed: IntervalMetric::publish(
+                    &counters.incomplete_elapsed,
+                    TURN_ELAPSED_BASIS,
+                ),
                 cache_reuse_evidence: CacheReuseEvidence::publish(&counters.cache_reuse),
                 accounting,
             });

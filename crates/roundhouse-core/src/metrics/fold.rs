@@ -44,6 +44,7 @@ use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::metrics::cache_evidence::CacheEvidence;
 use crate::metrics::evaluation::{EvaluationCounters, EvaluationFold};
 use crate::metrics::pricing::TokenShape;
+use crate::metrics::timing::{Elapsed, TurnClock};
 use crate::metrics::{ModelKey, ServingMode};
 use crate::routing::PooledUsage;
 use crate::validate::Arm;
@@ -197,21 +198,10 @@ pub(super) struct Counters {
     /// is priced. See [`DeclaredBaseline`] for why it is a three-state value
     /// rather than a set or a last-write.
     pub(super) declared_baseline: DeclaredBaseline,
-    /// Summed milliseconds from each turn's `TurnStarted` stamp to its first
-    /// non-empty `OutputTextDelta` stamp, over [`Self::first_output_samples`]
-    /// turns this row served.
-    ///
-    /// A total and a count rather than a mean, because this row is merged into
-    /// other rows: sums add exactly, and a mean of means weights a row that
-    /// served three turns like one that served three hundred.
-    pub(super) first_output_ms_total: u64,
-    pub(super) first_output_samples: u64,
-    /// Turns whose first delta was stamped before their own `TurnStarted`.
-    ///
-    /// Counted rather than dropped. The two ways a row can have no mean are a
-    /// deployment that measured nothing and a clock that went backwards, and a
-    /// silent drop makes the second one look like the first.
-    pub(super) first_output_rejected: u64,
+    /// Each served turn's `TurnStarted` stamp to its first non-empty
+    /// `OutputTextDelta` stamp. See [`Elapsed`] for why a total and a count
+    /// rather than a mean.
+    pub(super) first_output: Elapsed,
     /// Turn start to terminal event, over the turns this row *completed*.
     ///
     /// Never merged with [`Self::incomplete_elapsed`]: a fast refusal and a
@@ -284,54 +274,6 @@ impl DeclaredBaseline {
     }
 }
 
-/// One outcome class's turn-elapsed accumulator.
-///
-/// A total and a count rather than a mean: rows merge, sums add exactly, and
-/// a mean of means would weight a row that served three turns the same as
-/// one that served three hundred.
-///
-/// A struct rather than flat fields on `Counters`, so [`Self::absorb`] merges
-/// each class in one place instead of leaving [`Counters::absorb`] two more
-/// fields to remember.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct Elapsed {
-    pub(super) ms_total: u64,
-    pub(super) samples: u64,
-    /// Terminals stamped before their own `TurnStarted`.
-    ///
-    /// Counted rather than dropped, for the reason
-    /// [`Counters::first_output_rejected`] gives: a silent drop makes a clock
-    /// that moved look like a deployment that measured nothing.
-    pub(super) rejected: u64,
-}
-
-impl Elapsed {
-    /// Fold one terminal's interval.
-    ///
-    /// `None` is a stamp that preceded its own start, and it lands in
-    /// [`Self::rejected`] rather than as a zero: a zero is a real answer here —
-    /// a turn that started and ended inside one millisecond — so spending it on
-    /// a clock that moved would make the two indistinguishable.
-    fn observe(&mut self, elapsed_ms: Option<u64>) {
-        match elapsed_ms {
-            Some(elapsed_ms) => {
-                // Saturating for [`Usage::add`]'s reason: a wrapped total would
-                // report a near-zero mean for the busiest deployment on the
-                // fleet, which is the one where the number matters most.
-                self.ms_total = self.ms_total.saturating_add(elapsed_ms);
-                self.samples += 1;
-            }
-            None => self.rejected += 1,
-        }
-    }
-
-    fn absorb(&mut self, other: &Elapsed) {
-        self.ms_total += other.ms_total;
-        self.samples += other.samples;
-        self.rejected += other.rejected;
-    }
-}
-
 impl Counters {
     /// Every token this row measured, whoever paid for it.
     ///
@@ -378,9 +320,7 @@ impl Counters {
         self.provider_reported_usd += other.provider_reported_usd;
         self.provider_reported_calls += other.provider_reported_calls;
         self.declared_baseline.absorb(&other.declared_baseline);
-        self.first_output_ms_total += other.first_output_ms_total;
-        self.first_output_samples += other.first_output_samples;
-        self.first_output_rejected += other.first_output_rejected;
+        self.first_output.absorb(&other.first_output);
         self.completed_elapsed.absorb(&other.completed_elapsed);
         self.incomplete_elapsed.absorb(&other.incomplete_elapsed);
         self.cache_reuse.absorb(&other.cache_reuse);
@@ -457,46 +397,6 @@ struct Pending {
     /// about a cache this turn never touched.
     isl_tokens: u64,
     expected_prefill_tokens: f64,
-}
-
-/// One open response's clock.
-///
-/// The start stamp outlives the first-output delta: two intervals share one
-/// origin, the first text a caller could see and the terminal event, and the
-/// second is decided at an event the first has long since passed. One map
-/// keyed by response ID, drained once at that event, is what keeps the two
-/// from drifting apart.
-struct TurnClock {
-    /// This response's `TurnStarted` append stamp.
-    started_at_ms: u64,
-    first_output: FirstOutputState,
-}
-
-/// How far the first-output interval has got.
-///
-/// Three states rather than two `Option`s: the first non-empty delta decides
-/// the answer once, and a later one must not move it or replace a refusal.
-enum FirstOutputState {
-    /// Nothing said yet.
-    Waiting,
-    /// Milliseconds from the start to the first non-empty delta.
-    Measured(u64),
-    /// That delta was stamped before the start, so there is nothing to fold.
-    Rejected,
-}
-
-impl FirstOutputState {
-    /// This clock's contribution as `(milliseconds, samples, rejections)`.
-    ///
-    /// `None` for a response that never spoke: a turn with nothing to time
-    /// contributes no sample, and a zero here would read as an instant answer.
-    fn booking(&self) -> Option<(u64, u64, u64)> {
-        match self {
-            FirstOutputState::Measured(elapsed_ms) => Some((*elapsed_ms, 1, 0)),
-            FirstOutputState::Rejected => Some((0, 0, 1)),
-            FirstOutputState::Waiting => None,
-        }
-    }
 }
 
 /// Whose numbers a report is about.
@@ -779,13 +679,8 @@ impl MetricsFold {
                 // The stamp both intervals are measured from. A retry starts its
                 // own clock: the abandoned response never terminates, so it
                 // books nothing.
-                self.clocks.insert(
-                    response_id.clone(),
-                    TurnClock {
-                        started_at_ms: event.at_ms,
-                        first_output: FirstOutputState::Waiting,
-                    },
-                );
+                self.clocks
+                    .insert(response_id.clone(), TurnClock::started(event.at_ms));
             }
             SessionEventKind::Routed {
                 response_id,
@@ -849,13 +744,8 @@ impl MetricsFold {
             // through to the ignored kinds below: a provider opens a block
             // before it says anything, and that stamp measures nothing.
             SessionEventKind::OutputTextDelta { response_id, text } if !text.is_empty() => {
-                if let Some(clock) = self.clocks.get_mut(response_id)
-                    && let FirstOutputState::Waiting = clock.first_output
-                {
-                    clock.first_output = match event.at_ms.checked_sub(clock.started_at_ms) {
-                        Some(elapsed) => FirstOutputState::Measured(elapsed),
-                        None => FirstOutputState::Rejected,
-                    };
+                if let Some(clock) = self.clocks.get_mut(response_id) {
+                    clock.spoke_at(event.at_ms);
                 }
             }
             SessionEventKind::ResponseCompleted {
@@ -894,99 +784,41 @@ impl MetricsFold {
                 if let Some(turn_key) = self.turn_of_response.remove(response_id) {
                     self.response_of_turn.remove(&turn_key);
                 }
+
+                // Both halves of this response's state, taken once each and
+                // read from the local rather than re-looked-up below. Three
+                // independent re-lookups of `pending` used to gate three
+                // separate row-creation sites that had to be trusted to agree
+                // (core-metrics-3); one lookup each means there is only one
+                // row-creation rule to state, immediately below.
+                let clock = self.clocks.remove(response_id);
+                let completed = matches!(event.kind, SessionEventKind::ResponseCompleted { .. });
+                let Some(pending) = self.pending.remove(response_id) else {
+                    // No dispatch to attribute this terminal to: marked,
+                    // never booked. A superseded response's late terminal,
+                    // which has neither, never reaches this arm either — its
+                    // clock was removed at `TurnStarted`, so `clock` above is
+                    // already `None` by the time control gets here.
+                    if clock.is_some() {
+                        *self
+                            .unrouted_terminals_of_principal
+                            .entry(payer)
+                            .or_default() += 1;
+                    }
+                    return true;
+                };
+
                 // The provider's own figure for this call, accumulated on the
                 // row that made it and **never on the row's dollars**. It is
                 // the external bill the reconciliation view checks
                 // `frontier_spend_usd` against, so adding the two would be the
-                // view comparing a number with itself. Booked before the
-                // `consumed` gate for the same reason the attempt above is: a
-                // provider that reported a price reported one whatever this
-                // deployment's own evidence rule makes of the tokens.
-                if let SessionEventKind::ResponseCompleted {
-                    provider_reported_cost_usd: Some(cost_usd),
-                    ..
-                } = &event.kind
-                    && let Some(pending) = self.pending.get(response_id)
-                {
-                    let counters = self
-                        .by_principal
-                        .entry(payer.clone())
-                        .or_default()
-                        .entry(pending.key.clone())
-                        .or_default();
-                    counters.provider_reported_usd += cost_usd;
-                    counters.provider_reported_calls += 1;
-                }
-                // Booked on the target that served and **above the gate below**.
-                // The interval is a fact about two log stamps, so the evidence
-                // rule that keeps phantom calls out of token denominators does
-                // not bear on it: a response that spoke and billed nothing
-                // still has both stamps.
-                //
-                // Removed either way, so a superseded response whose terminal
-                // event arrives late drains rather than accumulates; with no
-                // `pending` there is no target to attribute it to.
-                //
-                // Drained on every path, but only a *decided* clock reaches a
-                // row: a turn that started and never spoke has nothing to book,
-                // and creating its row anyway would put a zero-token row on the
-                // dashboard for a response the gate below drops — which reads
-                // as a free call.
-                if let Some(clock) = self.clocks.remove(response_id) {
-                    let first_output = clock.first_output.booking();
-                    let terminal_ms = event.at_ms.checked_sub(clock.started_at_ms);
-                    let completed =
-                        matches!(event.kind, SessionEventKind::ResponseCompleted { .. });
-                    match self.pending.get(response_id) {
-                        // The two intervals this clock carries, booked to the
-                        // turn's last routed target. A turn that failed over
-                        // books its whole span there, including the time its
-                        // dead attempts burned, because there is one turn and
-                        // the caller waited once — what the abandoned targets
-                        // cost is already on their own rows as
-                        // `failed_attempts`.
-                        //
-                        // Unlike the first-output sample beside it, the
-                        // terminal interval exists for every response that
-                        // started and ended, so this branch can create a row
-                        // for a dispatch the evidence gate below drops. The
-                        // row carries `calls: 0`, which keeps it from reading
-                        // as a free call.
-                        Some(pending) => {
-                            let counters = self
-                                .by_principal
-                                .entry(payer.clone())
-                                .or_default()
-                                .entry(pending.key.clone())
-                                .or_default();
-                            if let Some((elapsed_ms, samples, rejected)) = first_output {
-                                counters.first_output_ms_total += elapsed_ms;
-                                counters.first_output_samples += samples;
-                                counters.first_output_rejected += rejected;
-                            }
-                            // Never the same pot. See `Counters::completed_elapsed`.
-                            match completed {
-                                true => counters.completed_elapsed.observe(terminal_ms),
-                                false => counters.incomplete_elapsed.observe(terminal_ms),
-                            }
-                        }
-                        // A clock with no dispatch to attribute it to: marked,
-                        // never booked. The gate is both halves — a clock that
-                        // exists and a dispatch that does not — so a
-                        // superseded response's late terminal, which has
-                        // neither, never reaches this arm either: its clock
-                        // was removed at `TurnStarted`, so it never enters
-                        // `if let Some(clock)` above.
-                        None => {
-                            *self
-                                .unrouted_terminals_of_principal
-                                .entry(payer.clone())
-                                .or_default() += 1;
-                        }
-                    }
-                }
-                let Some(pending) = self.pending.remove(response_id) else {
-                    return true;
+                // view comparing a number with itself.
+                let provider_cost = match &event.kind {
+                    SessionEventKind::ResponseCompleted {
+                        provider_reported_cost_usd: Some(cost_usd),
+                        ..
+                    } => Some(*cost_usd),
+                    _ => None,
                 };
                 // The same evidence rule the cache ledger uses, and for the
                 // same reason. A completion always consumed tokens; an
@@ -995,18 +827,43 @@ impl MetricsFold {
                 // anything reached the provider and those carry empty usage.
                 // Counting one of those would add a call that never happened
                 // to the denominator of every rate on the dashboard.
-                let consumed = matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
-                    || usage.input_tokens > 0;
-                if !consumed {
+                let consumed = completed || usage.input_tokens > 0;
+
+                // A row exists for this dispatch only if one of the three has
+                // something to book onto it — the one rule, stated once, that
+                // used to be spread across three `or_default()` calls: a
+                // dispatch with no reported cost, no clock and no consumption
+                // mints no row, which keeps a phantom dispatch off the
+                // dashboard as a free call.
+                if provider_cost.is_none() && clock.is_none() && !consumed {
                     return true;
                 }
-
                 let counters = self
                     .by_principal
                     .entry(payer)
                     .or_default()
                     .entry(pending.key)
                     .or_default();
+                if let Some(cost_usd) = provider_cost {
+                    counters.provider_reported_usd += cost_usd;
+                    counters.provider_reported_calls += 1;
+                }
+                // Booked on the target that served and above the `consumed`
+                // gate below. The interval is a fact about two log stamps, so
+                // the evidence rule that keeps phantom calls out of token
+                // denominators does not bear on it: a response that spoke and
+                // billed nothing still has both stamps. A turn that failed
+                // over books its whole span here, including the time its dead
+                // attempts burned, because there is one turn and the caller
+                // waited once — what the abandoned targets cost is already on
+                // their own rows as `failed_attempts`.
+                if let Some(clock) = clock {
+                    clock.book(counters, event.at_ms, completed);
+                }
+                if !consumed {
+                    return true;
+                }
+
                 settle(
                     counters,
                     usage,
@@ -1285,7 +1142,8 @@ impl MetricsFold {
     /// belong to, and handing it back beside rows it must never be summed into
     /// is how the two would eventually be summed.
     pub(super) fn evaluation(&self, scope: Scope<'_>) -> EvaluationCounters {
-        self.evaluation.tally(scope)
+        self.evaluation
+            .tally(scope, |session| self.principal_for(session))
     }
 
     /// Side calls made and abandoned, in one scope.
@@ -1379,6 +1237,8 @@ fn settle(
     }
 }
 
+#[cfg(test)]
+mod evaluation_tests;
 #[cfg(test)]
 mod first_output_tests;
 #[cfg(test)]
@@ -2055,9 +1915,9 @@ pub(super) mod tests {
         fold.extend(fast.events());
         fold.extend(slow.events());
         let merged_claude = &fold.summed_rows(Scope::Deployment)[&claude()];
-        assert_eq!(merged_claude.first_output_samples, 2);
-        assert_eq!(merged_claude.first_output_ms_total, 20 + 30);
-        assert_eq!(merged_claude.first_output_rejected, 0);
+        assert_eq!(merged_claude.first_output.samples, 2);
+        assert_eq!(merged_claude.first_output.ms_total, 20 + 30);
+        assert_eq!(merged_claude.first_output.rejected, 0);
     }
 
     /// A side call is money, and it books like money — under the model that

@@ -590,6 +590,19 @@ pub struct StagePolicy {
     inner: Box<dyn RoutingPolicy>,
 }
 
+/// What [`StagePolicy::resolve`] found, before a target is picked out of it.
+enum Resolved<'a> {
+    /// A tier served, one way or another: the ordered pool [`StageOutcome`]
+    /// describes, head first.
+    Tier {
+        outcome: StageOutcome,
+        ordered: Vec<&'a Candidate>,
+    },
+    /// Nothing either tier names was admitted; the caller degrades past the
+    /// recipe instead.
+    Degrade,
+}
+
 impl StagePolicy {
     pub fn new(inner: Box<dyn RoutingPolicy>) -> Self {
         Self { inner }
@@ -621,6 +634,102 @@ impl StagePolicy {
                     .find(|candidate| &candidate.target.policy_identity() == named)
             })
             .collect()
+    }
+
+    /// What narrowing the picked tier against the admitted pool comes to.
+    ///
+    /// **Pure, and returns the outcome rather than a tuple of locals to
+    /// rebuild it from.** `choose` used to reassign `serving` and `ordered`,
+    /// shadow-record `source` and `displaced`, and capture a boolean "before
+    /// the guard can move `serving`" — four pieces of state that a reader had
+    /// to check still agreed by the time the rationale and the evidence each
+    /// read their own subset of them. `Resolved` is the one place that
+    /// agreement is now structural: the guard tie the doc on the dominance
+    /// check below used to need a paragraph to argue ("the two cannot both
+    /// have fired") is now just the fact that the guard is one more arm
+    /// inside this function's single return, not a mutation after it.
+    fn resolve<'a>(recipe: &TierRecipe, pick: Pick, pool: &[&'a Candidate]) -> Resolved<'a> {
+        let picked = Self::tier_pool(recipe, pick.tier, pool);
+        let (tier, ordered, picked_tier_was_empty) = match picked.is_empty() {
+            false => (pick.tier, picked, false),
+            true => {
+                let other = Self::tier_pool(recipe, pick.tier.other(), pool);
+                match other.is_empty() {
+                    false => (pick.tier.other(), other, true),
+                    // The recipe named targets and the pool holds none of
+                    // them, in either tier. Whether that is a failure depends
+                    // on what admission left, which `resolve` cannot see —
+                    // `Admitted` is the caller's to hold, not this pure
+                    // function's — so the caller decides via
+                    // `Self::degrade_past_the_recipe`.
+                    true => return Resolved::Degrade,
+                }
+            }
+        };
+
+        // **The dominance guard, and the whole of T4.** The efficient tier
+        // exists to save cost; a capable candidate that also quotes *less*
+        // for this turn is better on function and cost at once, so serving
+        // the efficient head would be paying more for the weaker model. The
+        // only thing that produces that inversion in practice is cache
+        // affinity — a warm prefix on the capable target and a cold one on
+        // the efficient head — and the per-target ledger has already priced
+        // that into both quotes. Reading the quote is therefore how this
+        // policy sees warmth without holding a byte of session state.
+        //
+        // Only runs on a non-empty efficient pick, which is what makes the
+        // guard and `picked_tier_was_empty` mutually exclusive by
+        // construction rather than by the caller's argument: the two are
+        // different arms of this same `if`, not two flags a reader has to
+        // notice never both come true.
+        if !picked_tier_was_empty && pick.tier == Tier::Efficient {
+            let head = ordered[0];
+            let capable = Self::tier_pool(recipe, Tier::Capable, pool);
+            // **Strictly less, never equal**: at equal cost nothing is
+            // dominated, so the tier pick — a statement about function —
+            // stands. **The first cheaper member in recipe order, not the
+            // tier's head**: a head that quotes higher than what it
+            // displaced would reintroduce the inversion from the other side.
+            // **Efficient picks only**: an escalation says the cheap tier
+            // cannot finish this turn, and no price makes it able to.
+            if let Some(cheaper) = capable
+                .iter()
+                .position(|candidate| candidate.expected_cost_usd < head.expected_cost_usd)
+            {
+                // The prices live in the log line and never in the rationale:
+                // the rationale is republished into the calling model's own
+                // context by `explain_last_route` (see `choose`'s `format!`).
+                tracing::debug!(
+                    displaced = %head.target.policy_identity(),
+                    displaced_cost_usd = head.expected_cost_usd,
+                    serving = %capable[cheaper].target.policy_identity(),
+                    serving_cost_usd = capable[cheaper].expected_cost_usd,
+                    picked_by = pick.source.label(),
+                    "a capable target quotes lower for this turn than the efficient tier's head, \
+                     so it takes the turn on cost as well as on function"
+                );
+                let displaced = head.target.policy_identity();
+                // Rotated rather than truncated so the rest of the capable
+                // tier stays behind it in the recipe's order: a guarded
+                // turn's fallbacks are a capable turn's fallbacks.
+                let mut ordered = capable;
+                let winner = ordered.remove(cheaper);
+                ordered.insert(0, winner);
+                return Resolved::Tier {
+                    outcome: StageOutcome::CostGuard {
+                        served: Tier::Capable,
+                        displaced,
+                    },
+                    ordered,
+                };
+            }
+        }
+
+        let outcome = match picked_tier_was_empty {
+            true => StageOutcome::PickedTierEmpty { served: tier },
+            false => StageOutcome::Served { tier },
+        };
+        Resolved::Tier { outcome, ordered }
     }
 
     /// What a turn does when admission left capacity the recipe does not name.
@@ -675,37 +784,32 @@ impl StagePolicy {
             );
             return Err(admitted.refuse_no_viable());
         };
-        Ok(Decision {
+        Ok(admitted.decide(
+            degrade.target.clone(),
+            // **No price in this string**, the same rule the staged rationale
+            // below states at length: a rationale is republished into the
+            // calling model's own context by `explain_last_route`.
+            format!(
+                "stage router: no target this project's tier recipe names is admissible on \
+                 this turn, so the turn degrades to {} -- a spent allowance promises local \
+                 service and a recipe does not override it",
+                degrade.target.policy_identity()
+            ),
             // The recipe is still the recipe this turn ran under, and the pick
-            // is still what the scorer answered — both are recorded even though
-            // neither decided the target, because "which recipe failed to place
-            // this turn" is the question an operator reading a degrade asks.
-            // `StageOutcome::DegradedPastRecipe` is what says no tier served,
-            // which is the same thing the `None` source says to the handoff
-            // gate.
-            selector: Some(SelectorSnapshot::stage(StageEvidence {
-                capable: recipe.list(Tier::Capable).to_vec(),
-                efficient: recipe.list(Tier::Efficient).to_vec(),
-                picker: recipe.picker(),
-                confidence_threshold: recipe.confidence_threshold(),
+            // is still what the scorer answered — both are recorded even
+            // though neither decided the target, because "which recipe
+            // failed to place this turn" is the question an operator reading
+            // a degrade asks. `StageOutcome::DegradedPastRecipe` is what says
+            // no tier served, which is the same thing the `None` source says
+            // to the handoff gate.
+            SelectorSnapshot::stage(StageEvidence::new(
+                recipe,
                 pick,
-                outcome: StageOutcome::DegradedPastRecipe {
+                StageOutcome::DegradedPastRecipe {
                     degraded_to: degrade.target.policy_identity(),
                 },
-            })),
-            ..admitted.decide(
-                degrade.target.clone(),
-                // **No price in this string**, the same rule the staged rationale
-                // below states at length: a rationale is republished into the
-                // calling model's own context by `explain_last_route`.
-                format!(
-                    "stage router: no target this project's tier recipe names is admissible on \
-                     this turn, so the turn degrades to {} -- a spent allowance promises local \
-                     service and a recipe does not override it",
-                    degrade.target.policy_identity()
-                ),
-            )
-        })
+            )),
+        ))
     }
 }
 
@@ -744,74 +848,29 @@ impl RoutingPolicy for StagePolicy {
         let signals = ctx.signals.cloned().unwrap_or_default();
         let pick = pick_tier(&signals, recipe.picker(), recipe.confidence_threshold());
 
-        let picked = Self::tier_pool(recipe, pick.tier, pool);
-        let (mut serving, mut ordered) = match picked.is_empty() {
-            false => (pick.tier, picked),
-            true => {
-                let other = Self::tier_pool(recipe, pick.tier.other(), pool);
-                match other.is_empty() {
-                    false => (pick.tier.other(), other),
-                    // The recipe named targets and the pool holds none of them.
-                    // Whether that is a failure depends on what admission left.
-                    true => return Self::degrade_past_the_recipe(recipe, pick, &admitted),
-                }
+        let (outcome, ordered) = match Self::resolve(recipe, pick, pool) {
+            Resolved::Degrade => return Self::degrade_past_the_recipe(recipe, pick, &admitted),
+            Resolved::Tier { outcome, ordered } => (outcome, ordered),
+        };
+        // Read off the outcome rather than tracked in parallel with it: a
+        // `CostGuard` is the only arm that ever moves the decision off the
+        // scorer's own answer.
+        let source = match outcome {
+            StageOutcome::CostGuard { .. } => DecisionSource::CostGuard,
+            StageOutcome::Served { .. } | StageOutcome::PickedTierEmpty { .. } => pick.source,
+            StageOutcome::DegradedPastRecipe { .. } => {
+                unreachable!("resolve() returns Degrade for this arm, handled above")
             }
         };
-        // Captured before the guard can move `serving`: an empty picked tier
-        // and a declined one are two different sentences in the rationale, and
-        // after the guard fires `serving != pick.tier` can no longer tell them
-        // apart.
-        let picked_tier_was_empty = serving != pick.tier;
-
-        let mut source = pick.source;
-        let mut displaced = None;
-        if !picked_tier_was_empty && pick.tier == Tier::Efficient {
-            // **The dominance guard, and the whole of T4.** The efficient tier
-            // exists to save cost; a capable candidate that also quotes *less*
-            // for this turn is better on function and cost at once, so serving
-            // the efficient head would be paying more for the weaker model. The
-            // only thing that produces that inversion in practice is cache
-            // affinity — a warm prefix on the capable target and a cold one on
-            // the efficient head — and the per-target ledger has already priced
-            // that into both quotes. Reading the quote is therefore how this
-            // policy sees warmth without holding a byte of session state.
-            //
-            // **Strictly less, never equal**: at equal cost nothing is
-            // dominated, so the tier pick — a statement about function — stands.
-            // **The first cheaper member in recipe order, not the tier's
-            // head**: a head that quotes higher than what it displaced would
-            // reintroduce the inversion from the other side.
-            // **Efficient picks only**: an escalation says the cheap tier
-            // cannot finish this turn, and no price makes it able to.
-            let head = ordered[0];
-            let capable = Self::tier_pool(recipe, Tier::Capable, pool);
-            if let Some(cheaper) = capable
-                .iter()
-                .position(|candidate| candidate.expected_cost_usd < head.expected_cost_usd)
-            {
-                // The prices live in the log line and never in the rationale:
-                // the rationale is republished into the calling model's own
-                // context by `explain_last_route` (see the `format!` below).
-                tracing::debug!(
-                    displaced = %head.target.policy_identity(),
-                    displaced_cost_usd = head.expected_cost_usd,
-                    serving = %capable[cheaper].target.policy_identity(),
-                    serving_cost_usd = capable[cheaper].expected_cost_usd,
-                    picked_by = pick.source.label(),
-                    "a capable target quotes lower for this turn than the efficient tier's head, \
-                     so it takes the turn on cost as well as on function"
-                );
-                displaced = Some(head.target.policy_identity());
-                source = DecisionSource::CostGuard;
-                serving = Tier::Capable;
-                // Rotated rather than truncated so the rest of the capable tier
-                // stays behind it in the recipe's order: a guarded turn's
-                // fallbacks are a capable turn's fallbacks.
-                ordered = capable;
-                let winner = ordered.remove(cheaper);
-                ordered.insert(0, winner);
+        let serving = match &outcome {
+            StageOutcome::Served { tier } => *tier,
+            StageOutcome::PickedTierEmpty { served } | StageOutcome::CostGuard { served, .. } => {
+                *served
             }
-        }
+            StageOutcome::DegradedPastRecipe { .. } => {
+                unreachable!("resolve() returns Degrade for this arm, handled above")
+            }
+        };
 
         let winner = ordered[0];
         let fallbacks: Vec<Target> = ordered[1..]
@@ -837,42 +896,51 @@ impl RoutingPolicy for StagePolicy {
                 recipe.confidence_threshold()
             ));
         }
-        if let Some(displaced) = &displaced {
-            // **No price here either**, for the reason the clause above states:
-            // the two quotes that decided this went to the `tracing` event at
-            // the guard, which no model reads. What the model's own context
-            // gets is the pair of names and the direction between them.
-            rationale.push_str(&format!(
-                "; the {} tier led with {displaced}, which quotes higher for this turn, so the \
-                 cheaper capable target took it",
-                pick.tier.label()
-            ));
-        }
-        if picked_tier_was_empty {
-            // **"this turn", not "this key", and the edit is the whole of G09
-            // at this seam.** An empty tier has four possible causes and this
-            // policy can tell them apart from none of them: the key's own
-            // filter, a spent cadence or budget, a credential that reaches no
-            // provider — and a recipe entry naming a model this deployment does
-            // not serve at all. Blaming the key by name sent an operator with a
-            // transposed digit in a model id off to widen an `allow` list that
-            // was never the problem, and the sentence is republished to the
-            // calling model by `explain_last_route`, so it was wrong in two
-            // places at once.
-            //
-            // The narrower sentence is not recoverable here: `ctx.candidates`
-            // has already been filtered by `TurnPolicy::permits` and by the
-            // credential filter before the router sees it (engine.rs), so a
-            // name missing from it is a typo and a policy exclusion wearing the
-            // same clothes. The typo is caught where both files are loaded --
-            // `crosscheck::refuse_tier_recipes_naming_absent_targets` refuses
-            // it at boot and at every admin write -- which leaves this string
-            // saying only what a router honestly knows: nothing admissible on
-            // this turn carries an identity the picked tier names.
-            rationale.push_str(&format!(
-                "; the {} tier was picked and this turn admits none of it",
-                pick.tier.label()
-            ));
+        // One clause per outcome that has something to add; `Served` adds
+        // nothing because it is the case that needs no explaining.
+        match &outcome {
+            StageOutcome::CostGuard { displaced, .. } => {
+                // **No price here either**, for the reason the clause above
+                // states: the two quotes that decided this went to the
+                // `tracing` event inside `resolve`, which no model reads.
+                // What the model's own context gets is the pair of names and
+                // the direction between them.
+                rationale.push_str(&format!(
+                    "; the {} tier led with {displaced}, which quotes higher for this turn, so \
+                     the cheaper capable target took it",
+                    pick.tier.label()
+                ));
+            }
+            StageOutcome::PickedTierEmpty { .. } => {
+                // **"this turn", not "this key", and the edit is the whole of
+                // G09 at this seam.** An empty tier has four possible causes
+                // and this policy can tell them apart from none of them: the
+                // key's own filter, a spent cadence or budget, a credential
+                // that reaches no provider — and a recipe entry naming a
+                // model this deployment does not serve at all. Blaming the
+                // key by name sent an operator with a transposed digit in a
+                // model id off to widen an `allow` list that was never the
+                // problem, and the sentence is republished to the calling
+                // model by `explain_last_route`, so it was wrong in two
+                // places at once.
+                //
+                // The narrower sentence is not recoverable here:
+                // `ctx.candidates` has already been filtered by
+                // `TurnPolicy::permits` and by the credential filter before
+                // the router sees it (engine.rs), so a name missing from it
+                // is a typo and a policy exclusion wearing the same clothes.
+                // The typo is caught where both files are loaded --
+                // `crosscheck::refuse_tier_recipes_naming_absent_targets`
+                // refuses it at boot and at every admin write -- which leaves
+                // this string saying only what a router honestly knows:
+                // nothing admissible on this turn carries an identity the
+                // picked tier names.
+                rationale.push_str(&format!(
+                    "; the {} tier was picked and this turn admits none of it",
+                    pick.tier.label()
+                ));
+            }
+            StageOutcome::Served { .. } | StageOutcome::DegradedPastRecipe { .. } => {}
         }
         if !fallbacks.is_empty() {
             rationale.push_str(&format!(
@@ -881,36 +949,19 @@ impl RoutingPolicy for StagePolicy {
             ));
         }
 
-        // **Three branches, one arm each, and the guard's arm outranks the
-        // empty-tier one because the two cannot both have fired**: the guard
-        // only runs when the picked tier was *not* empty. `displaced` is
-        // therefore the discriminator and not a flag beside one.
-        let outcome = match (&displaced, picked_tier_was_empty) {
-            (Some(displaced), _) => StageOutcome::CostGuard {
-                served: serving,
-                displaced: displaced.clone(),
-            },
-            (None, true) => StageOutcome::PickedTierEmpty { served: serving },
-            (None, false) => StageOutcome::Served { tier: serving },
-        };
-
-        Ok(Decision {
-            // The operator's own lists, in the operator's own order, beside the
-            // scorer's own answer. A digest would tell a reader that two turns
-            // ran under different recipes and never which — and `pick` is
-            // carried rather than recomputed because `pick_tier` is pure over
-            // *this build's* thresholds, which is exactly the substitution a
-            // replay must not make.
-            selector: Some(SelectorSnapshot::stage(StageEvidence {
-                capable: recipe.list(Tier::Capable).to_vec(),
-                efficient: recipe.list(Tier::Efficient).to_vec(),
-                picker: recipe.picker(),
-                confidence_threshold: recipe.confidence_threshold(),
-                pick,
-                outcome,
-            })),
-            ..admitted.decide_staged(winner.target.clone(), fallbacks, source, rationale)
-        })
+        Ok(admitted.decide_staged(
+            winner.target.clone(),
+            fallbacks,
+            source,
+            rationale,
+            // The operator's own lists, in the operator's own order, beside
+            // the scorer's own answer. A digest would tell a reader that two
+            // turns ran under different recipes and never which — and `pick`
+            // is carried rather than recomputed because `pick_tier` is pure
+            // over *this build's* thresholds, which is exactly the
+            // substitution a replay must not make.
+            SelectorSnapshot::stage(StageEvidence::new(recipe, pick, outcome)),
+        ))
     }
 }
 

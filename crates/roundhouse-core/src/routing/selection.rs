@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::stage::{DecisionSource, Pick, PickerMode, Tier, TurnSignals};
+use super::stage::{DecisionSource, Pick, PickerMode, Tier, TierRecipe, TurnSignals};
 use super::{Decision, Target};
 use crate::classify::ClassificationWindow;
 use crate::validate::{ControlCallDialect, ObjectiveVersion};
@@ -127,12 +127,40 @@ pub struct StageEvidence {
     pub outcome: StageOutcome,
 }
 
+impl StageEvidence {
+    /// The recipe and the scorer's answer, paired with what the resolution
+    /// actually did.
+    ///
+    /// One constructor rather than the two hand-written literals it replaces
+    /// (`StagePolicy::choose` and `StagePolicy::degrade_past_the_recipe` each
+    /// wrote out all four recipe-derived fields by hand): a field added to
+    /// that half needs one edit instead of two that have to agree.
+    pub fn new(recipe: &TierRecipe, pick: Pick, outcome: StageOutcome) -> Self {
+        Self {
+            capable: recipe.list(Tier::Capable).to_vec(),
+            efficient: recipe.list(Tier::Efficient).to_vec(),
+            picker: recipe.picker(),
+            confidence_threshold: recipe.confidence_threshold(),
+            pick,
+            outcome,
+        }
+    }
+}
+
 /// Which builtin selector ran, and the configuration it ran under.
 ///
 /// `None` on a [`Decision`] a policy outside this module assembled by hand: the
 /// vocabulary here names the branches this module has, and a fourth policy's
 /// branch is honestly unknown to it. Silence is the correct answer there, and a
 /// nearest-fit arm would be a claim nothing measured.
+///
+/// **No in-tree path produces `None` today.**
+/// [`Admitted::decide`](super::Admitted::decide) and
+/// [`Admitted::decide_staged`](super::Admitted::decide_staged) both take a
+/// `SelectorSnapshot` as a required argument, and every builtin policy goes
+/// through one of the two — so `None` is reachable only from a `Decision` a
+/// policy outside this module assembles field by field, or from a record
+/// written before this field existed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelectorSnapshot {
     /// The revision of the branch's algorithm, so a later change to how a

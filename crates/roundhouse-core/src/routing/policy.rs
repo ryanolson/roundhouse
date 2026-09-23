@@ -195,30 +195,28 @@ impl RoutingPolicy for AffinityPolicy {
         // `expected_cost_usd` is a structured field on the same
         // `DecisionRecord`, beside `rate_card`, where the metrics fold and an
         // operator's dashboard read it and a tool result does not.
-        Ok(Decision {
-            // The tuning that produced `best_score`, recorded beside the choice
-            // it produced. Weights are a process's boot configuration and
-            // nothing in the log names them otherwise, so a turn scored under an
-            // earlier tuning is indistinguishable from one scored under this
-            // one without it.
-            selector: Some(SelectorSnapshot::affinity(AffinityEvidence {
+        Ok(admitted.decide(
+            winner.target.clone(),
+            format!(
+                "score {:.4} over {} candidate(s); expected prefill {:.0} of {} tokens ({:.0}% cached)",
+                best_score,
+                pool.len(),
+                winner.expected_prefill_tokens,
+                ctx.isl_tokens,
+                hit_ratio * 100.0,
+            ),
+            // The tuning that produced `best_score`, recorded beside the
+            // choice it produced. Weights are a process's boot configuration
+            // and nothing in the log names them otherwise, so a turn scored
+            // under an earlier tuning is indistinguishable from one scored
+            // under this one without it.
+            SelectorSnapshot::affinity(AffinityEvidence {
                 prefill_weight: self.weights.prefill,
                 cost_weight: self.weights.cost,
                 ttft_weight: self.weights.ttft,
                 max_load: self.max_load,
-            })),
-            ..admitted.decide(
-                winner.target.clone(),
-                format!(
-                    "score {:.4} over {} candidate(s); expected prefill {:.0} of {} tokens ({:.0}% cached)",
-                    best_score,
-                    pool.len(),
-                    winner.expected_prefill_tokens,
-                    ctx.isl_tokens,
-                    hit_ratio * 100.0,
-                ),
-            )
-        })
+            }),
+        ))
     }
 }
 
@@ -291,21 +289,19 @@ impl RoutingPolicy for EscalationPolicy {
         let admitted = ctx.admissible(None)?;
         let best = admitted.highest_quality();
 
-        Ok(Decision {
+        Ok(admitted.decide(
+            best.target.clone(),
+            format!(
+                "audit turn (every {}); escalated to highest quality prior {:.2}",
+                self.audit_every, best.quality_prior
+            ),
             // Stamped on the audit branch only. A delegated turn returns the
             // inner policy's decision untouched, carrying that policy's own
             // evidence — which is the honest answer, because that is the code
-            // that chose. An arm here would report an escalation on a turn that
-            // never escalated.
-            selector: Some(SelectorSnapshot::escalation_audit(self.audit_every)),
-            ..admitted.decide(
-                best.target.clone(),
-                format!(
-                    "audit turn (every {}); escalated to highest quality prior {:.2}",
-                    self.audit_every, best.quality_prior
-                ),
-            )
-        })
+            // that chose. An arm here would report an escalation on a turn
+            // that never escalated.
+            SelectorSnapshot::escalation_audit(self.audit_every),
+        ))
     }
 }
 

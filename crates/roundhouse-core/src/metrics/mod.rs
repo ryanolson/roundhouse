@@ -100,6 +100,7 @@ pub(crate) mod evaluation;
 pub mod fold;
 pub mod pricing;
 pub mod snapshot;
+pub(crate) mod timing;
 
 #[cfg(test)]
 mod cache_reuse_evidence_tests;
@@ -125,10 +126,10 @@ pub use pricing::{
 pub use snapshot::{
     CacheReuseEvidence, Coverage, EVALUATION_PRICE_BASIS, EvaluationMetrics,
     EvaluationModelMetrics, EvaluationSettlement, EvaluationTokens, EvaluationUnbooked,
-    FIRST_OUTPUT_BASIS, FirstOutputLatency, MetricsConfig, MetricsSnapshot, ModelAccounting,
+    FIRST_OUTPUT_BASIS, IntervalMetric, MetricsConfig, MetricsSnapshot, ModelAccounting,
     ModelMetrics, OBSERVED_CACHE_BASIS, OBSERVED_COST_SCOPE, ObservedCost, PREDICTED_CACHE_BASIS,
     ProviderMetrics, Rollup, SERVING_PRICE_BASIS, Savings, ServingCostGaps, ServingModeMetrics,
-    TURN_ELAPSED_BASIS, TokenBreakdown, TurnElapsed,
+    TURN_ELAPSED_BASIS, TokenBreakdown,
 };
 
 /// The provider name local targets are grouped under.
