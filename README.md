@@ -96,12 +96,9 @@ resumption (`starting_after`), reconnect replay for the bidirectional
 transports, and the routing audit trail.
 
 **Conversation items and the routing ledger are projections of that log**, not
-separately stored collections. There is one write path, so nothing can disagree
-after a crash — and `SessionStore` collapses to six methods as a result.
+separately stored collections. `SessionStore` supplies the shared append and replay path, lease management, and a durable index for learning recovery. The recovery index is implemented, but ordinary session writes do not yet populate it.
 
-**A single-writer lease with fencing.** Every mutating call takes a `Lease`. An
-owner that stalled, was partitioned, or died and came back fails its next append
-rather than interleaving with its successor.
+**A single-writer lease with fencing.** Event appends require a `Lease`. An owner that stalled, was partitioned, or died and came back fails its next append rather than interleaving with its successor. Learning-index acknowledgement and requeue use log-sequence checks, so recovery can run without owning the writer lease.
 
 **Incremental tokenization.** Routing on cache locality means knowing the
 prompt's block hashes before dispatch. Recomputing them each turn would cost

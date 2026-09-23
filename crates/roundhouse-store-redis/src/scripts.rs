@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The write path: four Lua scripts and their reply decoding.
+//! The write path: four Lua scripts and their reply decoding, plus the
+//! learning index's scripts in [`learning`].
 //!
 //! Scripts because the contract demands *atomicity*, not because Lua is nice:
 //! checking the lease and acting on it must be one step, or a writer fenced
@@ -19,6 +20,8 @@
 //! Each script returns a small status table — `{tag, numbers…}` — decoded
 //! here into typed outcomes. The tags are a wire contract between the Lua and
 //! the Rust below and appear nowhere else.
+
+pub(crate) mod learning;
 
 use redis::Value;
 use redis::aio::ConnectionManager;
@@ -71,10 +74,31 @@ return {'OK'}
 /// slip a write behind its successor. Seqs continue from the newest entry id;
 /// an id this store did not write (not `<seq>-0` shaped) aborts rather than
 /// guessing, because appending after a foreign entry would launder it into a
-/// log that otherwise proves its own integrity. Lua numbers are doubles, but
-/// exact through 2^53 — seqs count events per conversation and sit nowhere
-/// near that.
-const APPEND: &str = r"
+/// log that otherwise proves its own integrity.
+///
+/// **Seqs are exact only through [`learning::LAST_EXACT_SEQ`].** Lua numbers
+/// are doubles, but `..` renders them with `%.14g`, so the id for seq
+/// `10^14` would be written `1e+14-0` and its `XADD` would fail. Seqs count
+/// events per conversation and sit nowhere near that, but a batch that would
+/// cross the limit is still refused before its first write, marked or not:
+/// without the check, the `XADD`s before the failing one stay in the log, so a
+/// refused append would leave part of its batch durable.
+///
+/// With six keys, the append also writes a learning mark (see
+/// [`learning`]). Every check the mark needs — the index keys' types, the
+/// stored mark's shape and project — runs before the first `XADD`, as the
+/// range check does: Redis keeps a script's earlier writes when a later command
+/// fails, so a problem found at the index write would leave durable events
+/// with no mark, the one loss the index exists to prevent. The index keys are
+/// per namespace, not per session, so a marked append is not single-slot in a
+/// Redis Cluster; an unmarked append still touches only its three
+/// hash-tagged keys.
+///
+/// KEYS: meta, lease, log [, marks, marked, pending].
+/// ARGV: node id, fencing token, session id, 1-based position of the marked
+/// event in the batch, project, then one payload per event. The three mark
+/// arguments are ignored without the index keys.
+const APPEND_BODY: &str = r"
 if redis.call('EXISTS', KEYS[1]) == 0 then return {'NOSESSION'} end
 if redis.call('HGET', KEYS[2], 'node_id') ~= ARGV[1] then return {'FENCED'} end
 if redis.call('HGET', KEYS[2], 'fencing_token') ~= ARGV[2] then return {'FENCED'} end
@@ -85,11 +109,34 @@ if #newest > 0 then
   if not seq then return {'CORRUPT', newest[1][1]} end
   last = tonumber(seq)
 end
+local first_payload = 6
+if last + (#ARGV - first_payload + 1) > LAST_EXACT_SEQ then return {'RANGE', last} end
+local marked = #KEYS == 6
+local mark_seq
+if marked then
+  for i = 4, 6 do
+    local want = 'zset'
+    if i == 4 then want = 'hash' end
+    if not is_type_or_absent(KEYS[i], want) then return {'WRONGTYPE', KEYS[i]} end
+  end
+  local stored = redis.call('HGET', KEYS[4], ARGV[3])
+  if stored then
+    local _, _, project = parse_mark(stored)
+    if not project then return {'BADMARK', stored} end
+    if project ~= ARGV[5] then return {'PROJECT', project} end
+  end
+  mark_seq = last + tonumber(ARGV[4])
+end
 local t = redis.call('TIME')
 local at_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
-for i = 3, #ARGV do
+for i = first_payload, #ARGV do
   last = last + 1
   redis.call('XADD', KEYS[3], last .. '-0', 'at_ms', at_ms, 'kind', ARGV[i])
+end
+if marked then
+  redis.call('HSET', KEYS[4], ARGV[3], mark_seq .. ':' .. at_ms .. ':' .. ARGV[5])
+  redis.call('ZADD', KEYS[5], 0, ARGV[3])
+  redis.call('ZADD', KEYS[6], 0, ARGV[3])
 end
 return {'OK', at_ms, last}
 ";
@@ -114,6 +161,28 @@ pub(crate) enum AppendOutcome {
     },
     Fenced,
     NoSession,
+    /// The session is already marked for `marked`, another project. Nothing
+    /// was written.
+    ProjectMismatch {
+        marked: String,
+    },
+}
+
+/// What one append writes: a payload per event, and the mark, if any.
+pub(crate) struct AppendBatch<'a> {
+    pub(crate) kind_payloads: &'a [String],
+    pub(crate) mark: Option<MarkArgs<'a>>,
+}
+
+/// What a marked append adds to the script call: the three index keys, the
+/// member they are keyed by, where the marked event sits in the batch, and
+/// the project it is marked for.
+pub(crate) struct MarkArgs<'a> {
+    pub(crate) index_keys: [&'a str; 3],
+    pub(crate) session_id: &'a str,
+    /// Zero-based, already checked against the batch.
+    pub(crate) event_index: usize,
+    pub(crate) project: &'a str,
 }
 
 /// The two fields every lease script checks together.
@@ -135,7 +204,7 @@ impl<'a> LeaseIdentity<'a> {
     }
 }
 
-/// The four scripts, compiled once per store.
+/// The session scripts, compiled once per store.
 ///
 /// `redis::Script` sends `EVALSHA` and falls back to `EVAL` on `NOSCRIPT`,
 /// so a restarted or failed-over Redis re-learns them transparently.
@@ -144,6 +213,7 @@ pub(crate) struct Scripts {
     renew: redis::Script,
     release: redis::Script,
     append: redis::Script,
+    pub(crate) learning: learning::LearningScripts,
 }
 
 impl Scripts {
@@ -152,7 +222,8 @@ impl Scripts {
             acquire: redis::Script::new(ACQUIRE),
             renew: redis::Script::new(RENEW),
             release: redis::Script::new(RELEASE),
-            append: redis::Script::new(APPEND),
+            append: redis::Script::new(&format!("{}\n{APPEND_BODY}", learning::mark_prelude())),
+            learning: learning::LearningScripts::new(),
         }
     }
 
@@ -222,7 +293,7 @@ impl Scripts {
         lease_key: &str,
         log_key: &str,
         identity: LeaseIdentity<'_>,
-        kind_payloads: &[String],
+        batch: AppendBatch<'_>,
     ) -> Result<AppendOutcome, StoreError> {
         let mut invocation = self.append.prepare_invoke();
         invocation
@@ -231,7 +302,21 @@ impl Scripts {
             .key(log_key)
             .arg(identity.node_id)
             .arg(identity.fencing_token);
-        for payload in kind_payloads {
+        match &batch.mark {
+            Some(mark) => {
+                for key in mark.index_keys {
+                    invocation.key(key);
+                }
+                invocation
+                    .arg(mark.session_id)
+                    .arg(mark.event_index + 1)
+                    .arg(mark.project);
+            }
+            None => {
+                invocation.arg("").arg("").arg("");
+            }
+        }
+        for payload in batch.kind_payloads {
             invocation.arg(payload.as_str());
         }
         let reply: Vec<Value> = invocation
@@ -245,10 +330,32 @@ impl Scripts {
             }
             (Some("FENCED"), ..) => Ok(AppendOutcome::Fenced),
             (Some("NOSESSION"), ..) => Ok(AppendOutcome::NoSession),
+            (Some("PROJECT"), ..) => match str_at(&reply, 1) {
+                Some(marked) => Ok(AppendOutcome::ProjectMismatch {
+                    marked: marked.to_string(),
+                }),
+                None => Err(unexpected(&reply)),
+            },
             (Some("CORRUPT"), ..) => Err(StoreError::Backend(anyhow::anyhow!(
                 "log `{log_key}` ends in entry `{}`, which this store did not write; \
                  refusing to append after a foreign entry",
                 str_at(&reply, 1).unwrap_or("<unreadable>")
+            ))),
+            (Some("WRONGTYPE"), ..) => Err(StoreError::Backend(anyhow::anyhow!(
+                "learning index key `{}` holds another type; refusing the marked \
+                 append before writing any event",
+                str_at(&reply, 1).unwrap_or("<unreadable>")
+            ))),
+            (Some("BADMARK"), ..) => Err(StoreError::Backend(anyhow::anyhow!(
+                "the stored learning mark for this session is unreadable (`{}`); \
+                 refusing the marked append before writing any event",
+                str_at(&reply, 1).unwrap_or("<unreadable>")
+            ))),
+            (Some("RANGE"), Some(last), _) => Err(StoreError::Backend(anyhow::anyhow!(
+                "log `{log_key}` is at seq {last}; this batch would pass seq {}, the \
+                 last one the append script writes exactly, so the append is refused \
+                 before writing any event",
+                learning::LAST_EXACT_SEQ
             ))),
             _ => Err(unexpected(&reply)),
         }

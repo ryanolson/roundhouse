@@ -428,6 +428,7 @@ impl SessionStore for ReplayLog {
         &self,
         _: &Lease,
         _: Vec<SessionEventKind>,
+        _: Option<roundhouse_core::store::LearningMark>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
         unreachable!("a replay log is never written to")
     }
@@ -449,6 +450,39 @@ impl SessionStore for ReplayLog {
 
     async fn last_seq(&self, _: &SessionId) -> Result<u64, StoreError> {
         Ok(self.events.last().map_or(0, |event| event.seq))
+    }
+
+    async fn clear_learning_mark(
+        &self,
+        _: &SessionId,
+        _: u64,
+    ) -> Result<roundhouse_core::store::ClearOutcome, StoreError> {
+        unreachable!("a replay log has no learning index")
+    }
+
+    async fn requeue_learning(
+        &self,
+        _: &SessionId,
+        _: u64,
+    ) -> Result<roundhouse_core::store::RequeueOutcome, StoreError> {
+        unreachable!("a replay log has no learning index")
+    }
+
+    async fn pending_learning(
+        &self,
+        _: Option<&roundhouse_core::store::LearningCursor>,
+        _: u64,
+        _: std::num::NonZeroUsize,
+    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
+        unreachable!("a replay log has no learning index")
+    }
+
+    async fn learning_sessions(
+        &self,
+        _: Option<&roundhouse_core::store::LearningCursor>,
+        _: std::num::NonZeroUsize,
+    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
+        unreachable!("a replay log has no learning index")
     }
 }
 

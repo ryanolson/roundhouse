@@ -313,6 +313,7 @@ async fn a_repair_resolves_its_settlement_and_creates_no_feature() {
                     record: unconfirmed,
                 },
             ],
+            None,
         )
         .await
         .unwrap();
@@ -352,6 +353,7 @@ async fn a_repair_resolves_its_settlement_and_creates_no_feature() {
                     repaired_at_ms: 9_000,
                 },
             }],
+            None,
         )
         .await
         .unwrap();
@@ -435,6 +437,7 @@ async fn a_replayed_log_reports_an_answered_call_and_an_outstanding_one() {
                     },
                 },
             ],
+            None,
         )
         .await
         .expect("an in-memory log appends");

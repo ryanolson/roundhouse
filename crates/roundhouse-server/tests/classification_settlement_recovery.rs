@@ -651,6 +651,7 @@ async fn seed_unconfirmed_settlement(
                 SessionEventKind::ClassificationRequested { record: intent },
                 SessionEventKind::ClassificationRecorded { record },
             ],
+            None,
         )
         .await
         .unwrap();
@@ -1498,6 +1499,7 @@ async fn overlapping_turns_must_not_duplicate_a_repair_still_in_flight() {
                 principal: Some(Principal::default_open()),
                 arm: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -1655,6 +1657,7 @@ impl SessionStore for AckRefusingStore {
         &self,
         lease: &Lease,
         kinds: Vec<SessionEventKind>,
+        mark: Option<roundhouse_core::store::LearningMark>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
         let refuses = self.refusing.load(Ordering::SeqCst)
             && kinds.iter().any(|kind| {
@@ -1669,7 +1672,7 @@ impl SessionStore for AckRefusingStore {
                 "the store refused this repair acknowledgement append"
             )));
         }
-        self.inner.append_events(lease, kinds).await
+        self.inner.append_events(lease, kinds, mark).await
     }
 
     async fn read_events(
@@ -1683,6 +1686,41 @@ impl SessionStore for AckRefusingStore {
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         self.inner.last_seq(session_id).await
+    }
+
+    async fn clear_learning_mark(
+        &self,
+        session_id: &SessionId,
+        confirmed_through: u64,
+    ) -> Result<roundhouse_core::store::ClearOutcome, StoreError> {
+        self.inner
+            .clear_learning_mark(session_id, confirmed_through)
+            .await
+    }
+
+    async fn requeue_learning(
+        &self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<roundhouse_core::store::RequeueOutcome, StoreError> {
+        self.inner.requeue_learning(session_id, mark_seq).await
+    }
+
+    async fn pending_learning(
+        &self,
+        after: Option<&roundhouse_core::store::LearningCursor>,
+        idle_for_ms: u64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
+        self.inner.pending_learning(after, idle_for_ms, limit).await
+    }
+
+    async fn learning_sessions(
+        &self,
+        after: Option<&roundhouse_core::store::LearningCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
+        self.inner.learning_sessions(after, limit).await
     }
 }
 
@@ -1723,6 +1761,7 @@ async fn a_failed_repair_acknowledgement_append_stays_retryable() {
                 principal: Some(principal.clone()),
                 arm: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -1916,6 +1955,7 @@ async fn a_long_outage_backlog_is_drained_at_a_bounded_rate_per_turn() {
                 principal: Some(principal.clone()),
                 arm: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -2013,6 +2053,7 @@ async fn a_long_outage_backlog_bounds_what_a_turn_retains_and_copies() {
                 principal: Some(principal.clone()),
                 arm: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -2113,6 +2154,7 @@ async fn a_configured_tenants_charge_is_recovered_onto_its_own_account() {
                 principal: Some(payer.clone()),
                 arm: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -2191,6 +2233,7 @@ async fn a_session_with_no_recorded_payer_is_never_repaired() {
                 principal: None,
                 arm: None,
             }],
+            None,
         )
         .await
         .unwrap();
@@ -2486,6 +2529,7 @@ async fn seed_backlog(
                 principal: Some(principal.clone()),
                 arm: None,
             }],
+            None,
         )
         .await
         .unwrap();

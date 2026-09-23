@@ -755,6 +755,7 @@ impl SessionStore for RefusingStore {
         &self,
         lease: &Lease,
         kinds: Vec<SessionEventKind>,
+        mark: Option<roundhouse_core::store::LearningMark>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
         let refuses = (self.refusing.load(Ordering::SeqCst)
             && kinds
@@ -768,7 +769,7 @@ impl SessionStore for RefusingStore {
             true => Err(StoreError::Backend(anyhow::anyhow!(
                 "the store refused this append"
             ))),
-            false => self.inner.append_events(lease, kinds).await,
+            false => self.inner.append_events(lease, kinds, mark).await,
         }
     }
 
@@ -783,6 +784,41 @@ impl SessionStore for RefusingStore {
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         self.inner.last_seq(session_id).await
+    }
+
+    async fn clear_learning_mark(
+        &self,
+        session_id: &SessionId,
+        confirmed_through: u64,
+    ) -> Result<roundhouse_core::store::ClearOutcome, StoreError> {
+        self.inner
+            .clear_learning_mark(session_id, confirmed_through)
+            .await
+    }
+
+    async fn requeue_learning(
+        &self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<roundhouse_core::store::RequeueOutcome, StoreError> {
+        self.inner.requeue_learning(session_id, mark_seq).await
+    }
+
+    async fn pending_learning(
+        &self,
+        after: Option<&roundhouse_core::store::LearningCursor>,
+        idle_for_ms: u64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
+        self.inner.pending_learning(after, idle_for_ms, limit).await
+    }
+
+    async fn learning_sessions(
+        &self,
+        after: Option<&roundhouse_core::store::LearningCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<roundhouse_core::store::LearningPage, StoreError> {
+        self.inner.learning_sessions(after, limit).await
     }
 }
 

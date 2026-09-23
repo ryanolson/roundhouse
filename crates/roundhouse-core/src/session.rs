@@ -1629,7 +1629,10 @@ impl<S: SessionStore> Session<S> {
         &mut self,
         kinds: Vec<SessionEventKind>,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        let events = self.store.append_events(&self.lease, kinds).await?;
+        // No learning mark yet: which events produce a learner entry is the
+        // later projection slice's decision (see `store::learning`), and a
+        // guessed mark here would make sessions pending that no learner reads.
+        let events = self.store.append_events(&self.lease, kinds, None).await?;
         for event in &events {
             self.state.apply(event);
         }

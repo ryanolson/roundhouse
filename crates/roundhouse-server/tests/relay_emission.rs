@@ -164,7 +164,7 @@ async fn store_with(
         });
     }
     store
-        .append_events(&lease, kinds)
+        .append_events(&lease, kinds, None)
         .await
         .expect("the fixture appends");
     store

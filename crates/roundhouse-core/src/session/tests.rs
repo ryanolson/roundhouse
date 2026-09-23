@@ -968,8 +968,9 @@ impl SessionStore for BatchRecordingStore {
         &self,
         lease: &Lease,
         kinds: Vec<SessionEventKind>,
+        mark: Option<crate::store::LearningMark>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        let appended = self.inner.append_events(lease, kinds).await?;
+        let appended = self.inner.append_events(lease, kinds, mark).await?;
         // Recorded only on success: a rejected append wrote nothing, and
         // counting it would let a fenced writer look like a second batch.
         self.batches
@@ -990,6 +991,41 @@ impl SessionStore for BatchRecordingStore {
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         self.inner.last_seq(session_id).await
+    }
+
+    async fn clear_learning_mark(
+        &self,
+        session_id: &SessionId,
+        confirmed_through: u64,
+    ) -> Result<crate::store::ClearOutcome, StoreError> {
+        self.inner
+            .clear_learning_mark(session_id, confirmed_through)
+            .await
+    }
+
+    async fn requeue_learning(
+        &self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<crate::store::RequeueOutcome, StoreError> {
+        self.inner.requeue_learning(session_id, mark_seq).await
+    }
+
+    async fn pending_learning(
+        &self,
+        after: Option<&crate::store::LearningCursor>,
+        idle_for_ms: u64,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::store::LearningPage, StoreError> {
+        self.inner.pending_learning(after, idle_for_ms, limit).await
+    }
+
+    async fn learning_sessions(
+        &self,
+        after: Option<&crate::store::LearningCursor>,
+        limit: std::num::NonZeroUsize,
+    ) -> Result<crate::store::LearningPage, StoreError> {
+        self.inner.learning_sessions(after, limit).await
     }
 }
 
@@ -2721,7 +2757,7 @@ async fn attribution_holds_across_a_serialized_replay() {
         .unwrap()
         .expect("an unheld session");
     successor_store
-        .append_events(&lease, round_tripped)
+        .append_events(&lease, round_tripped, None)
         .await
         .unwrap();
 

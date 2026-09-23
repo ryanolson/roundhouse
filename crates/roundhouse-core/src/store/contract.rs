@@ -21,6 +21,8 @@
 //! only for the others. The functions stay public so a failing invariant can
 //! be re-run alone while debugging.
 
+pub mod learning;
+
 use async_trait::async_trait;
 
 use crate::control::Principal;
@@ -111,7 +113,9 @@ pub async fn unknown_sessions_are_not_found<S: SessionStore>(store: &S) {
     // and reporting the lease as the problem would send an operator chasing
     // failover where the actual defect is a session that was never created.
     assert!(matches!(
-        store.append_events(&ghost, vec![text_event("x")]).await,
+        store
+            .append_events(&ghost, vec![text_event("x")], None)
+            .await,
         Err(StoreError::SessionNotFound(_))
     ));
     assert!(matches!(
@@ -160,12 +164,12 @@ pub async fn a_live_lease_blocks_others_and_retakes_with_a_fresh_fence<S: Sessio
         .expect("the holder re-acquiring is recovery, not competition");
 
     let error = store
-        .append_events(&original, vec![text_event("stale tenure")])
+        .append_events(&original, vec![text_event("stale tenure")], None)
         .await
         .expect_err("re-acquisition must fence handles from the holder's previous tenure");
     assert!(matches!(error, StoreError::LeaseLost { .. }));
     store
-        .append_events(&retaken, vec![text_event("current tenure")])
+        .append_events(&retaken, vec![text_event("current tenure")], None)
         .await
         .expect("the freshly granted tenure must remain writable");
 }
@@ -182,11 +186,11 @@ pub async fn an_expired_lease_is_takeable_and_the_loser_cannot_append<S: LeaseCo
 
     // The successor writes; the displaced owner is fenced out.
     store
-        .append_events(&fresh, vec![text_event("ok")])
+        .append_events(&fresh, vec![text_event("ok")], None)
         .await
         .unwrap();
     let err = store
-        .append_events(&stale, vec![text_event("no")])
+        .append_events(&stale, vec![text_event("no")], None)
         .await
         .expect_err("a displaced writer must not interleave with its successor");
     assert!(matches!(err, StoreError::LeaseLost { .. }));
@@ -280,7 +284,7 @@ pub async fn release_by_a_non_holder_leaves_the_lease_standing<S: SessionStore>(
         "the holder must still hold after a non-holder's release"
     );
     store
-        .append_events(&holder, vec![text_event("still mine")])
+        .append_events(&holder, vec![text_event("still mine")], None)
         .await
         .unwrap();
 }
@@ -299,7 +303,7 @@ pub async fn a_stale_handle_works_while_the_record_is_live<S: SessionStore>(stor
     };
 
     store
-        .append_events(&stale_handle, vec![text_event("append via stale handle")])
+        .append_events(&stale_handle, vec![text_event("append via stale handle")], None)
         .await
         .expect("a backend rejecting a stale-looking handle would fail every append made during a long turn");
     assert!(
@@ -326,6 +330,7 @@ pub async fn appends_assign_contiguous_seqs_and_replay_is_gapless<S: SessionStor
                 },
                 text_event("one"),
             ],
+            None,
         )
         .await
         .unwrap();
@@ -336,7 +341,7 @@ pub async fn appends_assign_contiguous_seqs_and_replay_is_gapless<S: SessionStor
     );
 
     let second = store
-        .append_events(&lease, vec![text_event("two")])
+        .append_events(&lease, vec![text_event("two")], None)
         .await
         .unwrap();
     assert_eq!(second[0].seq, 3, "numbering must continue across calls");
@@ -401,12 +406,12 @@ pub async fn read_events_pages_oldest_first_and_reproduces_the_append<S: Session
         text_event("tail"),
     ];
     let mut appended = store
-        .append_events(&lease, kinds[..2].to_vec())
+        .append_events(&lease, kinds[..2].to_vec(), None)
         .await
         .unwrap();
     appended.extend(
         store
-            .append_events(&lease, kinds[2..].to_vec())
+            .append_events(&lease, kinds[2..].to_vec(), None)
             .await
             .unwrap(),
     );
@@ -442,7 +447,7 @@ pub async fn an_empty_session_reads_as_empty_and_seqs_track_the_tail<S: SessionS
     );
 
     store
-        .append_events(&lease, vec![text_event("one"), text_event("two")])
+        .append_events(&lease, vec![text_event("one"), text_event("two")], None)
         .await
         .unwrap();
     assert_eq!(store.last_seq(&sid).await.unwrap(), 2);
@@ -521,6 +526,20 @@ macro_rules! store_contract_suite {
             read_events_pages_oldest_first_and_reproduces_the_append,
             an_empty_session_reads_as_empty_and_seqs_track_the_tail,
             renew_fails_once_the_lease_was_taken_over,
+        );
+        // The learning index, from its own child module but in this same
+        // list: a backend that runs the log half runs the index half.
+        $crate::__contract_suite!(store, $crate::store::contract::learning, $attrs, $make;
+            the_mark_is_the_sequence_assigned_to_the_marked_event,
+            an_unmarked_append_leaves_no_learning_entry,
+            an_invalid_mark_refuses_the_append_before_any_write,
+            a_fenced_append_writes_neither_events_nor_mark,
+            a_delayed_clear_keeps_a_newer_mark,
+            a_covering_clear_keeps_the_permanent_mark,
+            requeue_restores_only_the_current_mark,
+            pages_reach_every_session_past_unfinished_ones,
+            marks_are_isolated_by_session_and_project,
+            a_marked_session_is_discoverable_without_a_learner_store,
         );
     };
 }

@@ -49,6 +49,42 @@ pub async fn connect_from_env() -> RedisSessionStore {
         .expect("Redis named by the env var must be reachable")
 }
 
+/// A namespace no other test, and no earlier run, has used.
+///
+/// For the session contract suite and the learning-index tests. The learning
+/// index is one set of keys per namespace, so under the shared default a
+/// permanent-index pass would grow with every run against the same Redis,
+/// and a test that sabotages an index key's type would break every test
+/// running beside it.
+pub fn fresh_namespace() -> KeyNamespace {
+    KeyNamespace::new(format!("rhtest-{}", uuid::Uuid::new_v4().simple()))
+        .expect("a hex suffix contains no forbidden character")
+}
+
+/// The store under test, connected under `namespace`.
+pub async fn connect_in(namespace: KeyNamespace) -> RedisSessionStore {
+    RedisSessionStore::connect_namespaced(url_from_env(), namespace)
+        .await
+        .expect("Redis named by the env var must be reachable")
+}
+
+/// The three raw learning-index keys under `namespace`: the permanent mark
+/// hash, the permanent membership set, and the pending set — for the tests
+/// that sabotage their types or assert no write reached them.
+pub fn learning_index_keys(namespace: &KeyNamespace) -> [String; 3] {
+    [
+        crate::learning_marks_key(namespace),
+        crate::learning_marked_key(namespace),
+        crate::learning_pending_key(namespace),
+    ]
+}
+
+/// The raw log key under `namespace`, for the test that seeds a log near the
+/// top of the exact sequence range.
+pub fn log_key_in(namespace: &KeyNamespace, session_id: &SessionId) -> String {
+    store_log_key(namespace, session_id)
+}
+
 /// The raw lease key used by adversarial tests.
 pub fn lease_key(session_id: &SessionId) -> String {
     store_lease_key(&default_namespace(), session_id)
