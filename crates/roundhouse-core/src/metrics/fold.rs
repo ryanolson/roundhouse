@@ -774,11 +774,11 @@ impl MetricsFold {
                 }
 
                 // Both halves of this response's state, taken once each and
-                // read from the local rather than re-looked-up below. Three
-                // independent re-lookups of `pending` used to gate three
-                // separate row-creation sites that had to be trusted to agree
-                // (core-metrics-3); one lookup each means there is only one
-                // row-creation rule to state, immediately below.
+                // read from the local rather than re-looked-up below. One
+                // lookup each means there is only one row-creation rule to
+                // state, immediately below, rather than three independent
+                // re-lookups of `pending` that would each have to be trusted
+                // to agree.
                 let clock = self.clocks.remove(response_id);
                 let completed = matches!(event.kind, SessionEventKind::ResponseCompleted { .. });
                 let Some(pending) = self.pending.remove(response_id) else {
@@ -818,8 +818,7 @@ impl MetricsFold {
                 let consumed = completed || usage.input_tokens > 0;
 
                 // A row exists for this dispatch only if there is a clock or
-                // consumption to book onto it — the one rule, stated once,
-                // that used to be spread across three `or_default()` calls: a
+                // consumption to book onto it — one rule, stated once: a
                 // dispatch with no clock and no consumption mints no row,
                 // which keeps a phantom dispatch off the dashboard as a free
                 // call. `provider_cost` is not a third term here: it is

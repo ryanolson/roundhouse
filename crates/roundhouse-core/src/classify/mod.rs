@@ -267,11 +267,11 @@ pub struct EvaluationUsage {
 
 /// Whether the ledger accepted this call's settle.
 ///
-/// **Separate from the usage beside it, because they are separate facts.** The
-/// first interface this module replaced said only that a spend had been
-/// *submitted*; a settle the ledger rejected then read, from every consumer, as
-/// money committed. Reported usage is what the service says it billed, and this
-/// is what this deployment's own accounting did about it.
+/// **Separate from the usage beside it, because they are separate facts.**
+/// A spend known only as *submitted* would read, from every consumer, as
+/// money committed even when the ledger rejected the settle. Reported usage
+/// is what the service says it billed, and this is what this deployment's
+/// own accounting did about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SettlementAck {
@@ -281,10 +281,9 @@ pub enum SettlementAck {
     /// reached, or did not answer inside the call's deadline. The hold is left
     /// to lapse on its TTL.
     ///
-    /// **Absence of an acknowledgement, not proof of absence** — which is why
-    /// this is named for what this process knows rather than for what it
-    /// guesses the backend did. It was `Rejected`, and that name asserted a
-    /// refusal: a settle that was submitted and then abandoned — a timeout, a
+    /// **Absence of an acknowledgement, not proof of absence** — named for
+    /// what this process knows rather than for what it guesses the backend
+    /// did: a settle that was submitted and then abandoned — a timeout, a
     /// cancelled worker, a connection dropped after the write — may well have
     /// been applied, and nothing this process holds tells that apart from one
     /// that never landed. So this must never be read as a rollback or as a

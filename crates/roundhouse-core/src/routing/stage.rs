@@ -19,7 +19,7 @@
 //! efficient pick whose head costs *more* for this turn than some admitted
 //! capable target yields to it, because a tier that exists to save cost has
 //! nothing left to argue when it is the expensive option. See the guard inside
-//! `choose` and [`DecisionSource::CostGuard`].
+//! `resolve` and [`DecisionSource::CostGuard`].
 //!
 //! # Attribution
 //!
@@ -194,7 +194,7 @@ pub enum DecisionSource {
     Ambiguous,
     /// The picked tier was [`Tier::Efficient`] and an admitted capable target
     /// quoted *lower* for this turn than the efficient tier's head, so the
-    /// capable one served. See [`StagePolicy::choose`] for why a cheaper
+    /// capable one served. See `StagePolicy::resolve` for why a cheaper
     /// capable candidate dominates.
     CostGuard,
 }
@@ -624,7 +624,7 @@ impl StagePolicy {
     /// put it back. Walking the recipe rather than the pool is what makes the
     /// *order* the operator's rather than the quoter's.
     ///
-    /// The cost guard in `choose` is the one place a quote reorders anything,
+    /// The cost guard in `resolve` is the one place a quote reorders anything,
     /// and it reorders *which tier serves* rather than this list: it picks the
     /// first capable member cheaper than the efficient head and leaves the rest
     /// of the tier behind it exactly as this function ordered them.

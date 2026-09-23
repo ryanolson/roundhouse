@@ -475,10 +475,7 @@ pub(crate) const TRUNCATION_MARKER: &str = "…[truncated]";
 /// panics, and the one input guaranteed to be arbitrary here is the transcript.
 /// The marker is inside the budget rather than added to it, so `limit` is a
 /// bound a caller can rely on when sizing a request.
-///
-/// Shared with side-call adapters so additional text fields use the same
-/// character bound and truncation marker as the judge brief.
-pub fn truncate(text: &str, limit: usize) -> String {
+fn truncate(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }

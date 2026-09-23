@@ -6,10 +6,11 @@
 //!
 //! Split out of `snapshot.rs` for [`super::columns`]'s reason: `build` touches
 //! this module in two lines — [`EvaluationMetrics::build`] and
-//! [`ObservedCost::build`] — and used to sit beside 550 lines of types it
-//! barely calls into (core-metrics-1). The fold side already made this split
-//! (`metrics/evaluation.rs` is its own module); this is the snapshot side
-//! catching up.
+//! [`ObservedCost::build`] — and sitting those two lines beside 550 lines of
+//! types they barely call into is exactly what makes a reader chasing what
+//! `build` does scroll past all of them first. The fold side already made
+//! this split (`metrics/evaluation.rs` is its own module); this is the
+//! snapshot side catching up.
 
 use serde::Serialize;
 

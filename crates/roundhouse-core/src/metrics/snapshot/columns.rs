@@ -3,12 +3,11 @@
 
 //! The per-row wire columns: timing and cache-reuse evidence.
 //!
-//! Split out of `snapshot.rs`, which used to hold these beside the serving
-//! projection `MetricsSnapshot::build` actually assembles. A reader chasing
-//! what `build` does had to scroll past every basis constant and `publish`
-//! rule here first; `snapshot.rs` now touches this module in the two lines
-//! that call [`IntervalMetric::publish`] and [`CacheReuseEvidence::publish`]
-//! (core-metrics-1).
+//! Split out of `snapshot.rs`, so a reader chasing what
+//! `MetricsSnapshot::build` actually assembles is not made to scroll past
+//! every basis constant and `publish` rule here first; `snapshot.rs` touches
+//! this module in only the two lines that call [`IntervalMetric::publish`]
+//! and [`CacheReuseEvidence::publish`].
 
 use serde::Serialize;
 
@@ -45,7 +44,7 @@ pub const TURN_ELAPSED_BASIS: &str = "turn_start_to_terminal";
 /// `TurnElapsed::publish`'s doc claimed it followed "`FirstOutputLatency`'s
 /// rule" while that rule was written out a second time, by hand, at the
 /// first-output call site. A basis that has drifted from its own doc is
-/// exactly the failure mode one shared rule removes (core-metrics-2).
+/// exactly the failure mode one shared rule removes.
 #[derive(Debug, Clone, Serialize)]
 pub struct IntervalMetric {
     /// Mean milliseconds over [`Self::samples`].

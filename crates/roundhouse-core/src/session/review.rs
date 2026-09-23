@@ -169,7 +169,7 @@ pub(crate) struct IntervalFacts<'a> {
     pub(crate) instructions: Option<&'a [Item]>,
     pub(crate) turns: Vec<ReviewTurn<'a>>,
     /// The last user request before the first turn, when that turn has none.
-    pub(crate) request_before: Option<&'a Item>,
+    pub(crate) request_before: Option<&'a str>,
     /// History before the first turn, where a result's call may have been made.
     pub(crate) prefix: &'a [Item],
 }
@@ -420,16 +420,16 @@ impl ReviewTracker {
     /// The gaps `(after, through]` alone establishes, from the decisions the
     /// interval itself covers.
     ///
-    /// **A pure function of the interval, deliberately not of the tip.** The
-    /// capture path and the fold's verification both call this over the same
-    /// `(after, through]` a review names, so a decision this fold made after
-    /// `through` -- a later `Routed`, a later configuration change -- must
-    /// never change what this call answers. `self.instructions.generation` is
-    /// tip state and does not appear here for exactly that reason: comparing
-    /// a covered decision's generation against *now* would make this
-    /// depend on whatever landed after the interval closed, and a review
-    /// captured correctly could come to look incomplete only because the log
-    /// kept moving underneath it.
+    /// **Reads one piece of tip state, `self.overflow_through`, and it is
+    /// safe to.** `verify` -- the only caller besides capture -- returns
+    /// before it ever reaches this call while the fold is overflowed, so the
+    /// two never disagree about what "overflowed" means; capture always runs
+    /// at the tip, so its own read is current by construction.
+    /// `self.instructions.generation` is tip state too and stays out for the
+    /// opposite reason: comparing a covered decision's generation against
+    /// *now* would make this depend on whatever landed after the interval
+    /// closed, and a review captured correctly could come to look incomplete
+    /// only because the log kept moving underneath it.
     fn gaps(&self, after: u64, through: u64) -> Vec<CoverageGap> {
         let mut gaps = Vec::new();
         if self.overflow_through.is_some() {
@@ -495,16 +495,13 @@ impl ReviewTracker {
         // above already fired), or one dropped from tracking
         // (`MetadataOverflow`). Either way `gaps` is not empty.
         //
-        // The narrower shape this would need to fail -- a `Routed` that
-        // bumps the generation for a response neither covered nor dropped --
-        // has no writer: `Session::record_routing` takes whatever
-        // `response_id` its one caller in `engine.rs` passes, and that
-        // caller only ever names the turn `begin_turn` most recently opened
-        // in this same `run_turn`. `Self::routed` (above) either adds that
-        // decision to its turn's span -- covered, or it disagrees with an
-        // earlier covered decision and `InstructionsChanged` already fired
-        // -- or falls to `mark_overflow` when the span is gone or the
-        // decision table is full, which is `MetadataOverflow`.
+        // `Self::routed` is the only thing that moves the generation, and it
+        // is the whole guard: it either tracks the decision -- covered,
+        // since at capture `through` is the tip and every tracked decision
+        // is past the checkpoint -- or falls to `mark_overflow`, which is
+        // `MetadataOverflow`. Keep that `mark_overflow` arm: a `routed()`
+        // that silently dropped an unknown response instead is the one
+        // change that would make the assertion below fire.
         let instructions = match first {
             Some(decision) if decision.generation == self.instructions.generation => {
                 Some(&*self.instructions.snapshot)
@@ -551,7 +548,8 @@ impl ReviewTracker {
                 .spans
                 .front()
                 .and_then(|span| span.request_before)
-                .and_then(|offset| history.get(offset)),
+                .and_then(|offset| history.get(offset))
+                .and_then(Item::user_request),
         };
         let from = self
             .spans
@@ -614,6 +612,71 @@ impl ReviewTracker {
         self.overflow_through = Some(
             self.overflow_through
                 .map_or(seq, |dropped| dropped.max(seq)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two turns tracked and covered under one configuration, then a
+    /// `Routed` naming a response no `turn_started` ever opened -- exactly
+    /// the shape `Session::record_routing` can write for any response id,
+    /// whatever the caller passes, since nothing upstream of this fold
+    /// checks that a response was ever admitted. `routed()`'s
+    /// `_ => mark_overflow` arm is the one guard that keeps this from
+    /// reaching `facts()` as a silent mismatch: the covered decisions still
+    /// name the generation they ran under, the tip's own generation moves on
+    /// regardless, and the recorded gap is why the two are allowed to
+    /// disagree.
+    #[test]
+    fn a_routed_response_with_no_span_marks_overflow_not_a_silent_mismatch() {
+        let mut tracker = ReviewTracker::default();
+        tracker.enable(true);
+
+        let config_a = [Item::user_text("config-a")];
+        let config_b = [Item::user_text("config-b")];
+        let objective = ObjectiveVersion::Undeclared;
+
+        let r0 = ResponseId::new("r0");
+        tracker.turn_started(1, 0, &r0, 0);
+        tracker.routed(2, &r0, Some(&objective), &config_a);
+        tracker.ended(3, &r0, TurnEnd::Completed);
+
+        let r1 = ResponseId::new("r1");
+        tracker.turn_started(4, 1, &r1, 0);
+        tracker.routed(5, &r1, Some(&objective), &config_a);
+        tracker.ended(6, &r1, TurnEnd::Completed);
+
+        // The configuration changed, but nothing has routed under it yet --
+        // `dirty` is set, `generation` has not moved.
+        tracker.configuration_appended();
+
+        // A `Routed` for a response with no span: `routed()` still resolves
+        // the new generation before the span lookup fails, so the tip moves
+        // to generation 2 while both covered decisions above still name 1.
+        let ghost = ResponseId::new("ghost");
+        tracker.routed(7, &ghost, Some(&objective), &config_b);
+
+        let facts = tracker.facts(&[], 7);
+        assert!(
+            facts.gaps.contains(&CoverageGap::MetadataOverflow),
+            "the ghost response has no span, so routed() must mark overflow \
+             rather than drop it silently: {:?}",
+            facts.gaps
+        );
+        assert!(
+            !facts.gaps.contains(&CoverageGap::VersionsUnavailable),
+            "both covered decisions stamped their objective: {:?}",
+            facts.gaps
+        );
+        assert_eq!(
+            facts.instructions, None,
+            "the first covered decision's generation (1) disagrees with the \
+             tip's (2, bumped by the ghost's own routed() call); \
+             MetadataOverflow is why facts() may say so without its debug \
+             assertion firing"
         );
     }
 }

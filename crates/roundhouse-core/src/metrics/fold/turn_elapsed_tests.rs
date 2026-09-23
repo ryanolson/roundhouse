@@ -543,8 +543,8 @@ fn a_refusal_with_no_dispatch_is_counted_as_unrouted_and_makes_no_row() {
 }
 
 /// A dispatch with no clock and no consumption mints no row either — the
-/// other half of core-metrics-3's unified guard from the test above, which
-/// covers a clock with no dispatch.
+/// other half of the fold's unified row-creation guard from the test above,
+/// which covers a clock with no dispatch.
 ///
 /// `Routed` with no preceding `TurnStarted` is not a shape the engine writes
 /// today, but the fold must not invent a zero-call row for it: the guard

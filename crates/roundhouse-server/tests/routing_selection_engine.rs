@@ -388,7 +388,7 @@ async fn a_tier_turn_commits_the_features_the_selector_actually_saw() {
     assert_eq!(selection.features.turn_index, 0, "the session's first turn");
 
     // --- the selection ----------------------------------------------------
-    assert_eq!(selection.source, Some(DecisionSource::Dimensions));
+    assert_eq!(selection.source(), Some(DecisionSource::Dimensions));
     assert_eq!(selection.selected, target(PRIMARY));
     assert_eq!(
         selection.fallbacks,
@@ -450,7 +450,7 @@ async fn a_quiet_session_records_empty_signals_rather_than_the_stalling_ones() {
 
     let selection = selection_of(&rig.decisions(&session_id).await[0]);
     assert_eq!(selection.features.signals, TurnSignals::default());
-    assert_eq!(selection.source, Some(DecisionSource::Ambiguous));
+    assert_eq!(selection.source(), Some(DecisionSource::Ambiguous));
     assert_eq!(selection.selected, target(THRIFTY));
     assert!(
         selection.fallbacks.is_empty(),
@@ -559,7 +559,8 @@ async fn a_recipe_a_router_cannot_read_is_not_recorded_as_a_tier_decision() {
         other => panic!("an unread recipe must not read as a consumed one: {other:?}"),
     }
     assert_eq!(
-        selection.source, None,
+        selection.source(),
+        None,
         "no tier was decided, so there is no source to state"
     );
     assert!(
@@ -631,7 +632,7 @@ async fn a_failover_repeats_one_selection_across_every_dispatch() {
         "and it still names the target the policy chose, not the one that served"
     );
     assert_eq!(second.fallbacks, vec![target(SECONDARY)]);
-    assert_eq!(second.source, Some(DecisionSource::Dimensions));
+    assert_eq!(second.source(), Some(DecisionSource::Dimensions));
 
     // --- the log position the features were read at -----------------------
     let events = rig.events(&session_id).await;

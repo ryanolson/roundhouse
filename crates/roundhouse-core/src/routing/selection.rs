@@ -249,12 +249,6 @@ pub struct SelectionSnapshot {
     /// rather than a tier.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallbacks: Vec<Target>,
-    /// The [`DecisionSource`] the returned [`Decision`] carried.
-    ///
-    /// **A property of the selection, not of the attempt**: every record of one
-    /// turn repeats it, because no fallback re-ran the scorer.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<DecisionSource>,
     /// The pool the policy's own admission call returned.
     ///
     /// `None` means unknown — a policy that assembled its [`Decision`] without
@@ -317,11 +311,25 @@ impl SelectionSnapshot {
             features,
             selected: decision.target.clone(),
             fallbacks: decision.fallbacks.clone(),
-            source: decision.source,
             admitted: decision.admitted.clone(),
             selector: decision.selector.clone(),
             classifications,
             objective,
+        }
+    }
+
+    /// The [`DecisionSource`] the selection ran under, read off the same
+    /// evidence [`Self::selector`] already carries rather than kept as a
+    /// second copy: a stage decision's source is [`StageEvidence::source`],
+    /// and every other branch -- affinity, the escalation audit, and an
+    /// unknown policy's `None` -- has no source to state.
+    pub fn source(&self) -> Option<DecisionSource> {
+        match &self.selector {
+            Some(SelectorSnapshot {
+                branch: SelectorBranch::Stage(evidence),
+                ..
+            }) => evidence.source(),
+            _ => None,
         }
     }
 }

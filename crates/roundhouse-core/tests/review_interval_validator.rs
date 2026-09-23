@@ -1251,9 +1251,10 @@ async fn a_routed_configuration_change_between_capture_and_commit_does_not_rejec
 /// itself exercise the deleted branch's specific guard (a tip generation the
 /// covered decisions agree with each other about, but not with the tip,
 /// because the decision that moved the tip past them was dropped by
-/// overflow rather than covered). That narrower shape is not reachable
-/// through the real session writer: see the deletion's own comment in
-/// `session/review.rs` for why.
+/// overflow rather than covered). That narrower shape cannot arise at all:
+/// `routed()` either tracks a decision or marks overflow, with nothing else
+/// it can do, so a decision that moved the tip is always one of the two --
+/// see the argument in `session/review.rs`'s `facts()` comment.
 #[tokio::test]
 async fn an_overflowed_interval_with_a_configuration_change_still_captures_as_unknown() {
     let mut log = Log::enrolled(Some(Arm::Shadow)).await;

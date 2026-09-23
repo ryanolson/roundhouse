@@ -106,7 +106,6 @@ pub fn decision(turn_index: u64, objective: Option<ObjectiveVersion>) -> Decisio
             },
             selected: routed_target(),
             fallbacks: Vec::new(),
-            source: None,
             admitted: None,
             selector: None,
             classifications: None,

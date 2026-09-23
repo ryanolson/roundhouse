@@ -141,10 +141,11 @@ impl PromptCapture {
     /// What may be said about one turn's input.
     ///
     /// **Allocation is bounded by [`ProjectionCaps::max_prompt_chars`], not by
-    /// the input.** The first version concatenated every user message and then
-    /// truncated the result, so a 200k-token history import built a 200k-token
-    /// string on the turn path to throw away all but two thousand characters of
-    /// it. Text is accumulated up to the cap and the remainder is not copied.
+    /// the input.** Concatenating every user message and then truncating the
+    /// result would build a 200k-token string on the turn path for a
+    /// 200k-token history import, to throw away all but two thousand
+    /// characters of it. Text is accumulated up to the cap and the remainder
+    /// is not copied.
     pub fn of(input: &[Item], caps: &ProjectionCaps) -> Self {
         // This turn's own contribution: everything after the last thing the
         // model said. See the type's own note on why the whole input is not it.

@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! core-metrics-5: the exact figure behind classifier evaluation settlement.
+//! The exact figure behind classifier evaluation settlement, once every open
+//! call has closed.
 //!
 //! A sibling file for the same reason `first_output_tests.rs` and
 //! `turn_elapsed_tests.rs` are: the fixtures stay in `fold.rs`'s own test
@@ -101,9 +102,10 @@ fn repair(call_id: &str) -> ClassificationSettlementRepair {
 
 /// Three unconfirmed results summed in result order, repaired in the
 /// *reverse* order. Float addition is not associative, so
-/// `awaiting_usd - repaired_usd` (the derivation this replaces) does not
-/// land on exactly `0.0` here even though every call has closed --
-/// see core-metrics-5.
+/// `awaiting_usd - repaired_usd` (a derivation this fold does not use) does
+/// not land on exactly `0.0` here even though every call has closed --
+/// summing the open set directly, rather than subtracting from a running
+/// total, is what lands on it.
 #[test]
 fn unconfirmed_usd_is_exactly_zero_once_every_open_call_is_repaired_in_reverse_order() {
     let ada = principal("acme", "ada");

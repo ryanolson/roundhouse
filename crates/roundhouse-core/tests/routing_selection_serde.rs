@@ -69,7 +69,6 @@ fn snapshot() -> SelectionSnapshot {
         features: features(),
         selected: hosted("sol"),
         fallbacks: vec![hosted("terra")],
-        source: Some(DecisionSource::CostGuard),
         admitted: Some(vec![hosted("sol"), hosted("luna"), hosted("terra")]),
         selector: Some(stage_snapshot()),
         classifications: Some(ClassificationWindow {
@@ -250,7 +249,7 @@ fn a_selection_snapshot_survives_a_round_trip_whole() {
     );
     assert_eq!(selection.features.observed_through_seq, 37);
     assert_eq!(selection.features.turn_index, 4);
-    assert_eq!(selection.source, Some(DecisionSource::CostGuard));
+    assert_eq!(selection.source(), Some(DecisionSource::CostGuard));
     assert_eq!(selection.fallbacks, vec![hosted("terra")]);
     assert_eq!(selection.admitted.as_ref().map(Vec::len), Some(3));
 }

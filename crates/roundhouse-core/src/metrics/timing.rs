@@ -21,9 +21,9 @@
 /// A total and a count rather than a mean: rows merge, sums add exactly, and
 /// a mean of means would weight a row that served three turns the same as
 /// one that served three hundred. One type for every class this fold times —
-/// first output, completed, incomplete — because they were the same three
-/// fields written out by hand at each site until now, which is what let the
-/// two write sites drift onto two different overflow rules (core-metrics-2).
+/// first output, completed, incomplete — because writing the same three
+/// fields out by hand at each site leaves the sites free to drift onto
+/// different overflow rules.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Elapsed {
     pub(super) ms_total: u64,
@@ -204,9 +204,8 @@ mod tests {
 
     /// **`absorb` saturates by the same rule `observe` does**, so a row that
     /// saturated in one scope does not wrap the moment it is merged into a
-    /// wider one. The two write paths drifted onto different overflow rules
-    /// once already (core-metrics-2); this pins the rule now that both paths
-    /// share it.
+    /// wider one. Pinning this here keeps the two paths from drifting onto
+    /// different overflow rules.
     #[test]
     fn absorb_saturates_a_total_that_would_otherwise_wrap() {
         let mut a = Elapsed {

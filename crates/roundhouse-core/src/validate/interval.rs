@@ -87,8 +87,7 @@ pub enum CoverageGap {
     /// A covered decision's turn has no terminal event, so its output is not
     /// durable as items and cannot be shown.
     UnterminatedTurn,
-    /// A covered decision recorded no objective version, or the instructions it
-    /// ran under are no longer available.
+    /// A covered decision recorded no objective version.
     VersionsUnavailable,
     /// Covered decisions ran under different instructions.
     InstructionsChanged,
@@ -479,11 +478,7 @@ fn write_section(
         }
         Objective::LastUserMessage(_) | Objective::Unknown => {
             sink.text("(not stated; the requests in these turns stand in for it)\n")?;
-            if let Some(Item {
-                content: ItemContent::Text { text },
-                ..
-            }) = facts.request_before
-            {
+            if let Some(text) = facts.request_before {
                 sink.text("The most recent request before these turns:\n")?;
                 sink.quote(text)?;
             }

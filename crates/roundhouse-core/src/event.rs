@@ -1020,12 +1020,9 @@ mod tests {
     }
 
     /// A zero-usage call -- a cancelled response, a side call that reported
-    /// nothing -- must be the identity for `add` whichever side it lands on.
-    /// Today it is only treated that way when it arrives first: `empty` is
-    /// read off `self` before the add, so a default addend folded in
-    /// *second* is compared against an accumulator that is no longer
-    /// default, and `min` taints the real measurement's provenance down to
-    /// `Unreported`.
+    /// nothing -- must be the identity for `add` whichever side it lands on:
+    /// a measurement folded in before a default addend must keep its own
+    /// provenance rather than have `min` taint it down to `Unreported`.
     #[test]
     fn an_all_default_addend_does_not_change_the_order_dependent_result() {
         let measured = Usage {

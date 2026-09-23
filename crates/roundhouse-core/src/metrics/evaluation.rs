@@ -37,11 +37,12 @@
 //!
 //! What each entry holds is the smallest join the contract needs. Before a
 //! result: the source turn and response the result must match, and the model
-//! the call was requested under. After one: the settlement state and, while it
-//! is open, the amount a repair would resolve. No projection, no prompt, no
-//! classification and no principal — the payer is resolved from the session's
-//! own `SessionCreated` at every event, so a second copy here could not drift
-//! from it.
+//! the call was requested under. After one: the settlement state alone --
+//! while it is open, the amount a repair would resolve lives on the payer's
+//! own [`EvaluationAccumulator::open`] entry, not here. No projection, no
+//! prompt, no classification and no principal — the payer is resolved from
+//! the session's own `SessionCreated` at every event, so a second copy here
+//! could not drift from it.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -130,8 +131,8 @@ impl EvaluationCallTally {
 /// repair closes it; this does not, because subtracting a float from an
 /// accumulated sum does not return the exact remainder any more than
 /// subtracting one accumulated sum from another does -- see
-/// [`Self::committed_usd`] and [`EvaluationFold::tally`] for where that
-/// float-order defect (core-metrics-5) actually got fixed. Add-only is also
+/// [`Self::committed_usd`] and [`EvaluationFold::tally`] for how that
+/// float-order residue is avoided instead. Add-only is also
 /// what makes [`Self::absorb`] a straight field-wise sum, which is what the
 /// deployment and project views are.
 ///
@@ -153,9 +154,9 @@ pub(super) struct EvaluationCounters {
     /// exactly once each: at the record, when the settle already arrived
     /// committed, or at the repair that later closes it (see
     /// [`EvaluationFold::repaired`]). Never derived by subtracting an open
-    /// amount from `measured_usd` -- that subtraction is exactly the
-    /// mechanism core-metrics-5 removed, and reusing it here would put the
-    /// same residue on this figure instead.
+    /// amount from `measured_usd` -- that subtraction would leave a float
+    /// residue behind once the open set empties, so committed dollars are
+    /// added directly at each of the three points above instead.
     pub(super) committed_usd: f64,
     /// Acknowledgements that arrived as a repair rather than with the
     /// result. A subset of `acknowledged_calls`, not an addition to it.
@@ -267,8 +268,8 @@ impl EvaluationAccumulator {
 }
 
 /// What [`EvaluationFold::tally`] answers for one scope: every collected
-/// principal's counters, plus the open-call question only a fresh scan
-/// answers.
+/// principal's counters, plus the open-call totals summed from each
+/// collected principal's own open set.
 pub(super) struct EvaluationView {
     pub(super) counters: EvaluationCounters,
     open_calls: u64,
@@ -502,11 +503,10 @@ impl EvaluationFold {
         let mut open_calls = 0u64;
         // Not `+= .sum()`: `Iterator::sum`'s `f64` identity is `-0.0`, so an
         // empty open set would publish a signed zero that formats as
-        // `-$0.00` on the dashboard -- the exact defect core-metrics-5
-        // removed, reintroduced by the standard library's own fold seed.
-        // `EvaluationAccumulator::unconfirmed_usd` already seeds each
-        // principal's own sum at `0.0`, so summing those across principals
-        // here cannot reintroduce it.
+        // `-$0.00` on the dashboard. `EvaluationAccumulator::unconfirmed_usd`
+        // already seeds each principal's own sum at `0.0`, so summing those
+        // across principals here with an explicit `0.0` seed cannot
+        // reintroduce the standard library's signed-zero fold seed.
         let mut open_usd = 0.0_f64;
         for (owner, row) in &self.by_principal {
             if !scope.collects(owner) {

@@ -84,7 +84,6 @@ use crate::routing::Target;
 pub use arm::{Arm, ArmShares, placebo_intervenes};
 pub use brief::{
     BriefConfig, BriefStep, Objective, StepContent, ValidationBrief, trailing_user_request,
-    truncate,
 };
 pub use control_call::{
     CONTROL_TOOL_DELIMITER, CONTROL_TOOL_NAMES, CONTROL_TOOL_NAMESPACE, ControlCallDialect,
