@@ -647,7 +647,7 @@ impl SessionState {
                     true => self.review.configuration_appended(),
                     false => self.review.history_appended(
                         self.items.len() - self.configuration.len(),
-                        item.is_user_request(),
+                        item.user_request().is_some(),
                     ),
                 }
                 self.configuration.append(&mut self.items, item.clone());
@@ -1805,50 +1805,13 @@ impl<S: SessionStore> Session<S> {
         Ok(())
     }
 
-    /// Deliver what a classifier call produced.
-    ///
-    /// Committed by whichever turn is next in the session, which is why the
-    /// record carries its own source turn: the delivering turn is not the turn
-    /// being described, and often several turns later.
-    pub async fn record_classification(
-        &mut self,
-        record: ClassificationRecord,
-    ) -> Result<(), SessionError> {
-        self.commit(vec![SessionEventKind::ClassificationRecorded { record }])
-            .await?;
-        Ok(())
-    }
-
-    /// Record that an unconfirmed evaluation settlement has been resolved.
-    ///
-    /// Committed by a later turn's writer for the same reason the result above
-    /// is: the repair runs on a background worker that holds no lease, and the
-    /// engine's own writer is the only one there is. A commit that fails leaves
-    /// the settlement unrepaired in the fold, so the next turn drives it again
-    /// — which costs one deduplicated ledger call and no classifier request at
-    /// all.
-    pub async fn record_classification_settlement_repair(
-        &mut self,
-        record: ClassificationSettlementRepair,
-    ) -> Result<(), SessionError> {
-        self.commit(vec![SessionEventKind::ClassificationSettlementRepaired {
-            record,
-        }])
-        .await?;
-        Ok(())
-    }
-
     /// Deliver a whole turn's drain of background-classifier output in one
     /// append: every result and every settlement-repair acknowledgement the
     /// runtime is holding for this session, committed together.
     ///
-    /// **One store round trip for the batch, not one per record.** A session
-    /// with several parked results or repairs used to pay one
-    /// [`Self::record_classification`] or
-    /// [`Self::record_classification_settlement_repair`] call each — on the
-    /// path to first token, before every turn's own `TurnStarted` — and nothing
-    /// about that work needs to be serialized: the store assigns every event in
-    /// one `commit` contiguous sequence numbers atomically, exactly as
+    /// **One store round trip for the batch, not one per record.** Nothing
+    /// about this work needs to be serialized: the store assigns every event
+    /// in one `commit` contiguous sequence numbers atomically, exactly as
     /// [`Self::begin_turn`] already relies on for a turn's own input items.
     ///
     /// **Typed parameters, not a raw `Vec<SessionEventKind>`.** `commit` is
@@ -1858,14 +1821,25 @@ impl<S: SessionStore> Session<S> {
     /// committed ahead of repairs, deterministically, regardless of the order
     /// the caller drained them in.
     ///
-    /// An empty call commits nothing: the caller is expected to skip this
-    /// entirely when both lists are empty, and an empty batch would otherwise
-    /// still cost a store round trip for zero events.
+    /// **`Result<()>`, not the committed events.** `commit` is all-or-nothing,
+    /// so on `Ok` the ids the caller passed in are exactly the ids that
+    /// landed; a caller that needs to know which never has to read them back
+    /// out of the returned events. A commit that fails leaves the settlement
+    /// unrepaired in the fold and every result undelivered, so the next turn
+    /// drives them again — which costs one deduplicated ledger call and no
+    /// classifier request at all.
+    ///
+    /// An empty call commits nothing, the way [`Self::record_control`] skips
+    /// an empty record: a store round trip for zero events would be a cost
+    /// paid by every turn that follows a classified one.
     pub async fn record_background_classification(
         &mut self,
         results: Vec<ClassificationRecord>,
         repairs: Vec<ClassificationSettlementRepair>,
-    ) -> Result<Vec<SessionEvent>, SessionError> {
+    ) -> Result<(), SessionError> {
+        if results.is_empty() && repairs.is_empty() {
+            return Ok(());
+        }
         let mut kinds = Vec::with_capacity(results.len() + repairs.len());
         kinds.extend(
             results
@@ -1877,7 +1851,8 @@ impl<S: SessionStore> Session<S> {
                 .into_iter()
                 .map(|record| SessionEventKind::ClassificationSettlementRepaired { record }),
         );
-        self.commit(kinds).await
+        self.commit(kinds).await?;
+        Ok(())
     }
 
     /// Commit facts an interjector produced for a turn that then proceeds.

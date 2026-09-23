@@ -14,6 +14,7 @@ use super::*;
 use crate::control::{Billing, PrincipalKey, ProjectId};
 use crate::event::{IncompleteReason, SessionEventKind, Usage};
 use crate::ids::{ResponseId, TurnId};
+use crate::metrics::timing::Elapsed;
 use crate::routing::{AttemptClass, DecisionRecord, DispatchAttempt};
 
 /// The whole B1 interval in one fixture: start, dispatch, text, terminal.
@@ -81,16 +82,16 @@ fn a_terminal_books_its_interval_in_its_own_outcome_class() {
     let claude = row(&fold, &claude());
     assert_eq!(
         (
-            claude.completed_elapsed.samples,
-            claude.completed_elapsed.ms_total
+            claude.timing.completed_elapsed.samples,
+            claude.timing.completed_elapsed.ms_total
         ),
         (1, 30),
         "the completed turn's own interval, and only it"
     );
     assert_eq!(
         (
-            claude.incomplete_elapsed.samples,
-            claude.incomplete_elapsed.ms_total
+            claude.timing.incomplete_elapsed.samples,
+            claude.timing.incomplete_elapsed.ms_total
         ),
         (1, 20),
         "the incomplete turn's own interval, and only it"
@@ -111,11 +112,14 @@ fn a_turn_that_never_spoke_still_has_a_terminal_interval() {
     fold.extend(log.events());
 
     let claude = row(&fold, &claude());
-    assert_eq!(claude.first_output.samples, 0, "nothing was ever said");
+    assert_eq!(
+        claude.timing.first_output.samples, 0,
+        "nothing was ever said"
+    );
     assert_eq!(
         (
-            claude.completed_elapsed.samples,
-            claude.completed_elapsed.ms_total
+            claude.timing.completed_elapsed.samples,
+            claude.timing.completed_elapsed.ms_total
         ),
         (1, 20),
         "but the turn still ended, and when it ended is measured"
@@ -170,8 +174,8 @@ fn a_failover_books_the_whole_interval_on_the_target_that_transmitted() {
     let served = row(&fold, &claude());
     assert_eq!(
         (
-            served.completed_elapsed.samples,
-            served.completed_elapsed.ms_total
+            served.timing.completed_elapsed.samples,
+            served.timing.completed_elapsed.ms_total
         ),
         (1, 30),
         "measured from the turn's start, not from the surviving dispatch, so \
@@ -188,9 +192,9 @@ fn a_failover_books_the_whole_interval_on_the_target_that_transmitted() {
     );
     assert_eq!(
         (
-            abandoned.completed_elapsed,
-            abandoned.incomplete_elapsed,
-            abandoned.first_output.samples
+            abandoned.timing.completed_elapsed,
+            abandoned.timing.incomplete_elapsed,
+            abandoned.timing.first_output.samples
         ),
         (Elapsed::default(), Elapsed::default(), 0),
         "the target that never transmitted gets no interval, in either outcome \
@@ -250,14 +254,14 @@ fn a_superseded_response_books_no_interval_and_its_late_terminal_books_none() {
     let claude = row(&fold, &claude());
     assert_eq!(
         (
-            claude.completed_elapsed.samples,
-            claude.completed_elapsed.ms_total
+            claude.timing.completed_elapsed.samples,
+            claude.timing.completed_elapsed.ms_total
         ),
         (1, 20),
         "only the retry, measured from the retry's own start"
     );
     assert_eq!(
-        claude.incomplete_elapsed.samples, 0,
+        claude.timing.incomplete_elapsed.samples, 0,
         "the abandoned response's late terminal is not a second observation"
     );
     assert_eq!(
@@ -323,7 +327,7 @@ fn one_turn_id_in_two_sessions_keeps_both_intervals() {
     fold.extend(&first.events()[first.events().len() - 1..]);
 
     assert_eq!(
-        row(&fold, &claude()).completed_elapsed.samples,
+        row(&fold, &claude()).timing.completed_elapsed.samples,
         2,
         "both sessions finished a turn, so both intervals are real"
     );
@@ -331,7 +335,7 @@ fn one_turn_id_in_two_sessions_keeps_both_intervals() {
         let scoped =
             fold.summed_rows(Scope::Principal(&PrincipalKey::from(who)))[&claude()].clone();
         assert_eq!(
-            scoped.completed_elapsed.samples, 1,
+            scoped.timing.completed_elapsed.samples, 1,
             "{who:?} keeps its own interval"
         );
     }
@@ -430,7 +434,7 @@ fn unusable_stamps_are_refused_or_ignored_but_never_folded_as_zero() {
         fold.extend(log.events());
 
         assert_eq!(
-            row(&fold, &claude()).completed_elapsed,
+            row(&fold, &claude()).timing.completed_elapsed,
             case.expect,
             "{}",
             case.name
@@ -479,9 +483,9 @@ fn a_backward_terminal_is_refused_only_in_its_own_class() {
     fold.extend(log.events());
 
     let claude = row(&fold, &claude());
-    assert_eq!(claude.incomplete_elapsed.rejected, 1);
+    assert_eq!(claude.timing.incomplete_elapsed.rejected, 1);
     assert_eq!(
-        claude.completed_elapsed,
+        claude.timing.completed_elapsed,
         Elapsed::default(),
         "a refusal must not appear in the class the turn did not end in"
     );
@@ -652,28 +656,34 @@ fn a_terminal_of_either_kind_drains_the_state_it_opened() {
 #[test]
 fn absorbing_a_row_adds_both_classes_in_every_term() {
     let mut left = Counters {
-        completed_elapsed: Elapsed {
-            ms_total: 30,
-            samples: 1,
-            rejected: 2,
-        },
-        incomplete_elapsed: Elapsed {
-            ms_total: 5,
-            samples: 1,
-            rejected: 0,
+        timing: TurnTimings {
+            completed_elapsed: Elapsed {
+                ms_total: 30,
+                samples: 1,
+                rejected: 2,
+            },
+            incomplete_elapsed: Elapsed {
+                ms_total: 5,
+                samples: 1,
+                rejected: 0,
+            },
+            ..TurnTimings::default()
         },
         ..Counters::default()
     };
     let right = Counters {
-        completed_elapsed: Elapsed {
-            ms_total: 70,
-            samples: 3,
-            rejected: 1,
-        },
-        incomplete_elapsed: Elapsed {
-            ms_total: 15,
-            samples: 2,
-            rejected: 4,
+        timing: TurnTimings {
+            completed_elapsed: Elapsed {
+                ms_total: 70,
+                samples: 3,
+                rejected: 1,
+            },
+            incomplete_elapsed: Elapsed {
+                ms_total: 15,
+                samples: 2,
+                rejected: 4,
+            },
+            ..TurnTimings::default()
         },
         ..Counters::default()
     };
@@ -681,7 +691,7 @@ fn absorbing_a_row_adds_both_classes_in_every_term() {
     left.absorb(&right);
 
     assert_eq!(
-        left.completed_elapsed,
+        left.timing.completed_elapsed,
         Elapsed {
             ms_total: 100,
             samples: 4,
@@ -689,7 +699,7 @@ fn absorbing_a_row_adds_both_classes_in_every_term() {
         }
     );
     assert_eq!(
-        left.incomplete_elapsed,
+        left.timing.incomplete_elapsed,
         Elapsed {
             ms_total: 20,
             samples: 3,
@@ -729,6 +739,7 @@ fn a_project_view_sums_its_members_intervals_and_its_own_unrouted_terminals() {
     let acme = ProjectId::from("acme");
     assert_eq!(
         fold.summed_rows(Scope::Project(&acme))[&claude()]
+            .timing
             .completed_elapsed
             .samples,
         1,
@@ -747,7 +758,7 @@ fn a_project_view_sums_its_members_intervals_and_its_own_unrouted_terminals() {
         "and to nobody else"
     );
     assert_eq!(
-        row(&fold, &claude()).completed_elapsed.samples,
+        row(&fold, &claude()).timing.completed_elapsed.samples,
         2,
         "the deployment sums every principal's"
     );
@@ -777,8 +788,8 @@ fn a_replayed_log_and_a_repeated_terminal_both_add_nothing() {
 
     fold.extend(log.events());
     assert_eq!(
-        row(&fold, &claude()).completed_elapsed,
-        once.completed_elapsed,
+        row(&fold, &claude()).timing.completed_elapsed,
+        once.timing.completed_elapsed,
         "the watermark makes a replay free"
     );
 
@@ -794,11 +805,11 @@ fn a_replayed_log_and_a_repeated_terminal_both_add_nothing() {
 
     let after = row(&fold, &claude());
     assert_eq!(
-        after.completed_elapsed, once.completed_elapsed,
+        after.timing.completed_elapsed, once.timing.completed_elapsed,
         "a second terminal cannot revive a drained clock"
     );
     assert_eq!(
-        after.incomplete_elapsed.samples, 0,
+        after.timing.incomplete_elapsed.samples, 0,
         "nor book the same turn again in the other class"
     );
     assert_eq!(
@@ -834,7 +845,7 @@ fn a_local_target_books_its_interval_too() {
     fold.extend(log.events());
 
     assert_eq!(
-        row(&fold, &llama).completed_elapsed.samples,
+        row(&fold, &llama).timing.completed_elapsed.samples,
         1,
         "a local turn ends at a stamp like any other"
     );

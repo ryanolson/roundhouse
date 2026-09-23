@@ -512,7 +512,6 @@ async fn the_cost_guard_keeps_the_original_pick_beside_the_final_source() {
     assert_eq!(
         evidence.outcome,
         StageOutcome::CostGuard {
-            served: Tier::Capable,
             displaced: "openai/luna".to_string(),
         },
         "and the head it dominated is named"
@@ -606,4 +605,83 @@ async fn degrading_past_the_recipe_is_recorded_as_its_own_branch() {
         "the recipe that was bypassed is still the recipe this turn ran under"
     );
     assert_eq!(admitted_of(&decision), vec!["local/llama".to_string()]);
+}
+
+/// **The claim.** `StageEvidence::source` is the one rule for what
+/// `Decision.source` carries, so the two cannot disagree -- on every one of
+/// the four `StageOutcome` arms, not only the ones the other tests in this
+/// file happen to check both halves of.
+///
+/// Each scenario below reruns a fixture from one of the tests above,
+/// specifically to keep this claim from being provable only against a shape
+/// nothing else in the suite reaches.
+#[tokio::test]
+async fn the_evidences_own_source_never_disagrees_with_the_decisions() {
+    let policy = StagePolicy::new(Box::new(AffinityPolicy::new()));
+
+    // `Served`: the picked tier's head takes the turn plainly.
+    let fixture = Fixture::open().with_recipe(recipe(PickerMode::EfficientFirst));
+    let decision = choose(&policy, &fixture, &fleet()).await;
+    assert_eq!(
+        stage_evidence(&decision).outcome,
+        StageOutcome::Served {
+            tier: Tier::Efficient
+        }
+    );
+    assert_eq!(decision.source, stage_evidence(&decision).source());
+
+    // `PickedTierEmpty`: the picked tier admits nothing this key allows.
+    let fixture = Fixture::open()
+        .with_recipe(recipe(PickerMode::EfficientFirst))
+        .with_signals(escalating_signals())
+        .under(TurnPolicy {
+            allow: TargetFilter::parse(["openai/luna", "openai/terra"])
+                .expect("two literal patterns"),
+            ..TurnPolicy::unrestricted()
+        });
+    let decision = choose(&policy, &fixture, &fleet()).await;
+    assert!(matches!(
+        stage_evidence(&decision).outcome,
+        StageOutcome::PickedTierEmpty { .. }
+    ));
+    assert_eq!(decision.source, stage_evidence(&decision).source());
+
+    // `CostGuard`: a cheaper capable candidate dominates the efficient head.
+    let guarded = vec![
+        hosted("sol", 0.95, 0.05),
+        hosted("luna", 0.70, 0.10),
+        hosted("terra", 0.80, 0.30),
+    ];
+    let fixture = Fixture::open().with_recipe(recipe(PickerMode::EfficientFirst));
+    let decision = choose(&policy, &fixture, &guarded).await;
+    assert!(matches!(
+        stage_evidence(&decision).outcome,
+        StageOutcome::CostGuard { .. }
+    ));
+    assert_eq!(decision.source, stage_evidence(&decision).source());
+
+    // `DegradedPastRecipe`: no tier this recipe names is admissible, and a
+    // spent budget leaves exactly the local worker. This is the one arm
+    // whose evidence is never handed to `decide_staged` at all -- `choose`
+    // routes it through `Admitted::decide` instead, which hard-codes
+    // `source: None` independently of `StageEvidence::source`. Asserting the
+    // two still agree here is what proves that independence has not drifted,
+    // not that the derivation ran.
+    let mut candidates = fleet();
+    candidates.push(local(1, 500.0));
+    let fixture = Fixture::open()
+        .with_recipe(recipe(PickerMode::EfficientFirst))
+        .with_budget(TurnBudget::exhausted(Exhaustion::DegradeToLocal {
+            overflow_when_local_saturated: false,
+        }));
+    let decision = choose(&policy, &fixture, &candidates).await;
+    assert!(matches!(
+        stage_evidence(&decision).outcome,
+        StageOutcome::DegradedPastRecipe { .. }
+    ));
+    assert_eq!(decision.source, stage_evidence(&decision).source());
+    assert_eq!(
+        decision.source, None,
+        "the one arm whose source is genuinely always absent"
+    );
 }

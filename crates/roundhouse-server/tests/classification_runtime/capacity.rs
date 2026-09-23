@@ -83,10 +83,11 @@ async fn a_turn_with_nothing_parked_pays_no_store_append_before_routing() {
 }
 
 /// **server-2: several parked results cost one store round trip, not one
-/// each.** `deliver_classifier_output` used to call `record_classification`
-/// once per drained result -- `k` sequential appends for `k` parked results,
-/// every one of them before this turn's own `TurnStarted` commit, on the
-/// path to first token. Three classifications are held in flight together
+/// each.** `deliver_classifier_output` batches every drained result into one
+/// `record_background_classification` call rather than `k` sequential
+/// appends for `k` parked results, every one of them before this turn's own
+/// `TurnStarted` commit, on the path to first token. Three classifications
+/// are held in flight together
 /// (their ledger call gated open) so none can complete -- and be drained one
 /// at a time by the turns that requested them -- before all three exist
 /// simultaneously; only then are they released to park, and only then does a

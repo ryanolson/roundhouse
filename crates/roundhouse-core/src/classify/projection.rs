@@ -44,13 +44,11 @@ use super::{AvailableClassification, ClassificationAxis, PriorTurnMetadata, TAXO
 /// Moves when the *content* of a projection changes, so a record written under
 /// one revision is never read as though it had been asked the other's question.
 ///
-/// **Bumped to 2** when the whitespace-only-prompt fix (core-session-5)
-/// changed what a turn like `[user_text("  \n"), tool_result(..)]` renders as
-/// — `origin` moves from `user_text` to `tool_continuation` and the `prompt:`
-/// section disappears. Safe to bump: this is a label on new records and
-/// nothing reads it to drop, re-key, or refuse a stored classification —
-/// `ClassifierIdentity::projection_revision` and `ClassificationWindow::revision`
-/// are recorded and never compared against the constant.
+/// **Free to bump on any such change**, because this is a label on new
+/// records only: `ClassifierIdentity::projection_revision` and
+/// `ClassificationWindow::revision` are recorded and never compared against
+/// the constant, so nothing here drops, re-keys, or refuses a stored
+/// classification because the label moved.
 pub const PROJECTION_REVISION: u32 = 2;
 
 /// What this deployment is willing to send.
@@ -168,15 +166,12 @@ impl PromptCapture {
         let mut omitted = 0usize;
 
         for item in current {
-            // `is_user_request` is the one predicate `trailing_user_request`
+            // `user_request` is the one predicate `trailing_user_request`
             // and the review fold also apply, so a turn's own contribution is
             // read as a request here exactly when it would be read as one
             // anywhere else — including trimming whitespace-only text, which
             // a bare `Role::User` match does not.
-            if item.is_user_request() {
-                let ItemContent::Text { text: said } = &item.content else {
-                    unreachable!("Item::is_user_request guarantees ItemContent::Text")
-                };
+            if let Some(said) = item.user_request() {
                 if !text.is_empty() {
                     match taken < keep {
                         true => {
@@ -209,7 +204,7 @@ impl PromptCapture {
                     tool_results += 1;
                     omitted += 1;
                 }
-                // Blank user text is not a request — `is_user_request` above
+                // Blank user text is not a request — `user_request` above
                 // said so — and it is not counted as omitted either: the turn
                 // contributed nothing readable, which is a different fact
                 // from the instructions and tool output this projection

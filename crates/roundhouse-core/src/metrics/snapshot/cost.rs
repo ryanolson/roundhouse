@@ -14,7 +14,7 @@
 use serde::Serialize;
 
 use crate::metrics::ServingMode;
-use crate::metrics::evaluation::{EvaluationCallTally, EvaluationCounters};
+use crate::metrics::evaluation::{EvaluationCallTally, EvaluationView};
 use crate::metrics::snapshot::{Coverage, ModelAccounting, ModelMetrics};
 
 /// What every serving dollar on this document was priced by.
@@ -66,8 +66,11 @@ impl From<&EvaluationCallTally> for EvaluationTokens {
 /// **Beside the cost and never instead of it.** A settle nobody acknowledged
 /// does not erase the usage that was billed, so `unconfirmed_usd` is money this
 /// deployment knows it owes and cannot yet prove it committed —
-/// `committed_usd + unconfirmed_usd` is always
-/// [`EvaluationMetrics::measured_usd`].
+/// `committed_usd + unconfirmed_usd` agrees with
+/// [`EvaluationMetrics::measured_usd`] up to the rounding of two independently
+/// ordered float sums over the same addends. `unconfirmed_usd` is exactly zero
+/// once nothing is open; that identity is bit-exact and pinned by
+/// `evaluation_tests.rs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct EvaluationSettlement {
     /// Calls that reached a service and whose settle the ledger answered for,
@@ -172,7 +175,8 @@ pub struct EvaluationMetrics {
 }
 
 impl EvaluationMetrics {
-    pub(super) fn build(counters: &EvaluationCounters) -> Self {
+    pub(super) fn build(view: &EvaluationView) -> Self {
+        let counters = &view.counters;
         Self {
             intents: counters.intents,
             results: counters.all.calls,
@@ -184,10 +188,10 @@ impl EvaluationMetrics {
             unknown_usage_calls: counters.all.unknown_usage_calls,
             refused_calls: counters.all.refused_calls,
             settlement: EvaluationSettlement {
-                acknowledged_calls: counters.acknowledged_calls(),
+                acknowledged_calls: view.acknowledged_calls(),
                 committed_usd: counters.committed_usd(),
-                unconfirmed_calls: counters.unconfirmed_calls(),
-                unconfirmed_usd: counters.unconfirmed_usd(),
+                unconfirmed_calls: view.unconfirmed_calls(),
+                unconfirmed_usd: view.unconfirmed_usd(),
                 repaired_calls: counters.repaired_calls,
             },
             cost_incomplete: counters.cost_incomplete(),

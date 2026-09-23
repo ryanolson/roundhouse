@@ -2186,10 +2186,10 @@ fn a_turns_leading_configuration_run_replaces_the_sessions_at_the_head() {
 // leaves the call's true answer still able to land.
 //
 // Every case is driven through the session's own commit methods
-// (`record_classification_intent`, `record_classification`) and then re-read
-// through `SessionState::project`, because the invariant belongs to the fold:
-// a writer that attributed one way and a successor replaying the same log the
-// other would disagree about which turn a feature describes.
+// (`record_classification_intent`, `record_background_classification`) and
+// then re-read through `SessionState::project`, because the invariant belongs
+// to the fold: a writer that attributed one way and a successor replaying the
+// same log the other would disagree about which turn a feature describes.
 
 use crate::classify::{
     ClassificationOutcome, ClassifierIdentity, ContextDependence, EvaluationSpend, EvaluationUsage,
@@ -2362,7 +2362,7 @@ async fn a_mismatched_source_result_must_not_close_the_intent_or_block_the_true_
     // The delivered record names call_1, but a different turn and a
     // different source response than the intent it claims to settle.
     session
-        .record_classification(classify_result("call_1", 9, "resp_9"))
+        .record_background_classification(vec![classify_result("call_1", 9, "resp_9")], vec![])
         .await
         .unwrap();
     let mismatch_seq = session.last_seq();
@@ -2396,7 +2396,7 @@ async fn a_mismatched_source_result_must_not_close_the_intent_or_block_the_true_
     // The true, correctly-sourced result for the same call must still be
     // able to land after the mismatched delivery above.
     session
-        .record_classification(classify_result("call_1", 3, "resp_3"))
+        .record_background_classification(vec![classify_result("call_1", 3, "resp_3")], vec![])
         .await
         .unwrap();
     let true_seq = session.last_seq();
@@ -2440,7 +2440,7 @@ async fn a_result_with_only_the_turn_index_wrong_must_not_close_the_intent() {
     // source_response_id ("resp_3") matches; source_turn_index (7, not 3)
     // does not.
     session
-        .record_classification(classify_result("call_1", 7, "resp_3"))
+        .record_background_classification(vec![classify_result("call_1", 7, "resp_3")], vec![])
         .await
         .unwrap();
 
@@ -2463,7 +2463,7 @@ async fn a_result_with_only_the_turn_index_wrong_must_not_close_the_intent() {
 
     // And the intent is still answerable, which is the point of leaving it.
     session
-        .record_classification(classify_result("call_1", 3, "resp_3"))
+        .record_background_classification(vec![classify_result("call_1", 3, "resp_3")], vec![])
         .await
         .unwrap();
     assert_eq!(
@@ -2489,7 +2489,7 @@ async fn a_result_with_only_the_response_id_wrong_must_not_close_the_intent() {
     // source_turn_index (3) matches; source_response_id ("resp_9", not
     // "resp_3") does not.
     session
-        .record_classification(classify_result("call_1", 3, "resp_9"))
+        .record_background_classification(vec![classify_result("call_1", 3, "resp_9")], vec![])
         .await
         .unwrap();
 
@@ -2512,7 +2512,7 @@ async fn a_result_with_only_the_response_id_wrong_must_not_close_the_intent() {
 
     // And the intent is still answerable, which is the point of leaving it.
     session
-        .record_classification(classify_result("call_1", 3, "resp_3"))
+        .record_background_classification(vec![classify_result("call_1", 3, "resp_3")], vec![])
         .await
         .unwrap();
     assert_eq!(
@@ -2538,7 +2538,7 @@ async fn a_result_with_no_matching_intent_must_not_be_settled_or_filed() {
     assert_eq!(session.state.outstanding_classifications().count(), 0);
 
     session
-        .record_classification(classify_result("call_orphan", 2, "resp_2"))
+        .record_background_classification(vec![classify_result("call_orphan", 2, "resp_2")], vec![])
         .await
         .unwrap();
 
@@ -2564,7 +2564,7 @@ async fn a_result_with_no_matching_intent_must_not_be_settled_or_filed() {
         .await
         .unwrap();
     session
-        .record_classification(classify_result("call_orphan", 2, "resp_2"))
+        .record_background_classification(vec![classify_result("call_orphan", 2, "resp_2")], vec![])
         .await
         .unwrap();
 
@@ -2604,7 +2604,7 @@ async fn a_delayed_and_then_duplicated_delivery_lands_exactly_once() {
         .await
         .unwrap();
     session
-        .record_classification(classify_result("call_b", 2, "resp_2"))
+        .record_background_classification(vec![classify_result("call_b", 2, "resp_2")], vec![])
         .await
         .unwrap();
     let b_seq = session.last_seq();
@@ -2612,7 +2612,7 @@ async fn a_delayed_and_then_duplicated_delivery_lands_exactly_once() {
 
     // `call_a`'s correctly-sourced result finally lands.
     session
-        .record_classification(classify_result("call_a", 1, "resp_1"))
+        .record_background_classification(vec![classify_result("call_a", 1, "resp_1")], vec![])
         .await
         .unwrap();
     let a_seq = session.last_seq();
@@ -2630,7 +2630,7 @@ async fn a_delayed_and_then_duplicated_delivery_lands_exactly_once() {
     // A duplicate delivery of the same call -- a successor re-driving a
     // result this session already folded.
     session
-        .record_classification(classify_result("call_a", 1, "resp_1"))
+        .record_background_classification(vec![classify_result("call_a", 1, "resp_1")], vec![])
         .await
         .unwrap();
     assert_eq!(
@@ -2663,7 +2663,7 @@ async fn attribution_holds_across_a_serialized_replay() {
         .await
         .unwrap();
     session
-        .record_classification(classify_result("call_1", 9, "resp_9"))
+        .record_background_classification(vec![classify_result("call_1", 9, "resp_9")], vec![])
         .await
         .unwrap();
     session
@@ -2671,7 +2671,7 @@ async fn attribution_holds_across_a_serialized_replay() {
         .await
         .unwrap();
     session
-        .record_classification(classify_result("call_2", 4, "resp_4"))
+        .record_background_classification(vec![classify_result("call_2", 4, "resp_4")], vec![])
         .await
         .unwrap();
 
@@ -2855,7 +2855,10 @@ async fn session_with_backlog(node: &str, size: usize) -> Session<MemoryStore> {
             .await
             .unwrap();
         session
-            .record_classification(unconfirmed_result(&call, turn, &response, index as f64))
+            .record_background_classification(
+                vec![unconfirmed_result(&call, turn, &response, index as f64)],
+                vec![],
+            )
             .await
             .unwrap();
     }
@@ -2899,10 +2902,10 @@ async fn acknowledging_a_batch_examines_entries_for_the_batch_and_not_the_backlo
         let before = session.state.unrepaired_settlements_examined();
         for index in 1..=ACKNOWLEDGED {
             session
-                .record_classification_settlement_repair(acknowledgement(
-                    &backlog_call(index),
-                    true,
-                ))
+                .record_background_classification(
+                    vec![],
+                    vec![acknowledgement(&backlog_call(index), true)],
+                )
                 .await
                 .unwrap();
         }
@@ -2937,7 +2940,7 @@ async fn an_acknowledgement_naming_nothing_in_the_backlog_examines_nothing() {
     let examined_before = session.state.unrepaired_settlements_examined();
 
     session
-        .record_classification_settlement_repair(acknowledgement("eval_never_seen", true))
+        .record_background_classification(vec![], vec![acknowledgement("eval_never_seen", true)])
         .await
         .unwrap();
 
@@ -2960,7 +2963,7 @@ async fn a_repeated_acknowledgement_examines_nothing_and_drains_nothing_twice() 
     let mut session = session_with_backlog("node-duplicate", 32).await;
 
     session
-        .record_classification_settlement_repair(acknowledgement(&backlog_call(7), true))
+        .record_background_classification(vec![], vec![acknowledgement(&backlog_call(7), true)])
         .await
         .unwrap();
     let after_first = backlog_order(&session.state);
@@ -2972,7 +2975,7 @@ async fn a_repeated_acknowledgement_examines_nothing_and_drains_nothing_twice() 
     );
 
     session
-        .record_classification_settlement_repair(acknowledgement(&backlog_call(7), false))
+        .record_background_classification(vec![], vec![acknowledgement(&backlog_call(7), false)])
         .await
         .unwrap();
 
@@ -2996,7 +2999,10 @@ async fn interior_removal_keeps_the_backlog_oldest_first_through_replay() {
 
     for (index, applied) in [(3usize, true), (6, false)] {
         session
-            .record_classification_settlement_repair(acknowledgement(&backlog_call(index), applied))
+            .record_background_classification(
+                vec![],
+                vec![acknowledgement(&backlog_call(index), applied)],
+            )
             .await
             .unwrap();
     }
@@ -3016,5 +3022,38 @@ async fn interior_removal_keeps_the_backlog_oldest_first_through_replay() {
         backlog_order(&replayed(&session).await),
         expected,
         "and a successor replaying this log repairs them in the same order"
+    );
+}
+
+/// **An empty background-classification batch must not reach the store at
+/// all**, the way [`Session::record_control`]'s empty record already does
+/// not. `BatchRecordingStore` proves the round trip was skipped rather than
+/// merely producing no events -- a batch that reached `append_events` and
+/// came back empty would look identical from the returned `Result` alone.
+#[tokio::test]
+async fn an_empty_background_classification_batch_costs_no_store_round_trip() {
+    let store = Arc::new(BatchRecordingStore::new());
+    let session_id = SessionId::generate();
+    store.create_session(&session_id, "affinity").await.unwrap();
+    let mut session = Session::open(
+        Arc::clone(&store),
+        session_id,
+        "node-a",
+        TTL,
+        CacheLedger::new(),
+    )
+    .await
+    .unwrap();
+    store.forget_batches();
+
+    session
+        .record_background_classification(vec![], vec![])
+        .await
+        .unwrap();
+
+    assert!(
+        store.batches().is_empty(),
+        "no results and no repairs means nothing to commit, and the method \
+         must not pay a store round trip to say so"
     );
 }

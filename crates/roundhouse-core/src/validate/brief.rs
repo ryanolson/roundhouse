@@ -126,12 +126,7 @@ impl Objective {
 /// render that absence rather than an empty string — see
 /// [`render_steer_answer`](crate::validate::render_steer_answer).
 pub fn trailing_user_request(items: &[Item]) -> Option<&str> {
-    let item = items.iter().rev().find(|item| item.is_user_request())?;
-    match &item.content {
-        ItemContent::Text { text } => Some(text.as_str()),
-        // `is_user_request` guarantees `Text` content; nothing else reaches here.
-        _ => None,
-    }
+    items.iter().rev().find_map(Item::user_request)
 }
 
 /// How much of a session the judge is shown.
@@ -470,8 +465,8 @@ fn truncate_objective(objective: Objective, limit: usize) -> Objective {
 /// Hoisted so the char count a caller budgets against can never drift from the
 /// marker `truncate` actually appends — a hand-counted length beside a literal
 /// is exactly the kind of pair that disagrees the day one of the two is
-/// edited and not the other, which is what happened to the classifier
-/// projection's own copy before this constant existed.
+/// edited and not the other. Shared with the classifier projection's own
+/// truncation for the same reason.
 pub(crate) const TRUNCATION_MARKER: &str = "…[truncated]";
 
 /// At most `limit` characters, with the cut marked.

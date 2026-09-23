@@ -172,6 +172,17 @@ impl Usage {
     /// `u64::MAX` would report a near-zero total for the busiest deployment on
     /// the fleet, which is the one case where the number matters most.
     pub fn add(&mut self, other: &Usage) {
+        // An all-default addend is the identity, on either side: it has no
+        // counts to add and no provenance to degrade `self` with. Without
+        // this, `empty` below is read off `self` and not `other`, so a
+        // zero-usage call folded in *after* a real measurement is compared
+        // against an accumulator that is no longer default and taints its
+        // provenance down through `min` instead of being ignored -- the same
+        // two calls would then land on two different totals depending only
+        // on which order they arrived in.
+        if *other == Self::default() {
+            return;
+        }
         // Only a default accumulator can adopt provenance. A zero input count
         // can still accompany unreported cache tokens.
         let empty = *self == Self::default();
@@ -1006,6 +1017,43 @@ mod tests {
             ..Usage::default()
         });
         assert_eq!(total.cache_read_source, CacheReadSource::Provider);
+    }
+
+    /// A zero-usage call -- a cancelled response, a side call that reported
+    /// nothing -- must be the identity for `add` whichever side it lands on.
+    /// Today it is only treated that way when it arrives first: `empty` is
+    /// read off `self` before the add, so a default addend folded in
+    /// *second* is compared against an accumulator that is no longer
+    /// default, and `min` taints the real measurement's provenance down to
+    /// `Unreported`.
+    #[test]
+    fn an_all_default_addend_does_not_change_the_order_dependent_result() {
+        let measured = Usage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            cache_read_source: CacheReadSource::Provider,
+            ..Usage::default()
+        };
+
+        let mut default_first = Usage::default();
+        default_first.add(&Usage::default());
+        default_first.add(&measured);
+
+        let mut default_second = Usage::default();
+        default_second.add(&measured);
+        default_second.add(&Usage::default());
+
+        assert_eq!(
+            default_first.cache_read_source,
+            CacheReadSource::Provider,
+            "a zero-usage call folded in first must not taint the provenance \
+             of the one real measurement"
+        );
+        assert_eq!(
+            default_second.cache_read_source, default_first.cache_read_source,
+            "the same two calls in the other order must land on the same \
+             provenance"
+        );
     }
 
     #[test]

@@ -52,17 +52,18 @@ pub const TAXONOMY_VERSION: u32 = 1;
 
 /// One axis of the taxonomy: the key it is asked under, and its options.
 ///
-/// A trait rather than three hand-written tables so that "every axis offers
-/// `unknown`" and "every option label round-trips" are properties one test can
-/// assert over all three.
+/// **A trait rather than three hand-written enums, one per axis.** "Every
+/// axis offers `unknown`" and "every option label round-trips" are properties
+/// one test can assert once, over all three axis types, instead of three
+/// times against three near-identical bodies.
 ///
-/// **One table per axis, not three.** `OPTIONS` is the single place a label,
-/// its rubric and the variant it parses to are written down; `from_label` and
-/// `label` are default methods derived from it rather than a second and third
-/// hand-written match. A fifth option used to mean editing the options list,
-/// `from_label`'s match and `label`'s match in step — and a missed
-/// `from_label` arm would silently drop a valid classifier answer as
-/// unusable. Now it means adding one entry.
+/// **`OPTIONS` is the one table each axis itself writes, not three.** It is
+/// the single place a label, its rubric and the variant it parses to are
+/// written down; `from_label` and `label` are default methods derived from it
+/// rather than a second and third hand-written match a reader would have to
+/// keep in step with it by hand — a missed `from_label` arm would silently
+/// drop a valid classifier answer as unusable. Adding an option is one
+/// `OPTIONS` entry.
 pub trait ClassificationAxis: Sized + Copy + PartialEq + 'static {
     /// The key this axis is asked and answered under.
     const KEY: &'static str;

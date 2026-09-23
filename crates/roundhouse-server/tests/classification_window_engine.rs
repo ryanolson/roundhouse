@@ -356,7 +356,7 @@ async fn seed_history(store: &Arc<MemoryStore>, session_id: &SessionId, count: u
             .await
             .expect("an intent commits");
         session
-            .record_classification(result(turn))
+            .record_background_classification(vec![result(turn)], vec![])
             .await
             .expect("and its result");
     }

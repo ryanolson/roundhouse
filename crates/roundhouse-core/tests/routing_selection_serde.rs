@@ -59,7 +59,6 @@ fn stage_snapshot() -> SelectorSnapshot {
             confidence: Some(0.125),
         },
         outcome: StageOutcome::CostGuard {
-            served: Tier::Capable,
             displaced: "openai/luna".into(),
         },
     })

@@ -204,16 +204,8 @@ impl ClassificationFold {
         &self.available
     }
 
-    /// References to the classifications that had landed by `seq`.
-    ///
-    /// **Takes a cutoff rather than answering "everything now", because a
-    /// routing decision must be explainable from what existed when it was
-    /// taken.** The engine captures its cutoff before selection; a result that
-    /// lands during the same turn therefore cannot enter that turn's evidence,
-    /// however quickly it arrives.
-    ///
-    /// The ordered prefix supports an exact count and reverse traversal without
-    /// scanning the older history to select the newest references.
+    /// References to the classifications that had landed by `seq`. See
+    /// [`super::SessionState::classifications_through`].
     pub(crate) fn through(
         &self,
         seq: u64,
@@ -226,38 +218,22 @@ impl ClassificationFold {
             .map(|available| &available.reference)
     }
 
-    /// Whether this session has accepted `call_id`'s answer.
-    ///
-    /// The delivery path uses this to avoid duplicate appends. Acceptance is
-    /// independent of ledger settlement: an unmatched result can remain in the
-    /// log without completing the intent or contributing a feature.
+    /// Whether this session has accepted `call_id`'s answer. See
+    /// [`super::SessionState::classification_settled`].
     pub(crate) fn settled(&self, call_id: &ResponseId) -> bool {
         self.settled.contains(call_id)
     }
 
     /// Evaluation settlements the log says nobody has confirmed, in arrival
-    /// order.
-    ///
-    /// Everything a repair needs and nothing it does not: the call's identity,
-    /// the amount the record holds, and the window the intent recorded. The
-    /// payer is the session's own principal and is deliberately not repeated
-    /// here.
-    ///
-    /// Borrowed and in arrival order, so a repair path that takes a bounded
-    /// prefix copies nothing it did not select and touches nothing it did not
-    /// take.
+    /// order. See [`super::SessionState::unrepaired_settlements`].
     pub(crate) fn unrepaired(&self) -> impl ExactSizeIterator<Item = &UnconfirmedSettlement> {
         self.unrepaired.iter()
     }
 
-    /// Whether `call_id`'s settlement is still recorded as unrepaired.
-    ///
-    /// The delivery path uses this to avoid re-appending a
-    /// `ClassificationSettlementRepaired` the log already holds — the same
-    /// duplicate-append guard [`Self::settled`] gives results, extended to
-    /// repairs. O(1) rather than a scan over [`Self::unrepaired`], which
-    /// matters here: this is checked once per parked repair on the path to
-    /// first token, and a scan would cost backlog × batch.
+    /// Whether `call_id`'s settlement is still recorded as unrepaired. O(1)
+    /// rather than a scan over [`Self::unrepaired`], which matters here: this
+    /// is checked once per parked repair on the path to first token. See
+    /// [`super::SessionState::is_settlement_unrepaired`].
     pub(crate) fn is_unrepaired(&self, call_id: &ResponseId) -> bool {
         self.unrepaired.contains(call_id)
     }
@@ -270,22 +246,14 @@ impl ClassificationFold {
         self.unrepaired.examined()
     }
 
-    /// Calls with no result, which is the same thing as unknown answers.
-    ///
-    /// **The durable half of "a crash costs knowledge, not money twice".** A
-    /// successor folding this log finds the intent here and learns that a third
-    /// party may have been paid and what it answered is unrecoverable. Nothing
-    /// iterates this to dispatch anything — that is what makes "replay never
-    /// redispatches" a property of the code's shape rather than of a check.
+    /// Calls with no result, which is the same thing as unknown answers. See
+    /// [`super::SessionState::outstanding_classifications`].
     pub(crate) fn outstanding(&self) -> impl Iterator<Item = &ClassificationIntent> {
         self.outstanding.values()
     }
 
-    /// This deployment's own read of recent turns, oldest first.
-    ///
-    /// The other half of the projection's permitted prior context — see
-    /// [`PriorTurnMetadata`]. Bounded by the fold, so a caller cannot ask for
-    /// more of a session's history than the window holds.
+    /// This deployment's own read of recent turns, oldest first. See
+    /// [`super::SessionState::prior_turns`].
     pub(crate) fn prior_turns(&self) -> &[PriorTurnMetadata] {
         &self.prior_turns
     }

@@ -729,13 +729,16 @@ impl MetricsSnapshot {
                 calls: counters.calls,
                 tokens,
                 coverage,
-                first_output: IntervalMetric::publish(&counters.first_output, FIRST_OUTPUT_BASIS),
+                first_output: IntervalMetric::publish(
+                    &counters.timing.first_output,
+                    FIRST_OUTPUT_BASIS,
+                ),
                 completed_turn_elapsed: IntervalMetric::publish(
-                    &counters.completed_elapsed,
+                    &counters.timing.completed_elapsed,
                     TURN_ELAPSED_BASIS,
                 ),
                 incomplete_turn_elapsed: IntervalMetric::publish(
-                    &counters.incomplete_elapsed,
+                    &counters.timing.incomplete_elapsed,
                     TURN_ELAPSED_BASIS,
                 ),
                 cache_reuse_evidence: CacheReuseEvidence::publish(&counters.cache_reuse),

@@ -148,13 +148,12 @@ fn the_two_absences_are_told_apart_and_neither_reads_as_an_empty_prompt() {
     assert_eq!(spoken.origin, PromptOrigin::UserText);
 }
 
-/// **CORRECTNESS (core-session-5).** Whitespace-only user text is not a
-/// request — the same predicate `Item::is_user_request` and
-/// `trailing_user_request` already apply this test by — so a turn carrying
-/// only blank user text ahead of a tool result is a tool continuation, not a
-/// spoken prompt. Before the fix, `PromptCapture::of` checked `said.is_empty()`
-/// rather than `said.trim().is_empty()`, so `"  \n"` read as `UserText` and
-/// rendered a `prompt:` section of blank quoted lines.
+/// Whitespace-only user text is not a request — the same predicate
+/// `Item::user_request` and `trailing_user_request` apply — so a turn
+/// carrying only blank user text ahead of a tool result is a tool
+/// continuation, not a spoken prompt. A check against `said.is_empty()`
+/// rather than `said.trim().is_empty()` would read `"  \n"` as `UserText` and
+/// render a `prompt:` section of blank quoted lines.
 #[test]
 fn whitespace_only_user_text_is_not_a_prompt() {
     let input = vec![Item::user_text("  \n"), tool_result("c1", "ok")];

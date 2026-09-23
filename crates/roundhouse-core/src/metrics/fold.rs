@@ -42,9 +42,9 @@ use crate::event::{
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::metrics::cache_evidence::CacheEvidence;
-use crate::metrics::evaluation::{EvaluationCounters, EvaluationFold};
+use crate::metrics::evaluation::{EvaluationFold, EvaluationView};
 use crate::metrics::pricing::TokenShape;
-use crate::metrics::timing::{Elapsed, TurnClock};
+use crate::metrics::timing::{TurnClock, TurnTimings};
 use crate::metrics::{ModelKey, ServingMode};
 use crate::routing::PooledUsage;
 use crate::validate::Arm;
@@ -199,22 +199,12 @@ pub(super) struct Counters {
     /// rather than a set or a last-write.
     pub(super) declared_baseline: DeclaredBaseline,
     /// Each served turn's `TurnStarted` stamp to its first non-empty
-    /// `OutputTextDelta` stamp. See [`Elapsed`] for why a total and a count
-    /// rather than a mean.
-    pub(super) first_output: Elapsed,
-    /// Turn start to terminal event, over the turns this row *completed*.
-    ///
-    /// Never merged with [`Self::incomplete_elapsed`]: a fast refusal and a
-    /// slow completed answer are both terminals, and one pot would let a
-    /// deployment improve its mean by failing faster.
-    pub(super) completed_elapsed: Elapsed,
-    /// The same interval over the turns this row *did not* complete, every
-    /// [`IncompleteReason`](crate::event::IncompleteReason) in one pot.
-    ///
-    /// Undivided by reason: which failures compare against a completed turn
-    /// is a reward question this observation does not answer. The reason
-    /// stays on the event for a later pass to split.
-    pub(super) incomplete_elapsed: Elapsed,
+    /// `OutputTextDelta` stamp, and turn start to terminal event split by
+    /// completion. See [`Elapsed`](crate::metrics::timing::Elapsed) for why
+    /// each is a total and a count rather than a mean, and [`TurnTimings`]
+    /// for why the three share one field and one `absorb` line rather than
+    /// three of each here.
+    pub(super) timing: TurnTimings,
     /// What this row's decisions predicted about cache reuse, and what evidence
     /// about the answer the log actually holds.
     pub(super) cache_reuse: CacheEvidence,
@@ -320,9 +310,7 @@ impl Counters {
         self.provider_reported_usd += other.provider_reported_usd;
         self.provider_reported_calls += other.provider_reported_calls;
         self.declared_baseline.absorb(&other.declared_baseline);
-        self.first_output.absorb(&other.first_output);
-        self.completed_elapsed.absorb(&other.completed_elapsed);
-        self.incomplete_elapsed.absorb(&other.incomplete_elapsed);
+        self.timing.absorb(&other.timing);
         self.cache_reuse.absorb(&other.cache_reuse);
     }
 }
@@ -862,7 +850,7 @@ impl MetricsFold {
                 // waited once — what the abandoned targets cost is already on
                 // their own rows as `failed_attempts`.
                 if let Some(clock) = clock {
-                    clock.book(counters, event.at_ms, completed);
+                    clock.book(&mut counters.timing, event.at_ms, completed);
                 }
                 if !consumed {
                     return true;
@@ -1145,9 +1133,8 @@ impl MetricsFold {
     /// than a field on [`ScopeView`]: an evaluation call has no model row to
     /// belong to, and handing it back beside rows it must never be summed into
     /// is how the two would eventually be summed.
-    pub(super) fn evaluation(&self, scope: Scope<'_>) -> EvaluationCounters {
-        self.evaluation
-            .tally(scope, |session| self.principal_for(session))
+    pub(super) fn evaluation(&self, scope: Scope<'_>) -> EvaluationView {
+        self.evaluation.tally(scope)
     }
 
     /// Side calls made and abandoned, in one scope.
@@ -1919,9 +1906,9 @@ pub(super) mod tests {
         fold.extend(fast.events());
         fold.extend(slow.events());
         let merged_claude = &fold.summed_rows(Scope::Deployment)[&claude()];
-        assert_eq!(merged_claude.first_output.samples, 2);
-        assert_eq!(merged_claude.first_output.ms_total, 20 + 30);
-        assert_eq!(merged_claude.first_output.rejected, 0);
+        assert_eq!(merged_claude.timing.first_output.samples, 2);
+        assert_eq!(merged_claude.timing.first_output.ms_total, 20 + 30);
+        assert_eq!(merged_claude.timing.first_output.rejected, 0);
     }
 
     /// A side call is money, and it books like money — under the model that

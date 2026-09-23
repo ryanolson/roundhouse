@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use roundhouse_core::classify::projection::PromptCapture;
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::ResponseId;
 use roundhouse_core::item::Item;
 use roundhouse_core::now_ms;
@@ -132,12 +131,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// acquires the lease, and nothing about background output is worth that.
     ///
     /// **One batched commit, not one append per record.** A session with k
-    /// parked results and j parked repairs used to pay k + j sequential store
-    /// round trips here, every one of them before this turn's own
+    /// parked results and j parked repairs commits them in one
+    /// [`Session::record_background_classification`] call rather than k + j
+    /// sequential store round trips, every one of them before this turn's own
     /// `TurnStarted` — on the path to first token, on every turn that follows
-    /// a classified one. Gathering both drains into one
-    /// [`Session::record_background_classification`] call turns that into at
-    /// most one; an empty drain costs none at all.
+    /// a classified one. An empty drain costs none at all.
     ///
     /// Append first, acknowledge second, still. A kind already in the log —
     /// its append landed on an earlier turn, its acknowledgement lost to that
@@ -158,48 +156,52 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             return;
         }
 
-        let mut delivered = Vec::new();
-        let mut results = Vec::new();
-        for completed in waiting_results {
-            let call_id = completed.record.call_id.clone();
-            if session.state().classification_settled(&call_id) {
-                delivered.push(call_id);
-            } else {
-                results.push(completed.record.clone());
-            }
-        }
-        let mut written = Vec::new();
-        let mut repairs = Vec::new();
-        for answered in waiting_repairs {
-            let call_id = answered.record.call_id.clone();
-            if !session.state().is_settlement_unrepaired(&call_id) {
-                written.push(call_id);
-            } else {
-                repairs.push(answered.record.clone());
-            }
-        }
+        // Each partition is (already in the log, needs appending). The engine
+        // already holds every call id it is about to append -- `commit` is
+        // all-or-nothing, so on `Ok` those ids are exactly what landed -- so
+        // there is nothing to read back out of the committed events.
+        let (settled, unsettled): (Vec<_>, Vec<_>) =
+            waiting_results.into_iter().partition(|completed| {
+                session
+                    .state()
+                    .classification_settled(&completed.record.call_id)
+            });
+        let mut delivered: Vec<_> = settled
+            .into_iter()
+            .map(|completed| completed.record.call_id.clone())
+            .collect();
+        let results: Vec<_> = unsettled
+            .into_iter()
+            .map(|completed| completed.record.clone())
+            .collect();
+
+        let (already_repaired, unrepaired): (Vec<_>, Vec<_>) =
+            waiting_repairs.into_iter().partition(|answered| {
+                !session
+                    .state()
+                    .is_settlement_unrepaired(&answered.record.call_id)
+            });
+        let mut written: Vec<_> = already_repaired
+            .into_iter()
+            .map(|answered| answered.record.call_id.clone())
+            .collect();
+        let repairs: Vec<_> = unrepaired
+            .into_iter()
+            .map(|answered| answered.record.clone())
+            .collect();
 
         if !results.is_empty() || !repairs.is_empty() {
+            // Collected before the move below: `record_background_classification`
+            // takes `results` and `repairs` by value.
+            let result_ids: Vec<_> = results.iter().map(|r| r.call_id.clone()).collect();
+            let repair_ids: Vec<_> = repairs.iter().map(|r| r.call_id.clone()).collect();
             match session
                 .record_background_classification(results, repairs)
                 .await
             {
-                Ok(events) => {
-                    for event in events {
-                        match event.kind {
-                            SessionEventKind::ClassificationRecorded { record } => {
-                                delivered.push(record.call_id)
-                            }
-                            SessionEventKind::ClassificationSettlementRepaired { record } => {
-                                written.push(record.call_id)
-                            }
-                            other => unreachable!(
-                                "record_background_classification commits only \
-                                 ClassificationRecorded and ClassificationSettlementRepaired, \
-                                 not {other:?}"
-                            ),
-                        }
-                    }
+                Ok(()) => {
+                    delivered.extend(result_ids);
+                    written.extend(repair_ids);
                 }
                 Err(error) => {
                     // The usual reason is a lost lease, and the turn about to

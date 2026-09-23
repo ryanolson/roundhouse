@@ -123,7 +123,7 @@ impl EvaluationCallTally {
     }
 }
 
-/// One principal's evaluation spend.
+/// One scope's evaluation spend, add-only over every field.
 ///
 /// **Every accumulated field is add-only, and stays that way even for
 /// settlement.** The obvious design decrements an "unconfirmed" pot when a
@@ -135,23 +135,27 @@ impl EvaluationCallTally {
 /// what makes [`Self::absorb`] a straight field-wise sum, which is what the
 /// deployment and project views are.
 ///
-/// [`Self::unconfirmed_calls`] and [`Self::unconfirmed_usd`] are the one
-/// exception to "accumulated": they are not folded field by field at all.
-/// [`EvaluationFold::tally`] fills them in, once, from the calls still open
-/// at query time, and [`Self::absorb`] leaves them alone -- see their doc.
+/// **Carries no answer to "how much is open right now"**: that question
+/// needs the open set, which lives beside this type rather than inside it --
+/// [`EvaluationAccumulator::open`] on a raw per-principal row, `open_calls`
+/// and `open_usd` on [`EvaluationView`] once `tally` has summed every
+/// collected principal's. One `acknowledged_calls` formula on this type
+/// takes the open count as an argument, so both callers derive the same
+/// answer from the same subtraction rather than each carrying a copy that
+/// could drift from the other.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct EvaluationCounters {
-    /// Calls this deployment committed to, by durable identity.
+    /// Calls this scope committed to, by durable identity.
     pub(super) intents: u64,
     /// Every accepted result: measured, unknown-usage and refused alike.
     pub(super) all: EvaluationCallTally,
-    /// Measured dollars whose settle this deployment has an answer for,
-    /// added exactly once each: at the record, when the settle already
-    /// arrived committed, or at the repair that later closes it (see
-    /// [`EvaluationFold::repaired`]). Never derived by subtracting
-    /// `unconfirmed_usd` from `measured_usd` -- that subtraction is exactly
-    /// the mechanism core-metrics-5 removed from `unconfirmed_usd`, and
-    /// reusing it here would put the same residue on this figure instead.
+    /// Measured dollars whose settle this scope has an answer for, added
+    /// exactly once each: at the record, when the settle already arrived
+    /// committed, or at the repair that later closes it (see
+    /// [`EvaluationFold::repaired`]). Never derived by subtracting an open
+    /// amount from `measured_usd` -- that subtraction is exactly the
+    /// mechanism core-metrics-5 removed, and reusing it here would put the
+    /// same residue on this figure instead.
     pub(super) committed_usd: f64,
     /// Acknowledgements that arrived as a repair rather than with the
     /// result. A subset of `acknowledged_calls`, not an addition to it.
@@ -165,30 +169,14 @@ pub(super) struct EvaluationCounters {
     /// settlement was already acknowledged.
     pub(super) unmatched_repairs: u64,
     pub(super) by_model: BTreeMap<EvaluationModelKey, EvaluationCallTally>,
-    /// Calls whose settle nobody has answered for, right now. Set only by
-    /// [`EvaluationFold::tally`]; every other `EvaluationCounters` in this
-    /// module (including the per-principal rows [`Self::absorb`] folds
-    /// together) leaves this at its default. See
-    /// [`Self::unconfirmed_usd`].
-    pub(super) unconfirmed_calls: u64,
-    /// The dollars behind [`Self::unconfirmed_calls`], summed once, directly,
-    /// over the calls that are open right now -- never by subtracting one
-    /// accumulated sum from another. That is what lands on exactly `0.0`
-    /// once the open set is empty, rather than on the few-bits-wide residue
-    /// two independently-ordered sums leave behind (core-metrics-5).
-    pub(super) unconfirmed_usd: f64,
 }
 
 impl EvaluationCounters {
-    /// Add another principal's row into this one, field by field.
+    /// Add another scope's counters into this one, field by field.
     ///
     /// The one definition of what merging means here, for
     /// [`Counters::absorb`](super::fold::Counters)'s reason: a field omitted is
     /// a figure the deployment view quietly under-reports.
-    ///
-    /// Never touches `unconfirmed_calls` or `unconfirmed_usd` -- those are
-    /// not per-principal accumulator state, they are [`EvaluationFold::tally`]'s
-    /// own answer, filled in after every `absorb` call has already run.
     fn absorb(&mut self, other: &Self) {
         self.intents += other.intents;
         self.all.absorb(&other.all);
@@ -207,26 +195,17 @@ impl EvaluationCounters {
         self.intents - self.all.calls
     }
 
-    /// Results that reached the service and whose settle nobody has confirmed.
-    pub(super) fn unconfirmed_calls(&self) -> u64 {
-        self.unconfirmed_calls
-    }
-
-    /// The measured dollars behind [`Self::unconfirmed_calls`].
-    pub(super) fn unconfirmed_usd(&self) -> f64 {
-        self.unconfirmed_usd
-    }
-
-    /// Results that reached the service with an acknowledged settle.
+    /// Results that reached the service with an acknowledged settle, given
+    /// how many of this scope's calls are open right now.
     ///
-    /// Derived rather than accumulated, so it cannot come to disagree with the
-    /// unconfirmed count published beside it. A refusal has no settlement at
+    /// Derived rather than accumulated, so it cannot come to disagree with
+    /// the open count it is computed against. A refusal has no settlement at
     /// all and is excluded here rather than counted as acknowledged.
-    pub(super) fn acknowledged_calls(&self) -> u64 {
-        self.all.calls - self.all.refused_calls - self.unconfirmed_calls()
+    pub(super) fn acknowledged_calls(&self, open_calls: u64) -> u64 {
+        self.all.calls - self.all.refused_calls - open_calls
     }
 
-    /// Measured dollars whose settle this deployment has an answer for.
+    /// Measured dollars whose settle this scope has an answer for.
     pub(super) fn committed_usd(&self) -> f64 {
         self.committed_usd
     }
@@ -237,6 +216,81 @@ impl EvaluationCounters {
     /// amount nobody here can name". A refusal is not: nothing was sent.
     pub(super) fn cost_incomplete(&self) -> bool {
         self.pending() > 0 || self.all.unknown_usage_calls > 0
+    }
+}
+
+/// One principal's evaluation spend, folded directly off the log.
+///
+/// The counters and the open set live beside each other rather than in one
+/// type: `counters` is add-only and can be merged into a wider scope by
+/// straight field addition, while `open` is a set this principal's own
+/// [`EvaluationFold::recorded`] and [`EvaluationFold::repaired`] insert into
+/// and remove from by identity -- the two would need different merge rules
+/// under one `absorb`, so they get one each.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(super) struct EvaluationAccumulator {
+    pub(super) counters: EvaluationCounters,
+    /// Calls whose settle is open right now, keyed by call identity and
+    /// valued at the amount a repair would resolve.
+    ///
+    /// A `BTreeMap` so [`EvaluationFold::tally`]'s sum over it runs in key
+    /// order without a separate sort.
+    pub(super) open: BTreeMap<(SessionId, ResponseId), f64>,
+}
+
+impl EvaluationAccumulator {
+    /// Results that reached the service and whose settle nobody has
+    /// confirmed, on this principal's own row.
+    pub(super) fn unconfirmed_calls(&self) -> u64 {
+        self.open.len() as u64
+    }
+
+    /// The dollars behind [`Self::unconfirmed_calls`], summed once, directly,
+    /// over this principal's open calls -- never by subtracting one
+    /// accumulated sum from another, which would leave a float residue
+    /// behind once the open set is empty instead of landing on exact `0.0`.
+    pub(super) fn unconfirmed_usd(&self) -> f64 {
+        self.open.values().fold(0.0, |sum, usd| sum + usd)
+    }
+
+    /// This principal's own answer to "acknowledged", from its own open set.
+    ///
+    /// No production caller: every real reader goes through
+    /// [`EvaluationFold::tally`] and [`EvaluationView`], because a report is
+    /// never scoped to "whatever this one row happens to hold" alone. Kept as
+    /// a real method rather than dropped, so a test can prove the row itself
+    /// -- not only the view built over it -- excludes an open call correctly.
+    #[cfg(test)]
+    pub(super) fn acknowledged_calls(&self) -> u64 {
+        self.counters.acknowledged_calls(self.unconfirmed_calls())
+    }
+}
+
+/// What [`EvaluationFold::tally`] answers for one scope: every collected
+/// principal's counters, plus the open-call question only a fresh scan
+/// answers.
+pub(super) struct EvaluationView {
+    pub(super) counters: EvaluationCounters,
+    open_calls: u64,
+    open_usd: f64,
+}
+
+impl EvaluationView {
+    /// Results that reached the service and whose settle nobody has
+    /// confirmed, across every principal this scope collects.
+    pub(super) fn unconfirmed_calls(&self) -> u64 {
+        self.open_calls
+    }
+
+    /// The dollars behind [`Self::unconfirmed_calls`].
+    pub(super) fn unconfirmed_usd(&self) -> f64 {
+        self.open_usd
+    }
+
+    /// This scope's answer to "acknowledged", from the open count `tally`
+    /// summed across every collected principal.
+    pub(super) fn acknowledged_calls(&self) -> u64 {
+        self.counters.acknowledged_calls(self.open_calls)
     }
 }
 
@@ -260,9 +314,11 @@ struct Outstanding {
 enum CallState {
     /// Committed to, with no accepted result yet.
     Intended(Outstanding),
-    /// A result was accepted and its settle is unacknowledged. Carries the
-    /// amount a repair resolves — the record's own, never one derived here.
-    Unacknowledged(f64),
+    /// A result was accepted and its settle is unacknowledged. The amount a
+    /// repair resolves lives on the payer's [`EvaluationAccumulator::open`]
+    /// entry for this call -- one home for the amount, not a second copy
+    /// here that [`EvaluationFold::repaired`] would have to keep in sync.
+    Unacknowledged,
     /// Nothing further can move: the settle is acknowledged, or there was none.
     Closed,
 }
@@ -282,7 +338,7 @@ pub(super) struct EvaluationFold {
     /// delivered by the session's own writer (`Engine::deliver_classifications`
     /// reads the runtime by session id), so the join never has to cross one.
     calls: HashMap<(SessionId, ResponseId), CallState>,
-    by_principal: BTreeMap<PrincipalKey, EvaluationCounters>,
+    by_principal: BTreeMap<PrincipalKey, EvaluationAccumulator>,
 }
 
 impl EvaluationFold {
@@ -309,7 +365,7 @@ impl EvaluationFold {
                 requested_model: record.identity.model.clone(),
             }),
         );
-        self.row(payer).intents += 1;
+        self.row(payer).counters.intents += 1;
     }
 
     /// What a call produced, booked once or not at all.
@@ -335,19 +391,19 @@ impl EvaluationFold {
             // that arrives later, including after a replay.
             Some(state @ CallState::Intended(_)) => {
                 self.calls.insert(key, state);
-                self.row(payer).unattributed_results += 1;
+                self.row(payer).counters.unattributed_results += 1;
                 return;
             }
             // Already settled. One answer, one cost, however often it is
             // delivered.
             Some(state) => {
                 self.calls.insert(key, state);
-                self.row(payer).duplicate_results += 1;
+                self.row(payer).counters.duplicate_results += 1;
                 return;
             }
             // No intent of this session names this call.
             None => {
-                self.row(payer).unattributed_results += 1;
+                self.row(payer).counters.unattributed_results += 1;
                 return;
             }
         };
@@ -363,15 +419,18 @@ impl EvaluationFold {
                 .filter(|name| !name.trim().is_empty())
                 .map(str::to_string),
         };
-        let counters = self.by_principal.entry(payer.clone()).or_default();
-        counters.all.book(spend);
-        counters.by_model.entry(model).or_default().book(spend);
+        let row = self.by_principal.entry(payer.clone()).or_default();
+        row.counters.all.book(spend);
+        row.counters.by_model.entry(model).or_default().book(spend);
         // The amount a repair would re-drive, which is the record's own: a zero
-        // on the unknown-usage arm is a *release* and not a price.
+        // on the unknown-usage arm is a *release* and not a price. Keyed into
+        // `open` under the same key `calls` uses, so `repaired` can find it
+        // by identity without a second lookup path.
         let state = match spend.filter(|spend| spend.settled() == SettlementAck::Unconfirmed) {
             Some(spend) => {
                 let usd = spend.unconfirmed_settlement_usd().unwrap_or_default();
-                CallState::Unacknowledged(usd)
+                row.open.insert(key.clone(), usd);
+                CallState::Unacknowledged
             }
             // Already answered for at record time -- a settle that arrived
             // committed needs no later repair, so its dollars join
@@ -380,7 +439,7 @@ impl EvaluationFold {
             // `committed_usd` is Some(_) only off `Measured`.
             None => {
                 if let Some(usd) = spend.and_then(EvaluationSpend::committed_usd) {
-                    counters.committed_usd += usd;
+                    row.counters.committed_usd += usd;
                 }
                 CallState::Closed
             }
@@ -402,74 +461,79 @@ impl EvaluationFold {
         record: &ClassificationSettlementRepair,
     ) {
         let key = (session.clone(), record.call_id.clone());
-        // `f64` is `Copy`, so the amount can be read out of the borrow and
-        // the state closed in the same match arm -- no `mem::replace`, no
-        // re-match to prove what was already just matched.
         if let Some(state) = self.calls.get_mut(&key)
-            && let CallState::Unacknowledged(usd) = *state
+            && matches!(state, CallState::Unacknowledged)
         {
             *state = CallState::Closed;
-            let counters = self.row(payer);
-            counters.repaired_calls += 1;
-            counters.committed_usd += usd;
+            let row = self.row(payer);
+            row.counters.repaired_calls += 1;
+            // The amount lives on this principal's `open` entry, inserted by
+            // `recorded` under the same key -- removing it here is what
+            // closes the call's one home for the amount, rather than a
+            // second copy `repaired` would have to keep in sync by hand.
+            let usd = row.open.remove(&key);
+            debug_assert!(
+                usd.is_some(),
+                "an Unacknowledged call state has no matching entry on its \
+                 payer's open set -- recorded and repaired disagree about \
+                 which row this call belongs to"
+            );
+            row.counters.committed_usd += usd.unwrap_or_default();
             return;
         }
-        self.row(payer).unmatched_repairs += 1;
+        self.row(payer).counters.unmatched_repairs += 1;
     }
 
-    /// Every collected principal's row added together, plus the settlement
-    /// question `absorb` cannot answer: how much is open *right now*.
+    /// Every collected principal's counters added together, plus the
+    /// settlement question `absorb` cannot answer: how much is open *right
+    /// now*.
     ///
     /// Summed on the way out through the same predicate the money view uses, so
     /// a tenant's report cannot read its neighbours' evaluation spend by
     /// forgetting to narrow, and a project's total covers the members who spent
     /// rather than the members the config still lists.
     ///
-    /// `principal_of` is [`MetricsFold::principal_for`](super::fold::MetricsFold::principal_for),
-    /// threaded in rather than duplicated: [`Self::calls`] is keyed by
-    /// session and deliberately carries no principal of its own (see the
-    /// module doc), so scoping the open set needs the one resolver that
-    /// already exists for this instead of a second copy that could drift
-    /// from it.
-    pub(super) fn tally(
-        &self,
-        scope: Scope<'_>,
-        principal_of: impl Fn(&SessionId) -> PrincipalKey,
-    ) -> EvaluationCounters {
-        let mut total = EvaluationCounters::default();
-        for (owner, counters) in &self.by_principal {
-            if scope.collects(owner) {
-                total.absorb(counters);
+    /// Each collected principal's own [`EvaluationAccumulator::open`] is the
+    /// open set: this needs no resolver back to a principal and no scan of
+    /// [`Self::calls`], because the amount already lives where the payer was
+    /// known when it was booked.
+    pub(super) fn tally(&self, scope: Scope<'_>) -> EvaluationView {
+        let mut counters = EvaluationCounters::default();
+        let mut open_calls = 0u64;
+        // Not `+= .sum()`: `Iterator::sum`'s `f64` identity is `-0.0`, so an
+        // empty open set would publish a signed zero that formats as
+        // `-$0.00` on the dashboard -- the exact defect core-metrics-5
+        // removed, reintroduced by the standard library's own fold seed.
+        // `EvaluationAccumulator::unconfirmed_usd` already seeds each
+        // principal's own sum at `0.0`, so summing those across principals
+        // here cannot reintroduce it.
+        let mut open_usd = 0.0_f64;
+        for (owner, row) in &self.by_principal {
+            if !scope.collects(owner) {
+                continue;
             }
+            counters.absorb(&row.counters);
+            open_calls += row.unconfirmed_calls();
+            open_usd += row.unconfirmed_usd();
         }
-        // The open amount is queried fresh every time, summed once, directly,
-        // over the calls still `Unacknowledged` right now -- never by
-        // subtracting one accumulated sum from another (see
-        // `EvaluationCounters::unconfirmed_usd`'s doc). Sorted by key first
-        // so the sum, and this method's answer, does not depend on a
-        // `HashMap`'s iteration order.
-        let mut open: Vec<(&(SessionId, ResponseId), f64)> = self
-            .calls
-            .iter()
-            .filter_map(|(key, state)| match state {
-                CallState::Unacknowledged(usd) if scope.collects(&principal_of(&key.0)) => {
-                    Some((key, *usd))
-                }
-                _ => None,
-            })
-            .collect();
-        open.sort_by_key(|(key, _)| *key);
-        total.unconfirmed_calls = open.len() as u64;
-        // Not `Iterator::sum`: its `f64` identity is `-0.0`, so an empty open
-        // set would publish a signed zero that formats as `-$0.00` on the
-        // dashboard -- the exact defect core-metrics-5 removed, reintroduced
-        // by the standard library's own fold seed.
-        total.unconfirmed_usd = open.iter().fold(0.0, |sum, (_, usd)| sum + usd);
-        total
+        EvaluationView {
+            counters,
+            open_calls,
+            open_usd,
+        }
     }
 
-    fn row(&mut self, payer: &PrincipalKey) -> &mut EvaluationCounters {
+    fn row(&mut self, payer: &PrincipalKey) -> &mut EvaluationAccumulator {
         self.by_principal.entry(payer.clone()).or_default()
+    }
+
+    /// A raw per-principal row, exactly as [`Self::by_principal`] holds it --
+    /// never as [`Self::tally`] would answer it. Test-only: production code
+    /// has exactly one way to read this fold, and this accessor exists so a
+    /// test can inspect what a row nobody has tallied yet actually carries.
+    #[cfg(test)]
+    pub(super) fn principal_row(&self, payer: &PrincipalKey) -> Option<&EvaluationAccumulator> {
+        self.by_principal.get(payer)
     }
 }
 

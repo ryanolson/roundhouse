@@ -15,7 +15,7 @@ use crate::classify::{
     ClassificationSettlementRepair, ClassifierIdentity, EvaluationSpend, EvaluationUsage,
     ReservationRecord, SettlementAck, TAXONOMY_VERSION,
 };
-use crate::control::BudgetWindow;
+use crate::control::{BudgetWindow, PrincipalKey};
 use crate::event::SessionEventKind;
 use crate::ids::ResponseId;
 use crate::routing::ledger::ProviderPricing;
@@ -128,7 +128,7 @@ fn unconfirmed_usd_is_exactly_zero_once_every_open_call_is_repaired_in_reverse_o
 
     let counters = fold.evaluation(Scope::Deployment);
     assert_eq!(
-        counters.unmatched_repairs, 0,
+        counters.counters.unmatched_repairs, 0,
         "every repair matched an open call"
     );
     assert_eq!(
@@ -202,9 +202,45 @@ fn committed_usd_is_exactly_zero_while_nothing_has_been_acknowledged() {
     assert_eq!(counters.unconfirmed_calls(), 3);
     assert_eq!(counters.acknowledged_calls(), 0);
     assert_eq!(
-        counters.committed_usd().to_bits(),
+        counters.counters.committed_usd().to_bits(),
         0.0_f64.to_bits(),
         "got {}",
-        counters.committed_usd()
+        counters.counters.committed_usd()
+    );
+}
+
+/// A row nobody has tallied yet must not count an open call as acknowledged.
+///
+/// `EvaluationFold::principal_row` reads exactly what `by_principal` holds,
+/// with no call through `tally`. The open amount lives on the row's own
+/// `open` set, so `acknowledged_calls()` -- which every per-principal row can
+/// answer for itself -- excludes it without needing a second scan or a
+/// resolver back to `tally`.
+#[test]
+fn a_row_nobody_has_tallied_must_not_count_an_open_call_as_acknowledged() {
+    let ada = principal("acme", "ada");
+    let mut log = LogBuilder::new("s1");
+    log.created(Some(ada.clone()));
+    log.push(SessionEventKind::ClassificationRequested {
+        record: classify_intent("c1", 1, "r1"),
+    });
+    log.push(SessionEventKind::ClassificationRecorded {
+        record: unconfirmed_result("c1", 1, "r1", 0.5),
+    });
+
+    let mut fold = MetricsFold::new();
+    fold.extend(log.events());
+
+    let key = PrincipalKey::from(&ada);
+    let row = fold
+        .evaluation
+        .principal_row(&key)
+        .expect("ada booked one call");
+    assert_eq!(row.counters.all.calls, 1, "the result was booked");
+    assert_eq!(
+        row.acknowledged_calls(),
+        0,
+        "the one call this row booked is still open, so a raw read of the \
+         row must not report it as acknowledged"
     );
 }

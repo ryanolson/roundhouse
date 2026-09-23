@@ -93,10 +93,16 @@ pub enum StageOutcome {
     PickedTierEmpty { served: Tier },
     /// An admitted capable candidate quoted below the efficient tier's head.
     ///
+    /// Carries no `served` field: the guard only ever fires out of the
+    /// capable pool, so a served tier here could only ever say `Capable` — a
+    /// field with one reachable value is not a fact worth recording, and the
+    /// caller that needs to know which tier served reads it off its own
+    /// resolution rather than reconstructing it from this arm.
+    ///
     /// `displaced` is the head it dominated, by
     /// [`Target::policy_identity`](super::Target::policy_identity) — the same
     /// spelling the recipe uses, so the two read as one language.
-    CostGuard { served: Tier, displaced: String },
+    CostGuard { displaced: String },
     /// Nothing the recipe names was admitted, and a local worker took the turn.
     ///
     /// No tier served, which is why this arm carries none: stamping one would
@@ -143,6 +149,24 @@ impl StageEvidence {
             confidence_threshold: recipe.confidence_threshold(),
             pick,
             outcome,
+        }
+    }
+
+    /// The [`DecisionSource`] this evidence implies.
+    ///
+    /// The one home for the rule, so a [`Decision`](super::Decision)'s own
+    /// `source` is *derived* from the evidence recorded beside it rather than
+    /// computed a second time by the caller and carried next to it hoping the
+    /// two agree. A cost guard moved the decision off the scorer's own
+    /// answer, so it names itself; a recipe degrade served no tier at all, so
+    /// it names none; every other arm is exactly what the scorer picked.
+    pub fn source(&self) -> Option<DecisionSource> {
+        match self.outcome {
+            StageOutcome::CostGuard { .. } => Some(DecisionSource::CostGuard),
+            StageOutcome::DegradedPastRecipe { .. } => None,
+            StageOutcome::Served { .. } | StageOutcome::PickedTierEmpty { .. } => {
+                Some(self.pick.source)
+            }
         }
     }
 }

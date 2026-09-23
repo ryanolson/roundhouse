@@ -442,18 +442,17 @@ async fn an_unconfirmed_settlement_is_repaired_by_a_later_turn_without_a_second_
     );
 }
 
-/// **server-3 red: a turn cancelled between a repair's durable append and its
+/// **A turn cancelled between a repair's durable append and its
 /// acknowledgement must not re-append that repair on the next turn.**
 ///
-/// `deliver_classifications` already guards results against exactly this
-/// shape of crash: `classification_settled` is checked before any append
-/// (`engine/classification.rs`, the `deliver_classifications` loop).
-/// `deliver_settlement_repairs` applies no equivalent guard. A turn cancelled
-/// after `record_classification_settlement_repair` commits but before
-/// `acknowledge_repairs` runs leaves the runtime still holding the handle, so
-/// the next turn's drain finds it "ready" again and appends a second
-/// `ClassificationSettlementRepaired` for a settlement the log already
-/// records as repaired.
+/// `deliver_classifier_output` (`engine/classification.rs`) guards both
+/// halves of its drain the same way: a result already reflected in
+/// `classification_settled`, or a repair already reflected in
+/// `is_settlement_unrepaired`, is acknowledged without being appended again,
+/// so a turn cancelled after the batch commits but before
+/// `acknowledge`/`acknowledge_repairs` runs leaves the next turn's drain
+/// finding the same handle "ready" -- and finding, from the log, that it
+/// already landed.
 #[tokio::test]
 async fn a_turn_cancelled_after_a_repairs_append_does_not_re_append_it_next_turn() {
     let (base_url, _upstream) = classifier_upstream().await;

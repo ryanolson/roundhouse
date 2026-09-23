@@ -198,10 +198,10 @@ fn classify_result(turn: u64) -> ClassificationRecord {
 }
 
 /// A session with `count` landed, usable classifications -- built through the
-/// real commit path (`record_classification_intent` + `record_classification`),
-/// which is what actually populates `SessionState::classifications` in
-/// production. Returns the session, its store, and the sequence its last event
-/// landed at.
+/// real commit path (`record_classification_intent` +
+/// `record_background_classification`), which is what actually populates
+/// `SessionState::classifications` in production. Returns the session, its
+/// store, and the sequence its last event landed at.
 async fn session_with_classifications(
     count: u64,
 ) -> (Session<MemoryStore>, Arc<MemoryStore>, SessionId, u64) {
@@ -223,7 +223,7 @@ async fn session_with_classifications(
             .await
             .unwrap();
         session
-            .record_classification(classify_result(turn))
+            .record_background_classification(vec![classify_result(turn)], vec![])
             .await
             .unwrap();
     }

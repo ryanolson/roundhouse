@@ -594,7 +594,15 @@ pub struct StagePolicy {
 enum Resolved<'a> {
     /// A tier served, one way or another: the ordered pool [`StageOutcome`]
     /// describes, head first.
+    ///
+    /// `served` is total over this arm, read directly off the branch that
+    /// produced it rather than re-derived from `outcome` by matching all
+    /// four `StageOutcome` arms a second time -- `outcome` spells the served
+    /// tier under a different field name in each of `Served` and
+    /// `PickedTierEmpty`, and not at all in `CostGuard`, which can only ever
+    /// mean `Capable`.
     Tier {
+        served: Tier,
         outcome: StageOutcome,
         ordered: Vec<&'a Candidate>,
     },
@@ -638,34 +646,41 @@ impl StagePolicy {
 
     /// What narrowing the picked tier against the admitted pool comes to.
     ///
-    /// **Pure, and returns the outcome rather than a tuple of locals to
-    /// rebuild it from.** `choose` used to reassign `serving` and `ordered`,
-    /// shadow-record `source` and `displaced`, and capture a boolean "before
-    /// the guard can move `serving`" — four pieces of state that a reader had
-    /// to check still agreed by the time the rationale and the evidence each
-    /// read their own subset of them. `Resolved` is the one place that
-    /// agreement is now structural: the guard tie the doc on the dominance
-    /// check below used to need a paragraph to argue ("the two cannot both
-    /// have fired") is now just the fact that the guard is one more arm
-    /// inside this function's single return, not a mutation after it.
+    /// **Pure, and returns the outcome rather than a tuple of locals for
+    /// `choose` to rebuild it from.** Reassigned locals, a shadow-recorded
+    /// `source` and `displaced`, and a boolean gating the guard are four
+    /// pieces of state a reader would have to check still agreed by the time
+    /// the rationale and the evidence each read their own subset of them.
+    /// `Resolved` is the one place that agreement is structural: `choose`
+    /// reads fields off a single returned value instead.
+    ///
+    /// **Three straight-line returns, not a tuple assembled up front and
+    /// matched apart later.** The picked tier being empty, the guard firing,
+    /// and the ordinary case are three different facts about the pool, and
+    /// each now returns for itself the moment it is known — which is what
+    /// makes the guard and an empty picked tier mutually exclusive by
+    /// *construction*: reaching the guard's `if` at all already required the
+    /// early return above it not to have fired, rather than a boolean two
+    /// arms downstream both having to remember to check.
     fn resolve<'a>(recipe: &TierRecipe, pick: Pick, pool: &[&'a Candidate]) -> Resolved<'a> {
         let picked = Self::tier_pool(recipe, pick.tier, pool);
-        let (tier, ordered, picked_tier_was_empty) = match picked.is_empty() {
-            false => (pick.tier, picked, false),
-            true => {
-                let other = Self::tier_pool(recipe, pick.tier.other(), pool);
-                match other.is_empty() {
-                    false => (pick.tier.other(), other, true),
-                    // The recipe named targets and the pool holds none of
-                    // them, in either tier. Whether that is a failure depends
-                    // on what admission left, which `resolve` cannot see —
-                    // `Admitted` is the caller's to hold, not this pure
-                    // function's — so the caller decides via
-                    // `Self::degrade_past_the_recipe`.
-                    true => return Resolved::Degrade,
-                }
-            }
-        };
+        if picked.is_empty() {
+            let served = pick.tier.other();
+            let ordered = Self::tier_pool(recipe, served, pool);
+            return match ordered.is_empty() {
+                // The recipe named targets and the pool holds none of them,
+                // in either tier. Whether that is a failure depends on what
+                // admission left, which `resolve` cannot see — `Admitted` is
+                // the caller's to hold, not this pure function's — so the
+                // caller decides via `Self::degrade_past_the_recipe`.
+                true => Resolved::Degrade,
+                false => Resolved::Tier {
+                    served,
+                    outcome: StageOutcome::PickedTierEmpty { served },
+                    ordered,
+                },
+            };
+        }
 
         // **The dominance guard, and the whole of T4.** The efficient tier
         // exists to save cost; a capable candidate that also quotes *less*
@@ -677,21 +692,18 @@ impl StagePolicy {
         // that into both quotes. Reading the quote is therefore how this
         // policy sees warmth without holding a byte of session state.
         //
-        // Only runs on a non-empty efficient pick, which is what makes the
-        // guard and `picked_tier_was_empty` mutually exclusive by
-        // construction rather than by the caller's argument: the two are
-        // different arms of this same `if`, not two flags a reader has to
-        // notice never both come true.
-        if !picked_tier_was_empty && pick.tier == Tier::Efficient {
-            let head = ordered[0];
+        // **Efficient picks only**: an escalation says the cheap tier cannot
+        // finish this turn, and no price makes it able to. Reached only when
+        // `picked` (the efficient pool) is non-empty, by the early return
+        // above.
+        if pick.tier == Tier::Efficient {
+            let head = picked[0];
             let capable = Self::tier_pool(recipe, Tier::Capable, pool);
             // **Strictly less, never equal**: at equal cost nothing is
             // dominated, so the tier pick — a statement about function —
             // stands. **The first cheaper member in recipe order, not the
             // tier's head**: a head that quotes higher than what it
             // displaced would reintroduce the inversion from the other side.
-            // **Efficient picks only**: an escalation says the cheap tier
-            // cannot finish this turn, and no price makes it able to.
             if let Some(cheaper) = capable
                 .iter()
                 .position(|candidate| candidate.expected_cost_usd < head.expected_cost_usd)
@@ -716,20 +728,18 @@ impl StagePolicy {
                 let winner = ordered.remove(cheaper);
                 ordered.insert(0, winner);
                 return Resolved::Tier {
-                    outcome: StageOutcome::CostGuard {
-                        served: Tier::Capable,
-                        displaced,
-                    },
+                    served: Tier::Capable,
+                    outcome: StageOutcome::CostGuard { displaced },
                     ordered,
                 };
             }
         }
 
-        let outcome = match picked_tier_was_empty {
-            true => StageOutcome::PickedTierEmpty { served: tier },
-            false => StageOutcome::Served { tier },
-        };
-        Resolved::Tier { outcome, ordered }
+        Resolved::Tier {
+            served: pick.tier,
+            outcome: StageOutcome::Served { tier: pick.tier },
+            ordered: picked,
+        }
     }
 
     /// What a turn does when admission left capacity the recipe does not name.
@@ -848,29 +858,24 @@ impl RoutingPolicy for StagePolicy {
         let signals = ctx.signals.cloned().unwrap_or_default();
         let pick = pick_tier(&signals, recipe.picker(), recipe.confidence_threshold());
 
-        let (outcome, ordered) = match Self::resolve(recipe, pick, pool) {
+        let (served, outcome, ordered) = match Self::resolve(recipe, pick, pool) {
             Resolved::Degrade => return Self::degrade_past_the_recipe(recipe, pick, &admitted),
-            Resolved::Tier { outcome, ordered } => (outcome, ordered),
+            Resolved::Tier {
+                served,
+                outcome,
+                ordered,
+            } => (served, outcome, ordered),
         };
-        // Read off the outcome rather than tracked in parallel with it: a
-        // `CostGuard` is the only arm that ever moves the decision off the
-        // scorer's own answer.
-        let source = match outcome {
-            StageOutcome::CostGuard { .. } => DecisionSource::CostGuard,
-            StageOutcome::Served { .. } | StageOutcome::PickedTierEmpty { .. } => pick.source,
-            StageOutcome::DegradedPastRecipe { .. } => {
-                unreachable!("resolve() returns Degrade for this arm, handled above")
-            }
-        };
-        let serving = match &outcome {
-            StageOutcome::Served { tier } => *tier,
-            StageOutcome::PickedTierEmpty { served } | StageOutcome::CostGuard { served, .. } => {
-                *served
-            }
-            StageOutcome::DegradedPastRecipe { .. } => {
-                unreachable!("resolve() returns Degrade for this arm, handled above")
-            }
-        };
+        // The evidence is built once and read from, rather than a `source`
+        // recomputed here beside it: `StageEvidence::source` is the rule's one
+        // home, so `Decision.source` (set inside `decide_staged`, below) and
+        // the rationale's own `by {}` cannot come to name two different
+        // things. `None` is unreachable on this path in practice --
+        // `resolve` never returns `DegradedPastRecipe` inside a `Tier` -- but
+        // the rationale falls back rather than panics on a fact this
+        // function cannot see in its own types.
+        let evidence = StageEvidence::new(recipe, pick, outcome);
+        let source = evidence.source();
 
         let winner = ordered[0];
         let fallbacks: Vec<Target> = ordered[1..]
@@ -884,9 +889,11 @@ impl RoutingPolicy for StagePolicy {
         // dollars.
         let mut rationale = format!(
             "stage router: {} tier ({}) by {}",
-            serving.label(),
+            served.label(),
             winner.target.policy_identity(),
-            source.label(),
+            source
+                .map(DecisionSource::label)
+                .unwrap_or("no tier served"),
         );
         if let Some(confidence) = pick.confidence {
             rationale.push_str(&format!(
@@ -898,7 +905,7 @@ impl RoutingPolicy for StagePolicy {
         }
         // One clause per outcome that has something to add; `Served` adds
         // nothing because it is the case that needs no explaining.
-        match &outcome {
+        match &evidence.outcome {
             StageOutcome::CostGuard { displaced, .. } => {
                 // **No price here either**, for the reason the clause above
                 // states: the two quotes that decided this went to the
@@ -952,15 +959,16 @@ impl RoutingPolicy for StagePolicy {
         Ok(admitted.decide_staged(
             winner.target.clone(),
             fallbacks,
-            source,
             rationale,
             // The operator's own lists, in the operator's own order, beside
-            // the scorer's own answer. A digest would tell a reader that two
-            // turns ran under different recipes and never which — and `pick`
-            // is carried rather than recomputed because `pick_tier` is pure
-            // over *this build's* thresholds, which is exactly the
-            // substitution a replay must not make.
-            SelectorSnapshot::stage(StageEvidence::new(recipe, pick, outcome)),
+            // the scorer's own answer, reused from above rather than rebuilt:
+            // a second `StageEvidence::new` call here could name a different
+            // outcome than the one `source` and the rationale were just
+            // derived from. `pick` is carried inside it rather than
+            // recomputed because `pick_tier` is pure over *this build's*
+            // thresholds, which is exactly the substitution a replay must
+            // not make.
+            evidence,
         ))
     }
 }
@@ -2124,18 +2132,19 @@ mod tests {
         );
     }
 
-    /// **The guard is gated on `!picked_tier_was_empty`, and this is the case
-    /// that gate exists for.** The comment above the guard in `StagePolicy::resolve`
-    /// says the guard and an empty-tier fallthrough "exclude each other by
-    /// construction" -- but the construction is exactly that `!` check, so a
-    /// pick that reached the capable tier only because the efficient one
-    /// admitted nothing must not be treated as a *comparison* the efficient
-    /// tier lost. `guard_recipe()`'s only efficient member (`luna`) is absent
-    /// from the pool here, so the default `EfficientFirst` pick still names
-    /// `Tier::Efficient`, but `resolve` falls through to the capable tier
-    /// before the guard runs. The capable tier is ordered `[sol, nova]` by
-    /// `guard_recipe()`, with `nova` the cheaper of the two -- exactly the
-    /// shape that fires the guard if the `!` is ever dropped.
+    /// **The guard's `if` is reached only when the picked tier was non-empty,
+    /// and this is the case that guards against a pick that reached the
+    /// capable tier by falling through an empty efficient one.** `StagePolicy::resolve`
+    /// returns from the empty-picked-tier arm before the guard's `if` exists
+    /// at all, so a fallthrough to the capable tier can never be mistaken for
+    /// a *comparison* the efficient tier lost -- there is no shared boolean
+    /// the two could disagree about. `guard_recipe()`'s only efficient member
+    /// (`luna`) is absent from the pool here, so the default `EfficientFirst`
+    /// pick still names `Tier::Efficient`, but `resolve` returns
+    /// `PickedTierEmpty` for the capable tier before the guard's `if` runs.
+    /// The capable tier is ordered `[sol, nova]` by `guard_recipe()`, with
+    /// `nova` the cheaper of the two -- exactly the shape that would fire the
+    /// guard were it reachable on this path.
     #[tokio::test]
     async fn the_guard_does_not_run_on_a_pick_that_fell_through_an_empty_efficient_tier() {
         let candidates = vec![

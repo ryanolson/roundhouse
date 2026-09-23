@@ -392,9 +392,8 @@ impl ReviewTracker {
     /// oldest first.
     ///
     /// The one filter [`Self::covered`], [`Self::gaps`] and [`Self::facts`]
-    /// all need, each with its own closure before this existed — three
-    /// spellings of "which decisions this interval covers" that the next gap
-    /// rule would have had to find and update in step.
+    /// all need, so a rule about which decisions an interval covers has one
+    /// spelling to update rather than three that could drift apart.
     fn covered_spans(
         &self,
         after: u64,
@@ -418,17 +417,25 @@ impl ReviewTracker {
             })
     }
 
-    /// The gaps the log alone establishes for `(after, through]`.
+    /// The gaps `(after, through]` alone establishes, from the decisions the
+    /// interval itself covers.
     ///
-    /// The capture and the fold's verification both call this, so a review the
-    /// runtime wrote always carries at least these.
+    /// **A pure function of the interval, deliberately not of the tip.** The
+    /// capture path and the fold's verification both call this over the same
+    /// `(after, through]` a review names, so a decision this fold made after
+    /// `through` -- a later `Routed`, a later configuration change -- must
+    /// never change what this call answers. `self.instructions.generation` is
+    /// tip state and does not appear here for exactly that reason: comparing
+    /// a covered decision's generation against *now* would make this
+    /// depend on whatever landed after the interval closed, and a review
+    /// captured correctly could come to look incomplete only because the log
+    /// kept moving underneath it.
     fn gaps(&self, after: u64, through: u64) -> Vec<CoverageGap> {
         let mut gaps = Vec::new();
         if self.overflow_through.is_some() {
             gaps.push(CoverageGap::MetadataOverflow);
         }
         let mut any = false;
-        let mut first_generation = None;
         let mut unterminated = false;
         let mut unstamped = false;
         let mut generation = None;
@@ -437,7 +444,6 @@ impl ReviewTracker {
         let mut objectives_differ = false;
         for (span, decision) in self.covered_spans(after, through) {
             any = true;
-            first_generation.get_or_insert(decision.generation);
             unterminated |= span.ended.is_none_or(|(seq, _)| seq > through);
             generations_differ |=
                 *generation.get_or_insert(decision.generation) != decision.generation;
@@ -463,18 +469,6 @@ impl ReviewTracker {
         if objectives_differ {
             gaps.push(CoverageGap::ObjectiveChanged);
         }
-        // The snapshot-staleness check `facts` used to make on its own,
-        // needing only the first covered decision's generation and the
-        // current snapshot's: `InstructionsChanged` above already covers
-        // covered decisions disagreeing with *each other*; this is the case
-        // where they agree with each other but not with the snapshot
-        // `facts` would hand back, which is a gap in exactly the same sense.
-        if let Some(first_generation) = first_generation
-            && first_generation != self.instructions.generation
-            && !gaps.contains(&CoverageGap::InstructionsChanged)
-        {
-            gaps.push(CoverageGap::VersionsUnavailable);
-        }
         gaps.sort();
         gaps.dedup();
         gaps
@@ -490,16 +484,42 @@ impl ReviewTracker {
             .next()
             .map(|(_, decision)| decision);
         let objective = first.and_then(|decision| decision.objective.as_ref());
-        // Covered decisions share one generation unless a gap says otherwise;
-        // its content is the snapshot only while no later decision replaced
-        // it — `gaps()` above already turned the mismatch into
-        // `VersionsUnavailable`, so this only resolves the actual reference,
-        // which a gap has no reason to hold.
+        // The snapshot is safe to show only while it is still what the first
+        // covered decision ran under. A mismatch here is not a gap this
+        // method adds on its own: `gaps()` above is a pure function of
+        // `(after, through]` and never reads `self.instructions.generation`,
+        // so at capture -- the only time `facts` runs, with `through` at the
+        // tip -- a mismatch can only mean the `Routed` that last set the
+        // generation is one of two things: a later covered decision whose own
+        // generation already disagrees with the first (`InstructionsChanged`
+        // above already fired), or one dropped from tracking
+        // (`MetadataOverflow`). Either way `gaps` is not empty.
+        //
+        // The narrower shape this would need to fail -- a `Routed` that
+        // bumps the generation for a response neither covered nor dropped --
+        // has no writer: `Session::record_routing` takes whatever
+        // `response_id` its one caller in `engine.rs` passes, and that
+        // caller only ever names the turn `begin_turn` most recently opened
+        // in this same `run_turn`. `Self::routed` (above) either adds that
+        // decision to its turn's span -- covered, or it disagrees with an
+        // earlier covered decision and `InstructionsChanged` already fired
+        // -- or falls to `mark_overflow` when the span is gone or the
+        // decision table is full, which is `MetadataOverflow`.
         let instructions = match first {
             Some(decision) if decision.generation == self.instructions.generation => {
                 Some(&*self.instructions.snapshot)
             }
-            _ => None,
+            Some(_) => {
+                debug_assert!(
+                    gaps.contains(&CoverageGap::MetadataOverflow)
+                        || gaps.contains(&CoverageGap::InstructionsChanged),
+                    "a stale instruction snapshot at capture with neither gap means a \
+                     generation-bumping Routed landed that this interval neither covers \
+                     nor lost to overflow"
+                );
+                None
+            }
+            None => None,
         };
 
         let last = self.spans.len().saturating_sub(1);
@@ -524,7 +544,7 @@ impl ReviewTracker {
             .collect::<Vec<_>>();
         let first_has_request = turns
             .first()
-            .is_some_and(|turn| turn.items.iter().any(Item::is_user_request));
+            .is_some_and(|turn| turn.items.iter().any(|item| item.user_request().is_some()));
         let request_before = match first_has_request {
             true => None,
             false => self

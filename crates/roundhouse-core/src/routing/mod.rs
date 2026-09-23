@@ -333,14 +333,19 @@ impl<'a> Admitted<'a> {
     }
 
     /// [`Self::decide`] for a policy that picked a *tier*: the same coupled
-    /// fields, plus the ordered second choices and the typed reason the tier
-    /// was picked.
+    /// fields, plus the ordered second choices and the evidence a stage
+    /// decision carries.
     ///
     /// A second constructor rather than two more arguments on `decide`, because
     /// the two non-staged policies have neither answer to give — an
     /// `EscalationPolicy` audit turn has no ordered runner-up and no
     /// [`DecisionSource`], and making them pass `Vec::new()` and `None` would
     /// be asking two callers to disclaim a concept they do not have.
+    ///
+    /// **`source` is derived from `evidence`, not a separate argument.**
+    /// [`StageEvidence::source`] is the one place that rule lives; taking a
+    /// `DecisionSource` here as well would let a caller pass one that
+    /// disagrees with the evidence recorded beside it.
     ///
     /// `fallbacks` is not checked against [`Self::pool`], for the same reason
     /// `target` is not: the pool holds borrows into the caller's slice, and the
@@ -351,14 +356,14 @@ impl<'a> Admitted<'a> {
         &self,
         target: Target,
         fallbacks: Vec<Target>,
-        source: DecisionSource,
         rationale: String,
-        selector: SelectorSnapshot,
+        evidence: StageEvidence,
     ) -> Decision {
+        let source = evidence.source();
         Decision {
             fallbacks,
-            source: Some(source),
-            ..self.decide(target, rationale, selector)
+            source,
+            ..self.decide(target, rationale, SelectorSnapshot::stage(evidence))
         }
     }
 

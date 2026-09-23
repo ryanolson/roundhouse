@@ -4,16 +4,15 @@
 //! Shared [`SessionStore`] test doubles.
 //!
 //! Every trait method [`SessionStore`] gains (the learning-index slice added
-//! four of them) used to multiply across every "wrap a backend and sabotage
-//! one method" double in the workspace, because each one hand-wrote all
-//! eleven forwarders next to the one it actually cared about. Three of those
-//! doubles were not even sabotaging anything — [`ReplayLog`] here — and were
-//! copy-pasted byte-for-byte across `roundhouse-core` and `roundhouse-server`
-//! test files. This module is the one place both patterns live now: a
-//! finished [`ReplayLog`] for read-only replay, and [`Delegating`], a trait a
-//! sabotaging double implements instead of [`SessionStore`] so that
-//! forwarding the other ten or eleven methods is a default it inherits
-//! rather than a body it repeats.
+//! four of them) is one more forwarder for every "wrap a backend and sabotage
+//! one method" double in the workspace to hand-write next to the one method
+//! it actually cares about — eleven of them, and rising. A double that is not
+//! even sabotaging anything, such as a read-only replay reader, is the same
+//! shape pasted byte-for-byte into every test file that needs one. This
+//! module is the one place both patterns live: a finished [`ReplayLog`] for
+//! read-only replay, and [`Delegating`], a trait a sabotaging double
+//! implements instead of [`SessionStore`] so that forwarding the other ten or
+//! eleven methods is a default it inherits rather than a body it repeats.
 //!
 //! Gated the same as [`super::contract`] — compiled for this crate's own
 //! tests and, under `test-support`, for dependent crates' integration tests —
@@ -132,21 +131,16 @@ impl SessionStore for ReplayLog {
 /// a default that forwards to [`Self::backend`], so a double that fails
 /// `append_events` while it is armed writes only that one method — the other
 /// ten (eleven, once a sabotaging double also needs `is_leased`) stay
-/// inherited rather than re-typed per double, which is what let nine
-/// near-identical forwarder blocks accumulate across the workspace before
-/// this existed.
+/// inherited rather than re-typed per double.
 ///
 /// **`is_leased`'s default here matches [`SessionStore`]'s own, not a
-/// forward.** Every double built directly against [`SessionStore`] before
-/// this trait existed either hand-wrote a forward to
-/// `self.inner.is_leased(..)` or omitted the method and took
-/// [`SessionStore`]'s own default (`Ok(true)`, "cannot prove idle")
-/// unchanged. Defaulting `Delegating::is_leased` to a forward would have
-/// flipped the omitting doubles onto their backend's real lease state — a
-/// behavior change this consolidation must not make. A double that wants the
-/// forward overrides `is_leased` with the same one-line body it always
-/// wrote; a double that wants the old default writes nothing, exactly as
-/// before.
+/// forward.** A double that overrides one method and leaves `is_leased`
+/// untouched must keep answering `Ok(true)` ("cannot prove idle") — the
+/// conservative default every other `SessionStore` implementation without an
+/// opinion on leasing gets — rather than silently start reading its
+/// backend's real lease state the moment it adopts this trait. A double that
+/// wants the forward writes it explicitly, one line; one that does not
+/// writes nothing.
 #[async_trait]
 pub trait Delegating: Send + Sync {
     type Backend: SessionStore;

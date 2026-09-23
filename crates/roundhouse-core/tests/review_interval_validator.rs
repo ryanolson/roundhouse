@@ -1179,3 +1179,115 @@ async fn the_section_bound_is_exact() {
     assert_eq!(gaps, vec![CoverageGap::Oversized]);
     assert_eq!(over, classic);
 }
+
+/// **REGRESSION.** A `Routed` that lands after a review is captured, but
+/// before that review is committed, must not make an already-correct review
+/// look incomplete.
+///
+/// The interval covers only the first turn's decision. The second turn opens
+/// under a replaced configuration but has not routed yet, so the tip's own
+/// instruction generation still agrees with the one covered decision's, and
+/// the captured review carries no gap. Only *after* capture does the second
+/// turn route -- under the new configuration -- which is what a build that
+/// re-derives coverage from the tip's current generation, instead of from the
+/// interval's own decisions, would mistake for staleness.
+#[tokio::test]
+async fn a_routed_configuration_change_between_capture_and_commit_does_not_reject_the_review() {
+    let config_a = "INSTRUCTIONS-A".to_string();
+    let config_b = "INSTRUCTIONS-B".to_string();
+
+    let mut log = Log::enrolled(Some(Arm::Shadow)).await;
+    let r0 = log
+        .begin("t0", vec![developer(&config_a), Item::user_text("q0")])
+        .await;
+    log.route(&r0, Some(ObjectiveVersion::Undeclared)).await;
+    log.complete(&r0, "a0").await;
+
+    // The second turn's leading configuration replaces the first's in place,
+    // but the turn has not routed yet.
+    let r1 = log
+        .begin("t1", vec![developer(&config_b), Item::user_text("q1")])
+        .await;
+
+    let judge = ScriptedJudge::answering(&[ON_TRACK]);
+    let validator = validator_over(judge.clone(), DEFAULT_INTERVAL_SECTION_BYTES);
+    let decided = consider(
+        &validator,
+        &observing(),
+        log.state(),
+        &r1,
+        Objective::Unknown,
+    )
+    .await;
+    let review = interval_of(&decided).expect("a judge-arm session with an open interval");
+    assert!(
+        review.gaps.is_empty(),
+        "one decision is covered, under the generation the tip still names \
+         at capture time: {:?}",
+        review.gaps
+    );
+
+    // The second turn routes under the replaced configuration, bumping the
+    // tip's instruction generation -- after capture, before the captured
+    // review below is committed.
+    log.route(&r1, Some(ObjectiveVersion::Undeclared)).await;
+    log.commit(&r1, decided).await;
+
+    let state = log.replay().await;
+    assert_eq!(
+        state.rejected_reviews(),
+        0,
+        "a Routed that landed after capture must not retroactively make an \
+         already-correct review look incomplete"
+    );
+    assert_eq!(state.accepted_reviews(), 1);
+}
+
+/// CONTROL for the regression above: an interval that has genuinely
+/// overflowed while its configuration also changed must still capture as
+/// incomplete, proving the deletion did not quietly widen what capture
+/// accepts. This fixture also changes configuration between every covered
+/// turn, so `InstructionsChanged` fires on its own here -- it does not by
+/// itself exercise the deleted branch's specific guard (a tip generation the
+/// covered decisions agree with each other about, but not with the tip,
+/// because the decision that moved the tip past them was dropped by
+/// overflow rather than covered). That narrower shape is not reachable
+/// through the real session writer: see the deletion's own comment in
+/// `session/review.rs` for why.
+#[tokio::test]
+async fn an_overflowed_interval_with_a_configuration_change_still_captures_as_unknown() {
+    let mut log = Log::enrolled(Some(Arm::Shadow)).await;
+    for n in 0..MAX_REVIEW_TURNS + 2 {
+        let config = format!("INSTRUCTIONS-{n}");
+        log.text_turn(
+            &format!("t{n}"),
+            vec![developer(&config), Item::user_text(format!("q{n}"))],
+            "a",
+            Some(ObjectiveVersion::Undeclared),
+        )
+        .await;
+    }
+    let judge = ScriptedJudge::answering(&[ON_TRACK]);
+    let validator = validator_over(judge.clone(), DEFAULT_INTERVAL_SECTION_BYTES);
+    let current = log
+        .begin(
+            "last",
+            vec![developer("INSTRUCTIONS-last"), Item::user_text("q-last")],
+        )
+        .await;
+    let decided = consider(
+        &validator,
+        &observing(),
+        log.state(),
+        &current,
+        Objective::Unknown,
+    )
+    .await;
+    let review = interval_of(&decided).expect("a judge-arm session with an open interval");
+    assert!(
+        review.gaps.contains(&CoverageGap::MetadataOverflow),
+        "{:?}",
+        review.gaps
+    );
+    assert_eq!(review.label, IntervalLabel::Unknown);
+}

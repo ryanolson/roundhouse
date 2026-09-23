@@ -8,8 +8,13 @@
 //! [`super::cache_evidence`]'s: `fold.rs` is already the fold's busiest file,
 //! and a reader chasing what "first output" or "turn elapsed" actually means
 //! should not have to find it among the terminal arm's row bookkeeping.
-
-use crate::metrics::fold::Counters;
+//!
+//! [`TurnClock::book`] writes into [`TurnTimings`], this module's own
+//! accumulator, rather than into `fold::Counters` directly, the way
+//! [`super::cache_evidence`]'s `CacheEvidence` is one field `Counters` holds
+//! with one `absorb` line. Writing straight against `Counters`' row layout
+//! would need an import of `fold` in a module `fold` also imports, which
+//! would put "what does timing mean" behind a read of the fold to find out.
 
 /// One outcome class's timing, folded down to a total and a count.
 ///
@@ -88,6 +93,37 @@ impl FirstOutputState {
     }
 }
 
+/// The intervals one row's `book` calls accumulate: first output, and the
+/// terminal span split by whether the turn completed.
+///
+/// One field on `Counters`, one `absorb` line, the same shape
+/// [`super::cache_evidence::CacheEvidence`] holds its evidence in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TurnTimings {
+    pub(super) first_output: Elapsed,
+    /// Turn start to terminal event, over turns that completed. See
+    /// [`Self::incomplete_elapsed`] for why it is a separate pot.
+    pub(super) completed_elapsed: Elapsed,
+    /// Never merged with [`Self::completed_elapsed`]: a fast refusal and a
+    /// slow completed answer are both terminals, and one pot would let a
+    /// deployment improve its mean by failing faster.
+    ///
+    /// Undivided by reason, every
+    /// [`IncompleteReason`](crate::event::IncompleteReason) in one pot: which
+    /// failures compare against a completed turn is a reward question this
+    /// observation does not answer, so the reason stays on the event for a
+    /// later pass to split.
+    pub(super) incomplete_elapsed: Elapsed,
+}
+
+impl TurnTimings {
+    pub(super) fn absorb(&mut self, other: &TurnTimings) {
+        self.first_output.absorb(&other.first_output);
+        self.completed_elapsed.absorb(&other.completed_elapsed);
+        self.incomplete_elapsed.absorb(&other.incomplete_elapsed);
+    }
+}
+
 /// One open response's clock.
 ///
 /// The start stamp outlives the first-output delta: two intervals share one
@@ -129,13 +165,13 @@ impl TurnClock {
     /// One call rather than two, so a caller cannot book one interval and
     /// forget the other — the two are read off the same clock and always
     /// move together.
-    pub(super) fn book(&self, counters: &mut Counters, terminal_at_ms: u64, completed: bool) {
-        self.first_output.book(&mut counters.first_output);
+    pub(super) fn book(&self, timings: &mut TurnTimings, terminal_at_ms: u64, completed: bool) {
+        self.first_output.book(&mut timings.first_output);
         let terminal_ms = terminal_at_ms.checked_sub(self.started_at_ms);
-        // Never the same pot. See `Counters::completed_elapsed`.
+        // Never the same pot. See `TurnTimings::completed_elapsed`.
         match completed {
-            true => counters.completed_elapsed.observe(terminal_ms),
-            false => counters.incomplete_elapsed.observe(terminal_ms),
+            true => timings.completed_elapsed.observe(terminal_ms),
+            false => timings.incomplete_elapsed.observe(terminal_ms),
         }
     }
 }
