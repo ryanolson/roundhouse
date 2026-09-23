@@ -33,7 +33,7 @@ The transport and observation checkpoints do not complete the owner's routing vi
 | Background execution | `438fe2f` implements durable intents, bounded work, expiry, cancellation, and retained delivery. Later tests close deadline and acknowledgement gaps. `f62c621` removes acknowledgement backlog scans and has scoped mutation evidence. |
 | Deployment wiring | `438fe2f` implements opt-in configuration, disabled defaults, evaluation accounting, and loopback startup tests. Local-only exclusion has a mutation guard. Live deployment evidence remains absent. |
 | Frontier quality feedback | Exact interval coverage across text and tool turns, per-turn instruction versions, snapshot cutoff, unknown outcomes, and once-only learning updates. |
-| Online bandit | Local selection uses available classifications and observed outcomes under policy, quality, budget, and latency constraints. The utility tradeoff still needs an owner ruling. |
+| Online bandit | Local selection must use available classifications and observed outcomes. The accepted policy minimizes cost within a configurable latency limit after satisfying quality requirements. Per-project learning and its durable updates remain unfinished. |
 | Offline learning | Versioned calibration artifacts, reproducible evaluation, and promotion evidence. Background estimates remain distinct from observed serving outcomes. |
 | Cache feedback | Prediction error informs destination reuse estimates without inventing cache-pressure causes or counting measured costs twice. C6 return-trip timing remains open. |
 | Deployment measurements | C2 live cache evidence, measured local prefill slope, and a production local-fleet attachment. Unit and loopback tests do not prove these. |
@@ -160,6 +160,18 @@ The owner accepted all three recommendations. These decisions supersede the open
 - An oversized review interval receives an unknown quality outcome. A new interval starts after a frontier checkpoint. Truncating an interval cannot produce positive feedback for its suffix.
 
 Frontier interval attribution is the next implementation stage. The accepted policy does not establish that a checkpoint occurred or that a review covered an interval.
+
+### Remaining integration after interval attribution (2026-09-22)
+
+The current engine records `SelectionSnapshot.classifications`, but `RoutingContext` does not pass those classifications to `choose`. Recording available inputs does not establish learned selection. The next stage must connect the recorded features to the live local selector and preserve the selection cutoff.
+
+The interval fold retains accepted review outcomes, but no learner consumes them yet. Learning must identify updates by project, session, and validation event. Repeated delivery and replay must not apply an update twice. Unknown coverage supplies no quality update. Interval feedback must not invent individual blame for each covered routing choice.
+
+The next implementation brief must define the strategy arms, feature encoding, learned state, and durable update transaction. It must also define exploration within the quality, policy, budget, and latency constraints. Deployment thresholds require explicit configuration; the accepted tradeoff does not supply numerical values.
+
+Offline evaluation must produce a versioned artifact and reproducible promotion evidence. Background classifications and estimates remain distinct from observed serving outcomes. Cache prediction updates must retain measurement provenance and must not count cache misses as an extra cost penalty.
+
+These requirements remain separate from live evidence. C2 still needs an approved catalog, model, spend cap, and provider access. Local serving still needs a production executor and a measured prefill slope. The PR remains a draft until implementation, deployment evidence, and the full review gates are complete.
 
 ### Frontier review feedback (2026-09-21)
 
