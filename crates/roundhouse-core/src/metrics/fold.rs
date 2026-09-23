@@ -974,9 +974,9 @@ impl MetricsFold {
                         // never booked. The gate is both halves — a clock that
                         // exists and a dispatch that does not — so a
                         // superseded response's late terminal, which has
-                        // neither, lands here; a terminal whose start this
-                        // fold never saw has only the dispatch and never
-                        // reaches this arm.
+                        // neither, never reaches this arm either: its clock
+                        // was removed at `TurnStarted`, so it never enters
+                        // `if let Some(clock)` above.
                         None => {
                             *self
                                 .unrouted_terminals_of_principal

@@ -104,6 +104,8 @@ pub mod snapshot;
 #[cfg(test)]
 mod cache_reuse_evidence_tests;
 #[cfg(test)]
+mod first_output_snapshot_tests;
+#[cfg(test)]
 mod turn_elapsed_snapshot_tests;
 
 use std::sync::{Arc, RwLock};
@@ -301,7 +303,7 @@ mod tests {
     // `fold::tests`. One builder means one clock, so a test that compares a
     // window across two logs is asserting about the fold rather than about two
     // fixtures that happened to agree.
-    use crate::control::{Billing, PrincipalKey};
+    use crate::control::PrincipalKey;
     use crate::event::{Accounting, IncompleteReason, SessionEventKind, Usage};
     use crate::ids::{ResponseId, TurnId};
     use crate::metrics::fold::tests::{LogBuilder, candidate, frontier, local, principal, usage};
@@ -938,101 +940,5 @@ mod tests {
         let shadow = 100_000.0 * 3.75e-6 + 1_000.0 * 15.0e-6;
         assert!((paid.savings.routing_savings_usd - shadow).abs() < 1e-12);
         assert!((paid.savings.routing_savings_at_decision_usd - 0.05).abs() < 1e-12);
-    }
-
-    /// The published column: a mean over its samples, with the basis beside it.
-    #[test]
-    fn a_model_row_publishes_its_first_output_latency_with_its_basis() {
-        let mut log = LogBuilder::new("s1");
-        log.turn_speaking(
-            "r1",
-            frontier("anthropic", "claude"),
-            usage(1_000, 0, 100, 0),
-            &["hi"],
-        );
-        log.turn_speaking(
-            "r2",
-            frontier("anthropic", "claude"),
-            usage(1_000, 0, 100, 0),
-            &["", "hi"],
-        );
-        let mut fold = MetricsFold::new();
-        fold.extend(log.events());
-
-        let row = snapshot(&fold)
-            .models
-            .into_iter()
-            .find(|row| row.model == "claude")
-            .expect("the turns booked a row");
-        let latency = row.first_output.expect("two turns spoke");
-        assert_eq!(latency.samples, 2);
-        assert_eq!(latency.rejected, 0);
-        assert_eq!(latency.mean_ms, Some(25.0), "the mean of 20 and 30");
-        // The literal, not the constant: this string is the wire contract, and
-        // asserting it against the value it came from would agree with any
-        // rename that silently changed what consumers read.
-        assert_eq!(latency.basis, "turn_start_to_first_output");
-        assert_eq!(FIRST_OUTPUT_BASIS, "turn_start_to_first_output");
-    }
-
-    /// A row nobody could time publishes no column at all.
-    #[test]
-    fn a_row_with_no_usable_timing_publishes_no_latency_column() {
-        let mut log = LogBuilder::new("s1");
-        log.turn(
-            "r1",
-            frontier("anthropic", "claude"),
-            Vec::new(),
-            usage(1_000, 0, 100, 0),
-        );
-        let mut fold = MetricsFold::new();
-        fold.extend(log.events());
-
-        let row = snapshot(&fold)
-            .models
-            .into_iter()
-            .find(|row| row.model == "claude")
-            .expect("the turn booked a row");
-        assert!(
-            row.first_output.is_none(),
-            "no sample is an absent column, never a zero millisecond answer"
-        );
-    }
-
-    /// A row whose only timings went backwards keeps the count and loses the
-    /// mean, so a skewed clock is visible instead of reading as unmeasured.
-    #[test]
-    fn a_row_whose_timings_went_backwards_reports_the_refusals_and_no_mean() {
-        let mut log = LogBuilder::new("s1");
-        log.start_and_route(
-            "r1",
-            frontier("anthropic", "claude"),
-            1_000,
-            Billing::Billed,
-        );
-        log.push_at(
-            5,
-            SessionEventKind::OutputTextDelta {
-                response_id: ResponseId::new("r1"),
-                text: "hello".into(),
-            },
-        );
-        log.push(SessionEventKind::ResponseCompleted {
-            response_id: ResponseId::new("r1"),
-            usage: usage(1_000, 0, 100, 0),
-            provider_reported_cost_usd: None,
-            stop_reason: None,
-        });
-        let mut fold = MetricsFold::new();
-        fold.extend(log.events());
-
-        let row = snapshot(&fold)
-            .models
-            .into_iter()
-            .find(|row| row.model == "claude")
-            .expect("the turn booked a row");
-        let latency = row.first_output.expect("a refusal is still a report");
-        assert_eq!((latency.samples, latency.rejected), (0, 1));
-        assert_eq!(latency.mean_ms, None, "no mean is fabricated from nothing");
     }
 }

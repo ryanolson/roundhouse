@@ -49,14 +49,21 @@ fn terms() -> BudgetTerms {
     }
 }
 
+/// The random component `unique_namespace` builds every namespace from, kept
+/// separate so a test can derive a sibling namespace from the same base
+/// without reading a namespace's raw string back out of the crate under test.
+fn unique_name() -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    format!("t{}", &id[..12])
+}
+
 /// A namespace no other run of this suite uses.
 ///
 /// The assertions are about what is *in* Redis, and the provisioned instance is
 /// shared across runs: a fixed namespace would let an earlier green run's
 /// committed dollars make a later run pass without the settle it claims.
 fn unique_namespace(suffix: &str) -> KeyNamespace {
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    KeyNamespace::new(format!("t{}{suffix}", &id[..12])).expect("a legal namespace")
+    KeyNamespace::new(format!("{}{suffix}", unique_name())).expect("a legal namespace")
 }
 
 /// Grant and settle `usd` for `principal` through `ledger`.
@@ -165,8 +172,9 @@ async fn evaluation_spend_is_separate_from_serving_spend_and_shared_between_node
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn one_deployments_evaluation_ledger_is_not_another_deployments_serving_ledger() {
     let url = url_from_env();
-    let tenant = unique_namespace("");
-    let tenant_eval = KeyNamespace::new(format!("{}-eval", tenant.as_str()))
+    let tenant_name = unique_name();
+    let tenant = KeyNamespace::new(tenant_name.clone()).expect("a legal namespace");
+    let tenant_eval = KeyNamespace::new(format!("{tenant_name}-eval"))
         .expect("a legal namespace an operator may choose");
 
     let first = open(Some(&url), &tenant).await.expect("deployment one");

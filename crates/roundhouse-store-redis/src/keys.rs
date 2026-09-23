@@ -193,15 +193,8 @@ impl KeyNamespace {
         Ok(Self(raw))
     }
 
-    /// The namespace as written, for a caller deriving a sibling of it.
-    ///
-    /// Public since the evaluation ledger: a deployment's classification spend
-    /// lives in a namespace *beside* its serving spend rather than in the same
-    /// keys, and the composition root derives that name from this one so the two
-    /// cannot drift apart. Building it there from the raw environment variable
-    /// instead would be a second reader of a value [`Self::new`] has already
-    /// refused the bad spellings of.
-    pub fn as_str(&self) -> &str {
+    /// The namespace as written, for [`build_key`] to open every key with.
+    fn as_str(&self) -> &str {
         &self.0
     }
 }

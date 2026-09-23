@@ -1933,17 +1933,6 @@ impl<S: SessionStore> Session<S> {
         Ok(())
     }
 
-    /// Commit facts an interjector produced for a turn that then proceeds.
-    ///
-    /// The `Proceed` half of the same contract [`Self::complete_with_item`]
-    /// serves for `Complete`. There is no atomicity to buy here — nothing else
-    /// is being committed alongside — but there is still exactly one writer,
-    /// and this is how an occupant reaches it.
-    ///
-    /// An empty record commits nothing rather than an empty batch: the
-    /// production default interjects on no turn, and a store round trip per
-    /// turn to say so would be a cost paid by every deployment that never
-    /// enables validation.
     /// Commit the intent to classify a turn, before anything is sent.
     ///
     /// **The engine's own writer, under the lease it already holds.** A
@@ -1993,6 +1982,17 @@ impl<S: SessionStore> Session<S> {
         Ok(())
     }
 
+    /// Commit facts an interjector produced for a turn that then proceeds.
+    ///
+    /// The `Proceed` half of the same contract [`Self::complete_with_item`]
+    /// serves for `Complete`. There is no atomicity to buy here — nothing else
+    /// is being committed alongside — but there is still exactly one writer,
+    /// and this is how an occupant reaches it.
+    ///
+    /// An empty record commits nothing rather than an empty batch: the
+    /// production default interjects on no turn, and a store round trip per
+    /// turn to say so would be a cost paid by every deployment that never
+    /// enables validation.
     pub async fn record_control(&mut self, record: ControlRecord) -> Result<(), SessionError> {
         if record.is_empty() {
             return Ok(());
