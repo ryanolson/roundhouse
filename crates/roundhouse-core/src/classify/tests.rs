@@ -11,6 +11,7 @@ use crate::item::{Item, ItemContent, Role};
 fn caps() -> ProjectionCaps {
     ProjectionCaps {
         max_prior_classifications: 3,
+        max_prior_turns: 3,
         max_prompt_chars: 120,
         max_total_bytes: 4 * 1024,
     }
@@ -63,16 +64,16 @@ fn available(turn: u64, seq: u64, intent: TurnIntent) -> AvailableClassification
 #[test]
 fn every_axis_offers_unknown_and_round_trips_every_label() {
     fn check<T: ClassificationAxis + std::fmt::Debug + PartialEq>() {
-        let options = T::options();
+        let options = T::OPTIONS;
         assert!(
-            options.iter().any(|(label, _)| *label == "unknown"),
+            options.iter().any(|(_, label, _)| *label == "unknown"),
             "{} offers no `unknown` option",
             T::KEY
         );
-        for (label, rubric) in options {
+        for &(_, label, rubric) in options {
             let parsed = T::from_label(label)
                 .unwrap_or_else(|| panic!("{}: `{label}` is offered and does not parse", T::KEY));
-            assert_eq!(parsed.label(), *label, "{}: `{label}` round trips", T::KEY);
+            assert_eq!(parsed.label(), label, "{}: `{label}` round trips", T::KEY);
             assert!(!rubric.is_empty(), "{}: `{label}` has a rubric", T::KEY);
         }
         assert!(T::from_label("a label nothing offers").is_none());
@@ -145,6 +146,25 @@ fn the_two_absences_are_told_apart_and_neither_reads_as_an_empty_prompt() {
 
     let spoken = PromptCapture::of(&[Item::user_text("hello")], &caps());
     assert_eq!(spoken.origin, PromptOrigin::UserText);
+}
+
+/// **CORRECTNESS (core-session-5).** Whitespace-only user text is not a
+/// request — the same predicate `Item::is_user_request` and
+/// `trailing_user_request` already apply this test by — so a turn carrying
+/// only blank user text ahead of a tool result is a tool continuation, not a
+/// spoken prompt. Before the fix, `PromptCapture::of` checked `said.is_empty()`
+/// rather than `said.trim().is_empty()`, so `"  \n"` read as `UserText` and
+/// rendered a `prompt:` section of blank quoted lines.
+#[test]
+fn whitespace_only_user_text_is_not_a_prompt() {
+    let input = vec![Item::user_text("  \n"), tool_result("c1", "ok")];
+    let capture = PromptCapture::of(&input, &caps());
+    assert_eq!(
+        capture.origin,
+        PromptOrigin::ToolContinuation,
+        "whitespace-only text must read as no prompt, the way an empty \
+         string already does"
+    );
 }
 
 /// Prior classifications ride as metadata, newest first to survive the cap, and

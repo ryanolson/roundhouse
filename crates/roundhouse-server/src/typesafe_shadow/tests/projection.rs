@@ -101,6 +101,7 @@ async fn an_oversized_projection_makes_no_call_and_takes_no_hold() {
         EXPECTED_OUTPUT_TOKENS,
         ProjectionCaps {
             max_prior_classifications: 4,
+            max_prior_turns: 4,
             max_prompt_chars: 4_000,
             max_total_bytes: 200,
         },
@@ -140,6 +141,7 @@ async fn a_body_over_the_transport_bound_is_refused_before_the_hold() {
         EXPECTED_OUTPUT_TOKENS,
         ProjectionCaps {
             max_prior_classifications: 4,
+            max_prior_turns: 4,
             max_prompt_chars: 40_000,
             max_total_bytes: 64 * 1024,
         },

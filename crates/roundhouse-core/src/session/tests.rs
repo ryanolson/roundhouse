@@ -9,6 +9,7 @@
 //! standing between a reader and the settle seam were not earning their
 //! position.
 
+use super::classification::landed_through;
 use super::*;
 use crate::control::Principal;
 use crate::item::{ItemContent, Role};

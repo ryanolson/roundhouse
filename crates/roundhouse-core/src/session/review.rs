@@ -388,18 +388,34 @@ impl ReviewTracker {
         Some(true)
     }
 
-    /// Tracked decisions in `(after, through]`, oldest first.
-    fn covered(&self, after: u64, through: u64) -> impl Iterator<Item = ReviewedDecision> + '_ {
+    /// `(span, decision)` pairs for every decision in `(after, through]`,
+    /// oldest first.
+    ///
+    /// The one filter [`Self::covered`], [`Self::gaps`] and [`Self::facts`]
+    /// all need, each with its own closure before this existed — three
+    /// spellings of "which decisions this interval covers" that the next gap
+    /// rule would have had to find and update in step.
+    fn covered_spans(
+        &self,
+        after: u64,
+        through: u64,
+    ) -> impl Iterator<Item = (&TurnSpan, &TrackedDecision)> + '_ {
         self.spans.iter().flat_map(move |span| {
             span.decisions
                 .iter()
                 .filter(move |decision| decision.seq > after && decision.seq <= through)
-                .map(|decision| ReviewedDecision {
-                    routed_seq: decision.seq,
-                    turn_index: span.turn_index,
-                    response_id: span.response_id.clone(),
-                })
+                .map(move |decision| (span, decision))
         })
+    }
+
+    /// Tracked decisions in `(after, through]`, oldest first.
+    fn covered(&self, after: u64, through: u64) -> impl Iterator<Item = ReviewedDecision> + '_ {
+        self.covered_spans(after, through)
+            .map(|(span, decision)| ReviewedDecision {
+                routed_seq: decision.seq,
+                turn_index: span.turn_index,
+                response_id: span.response_id.clone(),
+            })
     }
 
     /// The gaps the log alone establishes for `(after, through]`.
@@ -412,27 +428,23 @@ impl ReviewTracker {
             gaps.push(CoverageGap::MetadataOverflow);
         }
         let mut any = false;
+        let mut first_generation = None;
         let mut unterminated = false;
         let mut unstamped = false;
         let mut generation = None;
         let mut generations_differ = false;
         let mut objective: Option<&ObjectiveVersion> = None;
         let mut objectives_differ = false;
-        for span in &self.spans {
-            for decision in span
-                .decisions
-                .iter()
-                .filter(|decision| decision.seq > after && decision.seq <= through)
-            {
-                any = true;
-                unterminated |= span.ended.is_none_or(|(seq, _)| seq > through);
-                generations_differ |=
-                    *generation.get_or_insert(decision.generation) != decision.generation;
-                match &decision.objective {
-                    None => unstamped = true,
-                    Some(stamp) => {
-                        objectives_differ |= *objective.get_or_insert(stamp) != stamp;
-                    }
+        for (span, decision) in self.covered_spans(after, through) {
+            any = true;
+            first_generation.get_or_insert(decision.generation);
+            unterminated |= span.ended.is_none_or(|(seq, _)| seq > through);
+            generations_differ |=
+                *generation.get_or_insert(decision.generation) != decision.generation;
+            match &decision.objective {
+                None => unstamped = true,
+                Some(stamp) => {
+                    objectives_differ |= *objective.get_or_insert(stamp) != stamp;
                 }
             }
         }
@@ -451,6 +463,20 @@ impl ReviewTracker {
         if objectives_differ {
             gaps.push(CoverageGap::ObjectiveChanged);
         }
+        // The snapshot-staleness check `facts` used to make on its own,
+        // needing only the first covered decision's generation and the
+        // current snapshot's: `InstructionsChanged` above already covers
+        // covered decisions disagreeing with *each other*; this is the case
+        // where they agree with each other but not with the snapshot
+        // `facts` would hand back, which is a gap in exactly the same sense.
+        if let Some(first_generation) = first_generation
+            && first_generation != self.instructions.generation
+            && !gaps.contains(&CoverageGap::InstructionsChanged)
+        {
+            gaps.push(CoverageGap::VersionsUnavailable);
+        }
+        gaps.sort();
+        gaps.dedup();
         gaps
     }
 
@@ -458,30 +484,23 @@ impl ReviewTracker {
     pub(crate) fn facts<'a>(&'a self, history: &'a [Item], through: u64) -> IntervalFacts<'a> {
         let after = self.checkpoint;
         let decisions: Vec<ReviewedDecision> = self.covered(after, through).collect();
-        let mut gaps = self.gaps(after, through);
-        let mut covered = self.spans.iter().flat_map(|span| {
-            span.decisions
-                .iter()
-                .filter(move |decision| decision.seq > after && decision.seq <= through)
-        });
-        let first = covered.next();
+        let gaps = self.gaps(after, through);
+        let first = self
+            .covered_spans(after, through)
+            .next()
+            .map(|(_, decision)| decision);
         let objective = first.and_then(|decision| decision.objective.as_ref());
         // Covered decisions share one generation unless a gap says otherwise;
-        // its content is the snapshot only while no later decision replaced it.
+        // its content is the snapshot only while no later decision replaced
+        // it — `gaps()` above already turned the mismatch into
+        // `VersionsUnavailable`, so this only resolves the actual reference,
+        // which a gap has no reason to hold.
         let instructions = match first {
             Some(decision) if decision.generation == self.instructions.generation => {
                 Some(&*self.instructions.snapshot)
             }
-            Some(_) => {
-                if !gaps.contains(&CoverageGap::InstructionsChanged) {
-                    gaps.push(CoverageGap::VersionsUnavailable);
-                }
-                None
-            }
-            None => None,
+            _ => None,
         };
-        gaps.sort();
-        gaps.dedup();
 
         let last = self.spans.len().saturating_sub(1);
         let turns = self
@@ -505,7 +524,7 @@ impl ReviewTracker {
             .collect::<Vec<_>>();
         let first_has_request = turns
             .first()
-            .is_some_and(|turn| turn.items.iter().any(super::is_user_request));
+            .is_some_and(|turn| turn.items.iter().any(Item::is_user_request));
         let request_before = match first_has_request {
             true => None,
             false => self

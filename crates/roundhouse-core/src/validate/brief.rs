@@ -126,13 +126,12 @@ impl Objective {
 /// render that absence rather than an empty string — see
 /// [`render_steer_answer`](crate::validate::render_steer_answer).
 pub fn trailing_user_request(items: &[Item]) -> Option<&str> {
-    items
-        .iter()
-        .rev()
-        .find_map(|item| match (&item.role, &item.content) {
-            (Role::User, ItemContent::Text { text }) if !text.trim().is_empty() => Some(&**text),
-            _ => None,
-        })
+    let item = items.iter().rev().find(|item| item.is_user_request())?;
+    match &item.content {
+        ItemContent::Text { text } => Some(text.as_str()),
+        // `is_user_request` guarantees `Text` content; nothing else reaches here.
+        _ => None,
+    }
 }
 
 /// How much of a session the judge is shown.
@@ -466,6 +465,15 @@ fn truncate_objective(objective: Objective, limit: usize) -> Objective {
     }
 }
 
+/// What a truncated span ends with.
+///
+/// Hoisted so the char count a caller budgets against can never drift from the
+/// marker `truncate` actually appends — a hand-counted length beside a literal
+/// is exactly the kind of pair that disagrees the day one of the two is
+/// edited and not the other, which is what happened to the classifier
+/// projection's own copy before this constant existed.
+pub(crate) const TRUNCATION_MARKER: &str = "…[truncated]";
+
 /// At most `limit` characters, with the cut marked.
 ///
 /// Characters and not bytes: a byte slice through a multi-byte character
@@ -476,13 +484,12 @@ fn truncate_objective(objective: Objective, limit: usize) -> Objective {
 /// Shared with side-call adapters so additional text fields use the same
 /// character bound and truncation marker as the judge brief.
 pub fn truncate(text: &str, limit: usize) -> String {
-    const MARKER: &str = "…[truncated]";
     if text.chars().count() <= limit {
         return text.to_string();
     }
-    let keep = limit.saturating_sub(MARKER.chars().count());
+    let keep = limit.saturating_sub(TRUNCATION_MARKER.chars().count());
     let head: String = text.chars().take(keep).collect();
-    format!("{head}{MARKER}")
+    format!("{head}{TRUNCATION_MARKER}")
 }
 
 #[cfg(test)]

@@ -99,6 +99,27 @@ fn an_enabled_configuration_with_its_key_composes_a_runtime() {
     assert_eq!(runtime.limits().max_in_flight, 16);
     assert_eq!(runtime.limits().max_http_concurrency, 4);
     assert_eq!(runtime.projection_caps().max_prior_classifications, 6);
+    // `COMPLETE` predates the `max_prior_turns` split and names no opinion of
+    // its own, so an existing deployment's configuration must keep bounding
+    // local metadata exactly as `max_prior_classifications` always did.
+    assert_eq!(runtime.projection_caps().max_prior_turns, 6);
+}
+
+/// A file that has taken an opinion on `max_prior_turns` is read literally,
+/// and distinctly from `max_prior_classifications` — the two caps bound
+/// unrelated lists and an operator may size them differently.
+#[test]
+fn an_explicit_max_prior_turns_overrides_the_fallback() {
+    let config = ClassifyConfig::from_json(
+        &with(
+            "\"max_prior_classifications\": 6",
+            "\"max_prior_classifications\": 6, \"max_prior_turns\": 2",
+        ),
+        "<test>",
+    )
+    .expect("a valid file");
+    assert_eq!(config.caps().max_prior_classifications, 6);
+    assert_eq!(config.caps().max_prior_turns, 2);
 }
 
 /// **An enabled classifier with no key stops the process.**

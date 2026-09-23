@@ -41,15 +41,15 @@ fn the_adapter_asks_the_three_taxonomy_questions_and_names_no_model() {
     // label the request never offered cannot exist.
     assert_eq!(
         questions[TurnIntent::KEY].criteria.len(),
-        TurnIntent::options().len()
+        TurnIntent::OPTIONS.len()
     );
     assert_eq!(
         questions[TurnComplexity::KEY].criteria.len(),
-        TurnComplexity::options().len()
+        TurnComplexity::OPTIONS.len()
     );
     assert_eq!(
         questions[ContextDependence::KEY].criteria.len(),
-        ContextDependence::options().len()
+        ContextDependence::OPTIONS.len()
     );
 }
 

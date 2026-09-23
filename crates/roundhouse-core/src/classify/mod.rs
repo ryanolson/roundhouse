@@ -55,16 +55,38 @@ pub const TAXONOMY_VERSION: u32 = 1;
 /// A trait rather than three hand-written tables so that "every axis offers
 /// `unknown`" and "every option label round-trips" are properties one test can
 /// assert over all three.
-pub trait ClassificationAxis: Sized + Copy {
+///
+/// **One table per axis, not three.** `OPTIONS` is the single place a label,
+/// its rubric and the variant it parses to are written down; `from_label` and
+/// `label` are default methods derived from it rather than a second and third
+/// hand-written match. A fifth option used to mean editing the options list,
+/// `from_label`'s match and `label`'s match in step — and a missed
+/// `from_label` arm would silently drop a valid classifier answer as
+/// unusable. Now it means adding one entry.
+pub trait ClassificationAxis: Sized + Copy + PartialEq + 'static {
     /// The key this axis is asked and answered under.
     const KEY: &'static str;
     /// What the classifier is asked to decide.
     const INSTRUCTIONS: &'static str;
-    /// Every option, as `(label, rubric)`, in the order they are offered.
-    fn options() -> &'static [(&'static str, &'static str)];
+    /// Every option, as `(variant, label, rubric)`, in the order they are
+    /// offered.
+    const OPTIONS: &'static [(Self, &'static str, &'static str)];
+
     /// The variant a label names, or `None` for a label no option offers.
-    fn from_label(label: &str) -> Option<Self>;
-    fn label(self) -> &'static str;
+    fn from_label(label: &str) -> Option<Self> {
+        Self::OPTIONS
+            .iter()
+            .find(|(_, candidate, _)| *candidate == label)
+            .map(|(variant, _, _)| *variant)
+    }
+
+    fn label(self) -> &'static str {
+        Self::OPTIONS
+            .iter()
+            .find(|(variant, _, _)| *variant == self)
+            .map(|(_, label, _)| *label)
+            .expect("every constructible variant has an OPTIONS entry")
+    }
 }
 
 /// What the turn is trying to do.
@@ -88,58 +110,38 @@ pub enum TurnIntent {
 impl ClassificationAxis for TurnIntent {
     const KEY: &'static str = "intent";
     const INSTRUCTIONS: &'static str = "What is this turn asking for?";
-
-    fn options() -> &'static [(&'static str, &'static str)] {
-        &[
-            (
-                "implement",
-                "Write new code or change existing code to add or alter behaviour",
-            ),
-            (
-                "diagnose",
-                "Find the cause of a failure, a wrong result or unexpected behaviour",
-            ),
-            (
-                "explain",
-                "Answer a question about material that already exists, without changing it",
-            ),
-            (
-                "review",
-                "Judge work that already exists against a standard, and report on it",
-            ),
-            (
-                "operate",
-                "Run, inspect or report on something rather than change it",
-            ),
-            (
-                "unknown",
-                "The request does not clearly fit any other option, or there is too little to tell",
-            ),
-        ]
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        Some(match label {
-            "implement" => Self::Implement,
-            "diagnose" => Self::Diagnose,
-            "explain" => Self::Explain,
-            "review" => Self::Review,
-            "operate" => Self::Operate,
-            "unknown" => Self::Unknown,
-            _ => return None,
-        })
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Implement => "implement",
-            Self::Diagnose => "diagnose",
-            Self::Explain => "explain",
-            Self::Review => "review",
-            Self::Operate => "operate",
-            Self::Unknown => "unknown",
-        }
-    }
+    const OPTIONS: &'static [(Self, &'static str, &'static str)] = &[
+        (
+            Self::Implement,
+            "implement",
+            "Write new code or change existing code to add or alter behaviour",
+        ),
+        (
+            Self::Diagnose,
+            "diagnose",
+            "Find the cause of a failure, a wrong result or unexpected behaviour",
+        ),
+        (
+            Self::Explain,
+            "explain",
+            "Answer a question about material that already exists, without changing it",
+        ),
+        (
+            Self::Review,
+            "review",
+            "Judge work that already exists against a standard, and report on it",
+        ),
+        (
+            Self::Operate,
+            "operate",
+            "Run, inspect or report on something rather than change it",
+        ),
+        (
+            Self::Unknown,
+            "unknown",
+            "The request does not clearly fit any other option, or there is too little to tell",
+        ),
+    ];
 }
 
 /// How much work the turn is.
@@ -161,52 +163,33 @@ pub enum TurnComplexity {
 impl ClassificationAxis for TurnComplexity {
     const KEY: &'static str = "complexity";
     const INSTRUCTIONS: &'static str = "How much work is this turn?";
-
-    fn options() -> &'static [(&'static str, &'static str)] {
-        &[
-            (
-                "trivial",
-                "One obvious step, and the result is immediately checkable",
-            ),
-            (
-                "routine",
-                "Ordinary work along a path that is already clear",
-            ),
-            (
-                "involved",
-                "Several dependent steps, or one step whose approach has to be worked out first",
-            ),
-            (
-                "deep",
-                "Open-ended work where deciding what to do is part of the answer",
-            ),
-            (
-                "unknown",
-                "There is too little in the request to judge how much work it is",
-            ),
-        ]
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        Some(match label {
-            "trivial" => Self::Trivial,
-            "routine" => Self::Routine,
-            "involved" => Self::Involved,
-            "deep" => Self::Deep,
-            "unknown" => Self::Unknown,
-            _ => return None,
-        })
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Trivial => "trivial",
-            Self::Routine => "routine",
-            Self::Involved => "involved",
-            Self::Deep => "deep",
-            Self::Unknown => "unknown",
-        }
-    }
+    const OPTIONS: &'static [(Self, &'static str, &'static str)] = &[
+        (
+            Self::Trivial,
+            "trivial",
+            "One obvious step, and the result is immediately checkable",
+        ),
+        (
+            Self::Routine,
+            "routine",
+            "Ordinary work along a path that is already clear",
+        ),
+        (
+            Self::Involved,
+            "involved",
+            "Several dependent steps, or one step whose approach has to be worked out first",
+        ),
+        (
+            Self::Deep,
+            "deep",
+            "Open-ended work where deciding what to do is part of the answer",
+        ),
+        (
+            Self::Unknown,
+            "unknown",
+            "There is too little in the request to judge how much work it is",
+        ),
+    ];
 }
 
 /// How much of the conversation before it the turn needs.
@@ -229,46 +212,28 @@ pub enum ContextDependence {
 impl ClassificationAxis for ContextDependence {
     const KEY: &'static str = "context_dependence";
     const INSTRUCTIONS: &'static str = "How much of the earlier conversation does this turn need?";
-
-    fn options() -> &'static [(&'static str, &'static str)] {
-        &[
-            (
-                "self_contained",
-                "The request can be answered from itself, with no earlier exchange",
-            ),
-            (
-                "recent",
-                "The request continues the last few exchanges and needs them",
-            ),
-            (
-                "deep",
-                "The request depends on material from much earlier in the session",
-            ),
-            (
-                "unknown",
-                "There is too little here to tell what earlier material is needed",
-            ),
-        ]
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        Some(match label {
-            "self_contained" => Self::SelfContained,
-            "recent" => Self::Recent,
-            "deep" => Self::Deep,
-            "unknown" => Self::Unknown,
-            _ => return None,
-        })
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::SelfContained => "self_contained",
-            Self::Recent => "recent",
-            Self::Deep => "deep",
-            Self::Unknown => "unknown",
-        }
-    }
+    const OPTIONS: &'static [(Self, &'static str, &'static str)] = &[
+        (
+            Self::SelfContained,
+            "self_contained",
+            "The request can be answered from itself, with no earlier exchange",
+        ),
+        (
+            Self::Recent,
+            "recent",
+            "The request continues the last few exchanges and needs them",
+        ),
+        (
+            Self::Deep,
+            "deep",
+            "The request depends on material from much earlier in the session",
+        ),
+        (
+            Self::Unknown,
+            "unknown",
+            "There is too little here to tell what earlier material is needed",
+        ),
+    ];
 }
 
 /// One axis's answer and the statistic the classifier published about it.

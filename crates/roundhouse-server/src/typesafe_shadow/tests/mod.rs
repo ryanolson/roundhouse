@@ -222,6 +222,7 @@ impl SpendLedger for RecordingLedger {
 pub(crate) fn caps() -> ProjectionCaps {
     ProjectionCaps {
         max_prior_classifications: 4,
+        max_prior_turns: 4,
         max_prompt_chars: 2_000,
         max_total_bytes: 8 * 1024,
     }

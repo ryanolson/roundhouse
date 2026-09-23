@@ -35,6 +35,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::item::{Item, ItemContent, Role};
+use crate::validate::brief::{QUOTE, TRUNCATION_MARKER, quote};
 
 use super::{AvailableClassification, ClassificationAxis, PriorTurnMetadata, TAXONOMY_VERSION};
 
@@ -42,22 +43,15 @@ use super::{AvailableClassification, ClassificationAxis, PriorTurnMetadata, TAXO
 ///
 /// Moves when the *content* of a projection changes, so a record written under
 /// one revision is never read as though it had been asked the other's question.
-pub const PROJECTION_REVISION: u32 = 1;
-
-/// The line prefix every quoted line of client text carries.
 ///
-/// Structural framing, and that is all it claims: a reader — human or model —
-/// can tell which lines are the client's. It is not a defence against a prompt
-/// that instructs the model it quotes.
-const QUOTE: &str = "> ";
-
-/// What a truncated prompt ends with, and what it costs from the same budget.
-///
-/// Spelled here rather than borrowed from `validate::brief::truncate`, because
-/// this module cannot *call* that function: truncating requires the whole string
-/// to exist first, and not building it is the point.
-const MARKER: &str = "…[truncated]";
-const MARKER_CHARS: usize = 12;
+/// **Bumped to 2** when the whitespace-only-prompt fix (core-session-5)
+/// changed what a turn like `[user_text("  \n"), tool_result(..)]` renders as
+/// — `origin` moves from `user_text` to `tool_continuation` and the `prompt:`
+/// section disappears. Safe to bump: this is a label on new records and
+/// nothing reads it to drop, re-key, or refuse a stored classification —
+/// `ClassifierIdentity::projection_revision` and `ClassificationWindow::revision`
+/// are recorded and never compared against the constant.
+pub const PROJECTION_REVISION: u32 = 2;
 
 /// What this deployment is willing to send.
 ///
@@ -67,6 +61,16 @@ const MARKER_CHARS: usize = 12;
 pub struct ProjectionCaps {
     /// The most earlier classifications to carry. The newest survive.
     pub max_prior_classifications: usize,
+    /// The most prior-turn local metadata records to carry — this
+    /// deployment's own read of earlier turns (see
+    /// [`PriorTurnMetadata`]), not the classifications above. The newest
+    /// survive.
+    ///
+    /// A cap of its own rather than a reuse of `max_prior_classifications`:
+    /// the two lists are unrelated context with unrelated sizes, and a reader
+    /// bounding one by the other's name would be reading the wrong doc
+    /// comment to find out what it does.
+    pub max_prior_turns: usize,
     /// The most of the current prompt to send, in characters.
     pub max_prompt_chars: usize,
     /// The whole rendered projection. Over this, no call happens.
@@ -154,7 +158,9 @@ impl PromptCapture {
 
         // The marker costs from the same budget `truncate` charges it to, so a
         // capture and a truncated string of the same cap are the same length.
-        let keep = caps.max_prompt_chars.saturating_sub(MARKER_CHARS);
+        let keep = caps
+            .max_prompt_chars
+            .saturating_sub(TRUNCATION_MARKER.chars().count());
         let mut text = String::new();
         let mut taken = 0usize;
         let mut overflowed = false;
@@ -162,46 +168,58 @@ impl PromptCapture {
         let mut omitted = 0usize;
 
         for item in current {
-            match (&item.role, &item.content) {
-                (Role::User, ItemContent::Text { text: said }) => {
-                    if said.is_empty() {
-                        continue;
-                    }
-                    if !text.is_empty() {
-                        match taken < keep {
-                            true => {
-                                text.push('\n');
-                                taken += 1;
-                            }
-                            false => overflowed = true,
+            // `is_user_request` is the one predicate `trailing_user_request`
+            // and the review fold also apply, so a turn's own contribution is
+            // read as a request here exactly when it would be read as one
+            // anywhere else — including trimming whitespace-only text, which
+            // a bare `Role::User` match does not.
+            if item.is_user_request() {
+                let ItemContent::Text { text: said } = &item.content else {
+                    unreachable!("Item::is_user_request guarantees ItemContent::Text")
+                };
+                if !text.is_empty() {
+                    match taken < keep {
+                        true => {
+                            text.push('\n');
+                            taken += 1;
                         }
-                    }
-                    for ch in said.chars() {
-                        if taken >= keep {
-                            // Everything from here is dropped, and the loop stops
-                            // *reading* it rather than copying it to drop later.
-                            // That is the whole allocation bound: what this
-                            // builds is the size of the cap, whatever the size of
-                            // the input.
-                            overflowed = true;
-                            break;
-                        }
-                        text.push(ch);
-                        taken += 1;
+                        false => overflowed = true,
                     }
                 }
-                (_, ItemContent::ToolResult { .. }) => {
+                for ch in said.chars() {
+                    if taken >= keep {
+                        // Everything from here is dropped, and the loop stops
+                        // *reading* it rather than copying it to drop later.
+                        // That is the whole allocation bound: what this
+                        // builds is the size of the cap, whatever the size of
+                        // the input.
+                        overflowed = true;
+                        break;
+                    }
+                    text.push(ch);
+                    taken += 1;
+                }
+                continue;
+            }
+            match &item.content {
+                ItemContent::ToolResult { .. } => {
                     // Counted, never sent. A tool result is the raw output of
                     // somebody else's program and is exactly what the egress
                     // ruling excludes.
                     tool_results += 1;
                     omitted += 1;
                 }
+                // Blank user text is not a request — `is_user_request` above
+                // said so — and it is not counted as omitted either: the turn
+                // contributed nothing readable, which is a different fact
+                // from the instructions and tool output this projection
+                // deliberately withholds and counts.
+                ItemContent::Text { .. } if item.role == Role::User => {}
                 _ => omitted += 1,
             }
         }
         if overflowed {
-            text.push_str(MARKER);
+            text.push_str(TRUNCATION_MARKER);
         }
 
         let origin = match (text.is_empty(), tool_results > 0) {
@@ -262,7 +280,7 @@ pub fn project(
     let included = prior.len().min(caps.max_prior_classifications);
     let omitted = prior.len() - included;
     let kept = &prior[prior.len() - included..];
-    let local_included = local.len().min(caps.max_prior_classifications);
+    let local_included = local.len().min(caps.max_prior_turns);
     let local_kept = &local[local.len() - local_included..];
 
     let mut rendered = String::new();
@@ -343,11 +361,7 @@ pub fn project(
     match capture.origin {
         PromptOrigin::UserText => {
             rendered.push_str("prompt:\n");
-            for line in capture.text.lines() {
-                rendered.push_str(QUOTE);
-                rendered.push_str(line);
-                rendered.push('\n');
-            }
+            quote(&capture.text, QUOTE, &mut rendered);
         }
         // Stated rather than left as an empty section. "The user said nothing
         // this turn" is a fact about the turn, and a classifier shown a blank

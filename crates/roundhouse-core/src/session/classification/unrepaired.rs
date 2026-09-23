@@ -12,7 +12,7 @@ use crate::classify::UnconfirmedSettlement;
 use crate::ids::ResponseId;
 
 /// Settlements the log says nobody has confirmed, oldest arrival first.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct UnrepairedSettlements {
     /// Arrival order determines which pending settlements are offered first.
     entries: BTreeMap<u64, UnconfirmedSettlement>,
@@ -21,6 +21,15 @@ pub(super) struct UnrepairedSettlements {
     /// Monotonic arrival keys, reconstructed in the same order during replay.
     next: u64,
     /// Settlements visited during removal, excluding map lookup comparisons.
+    ///
+    /// **Test-only.** By construction it equals the number of successful
+    /// removals — `remove` increments it exactly once per indexed hit, so a
+    /// regression to a linear scan would only move it if the scan's own
+    /// author chose to count each visit. It costs a production field and a
+    /// public accessor for a guard that is self-reported rather than
+    /// observed, so it is gated out of a production build entirely rather
+    /// than kept as dead state nothing reads.
+    #[cfg(test)]
     examined: u64,
 }
 
@@ -41,7 +50,10 @@ impl UnrepairedSettlements {
         let Some(arrival) = self.index.remove(call_id) else {
             return;
         };
-        self.examined += 1;
+        #[cfg(test)]
+        {
+            self.examined += 1;
+        }
         self.entries.remove(&arrival);
     }
 
@@ -51,6 +63,7 @@ impl UnrepairedSettlements {
     }
 
     /// See [`Self::examined`].
+    #[cfg(test)]
     pub(super) fn examined(&self) -> u64 {
         self.examined
     }

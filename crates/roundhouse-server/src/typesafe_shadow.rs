@@ -273,9 +273,9 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
                 A::KEY.to_string(),
                 ChoiceQuestion {
                     instructions: A::INSTRUCTIONS.to_string(),
-                    criteria: A::options()
+                    criteria: A::OPTIONS
                         .iter()
-                        .map(|(label, rubric)| (label.to_string(), rubric.to_string()))
+                        .map(|(_, label, rubric)| (label.to_string(), rubric.to_string()))
                         .collect(),
                 },
             )

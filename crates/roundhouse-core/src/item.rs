@@ -420,6 +420,20 @@ impl Item {
         format!("<|{}|>{}", self.role.as_str(), self.content.render())
     }
 
+    /// Whether this item is a request somebody typed: user text that is not
+    /// blank.
+    ///
+    /// A fact about the item alone, not about a session or a brief, which is
+    /// what lets [`trailing_user_request`](crate::validate::brief::trailing_user_request),
+    /// the review fold, and the classifier's projection share one answer
+    /// instead of three drifting copies of "is this a request" — one of which
+    /// (the projection's) checked `is_empty()` rather than trimming, and so
+    /// read a whitespace-only turn as a spoken prompt.
+    pub fn is_user_request(&self) -> bool {
+        self.role == Role::User
+            && matches!(&self.content, ItemContent::Text { text } if !text.trim().is_empty())
+    }
+
     /// What this item says to a human reader, and nothing else.
     ///
     /// Empty for everything that is not plain text, which is the whole
