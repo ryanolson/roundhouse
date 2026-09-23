@@ -551,7 +551,7 @@ fn wait_until(mut condition: impl FnMut() -> bool, timeout: Duration) {
 /// polling the loopback double's call count, which can only have moved if
 /// `prepare` → `record_classification_intent` → `spawn` all already ran.
 /// Delivery is then polled across successive turns rather than assumed to
-/// land on the very next one, for the same reason `deliver_classifications`
+/// land on the very next one, for the same reason `deliver_classifier_output`
 /// delivers only what is already parked -- a result that finishes its HTTP
 /// round trip a few milliseconds late is still delivered, just not
 /// necessarily by turn two.

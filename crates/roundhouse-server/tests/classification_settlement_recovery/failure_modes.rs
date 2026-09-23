@@ -596,9 +596,9 @@ async fn control_the_two_failure_modes_differ_in_what_they_leave_committed() {
 /// The engine-level partner of `RefusingStore` in `tests/classification_runtime.rs`
 /// (out of scope here, so not reused directly): that double fails a
 /// classification's own append; this one fails the *settlement repair's*
-/// append instead — the seam
-/// `Engine::deliver_settlement_repairs` names explicitly ("An acknowledgement
-/// whose append fails stays with the runtime for a later turn to deliver").
+/// append instead — the seam `Engine::deliver_classifier_output`'s own doc
+/// names explicitly ("a batch that fails to commit leaves every kind in it
+/// with the runtime ... for a later turn to drain").
 struct AckRefusingStore {
     inner: MemoryStore,
     refusing: AtomicBool,
@@ -674,7 +674,7 @@ impl roundhouse_core::store::doubles::Delegating for AckRefusingStore {
 /// suite: those fail the *ledger's* settle; this one succeeds at the ledger
 /// (the repair genuinely resolves the settlement) and fails only at writing
 /// `ClassificationSettlementRepaired` into the session's own log. Per
-/// `Engine::deliver_settlement_repairs`, that failure must leave the
+/// `Engine::deliver_classifier_output`, that failure must leave the
 /// acknowledgement with the runtime (`acknowledge_repairs` is only called with
 /// what was actually written) rather than lost, so a later turn -- once the
 /// store recovers -- delivers it exactly once.

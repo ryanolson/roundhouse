@@ -345,3 +345,24 @@ fn bad_mark(reply: &[Value], session_id: &SessionId) -> StoreError {
         str_at(reply, 1).unwrap_or("<unreadable>")
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Writer and reader both derive the index's three keys from
+    /// `IndexKeys::new`, so nothing else in this crate notices a byte
+    /// changing in one of them — a rename round-trips clean against every
+    /// other test here, Redis-backed included, and only orphans whatever an
+    /// already-running deployment wrote under the old bytes. Pinned here the
+    /// way `spend.rs`'s `every_key_carries_the_namespace_the_version_and_the_family`
+    /// pins that family's keys.
+    #[test]
+    fn every_learning_index_key_is_pinned_by_byte() {
+        let namespace = KeyNamespace::new("probe").unwrap();
+        let keys = IndexKeys::new(&namespace);
+        assert_eq!(keys.marks, "probe:v1:sess:learning:marks");
+        assert_eq!(keys.marked, "probe:v1:sess:learning:marked");
+        assert_eq!(keys.pending, "probe:v1:sess:learning:pending");
+    }
+}

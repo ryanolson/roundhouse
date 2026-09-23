@@ -2170,5 +2170,20 @@ mod tests {
              compare it against: {}",
             decision.rationale
         );
+        // `Resolved::Tier.served` on this fallthrough arm must name the tier
+        // that was actually served (capable/"strong"), not the picked tier
+        // that fell through an empty efficient one -- the rationale is
+        // republished into the calling model's own context by
+        // `explain_last_route`, so a `served` that disagreed with the
+        // outcome's own `PickedTierEmpty { served }` would tell that model
+        // the wrong tier answered its turn.
+        assert!(
+            decision
+                .rationale
+                .starts_with("stage router: strong tier (openai/sol)"),
+            "the fallthrough must report the capable tier it actually \
+             served, not the efficient tier the pick fell through: {}",
+            decision.rationale
+        );
     }
 }

@@ -335,7 +335,7 @@ pub(super) struct EvaluationFold {
     /// A [`ClassificationIntent::call_id`] is fresh per external attempt, so one
     /// id appearing in two sessions is two real calls — deduplicating across
     /// them would drop a second tenant's spend. Results and repairs are
-    /// delivered by the session's own writer (`Engine::deliver_classifications`
+    /// delivered by the session's own writer (`Engine::deliver_classifier_output`
     /// reads the runtime by session id), so the join never has to cross one.
     calls: HashMap<(SessionId, ResponseId), CallState>,
     by_principal: BTreeMap<PrincipalKey, EvaluationAccumulator>,
