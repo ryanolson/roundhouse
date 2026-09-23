@@ -15,16 +15,17 @@
 //!
 //! ## The negative invariant is the sharp one
 //!
-//! **Never in the brief: any price, the candidate list, any target name, or
-//! the words this deployment uses for its own routing choices.** LLM judges
+//! **Do not add roundhouse's prices, candidate lists, target choices, or routing
+//! rationales to the brief.** Ordinary transcript text can name models or repeat
+//! routing details. This projection does not redact those spans. LLM judges
 //! carry self-preference and same-provider family bias — a judge is itself a
 //! member of one of the families being chosen between — so a judge asked
 //! "should we have used a stronger model?" is not a neutral instrument. The
 //! judge answers a *task* question; code maps the answer to an action under
 //! policy. The routing question is asked exactly once, of code.
 //!
-//! That invariant is held two ways, and both are needed. Structurally, this
-//! type has no field that could carry a price or a target: it is built from
+//! The routing records are excluded in two ways. Structurally, this
+//! type has no routing metadata field: it is built from
 //! items, hashes and sentences, and nothing here takes a
 //! [`DecisionRecord`](crate::routing::DecisionRecord) or a
 //! [`Candidate`](crate::routing::Candidate). By assertion, the guard test
