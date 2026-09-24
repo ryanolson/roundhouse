@@ -285,7 +285,7 @@ async fn a_skipped_local_quote_is_named_in_the_decision_record() {
     );
 }
 
-/// **ORDERING (server-r3-1).** Tools must win over policy.
+/// **ORDERING.** Tools must win over policy.
 ///
 /// A turn that declares tools under a policy that also excludes every local
 /// target is a shape where the two refusals in `local_quote_can_matter`

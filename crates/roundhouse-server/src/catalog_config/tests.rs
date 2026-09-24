@@ -322,13 +322,13 @@ fn one_decayed_entry(wire_protocol: &str, max_ttl_ms: u64) -> String {
     )
 }
 
-/// **CORRECTNESS (fleet-redis-r3-1).** Anthropic's Messages cache is
-/// deterministic, not automatic: past the wire's own silent five-minute
-/// default, its only lever is the explicit `1h` marker, not a decay curve.
-/// An `inactivity_decay` entry modelling retention past that default passed
-/// this boundary today -- the resolver mapped it to `CacheLifetime::Default`
-/// the same as a well-behaved one -- so the ledger kept predicting a hit for
-/// a stretch no marker ever asked the provider to hold.
+/// **CORRECTNESS.** Anthropic's Messages cache is deterministic, not
+/// automatic: past the wire's own silent five-minute default, its only
+/// lever is the explicit `1h` marker, not a decay curve. Without this
+/// boundary, an `inactivity_decay` entry modelling retention past that
+/// default would resolve to `CacheLifetime::Default` the same as a
+/// well-behaved one, and the ledger would keep predicting a hit for a
+/// stretch no marker ever asked the provider to hold.
 #[test]
 fn an_automatic_cache_retained_past_the_wire_default_is_refused_on_messages() {
     let error =

@@ -248,13 +248,14 @@ fn an_unknown_field_is_refused() {
     assert!(ClassifyConfig::from_json(&typo, "<test>").is_err());
 }
 
-/// **CORRECTNESS (server-r3-2).** `deny_unknown_fields` on the top-level
-/// `ClassifyConfig` does not reach its nested structs -- serde applies it per
-/// container, not by inheritance -- so a typo inside `budget` or `pricing`
-/// parsed and was silently dropped rather than refused. `member_share` is the
-/// sharpest case: a misspelled `member_shares` leaves the real field at its
-/// `#[serde(default)]` of `None`, which pools the whole evaluation ceiling to
-/// one member instead of capping their share of it.
+/// **CORRECTNESS.** `deny_unknown_fields` on the top-level `ClassifyConfig`
+/// does not reach its nested structs -- serde applies it per container, not
+/// by inheritance -- so without a `deny_unknown_fields` of its own, a typo
+/// inside `budget` or `pricing` would parse and be silently dropped rather
+/// than refused. `member_share` is the sharpest case: a misspelled
+/// `member_shares` would leave the real field at its `#[serde(default)]` of
+/// `None`, which pools the whole evaluation ceiling to one member instead of
+/// capping their share of it.
 #[test]
 fn a_misspelled_nested_field_is_refused() {
     let typo = with(

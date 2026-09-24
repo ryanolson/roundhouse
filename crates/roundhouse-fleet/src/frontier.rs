@@ -1547,11 +1547,10 @@ mod tests {
             .unwrap(),
             CacheLifetime::Default
         );
-        // **CORRECTNESS (fleet-redis-r3-1).** Past that default, Messages has
-        // no marker left to ask for more retention -- its cache is
-        // deterministic, not automatic -- so a deeper ceiling is refused
-        // rather than priced at the default the wire was never asked to
-        // extend.
+        // **CORRECTNESS.** Past that default, Messages has no marker left to
+        // ask for more retention -- its cache is deterministic, not
+        // automatic -- so a deeper ceiling is refused rather than priced at
+        // the default the wire was never asked to extend.
         assert!(matches!(
             messages(CacheModel::InactivityDecay {
                 half_life_ms: 60_000,

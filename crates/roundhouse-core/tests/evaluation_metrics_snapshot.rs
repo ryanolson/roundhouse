@@ -1169,6 +1169,41 @@ fn an_unreported_seat_is_not_a_gap_because_its_total_is_exact_either_way() {
     );
 }
 
+/// A serving row that is estimated, and a seat row that is not, in one
+/// document: the seat's calls must not blur into the serving gap just
+/// because they now share a snapshot with a row that has one.
+///
+/// The two single-project tests above each prove their case with only one
+/// row in the document. `ServingCostGaps::of` sums
+/// [`ModelMetrics::seat_estimated_calls`] across every row it is handed, so
+/// a seat exclusion that accidentally keyed off "the only row present"
+/// rather than "this row's own billing" would still pass both of them and
+/// only fail here, with a second row beside it.
+#[test]
+fn a_billed_estimated_call_and_a_seat_call_do_not_blur_together() {
+    let mut estimated = usage(1_000, 0, 100);
+    estimated.accounting = Accounting::Estimated;
+    let mut serving = Log::new("acme/ada/main", Some(ada()));
+    serving.turn(estimated);
+
+    let mut seat = Log::new("acme/bob/main", Some(bob()));
+    seat.turn_on_seat(usage(1_000, 0, 100));
+
+    let recorder = MetricsRecorder::new();
+    recorder.record(serving.events());
+    recorder.record(seat.events());
+    let document = json(&recorder.snapshot(&config(), 9_999));
+
+    assert_eq!(
+        count(
+            &document,
+            &["observed_cost", "serving_gaps", "estimated_calls"]
+        ),
+        1,
+        "the serving row's own gap, undiluted by the seat row beside it"
+    );
+}
+
 /// A rate card priced at an explicit `$0` is a rate card, and is not counted as
 /// a missing one.
 ///

@@ -141,8 +141,7 @@ pub fn classify_config(
 /// `classify_runtime`'s own unit tests keep a local `upstream`/`counted_upstream`
 /// pair because several of their callers need an answer *delayed* by a caller-
 /// chosen [`Duration`] — a shape this type does not offer, and adding it back
-/// would only relocate the dead constructor a round of review already found
-/// zero callers for (server-r2-5).
+/// would only relocate a dead constructor with zero callers.
 pub struct ClassifierUpstream {
     pub base_url: String,
     calls: Arc<AtomicUsize>,
@@ -162,9 +161,7 @@ struct AppState {
 /// count through [`ClassifierUpstream::count`]'s `SeqCst` load:
 /// [`ClassifierUpstream::await_calls`] waits on the count precisely so it can
 /// assume the corresponding body is already captured, and that assumption
-/// only holds in this order (server-r2-5 -- the shared fixture used to bump
-/// the count first, which every caller here happened not to depend on, but
-/// which made this type unusable for the one caller that does).
+/// only holds in this order.
 async fn handle(
     axum::extract::State(state): axum::extract::State<AppState>,
     body: String,

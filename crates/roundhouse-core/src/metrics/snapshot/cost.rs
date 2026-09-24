@@ -293,13 +293,20 @@ impl ServingCostGaps {
     /// [`ModelAccounting::Frontier::priced_by_catalog`], because a zero amount
     /// does not establish missing pricing.
     pub(super) fn of(models: &[ModelMetrics], coverage: &Coverage) -> Self {
+        let seat_estimated_calls: u64 = models.iter().map(ModelMetrics::seat_estimated_calls).sum();
+        // A seat's share is folded into `coverage.estimated_calls` alongside
+        // serving's, never on top of it — `saturating_sub` would otherwise
+        // silently floor a bookkeeping split at zero instead of surfacing it.
+        debug_assert!(
+            seat_estimated_calls <= coverage.estimated_calls,
+            "seat estimated calls ({seat_estimated_calls}) exceed the coverage \
+             total that is supposed to include them ({})",
+            coverage.estimated_calls,
+        );
         Self {
-            estimated_calls: coverage.estimated_calls.saturating_sub(
-                models
-                    .iter()
-                    .map(ModelMetrics::seat_estimated_calls)
-                    .sum::<u64>(),
-            ),
+            estimated_calls: coverage
+                .estimated_calls
+                .saturating_sub(seat_estimated_calls),
             unpriced_models: models
                 .iter()
                 .filter(|row| {

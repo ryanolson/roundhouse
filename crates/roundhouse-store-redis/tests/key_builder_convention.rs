@@ -164,14 +164,14 @@ fn every_key_function_calls_the_shared_builder() {
     );
 }
 
-/// PR 18 round-2 review, fleet-redis-r2-1: a file can sit in `FAMILY_FILES`
-/// and be scanned for nothing. That happened to `src/scripts/learning.rs`
-/// once its three `*_key` functions were inlined into `IndexKeys::new` —
-/// the row was added to name the file as covered, but `scan_key_function_names`
-/// found zero `fn ..._key(` in it, so `every_key_function_calls_the_shared_builder`
-/// passed vacuously over the one family whose keys are per namespace rather
-/// than per session. This asserts the scan itself is never empty for a listed
-/// file, so an inert row fails loudly instead of looking like coverage.
+/// A file can sit in `FAMILY_FILES` and be scanned for nothing. That is the
+/// present shape of `src/scripts/learning.rs`: its three `*_key` functions
+/// are inlined into `IndexKeys::new`, so the row names the file as covered
+/// but `scan_key_function_names` finds zero `fn ..._key(` in it, and
+/// `every_key_function_calls_the_shared_builder` would pass vacuously over
+/// the one family whose keys are per namespace rather than per session.
+/// This asserts the scan itself is never empty for a listed file, so an
+/// inert row fails loudly instead of looking like coverage.
 #[test]
 fn every_family_file_yields_at_least_one_key_function() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");

@@ -3,8 +3,8 @@
 
 //! The real judge: exact prompt bytes and the reservation.
 //!
-//! Split from review_interval_engine.rs (server-r3, PR 18 round 3) to keep
-//! each claim's file under 1000 lines; the shared fixtures -- `Rig`,
+//! Split from review_interval_engine.rs to keep each claim's file under
+//! 1000 lines; the shared fixtures -- `Rig`,
 //! `fleet_rig`'s callers, `shadow` and the log-reading helpers -- stay in the
 //! parent module, reached here through `use super::*`. Every other claim in
 //! that suite runs the scripted judge; these two use the real [`FleetJudge`]

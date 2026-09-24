@@ -248,6 +248,35 @@ fn one_character_over_the_cap_truncates_to_exactly_the_cap() {
     assert!(capture.text.ends_with(TRUNCATION_MARKER));
 }
 
+/// The cap counts characters, not bytes: a multi-byte character that exactly
+/// fills the cap is not truncated. `é` is two bytes and one character, so a
+/// byte-counted cap would have refused this input past ten of them.
+#[test]
+fn a_multi_byte_prompt_that_fits_the_cap_is_not_truncated() {
+    let caps = ProjectionCaps {
+        max_prompt_chars: 20,
+        ..caps()
+    };
+    let capture = PromptCapture::of(&[Item::user_text("é".repeat(20))], &caps);
+    assert!(!capture.truncated);
+    assert_eq!(capture.text, "é".repeat(20));
+}
+
+/// The multi-byte control for [`one_character_over_the_cap_truncates_to_exactly_the_cap`]:
+/// one `é` over the cap still truncates to exactly the cap, in characters,
+/// and the cut lands between characters rather than inside one's bytes.
+#[test]
+fn one_multi_byte_character_over_the_cap_truncates_to_exactly_the_cap() {
+    let caps = ProjectionCaps {
+        max_prompt_chars: 20,
+        ..caps()
+    };
+    let capture = PromptCapture::of(&[Item::user_text("é".repeat(21))], &caps);
+    assert!(capture.truncated);
+    assert_eq!(capture.text.chars().count(), 20);
+    assert!(capture.text.ends_with(TRUNCATION_MARKER));
+}
+
 /// Two items whose combined text and separator exactly fill the cap: the
 /// separator branch must not truncate a prompt that fits.
 #[test]
