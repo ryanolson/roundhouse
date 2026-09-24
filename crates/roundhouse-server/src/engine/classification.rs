@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use roundhouse_core::classify::projection::PromptCapture;
 use roundhouse_core::context::Tokenizer;
+use roundhouse_core::control::Principal;
 use roundhouse_core::ids::ResponseId;
 use roundhouse_core::item::Item;
 use roundhouse_core::now_ms;
@@ -43,7 +44,7 @@ pub(super) struct ClassificationTicket {
 impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// Drain whatever the classifier finished since the last turn, and take
     /// capacity plus a bounded prompt capture for this turn's own
-    /// classification, if there is room.
+    /// classification, if there is room and nothing is owed first.
     ///
     /// **Before `begin_turn`, on both halves.** The drain puts every
     /// delivered result at a sequence below the cutoff `plan` is about to
@@ -59,9 +60,22 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// because nothing downstream of the dedup short-circuit ever reaches
     /// [`Engine::classification_after_turn`] to spend it.
     ///
+    /// **Money already owed outranks new evaluation spend.** The drain just
+    /// above can be what first tells this session it owes a repair — its own
+    /// prior call settled unconfirmed, and delivering the result is what
+    /// moved that settlement into `unrepaired_settlements`. Taking a new
+    /// ticket right here would immediately hand this turn's own freed permit
+    /// to a fresh purchase, so `classification_after_turn`'s repair loop
+    /// would reach `classifier.capacity()` and find nothing: at one in-flight
+    /// slot this repeats every turn, forever, because the newest turn's own
+    /// ticket is always what is holding the slot. Withholding the ticket
+    /// here instead leaves that permit free for the repair; once the ledger
+    /// confirms and the acknowledgement is delivered, the next turn
+    /// classifies again.
+    ///
     /// `None` on every deployment that configured no classifier — the
-    /// shipped state — and on a saturated queue, which costs one `Option`
-    /// check either way.
+    /// shipped state — on a saturated queue, and while a repair is owed,
+    /// each costing one check either way.
     pub(super) async fn classification_before_turn(
         &self,
         session: &mut Session<S>,
@@ -69,6 +83,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     ) -> Option<ClassificationTicket> {
         let classifier = self.classifier.as_ref()?;
         self.deliver_classifier_output(session, classifier).await;
+        if Self::repair_payer(session).is_some() {
+            return None;
+        }
         let capacity = classifier.capacity()?;
         Some(ClassificationTicket {
             capacity,
@@ -80,11 +97,13 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// and took capacity for it, and schedule the bounded repair batch.
     ///
     /// **Gated on `self.classifier`, not on `background`.** A turn that took
-    /// no capacity — a saturated queue, most often — still owes the ledger
-    /// whatever repair work is outstanding; the two questions ("can this
-    /// turn buy a new classification" and "does this deployment have one
-    /// configured at all") are unrelated; only the second gates this method
-    /// running at all.
+    /// no capacity — a saturated queue, or this session already owing a
+    /// repair, most often — still owes the ledger whatever repair work is
+    /// outstanding; the two questions ("can this turn buy a new
+    /// classification" and "does this deployment have one configured at
+    /// all") are unrelated; only the second gates this method running at
+    /// all. A turn that withheld its own ticket for exactly this reason is
+    /// what frees the permit the repair loop below finds.
     ///
     /// **After the terminal event, before the lease is handed back**, so the
     /// durable intent is written by the writer that already holds it, and
@@ -228,6 +247,26 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             .await;
     }
 
+    /// Who an owed evaluation-settlement repair should be credited to, or
+    /// `None` when this session's log has nothing unrepaired or names no
+    /// payer to credit it to.
+    ///
+    /// The same two conditions this method's own caller,
+    /// [`Engine::repair_classification_settlements`], needs before it will
+    /// actually spend a permit on one — [`Engine::classification_before_turn`]
+    /// reads this too, to decide whether *this* turn may take a fresh
+    /// ticket at all. Sharing the check as one function returning the value
+    /// both callers want is what keeps the ticket-withholding decision from
+    /// drifting out of step with what the repair loop itself requires,
+    /// without a second caller re-deriving a principal a first call already
+    /// confirmed exists.
+    fn repair_payer(session: &Session<S>) -> Option<&Principal> {
+        if session.state().unrepaired_settlements().len() == 0 {
+            return None;
+        }
+        session.state().principal()
+    }
+
     /// Schedule a bounded batch of unconfirmed settlements.
     ///
     /// The durable session principal identifies the original payer. A later
@@ -244,7 +283,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         if unrepaired.len() == 0 {
             return;
         }
-        let Some(principal) = session.state().principal() else {
+        let Some(principal) = Self::repair_payer(session) else {
             tracing::warn!(
                 session_id = %session.session_id(),
                 unrepaired = unrepaired.len(),

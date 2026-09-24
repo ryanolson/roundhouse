@@ -235,6 +235,8 @@ mod ledger_isolation;
 mod lifetime;
 #[path = "classification_runtime/settlement_repair.rs"]
 mod settlement_repair;
+#[path = "classification_runtime/starvation.rs"]
+mod starvation;
 
 // -------------------------------------------------------- shared doubles
 //

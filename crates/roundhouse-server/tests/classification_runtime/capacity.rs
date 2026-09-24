@@ -193,14 +193,28 @@ async fn a_turn_with_several_parked_results_pays_one_store_append_before_routing
 /// together, not one each.** The test above only ever has results waiting; a
 /// regression that split `deliver_classifier_output`'s batch back into "one
 /// append for results, one for repairs" would still pass it, because a run
-/// with no repair in flight cannot see the second append. `SettleOnceFailingLedger`
-/// (`settlement_repair.rs`) is what makes a repair exist to wait alongside a
-/// result: it fails a call's settle once and succeeds on retry, so every
-/// classification here is `Unconfirmed` until something repairs it.
+/// with no repair in flight cannot see the second append.
+///
+/// A session that owes a repair withholds its own new ticket
+/// (`classification_before_turn`), so the two kinds cannot both arrive from
+/// one session's *newest* turn the way an earlier version of this test built
+/// them -- discovering the debt and buying a second call are mutually
+/// exclusive within a single drain. The mixed state is still reachable, just
+/// not from the newest turn: a call already dispatched before any debt
+/// existed can still be sitting undelivered when an older debt's repair
+/// finishes. `SettleOnceFailingLedger`'s ordinal gate on `open_grant` is what
+/// lines that up deterministically -- t1 and t2 both dispatch and both park
+/// in the ledger before either reaches the classifier, so t2's call exists
+/// independently of whatever t1's turn later discovers.
 #[tokio::test]
 async fn a_turn_that_drains_a_result_and_a_repair_together_pays_one_store_append_before_routing() {
     let (base_url, _upstream) = classifier_upstream().await;
-    let classify = config(&base_url, true);
+    let mut classify = config(&base_url, true);
+    // Two calls held open at once below, each already holding its own HTTP
+    // permit before it ever reaches the `open_grant` gate -- one spare over
+    // that so a repair sharing the same executor is never the reason
+    // something waits.
+    classify.executor.max_http_concurrency = 3;
     let ledger = SettleOnceFailingLedger::new();
     let runtime = compose(
         "<test>",
@@ -235,11 +249,37 @@ async fn a_turn_that_drains_a_result_and_a_repair_together_pays_one_store_append
         }
     };
 
-    // t1's call settles unconfirmed -- the ledger fails its first attempt for
-    // every call id -- and parks as a ready result.
+    ledger.arm_open_grant_gate();
+
+    // t1 and t2 each dispatch before either has any reason to owe anything --
+    // t2 runs while t1's call is still parked in the ledger, so its own
+    // drain sees nothing yet and takes a ticket of its own. Both calls now
+    // park in `open_grant`, at ordinals 1 and 2, neither having reached the
+    // classifier upstream at all.
     turn("t1", "fix the parser")
         .await
         .expect("this fleet always answers");
+    for _ in 0..300 {
+        if ledger.open_grant_calls() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    turn("t2", "add a test")
+        .await
+        .expect("this fleet always answers");
+    for _ in 0..300 {
+        if ledger.open_grant_calls() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Release only t1's call. It reaches the classifier, settles unconfirmed
+    // -- the ledger fails its first attempt for every call id -- and parks
+    // as a ready result. t2's call is still held, so it cannot yet be what
+    // this produces.
+    ledger.release_open_grant_through(1);
     for _ in 0..300 {
         if !runtime.ready(&session).await.is_empty() {
             break;
@@ -252,13 +292,30 @@ async fn a_turn_that_drains_a_result_and_a_repair_together_pays_one_store_append
         "t1's classification completed and parked"
     );
 
-    // t2 drains t1's result into the log, which starts a background repair
-    // for it, and dispatches a classification of its own -- which will also
-    // settle unconfirmed on the first attempt and park undrained. Poll for
-    // both: they are two independent background workers, racing each other.
-    turn("t2", "add a test")
+    // t3 drains t1's result into the log -- which is the same turn that
+    // discovers the session now owes a repair, withholds its own ticket, and
+    // starts the repair in its `after_turn`. t2's call is still parked in
+    // the ledger throughout, so nothing here is t3's own purchase.
+    turn("t3", "one more")
         .await
         .expect("this fleet always answers");
+    for _ in 0..300 {
+        if !runtime.ready_repairs(&session).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        runtime.ready_repairs(&session).await.len(),
+        1,
+        "t1's repair settled and parked"
+    );
+
+    // Now release t2's call, dispatched back before t1's turn ever owed
+    // anything. It reaches the classifier and settles unconfirmed in its own
+    // right -- a second debt, not yet delivered -- and parks as a second
+    // ready result, independent of the repair above.
+    ledger.release_open_grant_through(2);
     for _ in 0..300 {
         if !runtime.ready(&session).await.is_empty()
             && !runtime.ready_repairs(&session).await.is_empty()
@@ -275,12 +332,12 @@ async fn a_turn_that_drains_a_result_and_a_repair_together_pays_one_store_append
     assert_eq!(
         runtime.ready_repairs(&session).await.len(),
         1,
-        "t1's repair settled and parked"
+        "t1's repair is still parked, undrained"
     );
 
-    // t3 drains both together.
+    // t4 drains both together.
     store.reset_calls();
-    turn("t3", "one more")
+    turn("t4", "and another")
         .await
         .expect("this fleet always answers");
 

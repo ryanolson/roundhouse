@@ -177,12 +177,22 @@ pub(crate) struct SettleOnceFailingLedger {
     failed_once: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Every `(call, amount)` this ledger actually applied.
     ///
-    /// Per call rather than in total, because this rig has no local fleet: every
-    /// turn routes to the frontier and so buys its own classification, and a
-    /// project-wide committed figure here would be the sum of an unknown number
-    /// of unrelated calls. The subject is one call's recovery, so the evidence
-    /// is keyed by that call.
+    /// Per call rather than in total, because this rig has no local fleet: a
+    /// turn free to buy routes to the frontier and buys its own
+    /// classification, and a project-wide committed figure here would be the
+    /// sum of an unknown number of unrelated calls. The subject is one
+    /// call's recovery, so the evidence is keyed by that call.
     applied: std::sync::Mutex<Vec<(String, f64)>>,
+    /// Disarmed by default, so every caller but `capacity.rs`'s mixed-batch
+    /// test sees `open_grant` resolve immediately, exactly as it always has.
+    /// Armed, each `open_grant` call parks at its own arrival order (its
+    /// "ordinal") until [`Self::release_open_grant_through`] admits it --
+    /// what lets a test dispatch several calls before any of them completes,
+    /// then release them in a chosen order instead of all at once.
+    open_grant_gate_armed: AtomicBool,
+    open_grant_ordinal: AtomicUsize,
+    released_through: AtomicUsize,
+    open_grant_gate: tokio::sync::Notify,
 }
 
 impl SettleOnceFailingLedger {
@@ -192,15 +202,21 @@ impl SettleOnceFailingLedger {
             settle_calls: AtomicUsize::new(0),
             failed_once: std::sync::Mutex::new(std::collections::HashSet::new()),
             applied: std::sync::Mutex::new(Vec::new()),
+            open_grant_gate_armed: AtomicBool::new(false),
+            open_grant_ordinal: AtomicUsize::new(0),
+            released_through: AtomicUsize::new(0),
+            open_grant_gate: tokio::sync::Notify::new(),
         })
     }
 
-    fn settle_calls(&self) -> usize {
+    /// `pub(crate)`: `starvation.rs`'s own repair-recovery tests read this
+    /// too, alongside [`Self::applied_usd`] and [`Self::applications`].
+    pub(crate) fn settle_calls(&self) -> usize {
         self.settle_calls.load(Ordering::SeqCst)
     }
 
     /// What this ledger committed for one call, and `None` if it never did.
-    fn applied_usd(&self, call_id: &str) -> Option<f64> {
+    pub(crate) fn applied_usd(&self, call_id: &str) -> Option<f64> {
         self.applied
             .lock()
             .unwrap()
@@ -209,13 +225,33 @@ impl SettleOnceFailingLedger {
             .map(|(_, usd)| *usd)
     }
 
-    fn applications(&self, call_id: &str) -> usize {
+    pub(crate) fn applications(&self, call_id: &str) -> usize {
         self.applied
             .lock()
             .unwrap()
             .iter()
             .filter(|(id, _)| id == call_id)
             .count()
+    }
+
+    /// Arm the ordinal gate: every `open_grant` call from here on parks until
+    /// [`Self::release_open_grant_through`] names its own arrival order.
+    pub(crate) fn arm_open_grant_gate(&self) {
+        self.open_grant_gate_armed.store(true, Ordering::SeqCst);
+    }
+
+    /// How many `open_grant` calls have arrived (parked or not) since the
+    /// gate was armed -- what a test polls to know a dispatched call has
+    /// actually reached the ledger before dispatching the next one.
+    pub(crate) fn open_grant_calls(&self) -> usize {
+        self.open_grant_ordinal.load(Ordering::SeqCst)
+    }
+
+    /// Let every `open_grant` call whose arrival order is at most `ordinal`
+    /// proceed -- calls that arrived later keep waiting.
+    pub(crate) fn release_open_grant_through(&self, ordinal: usize) {
+        self.released_through.store(ordinal, Ordering::SeqCst);
+        self.open_grant_gate.notify_waiters();
     }
 }
 
@@ -225,6 +261,12 @@ impl roundhouse_core::control::SpendLedger for SettleOnceFailingLedger {
         &self,
         request: roundhouse_core::control::GrantRequest,
     ) -> Result<roundhouse_core::control::Grant, roundhouse_core::control::SpendError> {
+        if self.open_grant_gate_armed.load(Ordering::SeqCst) {
+            let ordinal = self.open_grant_ordinal.fetch_add(1, Ordering::SeqCst) + 1;
+            while self.released_through.load(Ordering::SeqCst) < ordinal {
+                self.open_grant_gate.notified().await;
+            }
+        }
         self.inner.open_grant(request).await
     }
 
@@ -361,9 +403,10 @@ async fn an_unconfirmed_settlement_is_repaired_by_a_later_turn_without_a_second_
         roundhouse_core::classify::EvaluationSpend::Measured { usd, .. } => *usd,
         other => panic!("the classifier answered, so usage must be measured: {other:?}"),
     };
-    // The identity everything below is keyed by. This rig has no local fleet,
-    // so later turns route to the frontier and buy classifications of their
-    // own; only this call's settlement is the subject.
+    // The identity everything below is keyed by. This rig has no local
+    // fleet, so a turn free to buy again routes to the frontier and buys a
+    // classification of its own; only this call's settlement is the
+    // subject.
     let call_id = parked[0].record.call_id.to_string();
     drop(parked);
     assert_eq!(ledger.settle_calls(), 1);
@@ -423,10 +466,11 @@ async fn an_unconfirmed_settlement_is_repaired_by_a_later_turn_without_a_second_
          separate event, not a rewrite of the evidence"
     );
 
-    // **A repair settles; it never sends.** Stated as a relation rather than as
-    // a hard-coded count, because this rig's later turns legitimately classify:
-    // every purchase must be accounted for by a durable intent, so a repair
-    // that issued a request would show up here as a call nobody committed to.
+    // **A repair settles; it never sends.** Stated as a relation rather than
+    // as a hard-coded count, because a turn free to buy again legitimately
+    // classifies: every purchase must be accounted for by a durable intent,
+    // so a repair that issued a request would show up here as a call nobody
+    // committed to.
     let intents = intents_in(&*store, &session).await;
     assert_eq!(
         upstream.count(),
