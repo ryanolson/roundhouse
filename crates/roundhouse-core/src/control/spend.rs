@@ -79,7 +79,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-/// Dollars compare to the cent, not to the bit — see [`contract::assert_usd`],
+/// Dollars compare within a millionth of a dollar, not to the bit — see [`contract::assert_usd`],
 /// which enforces the same tolerance on every backend's balance. A grant is
 /// the other place a dollar amount computed here is compared against one that
 /// crossed a backend: the Redis ledger returns its grant through

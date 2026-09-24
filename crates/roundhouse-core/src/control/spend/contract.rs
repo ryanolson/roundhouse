@@ -130,7 +130,7 @@ const AUGUST_18: u64 = 1_787_011_200_000;
 /// 2026-09-01T00:00:00Z: the next month boundary after [`AUGUST_18`].
 const SEPTEMBER_1: u64 = 1_788_220_800_000;
 
-/// Dollars compare to the cent, not to the bit. Every backend accumulates
+/// Dollars compare within a millionth of a dollar, not to the bit. Every backend accumulates
 /// through floating-point addition, and a Lua implementation will not round the
 /// same way a Rust one does; a contract that demanded bit equality would be
 /// asserting an implementation detail rather than a balance.
