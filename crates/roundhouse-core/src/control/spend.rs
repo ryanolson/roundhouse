@@ -79,14 +79,33 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-/// Dollars compare within a millionth of a dollar, not to the bit — see [`contract::assert_usd`],
-/// which enforces the same tolerance on every backend's balance. A grant is
-/// the other place a dollar amount computed here is compared against one that
-/// crossed a backend: the Redis ledger returns its grant through
-/// `string.format("%.10f", granted)`, and reparsing that string does not
-/// always reproduce the double this process priced the same quote at, so an
-/// honest grant can land a few bits below the request it exactly covers.
+/// Dollars compare within a millionth of a dollar, not to the bit — see
+/// [`contract::assert_usd`], which enforces the same tolerance on every
+/// backend's balance, and [`amount_covers`], the one rule every comparison of
+/// a granted or ceiling amount against a quote applies. The Redis ledger
+/// returns its grant through `string.format("%.10f", granted)`, and reparsing
+/// that string does not always reproduce the double this process priced the
+/// same quote at, so an honest amount can land a few bits below the request
+/// it exactly covers.
 const GRANT_TOLERANCE_USD: f64 = 1e-6;
+
+/// Whether `amount_usd` is enough to fund a request of `requested_usd`.
+///
+/// The one rule [`Grant::covers`] and
+/// [`TurnBudget::admits`](crate::control::budget::TurnBudget::admits) both
+/// apply — a granted amount and a budget ceiling are the same kind of number
+/// compared against the same kind of quote, and a caller pricing the same
+/// tokens at the same rate card as the ledger did can still land on a
+/// different double than the ledger's own answer. See [`GRANT_TOLERANCE_USD`].
+///
+/// The tolerance is withheld when `amount_usd` is exactly zero: a zero grant
+/// or a zero ceiling is a refusal, not a rounding artifact, and letting it
+/// fund a quote smaller than the tolerance itself would quietly reopen the
+/// degrade-to-local floor a zero amount exists to hold shut.
+pub(crate) fn amount_covers(amount_usd: f64, requested_usd: f64) -> bool {
+    requested_usd <= amount_usd
+        || (amount_usd > 0.0 && requested_usd <= amount_usd + GRANT_TOLERANCE_USD)
+}
 
 use crate::control::budget::{
     Allocation, Budget, BudgetState, BudgetWindow, Exhaustion, TurnBudget,
@@ -212,7 +231,7 @@ impl Grant {
     /// on a different double than the ledger's own answer, and a bare `<`
     /// would read that agreement as a shortfall.
     pub fn covers(&self, requested_usd: f64) -> bool {
-        self.granted_usd + GRANT_TOLERANCE_USD >= requested_usd
+        amount_covers(self.granted_usd, requested_usd)
     }
 }
 
@@ -833,6 +852,20 @@ mod tests {
             window_start_ms(BudgetWindow::Monthly, mid_august),
             1_785_542_400_000
         );
+    }
+
+    #[test]
+    fn a_zero_grant_does_not_fund_a_quote_under_the_tolerance() {
+        // A zero grant is a refusal, not a rounding artifact — the ledger had
+        // nothing left to give. The tolerance exists for an honest grant that
+        // lands a few bits short of the quote it covers, and must not read a
+        // zero as "short by less than a millionth of a dollar" of a quote it
+        // never granted anything toward.
+        let exhausted = Grant {
+            granted_usd: 0.0,
+            state: LedgerState::Exhausted,
+        };
+        assert!(!exhausted.covers(5e-7));
     }
 
     #[test]

@@ -331,6 +331,13 @@ impl TurnBudget {
     /// (`roundhouse-fleet/src/local.rs`), so a zero ceiling admits every local
     /// candidate and excludes every frontier one through this one comparison.
     ///
+    /// Compared through [`amount_covers`](super::spend::amount_covers) rather
+    /// than a bare `<=`: the ceiling is a grant priced by the same ledger this
+    /// module's sibling reserves it from, and a caller pricing the dearest
+    /// candidate at the same rate card the ledger used can still land on a
+    /// different double than the ceiling it was granted — the same rounding
+    /// [`Grant::covers`](super::spend::Grant::covers) exists to tolerate.
+    ///
     /// A candidate the *ledger* refuses is not unreachable — the next turn, or
     /// the next month, may well afford it — which is why this is an `admits`
     /// axis and not a `permits` one, and why a budget-excluded frontier model
@@ -338,7 +345,9 @@ impl TurnBudget {
     pub fn admits(&self, candidate: &crate::routing::Candidate) -> bool {
         match self {
             TurnBudget::Unlimited => true,
-            TurnBudget::Granted { ceiling_usd, .. } => candidate.expected_cost_usd <= *ceiling_usd,
+            TurnBudget::Granted { ceiling_usd, .. } => {
+                super::spend::amount_covers(*ceiling_usd, candidate.expected_cost_usd)
+            }
         }
     }
 
@@ -470,6 +479,38 @@ mod tests {
         assert!(funded.admits(&candidate(0.01)));
         assert!(!funded.admits(&candidate(5.0)), "the ceiling is a ceiling");
         assert!(TurnBudget::Unlimited.admits(&candidate(5.0)));
+
+        // The tolerance a grant is compared through does not reopen the zero
+        // ceiling: a quote smaller than the tolerance itself must still be
+        // excluded, or degrade-to-local stops being an exact floor.
+        assert!(!spent.admits(&candidate(1e-9)));
+    }
+
+    #[test]
+    fn a_ceiling_a_few_bits_below_an_honest_quote_still_admits_it() {
+        // The dearest admissible frontier candidate's own price, round-tripped
+        // the way the Redis ledger returns a grant: through `%.10f` and back.
+        // That reparse does not always reproduce the double this process
+        // priced the quote at, so an honest ceiling can land a few bits below
+        // the quote it is meant to exactly cover.
+        let quote_usd = 0.00012435000000000001;
+        let ceiling_usd: f64 = format!("{quote_usd:.10}").parse().unwrap();
+        assert!(
+            ceiling_usd < quote_usd,
+            "fixture must reproduce the round-trip loss, or this test proves \
+             nothing: quote {quote_usd}, ceiling {ceiling_usd}"
+        );
+
+        let funded = TurnBudget::Granted {
+            ceiling_usd,
+            state: BudgetState::Unconstrained,
+            on_exhaustion: Exhaustion::degrade_with_overflow(),
+        };
+        assert!(
+            funded.admits(&candidate(quote_usd)),
+            "a ceiling short only by the ledger's own decimal round trip must \
+             not exclude the quote it was granted to cover"
+        );
     }
 
     #[test]
