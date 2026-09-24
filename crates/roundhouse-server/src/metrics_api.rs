@@ -476,6 +476,38 @@ mod tests {
         found
     }
 
+    /// The source text of `function name(...) { ... }` in `page`, matched by
+    /// brace depth so a `{` inside a template literal or a nested block
+    /// cannot end the extraction early.
+    ///
+    /// **Why a scoped search at all.** `DASHBOARD_HTML.contains("m.calls")`
+    /// is satisfied by `renderModels`'s serving table as readily as by
+    /// `renderEvaluation`'s own table -- both bind a row to `m` and print
+    /// `m.calls` -- so a check against the whole page proves nothing about
+    /// which table actually renders a field. Extracting one function's body
+    /// first is what lets `contains` mean "this table," not "this page."
+    fn function_body<'a>(page: &'a str, name: &str) -> &'a str {
+        let needle = format!("function {name}(");
+        let start = page
+            .find(&needle)
+            .unwrap_or_else(|| panic!("the dashboard defines no `{name}`"));
+        let open = start + page[start..].find('{').expect("a function has a body");
+        let mut depth = 0usize;
+        for (offset, ch) in page[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &page[start..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{name}`'s body never closes its own braces")
+    }
+
     /// The page reads only fields the document publishes, under those names.
     ///
     /// The one failure this catches is silent in both directions: a renamed JSON
@@ -532,6 +564,13 @@ mod tests {
             row.is_object(),
             "the fixture classified a turn, so there is a row to check against"
         );
+        let evaluation_table = function_body(DASHBOARD_HTML, "renderEvaluation");
+        assert!(
+            !evaluation_table.contains("m.coverage"),
+            "red-test control: `m.coverage` belongs to `renderModels`'s serving \
+             table, not `renderEvaluation` -- if this extraction ever widens to \
+             include the wrong function, this must be the first thing to fail"
+        );
         for field in [
             "requested_model",
             "reported_model",
@@ -543,7 +582,7 @@ mod tests {
             "tokens",
         ] {
             assert!(
-                DASHBOARD_HTML.contains(&format!("m.{field}")),
+                evaluation_table.contains(&format!("m.{field}")),
                 "the evaluation table publishes `{field}` and does not render it"
             );
             assert!(row.get(field).is_some(), "the row lost `{field}`: {row}");
