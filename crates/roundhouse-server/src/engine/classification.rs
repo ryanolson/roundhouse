@@ -79,8 +79,10 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// that same, already-elapsed deadline ends `Unconfirmed` the same way a
     /// slow backend answer would. Withholding a ticket for that would starve
     /// this session's own classification at the very steady state described
-    /// above, over an entry that owes nothing and that the repair loop clears
-    /// on its next free permit regardless. [`Self::owes_settlement`] is what
+    /// above, over an entry that owes nothing and that never queues ahead of
+    /// a real one: `ClassificationRuntime::repair_batch` offers a positive
+    /// amount before any zero-dollar entry, however much longer the
+    /// zero-dollar entry has been waiting. [`Self::owes_settlement`] is what
     /// keeps the two cases apart.
     ///
     /// `None` on every deployment that configured no classifier — the
@@ -290,10 +292,13 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// deadline fired before an answer came back — ends `Unconfirmed`, and
     /// `EvaluationSpend::unconfirmed_settlement_usd` reports that release as
     /// `Some(0.0)`. That entry lapses on its own once the hold's TTL passes;
-    /// it is not a debt, and the repair loop clears it on the next free
-    /// permit regardless of whether this predicate ever withholds anything
-    /// for it. Only a positive amount is worth suspending this session's own
-    /// classification for — see [`Self::classification_before_turn`].
+    /// it is not a debt, and it never delays a positive entry's repair —
+    /// `ClassificationRuntime::repair_batch` offers every positive amount
+    /// before any zero-dollar one, so a real debt is never left waiting
+    /// behind a wall of zero-dollar releases that merely arrived first,
+    /// whatever this predicate does. Only a positive amount is worth
+    /// suspending this session's own classification for — see
+    /// [`Self::classification_before_turn`].
     fn owes_settlement(session: &Session<S>) -> bool {
         session
             .state()

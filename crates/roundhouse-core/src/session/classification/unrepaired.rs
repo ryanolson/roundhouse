@@ -1,23 +1,33 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Arrival-ordered settlements with indexed removal by call identity.
+//! Priority-ordered settlements with indexed removal by call identity.
 //!
-//! The index avoids scanning an outage backlog for each acknowledgement.
-//! The ordered map preserves oldest-first repair scheduling.
+//! The index avoids scanning an outage backlog for each acknowledgement. The
+//! ordered map preserves positive-amount-first, then-oldest-arrival repair
+//! scheduling — see [`UnrepairedSettlements::priority`] for why the amount
+//! is part of the sort key rather than a filter applied after it.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::classify::UnconfirmedSettlement;
 use crate::ids::ResponseId;
 
-/// Settlements the log says nobody has confirmed, oldest arrival first.
+/// `(owes_nothing, arrival)`: `false` sorts before `true`, so every positive
+/// amount precedes every zero-dollar one, and arrival order still breaks
+/// ties within each group.
+type PriorityKey = (bool, u64);
+
+/// Settlements the log says nobody has confirmed, positive amounts first and
+/// oldest arrival first within each group.
 #[derive(Debug, Default)]
 pub(super) struct UnrepairedSettlements {
-    /// Arrival order determines which pending settlements are offered first.
-    entries: BTreeMap<u64, UnconfirmedSettlement>,
-    /// The arrival key for each pending call, removed with its settlement.
-    index: HashMap<ResponseId, u64>,
+    /// Priority order determines which pending settlements are offered
+    /// first: every positive amount before every zero-dollar one, oldest
+    /// arrival first within each group.
+    entries: BTreeMap<PriorityKey, UnconfirmedSettlement>,
+    /// The priority key for each pending call, removed with its settlement.
+    index: HashMap<ResponseId, PriorityKey>,
     /// Monotonic arrival keys, reconstructed in the same order during replay.
     next: u64,
     /// Settlements visited during removal, excluding map lookup comparisons.
@@ -34,30 +44,47 @@ pub(super) struct UnrepairedSettlements {
 }
 
 impl UnrepairedSettlements {
+    /// The sort key one settlement occupies: positive amounts group ahead of
+    /// zero-dollar ones, so a real debt is never scheduled behind a
+    /// zero-dollar release that merely arrived first.
+    ///
+    /// **The same predicate `owes_settlement` uses** (`usd > 0.0`), so the
+    /// question "does this session owe a repair" and the question "which
+    /// entry does the repair loop offer first" can never disagree about a
+    /// single settlement.
+    fn priority(usd: f64, arrival: u64) -> PriorityKey {
+        (usd <= 0.0, arrival)
+    }
+
     /// Record a settlement whose result said nobody acknowledged the charge.
     pub(super) fn push(&mut self, settlement: UnconfirmedSettlement) {
         let arrival = self.next;
         self.next += 1;
+        let key = Self::priority(settlement.usd, arrival);
         // Keep both maps paired even if a caller replaces a pending identity.
-        if let Some(previous) = self.index.insert(settlement.call_id.clone(), arrival) {
+        if let Some(previous) = self.index.insert(settlement.call_id.clone(), key) {
             self.entries.remove(&previous);
         }
-        self.entries.insert(arrival, settlement);
+        self.entries.insert(key, settlement);
     }
 
     /// Remove the named settlement. Missing and repeated acknowledgements change nothing.
     pub(super) fn remove(&mut self, call_id: &ResponseId) {
-        let Some(arrival) = self.index.remove(call_id) else {
+        let Some(key) = self.index.remove(call_id) else {
             return;
         };
         #[cfg(test)]
         {
             self.examined += 1;
         }
-        self.entries.remove(&arrival);
+        self.entries.remove(&key);
     }
 
-    /// Borrowed arrival order lets scheduling select a prefix without copying the backlog.
+    /// Borrowed priority order lets scheduling select a prefix without
+    /// copying the backlog: every positive amount before any zero-dollar
+    /// entry, oldest first within each group, in one `O(max_in_flight)`
+    /// walk of an already-sorted map rather than a scan of the backlog
+    /// looking for one.
     pub(super) fn iter(&self) -> impl ExactSizeIterator<Item = &UnconfirmedSettlement> {
         self.entries.values()
     }
@@ -148,6 +175,63 @@ mod tests {
 
         backlog.remove(&ResponseId::new("eval_1"));
         paired(&backlog, 0, "and one acknowledgement drains it");
+    }
+
+    /// **A positive amount is never scheduled behind a zero-dollar entry
+    /// that merely arrived first.** A zero-dollar release is the routine
+    /// result of a call whose own deadline fired before an answer came
+    /// back, not a rare failure — oldest-arrival-only order would let a
+    /// wall of these delay the one entry that is an actual debt, one
+    /// `max_in_flight`-sized turn at a time.
+    #[test]
+    fn a_positive_amount_precedes_every_zero_dollar_entry_that_arrived_before_it() {
+        let mut backlog = UnrepairedSettlements::default();
+        backlog.push(settlement("eval_zero_1", 0.0));
+        backlog.push(settlement("eval_zero_2", 0.0));
+        backlog.push(settlement("eval_zero_3", 0.0));
+        backlog.push(settlement("eval_positive", 0.02));
+
+        assert_eq!(
+            backlog
+                .iter()
+                .map(|entry| entry.call_id.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "eval_positive".to_string(),
+                "eval_zero_1".to_string(),
+                "eval_zero_2".to_string(),
+                "eval_zero_3".to_string(),
+            ],
+            "the positive entry must be offered first even though every \
+             zero-dollar entry arrived before it"
+        );
+    }
+
+    /// Within each group -- positive and zero-dollar -- arrival order is
+    /// still the tiebreaker: two positive entries keep their own oldest-first
+    /// order, and the zero-dollar entries that follow them keep theirs.
+    #[test]
+    fn each_priority_group_keeps_its_own_oldest_first_order() {
+        let mut backlog = UnrepairedSettlements::default();
+        backlog.push(settlement("eval_zero_1", 0.0));
+        backlog.push(settlement("eval_positive_1", 0.02));
+        backlog.push(settlement("eval_zero_2", 0.0));
+        backlog.push(settlement("eval_positive_2", 0.05));
+        backlog.push(settlement("eval_zero_3", 0.0));
+
+        assert_eq!(
+            backlog
+                .iter()
+                .map(|entry| entry.call_id.to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "eval_positive_1".to_string(),
+                "eval_positive_2".to_string(),
+                "eval_zero_1".to_string(),
+                "eval_zero_2".to_string(),
+                "eval_zero_3".to_string(),
+            ]
+        );
     }
 
     /// Interior removal must preserve oldest-first scheduling.

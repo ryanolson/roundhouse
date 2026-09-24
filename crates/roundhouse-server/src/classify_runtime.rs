@@ -597,8 +597,16 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
         });
     }
 
-    /// Select a borrowed, oldest-first prefix without collecting or scanning the backlog.
-    /// The fixed limit bounds scheduling even when failed workers return permits during the loop.
+    /// Select a borrowed prefix without collecting or scanning the backlog.
+    /// The fixed limit bounds scheduling even when failed workers return
+    /// permits during the loop.
+    ///
+    /// **A prefix, not a re-sort.** `unrepaired` already arrives in the
+    /// priority order the fold maintains -- every positive amount before
+    /// any zero-dollar entry, oldest first within each group -- so a real
+    /// debt is never scheduled behind a zero-dollar release that merely
+    /// arrived first, however deep this turn's own `max_in_flight` window
+    /// reaches into the backlog.
     pub(crate) fn repair_batch<'a, I>(
         &self,
         unrepaired: I,

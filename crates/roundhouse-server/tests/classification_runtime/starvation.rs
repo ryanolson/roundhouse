@@ -355,3 +355,259 @@ async fn a_zero_dollar_release_does_not_withhold_the_next_turns_ticket() {
          owes nothing, so there is no repair for it to protect a permit for"
     );
 }
+
+/// How many durable `ClassificationRecorded` events this session's log holds
+/// whose settlement is zero-dollar and unconfirmed -- the routine release a
+/// deadline-fired call submits, not a rare failure.
+async fn zero_dollar_unconfirmed_results(store: &impl SessionStore, session: &SessionId) -> usize {
+    store
+        .read_events(session, 0, 1_000)
+        .await
+        .expect("a log reads")
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ClassificationRecorded { record }
+                    if record
+                        .outcome
+                        .spend()
+                        .and_then(|spend| spend.unconfirmed_settlement_usd())
+                        == Some(0.0)
+            )
+        })
+        .count()
+}
+
+/// **A real debt must not wait behind a wall of zero-dollar releases that
+/// merely arrived first.**
+///
+/// At one in-flight slot, over a classifier whose first three calls hang --
+/// each cut short only by its own `call_ttl_ms`, the routine shape a
+/// deadline firing before an answer comes back produces -- three zero-dollar
+/// unconfirmed entries accumulate in the log, one per turn that delivers the
+/// previous call and dispatches the next (`t1` dispatches the first; `t2`
+/// delivers it and dispatches the second; and so on). The fourth call
+/// answers normally, and [`SettleOnceFailingLedger`] -- which fails every
+/// call's first settle attempt regardless of timing -- turns it into a
+/// genuine positive debt the same way it turns any answered call's settle
+/// into one.
+///
+/// The turn that delivers the fourth call's result (`t5`) is also the turn
+/// that first owes a real repair, so it withholds its own new ticket (the
+/// self-starvation fix `a_sessions_own_new_ticket_does_not_starve_its_owed_repair`
+/// covers) rather than spending the freed permit on a fifth purchase --
+/// which is exactly what leaves that permit for the repair loop. Without
+/// `repair_batch`'s positive-first ordering, that permit would go to the
+/// oldest of the three zero-dollar entries instead, and the fourth call's
+/// own debt would wait one more `max_in_flight`-sized turn for each
+/// zero-dollar entry ahead of it -- four turns in this shape, not one.
+#[tokio::test]
+async fn a_positive_debt_is_repaired_ahead_of_zero_dollar_entries_that_arrived_first() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::response::Response;
+    use axum::routing::post;
+    use std::future::pending;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let handler_calls = Arc::clone(&calls);
+    let handler_arrived = Arc::clone(&arrived);
+    let app = Router::new().route(
+        "/systemone",
+        post(move || {
+            let calls = Arc::clone(&handler_calls);
+            let arrived = Arc::clone(&handler_arrived);
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                arrived.notify_one();
+                if n <= 3 {
+                    pending::<Response>().await
+                } else {
+                    Response::new(Body::from(
+                        roundhouse_server::test_support::classification::ANSWER,
+                    ))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let base_url = format!("http://{addr}");
+
+    let classify = classify_config(&base_url, |value| {
+        value["enabled"] = serde_json::json!(true);
+        value["executor"]["max_in_flight"] = serde_json::json!(1);
+        value["executor"]["call_ttl_ms"] = serde_json::json!(1_000);
+    });
+    let ledger = SettleOnceFailingLedger::new();
+    let runtime = compose(
+        "<test>",
+        &classify,
+        ledger.clone() as Arc<dyn roundhouse_core::control::SpendLedger>,
+        ByteTokenizer,
+        &env,
+    )
+    .expect("it composes")
+    .expect("and is present");
+    let store = Arc::new(MemoryStore::new());
+    let engine = engine_over(
+        Arc::clone(&store),
+        Arc::new(Answering) as Arc<dyn FrontierClient>,
+        Arc::clone(&runtime),
+    );
+    let session = SessionId::new("sess_repair_priority");
+    engine.create_session(&session).await.unwrap();
+
+    let turn = |id: &'static str, text: &'static str| {
+        let engine = Arc::clone(&engine);
+        let session = session.clone();
+        async move {
+            engine
+                .run_turn(
+                    &session,
+                    TurnId::new(id),
+                    vec![Item::user_text(text)],
+                    &Admission::open(),
+                )
+                .await
+                .expect("this fleet always answers")
+        }
+    };
+
+    /// Wait for the `want`th call to reach the upstream, then for the
+    /// runtime to park at least `count` results for this session -- bounded
+    /// on the arrival notification rather than a guessed sleep, and on the
+    /// park count rather than the elapsed time, so this does not race the
+    /// classifier's own `call_ttl_ms`.
+    async fn await_call_then_parked(
+        arrived: &tokio::sync::Notify,
+        calls: &AtomicUsize,
+        want: usize,
+        runtime: &Arc<ClassificationRuntime<ByteTokenizer>>,
+        session: &SessionId,
+        count: usize,
+    ) {
+        while calls.load(Ordering::SeqCst) < want {
+            tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+                .await
+                .expect("the call must reach the upstream");
+        }
+        for _ in 0..600 {
+            if runtime.ready(session).await.len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("call {want} never parked a result");
+    }
+
+    turn("t1", "fix the parser").await;
+    await_call_then_parked(&arrived, &calls, 1, &runtime, &session, 1).await;
+    {
+        let parked = runtime.ready(&session).await;
+        assert_eq!(
+            parked[0]
+                .record
+                .outcome
+                .spend()
+                .and_then(|spend| spend.unconfirmed_settlement_usd()),
+            Some(0.0),
+            "the first call must hang past its own deadline and release at zero"
+        );
+    }
+
+    turn("t2", "add a test").await;
+    await_call_then_parked(&arrived, &calls, 2, &runtime, &session, 1).await;
+    {
+        let parked = runtime.ready(&session).await;
+        assert_eq!(
+            parked[0]
+                .record
+                .outcome
+                .spend()
+                .and_then(|spend| spend.unconfirmed_settlement_usd()),
+            Some(0.0),
+            "the second call must release at zero the same way"
+        );
+    }
+
+    turn("t3", "one more").await;
+    await_call_then_parked(&arrived, &calls, 3, &runtime, &session, 1).await;
+    {
+        let parked = runtime.ready(&session).await;
+        assert_eq!(
+            parked[0]
+                .record
+                .outcome
+                .spend()
+                .and_then(|spend| spend.unconfirmed_settlement_usd()),
+            Some(0.0),
+            "the third call must release at zero the same way"
+        );
+    }
+
+    // t4 delivers the third zero-dollar result -- the accumulated premise
+    // this test is about -- and dispatches the fourth call, the one this
+    // classifier answers normally.
+    turn("t4", "and another").await;
+    assert_eq!(
+        zero_dollar_unconfirmed_results(&*store, &session).await,
+        3,
+        "three zero-dollar entries must have accumulated before the debt \
+         this test is about even exists"
+    );
+
+    let call4_id = {
+        let mut found = None;
+        for _ in 0..600 {
+            let parked = runtime.ready(&session).await;
+            if let Some(entry) = parked.first() {
+                let spend = entry
+                    .record
+                    .outcome
+                    .spend()
+                    .expect("the fourth call answered, so a spend was attempted");
+                assert_eq!(
+                    spend.settled(),
+                    roundhouse_core::classify::SettlementAck::Unconfirmed,
+                    "SettleOnceFailingLedger fails every call's first settle"
+                );
+                assert!(
+                    spend.unconfirmed_settlement_usd().unwrap_or(0.0) > 0.0,
+                    "the fourth call answered normally and must carry a \
+                     positive, unconfirmed debt: {spend:?}"
+                );
+                found = Some(entry.record.call_id.to_string());
+                break;
+            }
+            drop(parked);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        found.expect("the fourth call must complete and park a result")
+    };
+
+    // t5 delivers the fourth call's result. Delivering it is what first
+    // makes this session owe a real repair, so t5 withholds its own new
+    // ticket rather than spending the just-freed permit on a fifth
+    // purchase -- leaving that permit for the repair loop below to find.
+    turn("t5", "keep going").await;
+    let mut recovered = None;
+    for _ in 0..300 {
+        recovered = ledger.applied_usd(&call4_id);
+        if recovered.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        recovered.is_some(),
+        "the fourth call's own debt must be repaired within a turn or two \
+         of becoming one, not after every zero-dollar entry ahead of it has \
+         first been drained one at a time"
+    );
+}
