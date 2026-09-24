@@ -864,6 +864,7 @@ fn transport_reason(error: &SystemOneError) -> &'static str {
 /// The same treatment for an answer set that arrived and cannot be used.
 fn signal_reason(signal: SignalError) -> &'static str {
     match signal {
+        SignalError::MalformedAnswers => "malformed_answers",
         SignalError::MissingAnswer => "missing_answer",
         SignalError::UnexpectedAnswer => "unexpected_answer",
         SignalError::NotAChoice => "not_a_choice",

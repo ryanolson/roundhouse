@@ -77,6 +77,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use roundhouse_core::control::{CredentialError, TurnCredential};
@@ -209,6 +210,12 @@ pub struct SystemOneReply {
 /// Unit variants keep untrusted response keys and values out of diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SignalError {
+    /// `answers` was `null`, was not a JSON object, or held a value
+    /// [`serde_json`] itself could not parse — a non-finite number, for one.
+    /// Held apart from every fault below, which is about one answer inside an
+    /// otherwise-usable batch.
+    #[error("`answers` did not parse as a batch of answers")]
+    MalformedAnswers,
     #[error("no answer came back under a key some question was asked under")]
     MissingAnswer,
     /// Answer ids must match the request. Unrelated envelope fields remain allowed.
@@ -575,7 +582,7 @@ impl SystemOneClient {
         Ok(SystemOneReply {
             usage,
             reported_model,
-            answers: Self::signal(&envelope.answers, questions),
+            answers: Self::signal(envelope.answers.as_deref(), questions),
         })
     }
 
@@ -583,10 +590,22 @@ impl SystemOneClient {
     ///
     /// **All or nothing.** The first fault ends the batch, so a caller never
     /// sees a partial answer set it would have to decide the sufficiency of.
+    ///
+    /// `answers` arrives unparsed: the envelope holds it as a [`RawValue`] so
+    /// that a shape [`serde_json`] cannot even read as a `Value` -- `null`, a
+    /// non-object, or a number too extreme for `f64` -- fails only here,
+    /// after `usage` has already been read off the same envelope.
     fn signal(
-        answers: &BTreeMap<String, Value>,
+        answers: Option<&RawValue>,
         questions: &BTreeMap<String, ChoiceQuestion>,
     ) -> Result<BTreeMap<String, ChoiceAnswer>, SignalError> {
+        let answers: BTreeMap<String, Value> = match answers {
+            // Absent and `null` read the same: no answer arrived under any
+            // key, so the batch is empty rather than a distinct fault.
+            None => BTreeMap::new(),
+            Some(raw) => serde_json::from_str(raw.get())
+                .map_err(|_| SignalError::MalformedAnswers)?,
+        };
         // The id set first, for the same reason [`Self::answer`] checks a
         // question's options before its distribution: a reply whose ids are not
         // this request's ids is not this request's reply, and reporting a bad
@@ -678,8 +697,15 @@ fn bearer_key(headers: &HeaderMap) -> Option<String> {
 /// that refused one would break on a deployment nobody touched.
 #[derive(Debug, Deserialize)]
 struct Envelope {
+    /// Held unparsed, for the reason `usage` and `model` below are held as a
+    /// bare `Value`: a wrong-shaped `answers` -- `null`, a non-object, or a
+    /// number too extreme for `f64` -- must not fail the envelope and take
+    /// `usage` down with it. `RawValue` goes one step further than `Value`
+    /// does for those two, because a non-finite number fails to parse *as* a
+    /// `Value` -- deferring that parse to [`SystemOneClient::signal`] is what
+    /// keeps the failure inside the one field that carried it.
     #[serde(default)]
-    answers: BTreeMap<String, Value>,
+    answers: Option<Box<RawValue>>,
     #[serde(default)]
     usage: Option<Value>,
     /// Held as a `Value` for the reason `usage` is: a wrong-shaped one is an

@@ -274,16 +274,61 @@ mod signal {
     }
 
     /// Why `signal`'s `is_finite` guard has no fixture in the table above:
-    /// JSON carries no NaN or infinity literal, and a number that overflows
-    /// `f64` fails the envelope rather than arriving as one. The guard states
-    /// what the range means; this records that the wire cannot reach it.
+    /// JSON carries no NaN or infinity literal, so the wire cannot reach it
+    /// directly. A number that overflows `f64` instead fails to parse at all,
+    /// and `answers` is held unparsed for exactly this reason: the failure is
+    /// confined to the answer that carried it, and the usage beside it still
+    /// arrives.
     #[test]
-    fn a_probability_that_overflows_f64_fails_the_envelope() {
+    fn a_probability_that_overflows_f64_fails_only_the_answers() {
         let overflowing = r#"{"type":"choice","choice":"capable","probabilities":{"capable":1e400,"efficient":0.15},"confidence":0.8}"#;
+        let reply = SystemOneClient::reply(&envelope(overflowing, USAGE), &one())
+            .expect("the envelope parses; only the answer is unusable");
         assert_eq!(
-            SystemOneClient::reply(&envelope(overflowing, USAGE), &one()),
-            Err(SystemOneError::Malformed)
+            reply.usage,
+            Some(SystemOneUsage {
+                input_tokens: 312,
+                output_tokens: 48
+            }),
+            "a number one answer cannot carry must not discard the usage beside it"
         );
+        assert!(reply.answers.is_err());
+    }
+
+    /// An explicit `null` for `answers` is a wrong-shaped batch, not a
+    /// wrong-shaped envelope: the reported usage still arrives, and only the
+    /// answers come back refused.
+    #[test]
+    fn a_null_answers_block_keeps_the_usage_and_fails_only_the_answers() {
+        let raw = br#"{"answers":null,"usage":{"input_tokens":900,"output_tokens":4}}"#;
+        let reply = SystemOneClient::reply(raw, &one()).expect("the envelope parses");
+        assert_eq!(
+            reply.usage,
+            Some(SystemOneUsage {
+                input_tokens: 900,
+                output_tokens: 4
+            })
+        );
+        assert!(
+            reply.answers.is_err(),
+            "no answer arrived under any key that was asked under"
+        );
+    }
+
+    /// A non-object `answers` -- a string, here -- is the same wrong-shaped
+    /// batch as `null`, and is refused the same way rather than taken apart.
+    #[test]
+    fn a_non_object_answers_block_keeps_the_usage_and_fails_only_the_answers() {
+        let raw = br#"{"answers":"not a batch","usage":{"input_tokens":900,"output_tokens":4}}"#;
+        let reply = SystemOneClient::reply(raw, &one()).expect("the envelope parses");
+        assert_eq!(
+            reply.usage,
+            Some(SystemOneUsage {
+                input_tokens: 900,
+                output_tokens: 4
+            })
+        );
+        assert_eq!(reply.answers, Err(SignalError::MalformedAnswers));
     }
 
     /// D5. An answer of another question type is not a `choice`, whether or not
