@@ -79,6 +79,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
+/// Dollars compare to the cent, not to the bit — see [`contract::assert_usd`],
+/// which enforces the same tolerance on every backend's balance. A grant is
+/// the other place a dollar amount computed here is compared against one that
+/// crossed a backend: the Redis ledger returns its grant through
+/// `string.format("%.10f", granted)`, and reparsing that string does not
+/// always reproduce the double this process priced the same quote at, so an
+/// honest grant can land a few bits below the request it exactly covers.
+const GRANT_TOLERANCE_USD: f64 = 1e-6;
+
 use crate::control::budget::{
     Allocation, Budget, BudgetState, BudgetWindow, Exhaustion, TurnBudget,
 };
@@ -194,6 +203,16 @@ impl Grant {
             state: self.state.into(),
             on_exhaustion,
         }
+    }
+
+    /// Whether this grant is enough to fund a quote of `requested_usd`.
+    ///
+    /// Within [`GRANT_TOLERANCE_USD`] counts as covering it: a caller pricing
+    /// the same tokens at the same rate card as the ledger did can still land
+    /// on a different double than the ledger's own answer, and a bare `<`
+    /// would read that agreement as a shortfall.
+    pub fn covers(&self, requested_usd: f64) -> bool {
+        self.granted_usd + GRANT_TOLERANCE_USD >= requested_usd
     }
 }
 

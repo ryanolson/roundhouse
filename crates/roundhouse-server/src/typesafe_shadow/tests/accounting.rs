@@ -49,6 +49,66 @@ async fn a_short_or_zero_grant_makes_no_call_and_says_so_durably() {
     }
 }
 
+/// **A grant short only by the ledger's own round trip still funds the call.**
+///
+/// The Redis backend hands a grant back through `%.10f`, and reparsing that
+/// string does not always reproduce the double this process priced the quote
+/// at — the same arithmetic run through a decimal string and back can land a
+/// few bits lower. A raw `<` reads that as a refusal for a quote the ledger
+/// in fact covered in full; the tolerance the spend contract already defines
+/// for comparing dollars is what a grant must be measured against instead.
+#[tokio::test]
+async fn a_grant_short_only_by_the_ledgers_own_round_trip_still_funds_the_call() {
+    let (addr, up) = upstream(ANSWER).await;
+    let pricing = ProviderPricing {
+        input_per_mtok_usd: 0.15,
+        cached_input_per_mtok_usd: 0.0,
+        cache_write_per_mtok_usd: 0.0,
+        output_per_mtok_usd: 0.6,
+    };
+    let config = ShadowConfig::new("jev-1.12", pricing, 64, caps(), CONFIG_REVISION);
+    let credential = credential();
+
+    // The same formula `prepare` quotes a call with, at the exact token
+    // counts that reproduce the round-trip loss: 573 input, 64 output.
+    let requested_usd = pricing.price(&Usage {
+        input_tokens: 573,
+        output_tokens: 64,
+        ..Default::default()
+    });
+    // A Redis grant is `string.format("%.10f", granted)`, parsed back by
+    // `f64_at` — simulated here without a Redis instance, since the loss is
+    // a property of the decimal round trip and not of the store behind it.
+    let granted_usd: f64 = format!("{requested_usd:.10}").parse().unwrap();
+    assert!(
+        granted_usd < requested_usd,
+        "the fixture must reproduce the round-trip loss, or this test proves \
+         nothing: requested {requested_usd}, granted {granted_usd}"
+    );
+    let ledger = RecordingLedger::granting(granted_usd);
+    let shadow = shadow(addr, config, ledger.clone());
+
+    let projection = shadow.projection(&capture(), &[], &[]).unwrap();
+    let mut prepared = shadow
+        .prepare(call(&credential), &projection, Some(&[frontier()]))
+        .expect("prepared");
+    prepared.intent.reservation.requested_usd = requested_usd;
+
+    let record = shadow.execute(prepared, never()).await;
+
+    assert!(
+        matches!(record.outcome, ClassificationOutcome::Classified { .. }),
+        "a grant short only by the ledger's own decimal round trip must not \
+         read as a budget refusal: {:?}",
+        record.outcome
+    );
+    assert_eq!(
+        up.count(),
+        1,
+        "and the call the ledger in fact covered must reach the upstream"
+    );
+}
+
 /// A ledger nobody can reach fails closed, and records that it did.
 #[tokio::test]
 async fn an_unavailable_ledger_makes_no_call() {

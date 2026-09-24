@@ -709,7 +709,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         // quote is equally a refusal: the prompt is already written and its
         // price is not negotiable downwards, so a partial reservation buys
         // nothing and is handed straight back rather than left to lapse.
-        if grant.granted_usd < reservation.requested_usd {
+        if !grant.covers(reservation.requested_usd) {
             // Bounded like every other ledger wait, and its answer is
             // deliberately not read: the refusal below is established by the
             // grant, and whether the release was acknowledged changes neither

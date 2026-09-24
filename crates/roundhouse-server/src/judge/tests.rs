@@ -6,8 +6,8 @@
 use super::*;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{
-    Allocation, Balance, BalanceQuery, Budget, BudgetWindow, DEFAULT_WARN_AT, Exhaustion,
-    MemorySpendLedger, Principal,
+    Allocation, Balance, BalanceQuery, Budget, BudgetWindow, DEFAULT_WARN_AT, Exhaustion, Grant,
+    LedgerState, MemorySpendLedger, Principal, Settled, SpendError,
 };
 use roundhouse_core::ids::{SessionId, SideCallId};
 use roundhouse_core::routing::{CacheModel, ProviderPricing};
@@ -520,6 +520,96 @@ async fn a_budget_with_no_room_skips_the_check_instead_of_failing_the_turn() {
         .await
         .expect("a funded membership gets its check");
     assert_eq!(client.seen.lock().expect("recording").len(), 1);
+}
+
+/// A ledger that answers the way the Redis backend's own `%.10f` round trip
+/// does: whatever a grant is asked for, formatted to ten decimal places and
+/// reparsed, which can land a few bits below what this process priced the
+/// same quote at through ordinary double rounding.
+struct RoundedLedger;
+
+#[async_trait]
+impl SpendLedger for RoundedLedger {
+    async fn open_grant(&self, request: GrantRequest) -> Result<Grant, SpendError> {
+        Ok(Grant {
+            granted_usd: format!("{:.10}", request.requested_usd).parse().unwrap(),
+            state: LedgerState::Unconstrained,
+        })
+    }
+
+    async fn settle_grant(&self, settlement: Settlement) -> Result<Settled, SpendError> {
+        Ok(Settled {
+            applied: true,
+            released_usd: 0.0,
+            committed_usd: settlement.actual_usd,
+        })
+    }
+
+    async fn balance(&self, _query: BalanceQuery) -> Result<Balance, SpendError> {
+        unimplemented!("no test here reads a balance")
+    }
+}
+
+/// **A grant short only by the ledger's own round trip still funds the
+/// check.** The same defect `typesafe_shadow::reserve` carries: a Redis
+/// grant comes back through `%.10f`, and reparsing it does not always
+/// reproduce the double this process priced the quote at, so a raw `<`
+/// against `cost_usd` reads an honest grant as `Unaffordable`.
+#[tokio::test]
+async fn a_grant_short_only_by_the_ledgers_own_round_trip_still_funds_the_check() {
+    let client = Arc::new(RecordingClient::default());
+    let spec = FrontierModelSpec {
+        pricing: ProviderPricing {
+            input_per_mtok_usd: 0.15,
+            cached_input_per_mtok_usd: 0.0,
+            cache_write_per_mtok_usd: 0.0,
+            output_per_mtok_usd: 0.6,
+        },
+        ..spec()
+    };
+    let judge = FleetJudge::new(
+        Arc::clone(&client) as Arc<dyn FrontierClient>,
+        spec,
+        ByteTokenizer,
+        120_000,
+        JudgeConfig {
+            expected_output_tokens: 64,
+            ..JudgeConfig::default()
+        },
+    )
+    .with_spend_ledger(Arc::new(RoundedLedger) as Arc<dyn SpendLedger>);
+
+    // 573 input tokens, at the exact token count that reproduces the
+    // round-trip loss against this pricing.
+    let brief = "x".repeat(565);
+    let tokens = ByteTokenizer.encode(&format!("system\n\n{brief}")).len() as u64;
+    assert_eq!(
+        tokens, 573,
+        "the fixture must hit the exact token count the round-trip loss needs"
+    );
+    let cost_usd = judge.estimated_cost_usd(tokens);
+    let granted_usd: f64 = format!("{cost_usd:.10}").parse().unwrap();
+    assert!(
+        granted_usd < cost_usd,
+        "the fixture must reproduce the round-trip loss, or this test proves \
+         nothing: cost {cost_usd}, granted {granted_usd}"
+    );
+
+    let funded = terms(100.0);
+    let outcome = judge
+        .consult(&Check::nth(0).under(Some(&funded)), "system", &brief)
+        .await;
+
+    assert!(
+        outcome.is_ok(),
+        "a grant short only by the ledger's own decimal round trip must not \
+         read as unaffordable: {outcome:?}"
+    );
+    assert_eq!(
+        client.seen.lock().expect("recording").len(),
+        1,
+        "and the check the ledger in fact covered must reach the provider"
+    );
 }
 
 #[tokio::test]

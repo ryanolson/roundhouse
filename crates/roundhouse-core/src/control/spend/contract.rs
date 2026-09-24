@@ -137,7 +137,7 @@ const SEPTEMBER_1: u64 = 1_788_220_800_000;
 #[track_caller]
 pub fn assert_usd(actual: f64, expected: f64, what: &str) {
     assert!(
-        (actual - expected).abs() < 1e-6,
+        (actual - expected).abs() < super::GRANT_TOLERANCE_USD,
         "{what}: expected ${expected}, got ${actual}"
     );
 }

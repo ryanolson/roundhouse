@@ -351,7 +351,7 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
                 return Err(JudgeFailure::Unaffordable);
             }
         };
-        if grant.granted_usd < cost_usd {
+        if !grant.covers(cost_usd) {
             self.settle(side_call, 0.0).await;
             return Err(JudgeFailure::Unaffordable);
         }
