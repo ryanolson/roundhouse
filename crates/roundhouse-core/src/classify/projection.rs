@@ -155,11 +155,14 @@ impl PromptCapture {
             .map_or(0, |index| index + 1);
         let current = &input[boundary..];
 
-        // The marker costs from the same budget `truncate` charges it to, so a
-        // capture and a truncated string of the same cap are the same length.
-        let keep = caps
-            .max_prompt_chars
-            .saturating_sub(TRUNCATION_MARKER.chars().count());
+        // Copied up to the cap itself, not to `keep`: `brief::truncate` cuts
+        // a string it already holds whole down to `keep` only when the whole
+        // thing is longer than the cap, and this loop has to make the same
+        // call while it is still reading. Bounding it at `keep` unconditionally
+        // would mark a prompt that fits inside the cap, just past `keep`, as
+        // truncated for no reason and cut real characters off it.
+        let cap = caps.max_prompt_chars;
+        let keep = cap.saturating_sub(TRUNCATION_MARKER.chars().count());
         let mut text = String::new();
         let mut taken = 0usize;
         let mut overflowed = false;
@@ -174,7 +177,7 @@ impl PromptCapture {
             // a bare `Role::User` match does not.
             if let Some(said) = item.user_request() {
                 if !text.is_empty() {
-                    match taken < keep {
+                    match taken < cap {
                         true => {
                             text.push('\n');
                             taken += 1;
@@ -183,7 +186,7 @@ impl PromptCapture {
                     }
                 }
                 for ch in said.chars() {
-                    if taken >= keep {
+                    if taken >= cap {
                         // Everything from here is dropped, and the loop stops
                         // *reading* it rather than copying it to drop later.
                         // That is the whole allocation bound: what this
@@ -215,6 +218,10 @@ impl PromptCapture {
             }
         }
         if overflowed {
+            // `text` may hold up to `cap` characters at this point; cut it
+            // back to `keep` so the marker still lands inside the cap rather
+            // than past it.
+            text = text.chars().take(keep).collect();
             text.push_str(TRUNCATION_MARKER);
         }
 

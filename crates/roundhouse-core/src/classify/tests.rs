@@ -7,6 +7,7 @@ use super::projection::{PROJECTION_REVISION, PromptCapture, project};
 use super::*;
 use crate::ids::ResponseId;
 use crate::item::{Item, ItemContent, Role};
+use crate::validate::brief::TRUNCATION_MARKER;
 
 fn caps() -> ProjectionCaps {
     ProjectionCaps {
@@ -218,6 +219,49 @@ fn a_long_prompt_is_truncated_and_says_so() {
     let projection = project(&capture, &[], &[], &caps).unwrap();
     assert!(projection.prompt_truncated);
     assert!(projection.rendered.contains("truncated"));
+}
+
+/// A prompt that fits inside the cap is not truncated at all — the marker
+/// itself only ever spends budget on the branch that needs it.
+#[test]
+fn a_prompt_that_fits_the_cap_is_not_truncated() {
+    let caps = ProjectionCaps {
+        max_prompt_chars: 20,
+        ..caps()
+    };
+    let capture = PromptCapture::of(&[Item::user_text("fifteen chars!!")], &caps);
+    assert!(!capture.truncated);
+    assert_eq!(capture.text, "fifteen chars!!");
+}
+
+/// One character over the cap is the control for the case above: it does
+/// truncate, to exactly the cap, ending in the marker.
+#[test]
+fn one_character_over_the_cap_truncates_to_exactly_the_cap() {
+    let caps = ProjectionCaps {
+        max_prompt_chars: 20,
+        ..caps()
+    };
+    let capture = PromptCapture::of(&[Item::user_text("x".repeat(21))], &caps);
+    assert!(capture.truncated);
+    assert_eq!(capture.text.chars().count(), 20);
+    assert!(capture.text.ends_with(TRUNCATION_MARKER));
+}
+
+/// Two items whose combined text and separator exactly fill the cap: the
+/// separator branch must not truncate a prompt that fits.
+#[test]
+fn two_items_that_fit_exactly_through_the_separator_are_not_truncated() {
+    let caps = ProjectionCaps {
+        max_prompt_chars: 20,
+        ..caps()
+    };
+    let capture = PromptCapture::of(
+        &[Item::user_text("a".repeat(9)), Item::user_text("b".repeat(10))],
+        &caps,
+    );
+    assert!(!capture.truncated);
+    assert_eq!(capture.text, format!("{}\n{}", "a".repeat(9), "b".repeat(10)));
 }
 
 /// Every line of client text carries the quote prefix, so a prompt that writes
