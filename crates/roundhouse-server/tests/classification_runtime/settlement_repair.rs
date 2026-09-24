@@ -302,6 +302,60 @@ impl roundhouse_core::control::SpendLedger for SettleOnceFailingLedger {
     }
 }
 
+/// A [`MemorySpendLedger`] whose `settle_grant` forces one `tokio::task::yield_now`
+/// before delegating.
+///
+/// **What a real backend gets for free and an in-memory one does not.** A
+/// call to Redis never resolves on its first poll -- there is a socket in the
+/// way -- so `settle_once`'s `timeout_at`, given a deadline that has already
+/// elapsed, reliably finds the clock already past on the *next* poll and
+/// answers `TimedOut`. An uncontended in-memory settle has no such poll: it
+/// can run to completion the first time it is polled, in which case
+/// `timeout_at` returns its `Ok` before ever consulting the deadline, and a
+/// settle attempted against an elapsed deadline would commit anyway --
+/// silently defeating any test about what happens when it does not. Forcing
+/// the yield here is what makes an in-memory ledger behave, for this one
+/// question, like the real one.
+///
+/// `pub(crate)`: `starvation.rs`'s zero-dollar-release test is its only
+/// caller.
+pub(crate) struct YieldingLedger {
+    inner: MemorySpendLedger,
+}
+
+impl YieldingLedger {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemorySpendLedger::new(),
+        })
+    }
+}
+
+#[async_trait]
+impl roundhouse_core::control::SpendLedger for YieldingLedger {
+    async fn open_grant(
+        &self,
+        request: roundhouse_core::control::GrantRequest,
+    ) -> Result<roundhouse_core::control::Grant, roundhouse_core::control::SpendError> {
+        self.inner.open_grant(request).await
+    }
+
+    async fn settle_grant(
+        &self,
+        settlement: roundhouse_core::control::Settlement,
+    ) -> Result<roundhouse_core::control::Settled, roundhouse_core::control::SpendError> {
+        tokio::task::yield_now().await;
+        self.inner.settle_grant(settlement).await
+    }
+
+    async fn balance(
+        &self,
+        query: roundhouse_core::control::BalanceQuery,
+    ) -> Result<roundhouse_core::control::Balance, roundhouse_core::control::SpendError> {
+        self.inner.balance(query).await
+    }
+}
+
 /// **A settlement nobody acknowledged is recovered by a later turn, under its
 /// original identity and its original measured amount, with no second
 /// purchase.**

@@ -60,22 +60,32 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// because nothing downstream of the dedup short-circuit ever reaches
     /// [`Engine::classification_after_turn`] to spend it.
     ///
-    /// **Money already owed outranks new evaluation spend.** The drain just
-    /// above can be what first tells this session it owes a repair — its own
-    /// prior call settled unconfirmed, and delivering the result is what
-    /// moved that settlement into `unrepaired_settlements`. Taking a new
-    /// ticket right here would immediately hand this turn's own freed permit
-    /// to a fresh purchase, so `classification_after_turn`'s repair loop
-    /// would reach `classifier.capacity()` and find nothing: at one in-flight
-    /// slot this repeats every turn, forever, because the newest turn's own
-    /// ticket is always what is holding the slot. Withholding the ticket
-    /// here instead leaves that permit free for the repair; once the ledger
-    /// confirms and the acknowledgement is delivered, the next turn
-    /// classifies again.
+    /// **Money already owed outranks new evaluation spend — but only when it
+    /// is actually owed.** The drain just above can be what first tells this
+    /// session it owes a repair — its own prior call settled unconfirmed, and
+    /// delivering the result is what moved that settlement into
+    /// `unrepaired_settlements`. Taking a new ticket right here would
+    /// immediately hand this turn's own freed permit to a fresh purchase, so
+    /// `classification_after_turn`'s repair loop would reach
+    /// `classifier.capacity()` and find nothing: at one in-flight slot this
+    /// repeats every turn, forever, because the newest turn's own ticket is
+    /// always what is holding the slot. Withholding the ticket here instead
+    /// leaves that permit free for the repair; once the ledger confirms and
+    /// the acknowledgement is delivered, the next turn classifies again.
+    ///
+    /// A zero-dollar unrepaired settlement is not a debt, and reaches this
+    /// drain routinely: the outer call deadline firing before any answer
+    /// comes back submits a release at zero, and a settle attempted against
+    /// that same, already-elapsed deadline ends `Unconfirmed` the same way a
+    /// slow backend answer would. Withholding a ticket for that would starve
+    /// this session's own classification at the very steady state described
+    /// above, over an entry that owes nothing and that the repair loop clears
+    /// on its next free permit regardless. [`Self::owes_settlement`] is what
+    /// keeps the two cases apart.
     ///
     /// `None` on every deployment that configured no classifier — the
-    /// shipped state — on a saturated queue, and while a repair is owed,
-    /// each costing one check either way.
+    /// shipped state — on a saturated queue, and while a real repair is
+    /// owed, each costing one check either way.
     pub(super) async fn classification_before_turn(
         &self,
         session: &mut Session<S>,
@@ -83,7 +93,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     ) -> Option<ClassificationTicket> {
         let classifier = self.classifier.as_ref()?;
         self.deliver_classifier_output(session, classifier).await;
-        if Self::repair_payer(session).is_some() {
+        if Self::owes_settlement(session) && Self::repair_payer(session).is_some() {
             return None;
         }
         let capacity = classifier.capacity()?;
@@ -251,20 +261,44 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// `None` when this session's log has nothing unrepaired or names no
     /// payer to credit it to.
     ///
-    /// The same two conditions this method's own caller,
-    /// [`Engine::repair_classification_settlements`], needs before it will
-    /// actually spend a permit on one — [`Engine::classification_before_turn`]
-    /// reads this too, to decide whether *this* turn may take a fresh
-    /// ticket at all. Sharing the check as one function returning the value
-    /// both callers want is what keeps the ticket-withholding decision from
-    /// drifting out of step with what the repair loop itself requires,
-    /// without a second caller re-deriving a principal a first call already
-    /// confirmed exists.
+    /// **Deliberately blind to amount.** [`Engine::repair_classification_settlements`]
+    /// must repair every unrepaired entry it can reach, zero-dollar releases
+    /// included — an acknowledgement lost to a crash still has to land
+    /// eventually, whatever the entry is worth — so this answers only "is
+    /// there anyone to credit", never "is anything actually owed".
+    /// [`Engine::classification_before_turn`] reads this too, but never
+    /// alone: it pairs this with [`Self::owes_settlement`], because a
+    /// session whose only unrepaired entries are zero-dollar has nobody
+    /// worth suspending its own classification for. Keeping the two checks
+    /// separate is what lets "can the repair loop credit anyone" answer
+    /// truthfully for every entry while "does this turn owe real money"
+    /// answers only for the ones that do.
     fn repair_payer(session: &Session<S>) -> Option<&Principal> {
         if session.state().unrepaired_settlements().len() == 0 {
             return None;
         }
         session.state().principal()
+    }
+
+    /// Whether this session's log holds an unrepaired settlement that owes
+    /// real money, as opposed to one that only released a hold and is
+    /// waiting on an acknowledgement.
+    ///
+    /// A zero-dollar entry reaches `unrepaired_settlements` routinely, not on
+    /// some rare failure path: any settle attempted against a deadline that
+    /// has already elapsed — the ordinary shape of a call whose outer
+    /// deadline fired before an answer came back — ends `Unconfirmed`, and
+    /// `EvaluationSpend::unconfirmed_settlement_usd` reports that release as
+    /// `Some(0.0)`. That entry lapses on its own once the hold's TTL passes;
+    /// it is not a debt, and the repair loop clears it on the next free
+    /// permit regardless of whether this predicate ever withholds anything
+    /// for it. Only a positive amount is worth suspending this session's own
+    /// classification for — see [`Self::classification_before_turn`].
+    fn owes_settlement(session: &Session<S>) -> bool {
+        session
+            .state()
+            .unrepaired_settlements()
+            .any(|settlement| settlement.usd > 0.0)
     }
 
     /// Schedule a bounded batch of unconfirmed settlements.

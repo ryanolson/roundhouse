@@ -12,8 +12,13 @@
 //! [`settlement_repair::SettleOnceFailingLedger`] is what makes the first
 //! settlement go unconfirmed without a real provider outage: this suite
 //! reuses it rather than inventing a second failing ledger.
+//!
+//! A zero-dollar release must never trigger that same withhold at all --
+//! the routine case behind the claim, not a ledger outage, and just as
+//! untested by the shape above. [`settlement_repair::YieldingLedger`] is
+//! what reproduces one without touching `typesafe_shadow` itself.
 
-use super::settlement_repair::SettleOnceFailingLedger;
+use super::settlement_repair::{SettleOnceFailingLedger, YieldingLedger};
 use super::*;
 
 /// [`config`] at one in-flight slot -- so the permit a session's own new
@@ -198,5 +203,122 @@ async fn two_slots_leave_room_for_the_repair() {
         ledger.applications(&call_id),
         1,
         "settled exactly once, however many turns replayed the log after it"
+    );
+}
+
+/// **A zero-dollar release must never withhold the next turn's own ticket.**
+///
+/// t1's call never gets an answer: the upstream hangs, so the client's own
+/// `call_ttl_ms` deadline fires first and `send_and_settle` submits a release
+/// at zero -- `EvaluationSpend::Unknown`. The settle that follows reuses that
+/// same, already-elapsed deadline, and [`YieldingLedger`] forces its first
+/// poll to return `Pending` -- exactly what a real network round trip does
+/// for free -- so `settle_once`'s own `timeout_at` finds the clock already
+/// past and answers `Unconfirmed`: a zero-dollar entry in
+/// `unrepaired_settlements`, the routine case this test is about, not a
+/// contrived one. t2 owes nothing and must still buy its own classification.
+#[tokio::test]
+async fn a_zero_dollar_release_does_not_withhold_the_next_turns_ticket() {
+    use axum::Router;
+    use axum::routing::post;
+    use std::future::pending;
+
+    // A classifier that never answers -- signals `arrived` the instant its
+    // handler is invoked, then hangs forever, so t1's call is cut off by its
+    // own deadline rather than by anything server-side.
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let handler_arrived = Arc::clone(&arrived);
+    let app = Router::new().route(
+        "/systemone",
+        post(move || {
+            let arrived = Arc::clone(&handler_arrived);
+            async move {
+                arrived.notify_one();
+                pending::<()>().await
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let base_url = format!("http://{addr}");
+
+    let classify = classify_config(&base_url, |value| {
+        value["enabled"] = serde_json::json!(true);
+        value["executor"]["call_ttl_ms"] = serde_json::json!(200);
+    });
+    let ledger = YieldingLedger::new();
+    let runtime = compose(
+        "<test>",
+        &classify,
+        ledger as Arc<dyn roundhouse_core::control::SpendLedger>,
+        ByteTokenizer,
+        &env,
+    )
+    .expect("it composes")
+    .expect("and is present");
+    let store = Arc::new(MemoryStore::new());
+    let engine = engine_over(
+        Arc::clone(&store),
+        Arc::new(Answering) as Arc<dyn FrontierClient>,
+        Arc::clone(&runtime),
+    );
+    let session = SessionId::new("sess_zero_dollar_release");
+    engine.create_session(&session).await.unwrap();
+
+    let turn = |id: &'static str, text: &'static str| {
+        let engine = Arc::clone(&engine);
+        let session = session.clone();
+        async move {
+            engine
+                .run_turn(
+                    &session,
+                    TurnId::new(id),
+                    vec![Item::user_text(text)],
+                    &Admission::open(),
+                )
+                .await
+                .expect("this fleet always answers")
+        }
+    };
+
+    turn("t1", "fix the parser").await;
+    tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+        .await
+        .expect("t1's call must actually reach the upstream for this test to be about anything");
+    for _ in 0..500 {
+        if !runtime.ready(&session).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let parked = runtime.ready(&session).await;
+    assert_eq!(
+        parked.len(),
+        1,
+        "t1's call must complete by its own deadline, not by an answer"
+    );
+    let spend = parked[0]
+        .record
+        .outcome
+        .spend()
+        .expect("a spend was attempted");
+    assert_eq!(
+        spend.unconfirmed_settlement_usd(),
+        Some(0.0),
+        "the release must be zero-dollar and unconfirmed for this test to be \
+         about the claim it names"
+    );
+    drop(parked);
+
+    turn("t2", "add a test").await;
+    let intents = intents_in(&*store, &session).await;
+    assert_eq!(
+        intents.len(),
+        2,
+        "t2 must still buy its own classification -- a zero-dollar release \
+         owes nothing, so there is no repair for it to protect a permit for"
     );
 }
