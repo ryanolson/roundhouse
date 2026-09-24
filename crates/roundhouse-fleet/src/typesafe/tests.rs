@@ -292,12 +292,18 @@ mod signal {
             }),
             "a number one answer cannot carry must not discard the usage beside it"
         );
-        assert!(reply.answers.is_err());
+        assert_eq!(
+            reply.answers,
+            Err(SignalError::MalformedAnswers),
+            "the whole batch fails to parse as a `Value`, not just the one answer"
+        );
     }
 
-    /// An explicit `null` for `answers` is a wrong-shaped batch, not a
-    /// wrong-shaped envelope: the reported usage still arrives, and only the
-    /// answers come back refused.
+    /// An explicit `null` for `answers` reads the same as an absent field --
+    /// `serde` maps JSON `null` to `None` for the envelope's `Option<Box<RawValue>>`
+    /// before any batch parsing runs -- so it is an empty batch, not a
+    /// wrong-shaped one: the reported usage still arrives, and the missing
+    /// key is what the answers come back refused over.
     #[test]
     fn a_null_answers_block_keeps_the_usage_and_fails_only_the_answers() {
         let raw = br#"{"answers":null,"usage":{"input_tokens":900,"output_tokens":4}}"#;
@@ -309,9 +315,11 @@ mod signal {
                 output_tokens: 4
             })
         );
-        assert!(
-            reply.answers.is_err(),
-            "no answer arrived under any key that was asked under"
+        assert_eq!(
+            reply.answers,
+            Err(SignalError::MissingAnswer),
+            "an empty batch, not a malformed one: no answer arrived under any \
+             key that was asked under"
         );
     }
 

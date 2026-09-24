@@ -210,10 +210,15 @@ pub struct SystemOneReply {
 /// Unit variants keep untrusted response keys and values out of diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SignalError {
-    /// `answers` was `null`, was not a JSON object, or held a value
+    /// `answers` was not a JSON object, or was an object holding a value
     /// [`serde_json`] itself could not parse — a non-finite number, for one.
     /// Held apart from every fault below, which is about one answer inside an
     /// otherwise-usable batch.
+    ///
+    /// Not what an absent or `null` `answers` produces: `serde` reads JSON
+    /// `null` as `None` for an `Option` field before any of this parsing runs,
+    /// the same as a field that never arrived, so both read as an empty batch
+    /// and end up at [`MissingAnswer`](Self::MissingAnswer) instead.
     #[error("`answers` did not parse as a batch of answers")]
     MalformedAnswers,
     #[error("no answer came back under a key some question was asked under")]
@@ -592,9 +597,12 @@ impl SystemOneClient {
     /// sees a partial answer set it would have to decide the sufficiency of.
     ///
     /// `answers` arrives unparsed: the envelope holds it as a [`RawValue`] so
-    /// that a shape [`serde_json`] cannot even read as a `Value` -- `null`, a
+    /// that a shape [`serde_json`] cannot even read as a `Value` -- a
     /// non-object, or a number too extreme for `f64` -- fails only here,
-    /// after `usage` has already been read off the same envelope.
+    /// after `usage` has already been read off the same envelope. `null`
+    /// never reaches this parse at all: it reads as `None` at the envelope,
+    /// the same as an absent field, so it ends up as an empty batch below
+    /// rather than a fault here.
     fn signal(
         answers: Option<&RawValue>,
         questions: &BTreeMap<String, ChoiceQuestion>,
@@ -699,12 +707,13 @@ fn bearer_key(headers: &HeaderMap) -> Option<String> {
 #[derive(Debug, Deserialize)]
 struct Envelope {
     /// Held unparsed, for the reason `usage` and `model` below are held as a
-    /// bare `Value`: a wrong-shaped `answers` -- `null`, a non-object, or a
-    /// number too extreme for `f64` -- must not fail the envelope and take
-    /// `usage` down with it. `RawValue` goes one step further than `Value`
-    /// does for those two, because a non-finite number fails to parse *as* a
-    /// `Value` -- deferring that parse to [`SystemOneClient::signal`] is what
-    /// keeps the failure inside the one field that carried it.
+    /// bare `Value`: a wrong-shaped `answers` -- a non-object, or a number too
+    /// extreme for `f64` -- must not fail the envelope and take `usage` down
+    /// with it. `RawValue` goes one step further than `Value` does for those
+    /// two, because a non-finite number fails to parse *as* a `Value` --
+    /// deferring that parse to [`SystemOneClient::signal`] is what keeps the
+    /// failure inside the one field that carried it. `null` never reaches
+    /// that parse: `serde` reads it as `None` here, same as an absent field.
     #[serde(default)]
     answers: Option<Box<RawValue>>,
     #[serde(default)]
