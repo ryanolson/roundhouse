@@ -563,24 +563,32 @@ impl SystemOneClient {
     ) -> Result<SystemOneReply, SystemOneError> {
         let envelope: Envelope =
             serde_json::from_slice(raw).map_err(|_| SystemOneError::Malformed)?;
-        // Read through a `Value` and discarded on any mismatch, so a usage
-        // object missing an axis becomes *unknown* rather than a zero on that
-        // axis -- a zero would book a billed call as free. Held as `Option<Value>`
-        // on the envelope rather than a strict `Option<WireUsage>` for the other
-        // half: a malformed accounting block must not fail the whole envelope
-        // and throw away an answer that did arrive.
+        // Parsed from the raw text and discarded on any mismatch, so a usage
+        // object missing an axis, or carrying a number too extreme for `f64`
+        // anywhere in it, becomes *unknown* rather than a zero on that axis --
+        // a zero would book a billed call as free -- or a failure of the
+        // whole envelope. `usage` is held as `Option<Box<RawValue>>` rather
+        // than a strict `Option<WireUsage>` for the same reason `answers` is:
+        // a malformed accounting block must not fail the whole envelope and
+        // throw away an answer that did arrive.
         let usage = envelope
             .usage
-            .and_then(|usage| serde_json::from_value::<WireUsage>(usage).ok())
+            .as_deref()
+            .and_then(|usage| serde_json::from_str::<WireUsage>(usage.get()).ok())
             .map(|usage| SystemOneUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
             });
         // Read the same lenient way, and for the same reason: the identity is
-        // metadata about the call, so a `model` of the wrong JSON shape must
-        // not fail the envelope and take the answers and the accounting with
-        // it. A non-string is no identity, not a malformed reply.
-        let reported_model = match envelope.model {
+        // metadata about the call, so a `model` of the wrong JSON shape --
+        // including a number too extreme for `f64` -- must not fail the
+        // envelope and take the answers and the accounting with it. A
+        // non-string is no identity, not a malformed reply.
+        let reported_model = match envelope
+            .model
+            .as_deref()
+            .and_then(|model| serde_json::from_str::<Value>(model.get()).ok())
+        {
             Some(Value::String(model)) => Some(model),
             _ => None,
         };
@@ -706,22 +714,23 @@ fn bearer_key(headers: &HeaderMap) -> Option<String> {
 /// that refused one would break on a deployment nobody touched.
 #[derive(Debug, Deserialize)]
 struct Envelope {
-    /// Held unparsed, for the reason `usage` and `model` below are held as a
-    /// bare `Value`: a wrong-shaped `answers` -- a non-object, or a number too
-    /// extreme for `f64` -- must not fail the envelope and take `usage` down
-    /// with it. `RawValue` goes one step further than `Value` does for those
-    /// two, because a non-finite number fails to parse *as* a `Value` --
-    /// deferring that parse to [`SystemOneClient::signal`] is what keeps the
-    /// failure inside the one field that carried it. `null` never reaches
-    /// that parse: `serde` reads it as `None` here, same as an absent field.
+    /// Held unparsed, all three for the same reason: a wrong-shaped field --
+    /// a non-object `answers`, or a number too extreme for `f64` in any of
+    /// them -- must not fail the envelope and take the other two down with
+    /// it. `RawValue` rather than `Value` for exactly that number case,
+    /// because a non-finite number fails to parse *as* a `Value` --
+    /// deferring that parse to [`SystemOneClient::reply`] and
+    /// [`SystemOneClient::signal`] is what keeps the failure inside the one
+    /// field that carried it. `null` never reaches that parse for any of the
+    /// three: `serde` reads it as `None` here, same as an absent field.
     #[serde(default)]
     answers: Option<Box<RawValue>>,
     #[serde(default)]
-    usage: Option<Value>,
-    /// Held as a `Value` for the reason `usage` is: a wrong-shaped one is an
-    /// absent identity, and never a reason to discard the reply it came on.
+    usage: Option<Box<RawValue>>,
+    /// Held raw for the reason `usage` is: a wrong-shaped one is an absent
+    /// identity, and never a reason to discard the reply it came on.
     #[serde(default)]
-    model: Option<Value>,
+    model: Option<Box<RawValue>>,
 }
 
 /// Both axes required: a default on either turns silence about one into a

@@ -224,6 +224,54 @@ mod signal {
         );
     }
 
+    /// A `model` too extreme for `f64` is metadata `serde_json` cannot even
+    /// hold as a `Value`, and must be unknown rather than take the answers
+    /// and the accounting down with it -- the same leniency `usage` and
+    /// `answers` already get.
+    #[test]
+    fn a_model_too_extreme_for_f64_is_unknown_rather_than_failing_the_envelope() {
+        let raw = format!(
+            r#"{{"model":1e400,"answers":{{"tier":{}}},"usage":{USAGE}}}"#,
+            valid()
+        );
+        let reply = SystemOneClient::reply(raw.as_bytes(), &one())
+            .expect("a malformed model must not fail the whole envelope");
+        assert_eq!(reply.reported_model, None);
+        assert_eq!(
+            reply.usage,
+            Some(SystemOneUsage {
+                input_tokens: 312,
+                output_tokens: 48
+            }),
+            "the accounting must survive a model that could not be read"
+        );
+        assert!(reply.answers.is_ok(), "{:?}", reply.answers);
+    }
+
+    /// A `usage` axis `serde_json` cannot even hold as a `Value` -- here, an
+    /// unrelated extra key carrying a number too extreme for `f64` -- must
+    /// not fail the whole envelope either.
+    #[test]
+    fn a_usage_block_carrying_an_unreadable_extra_key_does_not_fail_the_envelope() {
+        let raw = format!(
+            r#"{{"model":"jev-1.12","answers":{{"tier":{}}},"usage":{{"input_tokens":900,"output_tokens":4,"x":1e400}}}}"#,
+            valid()
+        );
+        let reply = SystemOneClient::reply(raw.as_bytes(), &one())
+            .expect("a malformed usage block must not fail the whole envelope");
+        assert_eq!(
+            reply.usage,
+            Some(SystemOneUsage {
+                input_tokens: 900,
+                output_tokens: 4
+            }),
+            "WireUsage does not deny unknown fields, so an extra key -- even \
+             one serde_json cannot represent as a Value -- is ignored rather \
+             than failing the usage block it sits beside"
+        );
+        assert!(reply.answers.is_ok(), "{:?}", reply.answers);
+    }
+
     /// Every way a distribution can be wrong, each rejected by its own name.
     ///
     /// These fixtures pin exactly one ordering constraint: case `options that
