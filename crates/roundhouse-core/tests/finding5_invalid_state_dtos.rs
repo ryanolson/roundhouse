@@ -194,6 +194,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
             reason: "nothing comparable".into(),
         },
         seat_tokens: Default::default(),
+        seat_estimated_calls: 0,
     };
     let row = roundhouse_core::metrics::ModelMetrics {
         provider: "dynamo".into(),
@@ -231,6 +232,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
             billed_estimated_usd: 1.0,
             cache_savings_usd: 0.5,
             seat_tokens: Default::default(),
+            seat_estimated_calls: 0,
         },
     };
     assert_eq!(hosted.mode(), ServingMode::Frontier);

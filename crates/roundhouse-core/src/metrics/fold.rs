@@ -129,6 +129,15 @@ pub(super) struct Counters {
     /// money it was never going to spend. See
     /// [`Billing::of`](crate::control::Billing::of).
     pub(super) seat: Counted,
+    /// Of [`Self::estimated_calls`], how many landed in [`Self::seat`].
+    ///
+    /// A seat's total is exact whether or not the provider reported it —
+    /// priced nowhere either way, see [`Self::seat`] — so a gap counter over
+    /// what this deployment's own cost total is missing has to subtract this
+    /// back out of `estimated_calls` rather than publish the combined figure
+    /// whole. `estimated_calls` itself stays combined; this is the one
+    /// consumer that needs the split.
+    pub(super) seat_estimated_calls: u64,
     /// Summed over locally-served turns: the cheapest frontier option the
     /// router had quoted at the moment it chose local.
     ///
@@ -303,6 +312,7 @@ impl Counters {
         self.estimated_calls += other.estimated_calls;
         self.billed.absorb(&other.billed);
         self.seat.absorb(&other.seat);
+        self.seat_estimated_calls += other.seat_estimated_calls;
         self.quoted_alternative_usd += other.quoted_alternative_usd;
         self.side_calls += other.side_calls;
         self.abandoned_side_calls += other.abandoned_side_calls;
@@ -1217,7 +1227,12 @@ fn settle(
     // billed/accounted rule is applied here and nowhere else in this module.
     match billing {
         Billing::Billed => counters.billed.add(usage),
-        Billing::AccountedNotBilled => counters.seat.add(usage),
+        Billing::AccountedNotBilled => {
+            counters.seat.add(usage);
+            if usage.accounting == Accounting::Estimated {
+                counters.seat_estimated_calls += 1;
+            }
+        }
     }
     // A counterfactual is a saving only if the money it stands in for would
     // have been ours — the same predicate the pot above turns on, asked of the

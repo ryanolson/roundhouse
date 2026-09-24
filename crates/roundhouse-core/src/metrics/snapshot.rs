@@ -165,6 +165,10 @@ pub enum ModelAccounting {
         correlary: Correlary,
         /// Tokens this row served for a project whose money is a seat's.
         seat_tokens: TokenBreakdown,
+        /// Of this row's [`Coverage::estimated_calls`], how many were a
+        /// seat's. See the hosted arm's own field for why this is a count
+        /// beside `seat_tokens` rather than folded into it.
+        seat_estimated_calls: u64,
     },
     /// Issued to an external endpoint: bills real money.
     Frontier {
@@ -201,6 +205,11 @@ pub enum ModelAccounting {
         /// Zero on a deployment with no pass-through project, which is what
         /// keeps every pre-M7 row reading exactly as it did.
         seat_tokens: TokenBreakdown,
+        /// Of this row's [`Coverage::estimated_calls`], how many were a
+        /// seat's — priced nowhere and exact either way, so
+        /// [`ServingCostGaps`] has to subtract these back out rather than
+        /// publish the coverage figure whole.
+        seat_estimated_calls: u64,
     },
 }
 
@@ -311,6 +320,20 @@ impl ModelMetrics {
         match self.accounting {
             ModelAccounting::Local { seat_tokens, .. }
             | ModelAccounting::Frontier { seat_tokens, .. } => seat_tokens,
+        }
+    }
+
+    /// Of this row's [`Coverage::estimated_calls`], how many were a seat's.
+    pub fn seat_estimated_calls(&self) -> u64 {
+        match self.accounting {
+            ModelAccounting::Local {
+                seat_estimated_calls,
+                ..
+            }
+            | ModelAccounting::Frontier {
+                seat_estimated_calls,
+                ..
+            } => seat_estimated_calls,
         }
     }
 }
@@ -643,6 +666,7 @@ impl MetricsSnapshot {
             // handed. See `Counters::seat`.
             let priceable = counters.billed.total();
             let seat_tokens = TokenBreakdown::from_usage(counters.seat.total().tokens());
+            let seat_estimated_calls = counters.seat_estimated_calls;
 
             let accounting = match key.mode {
                 ServingMode::Frontier => {
@@ -686,6 +710,7 @@ impl MetricsSnapshot {
                         cache_savings_usd: rate
                             .map_or(0.0, |r| r.pricing.cache_savings(priceable.tokens())),
                         seat_tokens,
+                        seat_estimated_calls,
                     }
                 }
                 ServingMode::Local => {
@@ -719,6 +744,7 @@ impl MetricsSnapshot {
                         shadow_usd: correlary.shadow_cost_pooled(&priceable),
                         correlary,
                         seat_tokens,
+                        seat_estimated_calls,
                     }
                 }
             };

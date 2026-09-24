@@ -281,18 +281,26 @@ impl ServingCostGaps {
 
     /// The gaps in one scope's already-priced rows.
     ///
-    /// `coverage` is handed in rather than re-summed off the rows, because the
-    /// document already publishes that sum through
-    /// [`Rollup::absorb`](super::Rollup::absorb) and a second walk would be a
-    /// second definition of one number — the duplication `Rollup` exists to
-    /// have removed.
+    /// `coverage.estimated_calls` is handed in rather than re-summed off the
+    /// rows — the document already publishes that sum through
+    /// [`Rollup::absorb`](super::Rollup::absorb) — but it counts both pots
+    /// [`Counters::estimated_calls`](crate::metrics::fold::Counters) always
+    /// has, and a seat's tokens are priced nowhere and exact either way, so a
+    /// seat call the provider never reported is not a gap in *this*
+    /// deployment's total. [`ModelMetrics::seat_estimated_calls`] is what each
+    /// row knows about its own share of that, summed back out below.
     ///
     /// Catalog coverage comes from each row's
     /// [`ModelAccounting::Frontier::priced_by_catalog`], because a zero amount
     /// does not establish missing pricing.
     pub(super) fn of(models: &[ModelMetrics], coverage: &Coverage) -> Self {
         Self {
-            estimated_calls: coverage.estimated_calls,
+            estimated_calls: coverage.estimated_calls.saturating_sub(
+                models
+                    .iter()
+                    .map(ModelMetrics::seat_estimated_calls)
+                    .sum::<u64>(),
+            ),
             unpriced_models: models
                 .iter()
                 .filter(|row| {

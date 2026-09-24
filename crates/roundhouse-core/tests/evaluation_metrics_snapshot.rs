@@ -1133,6 +1133,42 @@ fn a_forwarded_seat_is_not_a_gap_because_it_is_not_this_deployments_cost() {
     );
 }
 
+/// The same seat, unreported this time: still not a serving gap.
+///
+/// `coverage.estimated_calls` folds this call in — coverage asks whether the
+/// *provider* accounted for a turn, which a seat turn can fail exactly like a
+/// billed one. `serving_gaps.estimated_calls` asks a different question, "how
+/// much of the combined total is uncertain because of our own tokenizer," and
+/// a seat's tokens are never in that total to begin with: they are priced
+/// nowhere and their total is exact, not estimated. A gap counter that copied
+/// coverage's figure whole would mark an exact seat total incomplete.
+#[test]
+fn an_unreported_seat_is_not_a_gap_because_its_total_is_exact_either_way() {
+    let mut log = Log::new("acme/ada/main", Some(ada()));
+    let mut estimated = usage(1_000, 0, 100);
+    estimated.accounting = Accounting::Estimated;
+    log.turn_on_seat(estimated);
+
+    let recorder = MetricsRecorder::new();
+    recorder.record(log.events());
+    let document = json(&recorder.snapshot(&config(), 9_999));
+
+    // The provider's silence is still on the record.
+    assert!(count(&document, &["coverage", "estimated_calls"]) > 0);
+    for gap in ["estimated_calls", "unpriced_models", "local_calls"] {
+        assert_eq!(
+            count(&document, &["observed_cost", "serving_gaps", gap]),
+            0,
+            "a seat is not a serving gap: `{gap}`"
+        );
+    }
+    assert_eq!(
+        at(&document, &["observed_cost", "incomplete"]),
+        &Value::Bool(false),
+        "nothing this deployment paid for is missing or uncertain"
+    );
+}
+
 /// A rate card priced at an explicit `$0` is a rate card, and is not counted as
 /// a missing one.
 ///
