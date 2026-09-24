@@ -466,8 +466,11 @@ fn truncate_objective(objective: Objective, limit: usize) -> Objective {
 /// marker `truncate` actually appends — a hand-counted length beside a literal
 /// is exactly the kind of pair that disagrees the day one of the two is
 /// edited and not the other. Shared with the classifier projection's own
-/// truncation for the same reason.
-pub(crate) const TRUNCATION_MARKER: &str = "…[truncated]";
+/// truncation for the same reason, and `pub` rather than crate-private so a
+/// config boundary in another crate can refuse a cap too narrow to hold
+/// anything but the marker itself — see `roundhouse-server`'s
+/// `classify_config`.
+pub const TRUNCATION_MARKER: &str = "…[truncated]";
 
 /// At most `limit` characters, with the cut marked.
 ///
@@ -475,6 +478,17 @@ pub(crate) const TRUNCATION_MARKER: &str = "…[truncated]";
 /// panics, and the one input guaranteed to be arbitrary here is the transcript.
 /// The marker is inside the budget rather than added to it, so `limit` is a
 /// bound a caller can rely on when sizing a request.
+///
+/// **Precondition, not enforced here:** `limit` must exceed
+/// [`TRUNCATION_MARKER`]'s own length, or `keep` saturates to zero and the
+/// result is the bare marker with none of the text it was meant to preview.
+/// Nothing refuses that here because [`BriefConfig`] carries no config-file
+/// boundary of its own to refuse it at — every caller today passes a
+/// compile-time constant well clear of the marker's twelve characters
+/// (`BriefConfig::default()`'s narrowest field is 240). The classifier
+/// projection's own prompt cap takes the same shape of limit from a real
+/// config file, and is refused at that boundary instead — see
+/// `roundhouse-server`'s `classify_config`.
 fn truncate(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_string();

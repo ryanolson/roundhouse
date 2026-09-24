@@ -219,10 +219,18 @@ impl ClassifyConfig {
                 return Err(invalid(field, "a finite rate of zero or more"));
             }
         }
-        if self.caps.max_prompt_chars == 0 || self.caps.max_total_bytes == 0 {
+        // A cap no wider than the truncation marker itself saturates `keep`
+        // to zero: the capture would be the bare marker with no user text at
+        // all, which breaks the bound this cap exists to state. Named
+        // against the marker's own length rather than a literal, so the two
+        // can never drift apart the way a hand-counted twelve would.
+        let min_prompt_chars = roundhouse_core::validate::brief::TRUNCATION_MARKER
+            .chars()
+            .count();
+        if self.caps.max_prompt_chars <= min_prompt_chars || self.caps.max_total_bytes == 0 {
             return Err(invalid(
                 "caps",
-                "non-zero, or nothing could ever be projected",
+                "max_prompt_chars wider than the truncation marker, and max_total_bytes non-zero",
             ));
         }
         if self.transport.max_request_bytes == 0

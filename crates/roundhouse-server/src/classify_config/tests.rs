@@ -210,6 +210,36 @@ fn a_zero_bound_is_refused_rather_than_read_as_unlimited() {
     }
 }
 
+/// A cap no wider than the truncation marker itself saturates `keep` to
+/// zero: the capture would be the bare marker with no user text at all,
+/// which breaks the bound the cap exists to state.
+#[test]
+fn a_prompt_cap_no_wider_than_the_truncation_marker_is_refused() {
+    let marker_len = roundhouse_core::validate::brief::TRUNCATION_MARKER
+        .chars()
+        .count();
+    for chars in [marker_len - 1, marker_len] {
+        let broken = with(
+            "\"max_prompt_chars\": 2000",
+            &format!("\"max_prompt_chars\": {chars}"),
+        );
+        assert!(
+            ClassifyConfig::from_json(&broken, "<test>").is_err(),
+            "a cap of {chars} chars holds nothing but the marker and must be refused"
+        );
+    }
+
+    // The control: one character past the marker's own length loads.
+    let ok = with(
+        "\"max_prompt_chars\": 2000",
+        &format!("\"max_prompt_chars\": {}", marker_len + 1),
+    );
+    assert!(
+        ClassifyConfig::from_json(&ok, "<test>").is_ok(),
+        "a cap one character past the marker must load"
+    );
+}
+
 /// An unknown key is a typo, and a typo in a file that governs egress is worth
 /// refusing rather than ignoring.
 #[test]
