@@ -2146,9 +2146,8 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // candidate ever reaches `candidates` for a turn like this one — see
         // that function's doc for why the order is load-bearing and not just
         // tidy. `debug_assert!` rather than a retain: a retain here would be
-        // filtering a set that server-r3-1 found is already structurally
-        // empty, which gives a reader false comfort that a second line of
-        // defence exists.
+        // filtering a set that is already structurally empty, which gives a
+        // reader false comfort that a second line of defence exists.
         debug_assert!(
             !declarations.declares_tools()
                 || candidates

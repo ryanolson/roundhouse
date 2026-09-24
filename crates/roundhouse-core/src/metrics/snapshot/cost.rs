@@ -8,9 +8,8 @@
 //! this module in two lines — [`EvaluationMetrics::build`] and
 //! [`ObservedCost::build`] — and sitting those two lines beside 550 lines of
 //! types they barely call into is exactly what makes a reader chasing what
-//! `build` does scroll past all of them first. The fold side already made
-//! this split (`metrics/evaluation.rs` is its own module); this is the
-//! snapshot side catching up.
+//! `build` does scroll past all of them first. `metrics/evaluation.rs` holds
+//! the same split on the fold side, for the same reason.
 
 use serde::Serialize;
 

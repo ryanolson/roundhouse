@@ -39,12 +39,10 @@ pub const TURN_ELAPSED_BASIS: &str = "turn_start_to_terminal";
 /// One measured interval, wherever this snapshot publishes one: first output,
 /// and each of the two `turn_elapsed` outcome classes beside it.
 ///
-/// One type rather than three, because the three were field-for-field
-/// identical structs that had grown their own `publish` rule apiece —
-/// `TurnElapsed::publish`'s doc claimed it followed "`FirstOutputLatency`'s
-/// rule" while that rule was written out a second time, by hand, at the
-/// first-output call site. A basis that has drifted from its own doc is
-/// exactly the failure mode one shared rule removes.
+/// One type rather than three field-for-field identical structs, each
+/// growing its own `publish` rule by hand at its own call site: a doc on one
+/// that merely claims to follow another's rule, rather than sharing it, is
+/// exactly the drift one shared rule removes by construction.
 #[derive(Debug, Clone, Serialize)]
 pub struct IntervalMetric {
     /// Mean milliseconds over [`Self::samples`].

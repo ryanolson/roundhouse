@@ -2889,8 +2889,10 @@ fn acknowledgement(call_id: &str, applied: bool) -> ClassificationSettlementRepa
     }
 }
 
-/// Count settlement visits for a fixed acknowledgement batch at two backlog sizes.
-/// Map lookup comparisons are excluded; this guards against a full scan, not logarithmic lookup.
+/// The counted hits for a fixed acknowledgement batch do not grow with
+/// backlog size: `examined` counts successful removals, not comparisons --
+/// see `UnrepairedSettlements::examined`'s own doc for what that does and
+/// does not guard against.
 #[tokio::test]
 async fn acknowledging_a_batch_examines_entries_for_the_batch_and_not_the_backlog() {
     const ACKNOWLEDGED: usize = 4;
@@ -2920,19 +2922,18 @@ async fn acknowledging_a_batch_examines_entries_for_the_batch_and_not_the_backlo
 
     assert_eq!(
         examined[0], examined[1],
-        "acknowledging {ACKNOWLEDGED} settlements examined {} backlog entries \
-         under a backlog of {} and {} under a backlog of {} -- work that grows \
-         with the outage is what a recovering deployment cannot afford",
+        "acknowledging {ACKNOWLEDGED} settlements is counted as {} hits under \
+         a backlog of {} and {} hits under a backlog of {}: the count does \
+         not move with backlog size",
         examined[0], SIZES[0], examined[1], SIZES[1]
     );
     assert_eq!(
         examined[0], ACKNOWLEDGED as u64,
-        "one entry per acknowledgement and no others: an equal-but-large count \
-         would mean both backlogs were walked equally badly"
+        "one hit per acknowledgement and no others"
     );
 }
 
-/// Missing acknowledgements must leave the backlog unchanged without scanning its entries.
+/// Missing acknowledgements must leave the backlog unchanged and count no hit.
 #[tokio::test]
 async fn an_acknowledgement_naming_nothing_in_the_backlog_examines_nothing() {
     let mut session = session_with_backlog("node-missing", 32).await;
@@ -2953,11 +2954,12 @@ async fn an_acknowledgement_naming_nothing_in_the_backlog_examines_nothing() {
     assert_eq!(
         session.state.unrepaired_settlements_examined(),
         examined_before,
-        "and must not pay to discover that"
+        "and a miss must not be counted as a hit"
     );
 }
 
-/// A repeated acknowledgement must not scan or remove another settlement.
+/// A repeated acknowledgement must not remove another settlement or count a
+/// second hit.
 #[tokio::test]
 async fn a_repeated_acknowledgement_examines_nothing_and_drains_nothing_twice() {
     let mut session = session_with_backlog("node-duplicate", 32).await;
@@ -2988,7 +2990,7 @@ async fn a_repeated_acknowledgement_examines_nothing_and_drains_nothing_twice() 
     assert_eq!(
         session.state.unrepaired_settlements_examined(),
         examined_after_first,
-        "and must not scan the backlog to find that out"
+        "and a duplicate acknowledgement must not be counted as a second hit"
     );
 }
 

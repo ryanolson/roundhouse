@@ -831,13 +831,13 @@ async fn main() -> anyhow::Result<()> {
     // `shared_backend::open` gives about wiring inside a `[[bin]]`: this site
     // wires what it returns and re-derives no part of the choice.
     //
-    // **Composed here, before the bind — not inside `serve`, where it used to
-    // run after "roundhouse listening" had already been logged.** An enabled
+    // **Composed here, before the bind, so a configuration error in it is
+    // caught before `serve` ever logs "roundhouse listening."** An enabled
     // file with no credential is a configuration error the same way an
     // unreadable catalog or control-plane file is, and every other boot
     // refusal in this function stops the process before it opens a socket.
-    // `compose`'s own doc used to claim the same posture without having it;
-    // this is what makes the claim true.
+    // This is what makes `compose`'s own doc, which claims exactly this
+    // posture, true.
     let classifier: Option<Arc<classify_runtime::ClassificationRuntime<ByteTokenizer>>> = classify
         .as_ref()
         .map(|(path, config)| {

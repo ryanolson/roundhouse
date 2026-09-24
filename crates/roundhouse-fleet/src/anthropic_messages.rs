@@ -206,7 +206,7 @@ const ONE_HOUR_MS: u64 = 3_600_000;
 ///
 /// `pub(crate)` rather than private: `frontier::requested_cache_lifetime`
 /// needs the same number to decide whether an `InactivityDecay` ceiling
-/// still fits inside the wire's silent default (fleet-redis-r3-1).
+/// still fits inside the wire's silent default.
 pub(crate) const DEFAULT_CACHE_TTL_MS: u64 = 300_000;
 
 /// The cache lifetimes Anthropic's Messages wire actually offers.
@@ -1759,8 +1759,11 @@ mod tests {
     /// A quote long enough that both breakpoints are placed, at `lifetime`.
     ///
     /// `previous_segment_count: Some(6)` names a previous dispatch of six
-    /// segments -- `cache_markers::penultimate(6) == Some(4)`, well inside
-    /// the lookback window from this quote's own 29.
+    /// segments -- `cache_markers::penultimate(6) == Some(4)`, a gap of 25
+    /// blocks from this quote's own 29 and past `CACHE_LOOKBACK_BLOCKS`
+    /// (20), which is why `plan` places a marker at both blocks: block 4 is
+    /// far enough back that Anthropic's own cache lookup would not reach it
+    /// unasked.
     fn quote_at_ttl(lifetime: CacheLifetime) -> FrontierQuote {
         let (prompt, boundaries) = segments_of(6 + 25);
         FrontierQuote {
@@ -2131,7 +2134,7 @@ mod tests {
     ///
     /// Riding four tool markers, the *same* six-segment dispatch places no
     /// block marker at all -- the allowance is already spent (the four-marker
-    /// case `a_request_with_the_client_holding_four_tool_markers_still_sends_none`
+    /// case `normalizing_four_riding_markers_still_spends_the_whole_allowance`
     /// pins above). But `engine.rs` passes `last_segment_count` (6) to the
     /// next request exactly as it does for the control above, and
     /// `cache_markers::plan` has no way to learn from that count alone

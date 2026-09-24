@@ -322,7 +322,7 @@ pub enum CatalogError {
     /// `1h` marker `CacheModel::Deterministic` spells, not a decay curve.
     /// A `max_ttl_ms` past the default therefore prices warmth this wire was
     /// never asked to grant, for the same reason a `deterministic` TTL it
-    /// cannot spell is refused above (fleet-redis-r3-1).
+    /// cannot spell is refused above.
     #[error(
         "catalog `{path}`: `{model}` models an automatic cache retained up to \
          {max_ttl_ms}ms on `anthropic_messages`, past the {default_ttl_ms}ms the wire \
@@ -563,11 +563,11 @@ impl CatalogConfig {
             // rather than re-deriving the same rule by hand, is what keeps
             // that compile-time protection real: a hand-written `==` copy
             // would not fail to compile on a new variant, it would silently
-            // accept it (fleet-redis-r2-2 / server-r2-1). The match below is
-            // over `CacheLifetimeError`'s own two variants rather than the
-            // wide `FrontierError`, so it too is exhaustive -- a third
-            // refusal the resolver grows fails to compile here instead of
-            // panicking at boot through a wildcard arm (fleet-redis-r3-1).
+            // accept it. The match below is over `CacheLifetimeError`'s own
+            // two variants rather than the wide `FrontierError`, so it too
+            // is exhaustive -- a third refusal the resolver grows fails to
+            // compile here instead of panicking at boot through a wildcard
+            // arm.
             let lifetime = spec
                 .requested_cache_lifetime()
                 .map_err(|error| match error {

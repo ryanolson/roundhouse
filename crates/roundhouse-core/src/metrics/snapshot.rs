@@ -228,8 +228,8 @@ pub struct ModelMetrics {
     /// Turn start to terminal, over the turns this row completed.
     ///
     /// Absent on the same rule `first_output` uses, and never added to
-    /// [`Self::incomplete_turn_elapsed`]: see `Counters::completed_elapsed`
-    /// in the fold module for why one pot would reward failing faster.
+    /// [`Self::incomplete_turn_elapsed`]: see `TurnTimings::completed_elapsed`
+    /// in the timing module for why one pot would reward failing faster.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_turn_elapsed: Option<IntervalMetric>,
     /// The same interval over the turns this row did not complete.

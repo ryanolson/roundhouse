@@ -257,11 +257,17 @@ fn two_items_that_fit_exactly_through_the_separator_are_not_truncated() {
         ..caps()
     };
     let capture = PromptCapture::of(
-        &[Item::user_text("a".repeat(9)), Item::user_text("b".repeat(10))],
+        &[
+            Item::user_text("a".repeat(9)),
+            Item::user_text("b".repeat(10)),
+        ],
         &caps,
     );
     assert!(!capture.truncated);
-    assert_eq!(capture.text, format!("{}\n{}", "a".repeat(9), "b".repeat(10)));
+    assert_eq!(
+        capture.text,
+        format!("{}\n{}", "a".repeat(9), "b".repeat(10))
+    );
 }
 
 /// Every line of client text carries the quote prefix, so a prompt that writes

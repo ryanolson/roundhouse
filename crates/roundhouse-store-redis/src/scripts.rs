@@ -70,11 +70,10 @@ return {'OK'}
 /// The largest sequence the append script writes exactly. Lua's `..` renders
 /// numbers with `%.14g`, so `10^14` would come out as `1e+14`.
 ///
-/// Lives here rather than in `learning` (fleet-redis-5): the range guard it
-/// names belongs to `APPEND_BODY`, which every write path takes whether or
-/// not the batch carries a mark, and the canonical session write path should
-/// not depend on the deliberately unwired feature module for a fact about
-/// its own log.
+/// Lives here rather than in `learning`: the range guard it names belongs to
+/// `APPEND_BODY`, which every write path takes whether or not the batch
+/// carries a mark, and the canonical session write path should not depend on
+/// the deliberately unwired feature module for a fact about its own log.
 const LAST_EXACT_SEQ: u64 = 99_999_999_999_999;
 
 /// The fenced append, and the reason this module exists.

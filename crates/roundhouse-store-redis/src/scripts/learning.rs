@@ -142,8 +142,8 @@ pub(crate) struct LearningScripts {
 /// built by the three `fn *_key` functions below so the key-builder
 /// convention scan (`key_builder_convention.rs`) covers this family the same
 /// way it covers every other — an owning struct whose constructor inlined
-/// `build_key` calls directly is invisible to a scan that looks for named
-/// `fn ..._key` functions, which is exactly the gap fleet-redis-r2-1 named.
+/// `build_key` calls directly would be invisible to a scan that looks for
+/// named `fn ..._key` functions.
 pub(crate) struct IndexKeys {
     pub(crate) marks: String,
     pub(crate) marked: String,

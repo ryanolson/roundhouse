@@ -454,12 +454,12 @@ mod tests {
     /// **The evaluation ledger shares the deployment's namespace and not its
     /// keys.**
     ///
-    /// The first draft derived `<ns>-eval`, which made deployment `tenant`'s
+    /// A key derived as `<ns>-eval` would make deployment `tenant`'s
     /// evaluation ledger identical to deployment `tenant-eval`'s *serving*
-    /// ledger — two tenants on one counter, and the only symptom would have
-    /// been one of them refusing turns it had budget for. This asserts the
-    /// fix in the shape the collision had: the two deployments' four key
-    /// spaces are pairwise distinct, and the serving keys are unchanged.
+    /// ledger — two tenants on one counter, and the only symptom would be
+    /// one of them refusing turns it had budget for. This asserts the two
+    /// deployments' four key spaces are pairwise distinct, with the serving
+    /// keys unchanged.
     ///
     /// Lives here rather than in `roundhouse-server`: the property under test
     /// is the store's own key layout, and `pub(crate)` visibility of

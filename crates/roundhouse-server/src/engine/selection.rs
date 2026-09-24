@@ -131,7 +131,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
 /// as `local_quote_skipped`, and a tool-declaring turn is withheld from local
 /// exactly when it is `Some(LocalQuoteSkip::ToolsDeclared)`: no local
 /// candidate is ever quoted for one, so there is nothing downstream left to
-/// filter back out (server-r3-1). A free function over values the call site
+/// filter back out. A free function over values the call site
 /// already holds, so the decision to skip an HTTP call is testable without a
 /// session, a fleet or a clock.
 ///
@@ -164,7 +164,7 @@ fn local_quote_can_matter(
     // one failure shape this codebase treats as worse than an error.
     //
     // **Checked before the policy arm below, and the order is load-bearing,
-    // not tidy** (server-r3-1). A candidate that could never have served this
+    // not tidy.** A candidate that could never have served this
     // turn must not sit in `considered` either, or the dashboard prices a
     // counterfactual saving against a target the turn could not have used —
     // checking policy first would report `PolicyAdmitsNoLocal` for a
@@ -216,7 +216,7 @@ mod tests {
             local_quote_can_matter(false, &hosted_only, &identity, 0.6),
             Err(LocalQuoteSkip::PolicyAdmitsNoLocal)
         );
-        // **ORDERING (server-r3-1).** Tools must win over policy: a
+        // **ORDERING.** Tools must win over policy: a
         // tool-declaring turn under a policy that also excludes every local
         // target still has to name the tool reason, because that is the name
         // `plan` reads to refuse or annotate the turn — a policy reason here

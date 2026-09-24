@@ -65,8 +65,7 @@ pub struct FrontierModelSpec {
 /// directly: a caller that matches *this* type is exhaustive by
 /// construction, so `catalog_config`'s boot-time mapping can refuse a third
 /// variant at compile time instead of falling through an `unreachable!` that
-/// only starts panicking once the resolver actually grows one
-/// (fleet-redis-r2-2's caveat, closed by fleet-redis-r3-1). A dispatch caller
+/// only starts panicking once the resolver actually grows one. A dispatch caller
 /// that needs the wide error space restates this through
 /// [`FrontierModelSpec::cache_lifetime_error`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -142,7 +141,7 @@ impl FrontierModelSpec {
                 // price. Past it, this dialect has no marker left to ask
                 // for more -- its cache is deterministic, not automatic --
                 // so a deeper ceiling keeps predicting a hit for a stretch
-                // nothing asked the provider to hold (fleet-redis-r3-1).
+                // nothing asked the provider to hold.
                 CacheModel::InactivityDecay { max_ttl_ms, .. }
                     if max_ttl_ms <= DEFAULT_CACHE_TTL_MS =>
                 {
@@ -618,7 +617,7 @@ pub struct FrontierQuote {
     /// where that dispatch *would* mark with the exact same formula it uses
     /// for the current request, rather than two crates each carrying their own
     /// copy of "the penultimate block is `n - 2`" and risking the two
-    /// drifting apart (fleet-redis-3). What no count can carry is whether
+    /// drifting apart. What no count can carry is whether
     /// that earlier request actually had a free slot to place the marker in
     /// — see `anthropic_messages::cache_markers`'s module doc for the case
     /// this misses.

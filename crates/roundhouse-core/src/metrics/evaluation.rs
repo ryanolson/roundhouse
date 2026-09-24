@@ -502,8 +502,10 @@ impl EvaluationFold {
         let mut counters = EvaluationCounters::default();
         let mut open_calls = 0u64;
         // Not `+= .sum()`: `Iterator::sum`'s `f64` identity is `-0.0`, so an
-        // empty open set would publish a signed zero that formats as
-        // `-$0.00` on the dashboard. `EvaluationAccumulator::unconfirmed_usd`
+        // empty open set would serialize as `-0.0` in the wire JSON rather
+        // than `0.0` -- the dashboard's own `usd()` treats `n === 0` as true
+        // for a negative zero too and hides it there, but the raw document
+        // would still carry the sign. `EvaluationAccumulator::unconfirmed_usd`
         // already seeds each principal's own sum at `0.0`, so summing those
         // across principals here with an explicit `0.0` seed cannot
         // reintroduce the standard library's signed-zero fold seed.

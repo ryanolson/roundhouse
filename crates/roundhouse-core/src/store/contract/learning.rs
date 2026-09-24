@@ -5,9 +5,13 @@
 //!
 //! Listed in [`store_contract_suite!`](crate::store_contract_suite), so every
 //! backend runs these beside the lease and log cases. Like the rest of the
-//! suite, each test tolerates a shared backend: it filters every enumeration
-//! to the sessions it created, so another test's marks in the same index can
-//! lengthen a pass but cannot change what it asserts.
+//! suite, each test tolerates a shared backend: most enumerations are
+//! filtered to the sessions a test created, through `only`, so another
+//! test's marks in the same index can lengthen a pass but cannot change what
+//! it asserts. A handful of cursor-boundary checks in
+//! `pages_reach_every_session_past_unfinished_ones` isolate themselves a
+//! different way instead, with a unique session-id prefix and a cursor
+//! positioned just before it, rather than filtering their result.
 //!
 //! Nothing here calls a learner store. That is the point of the source-side
 //! index: everything a recovery task needs to find undelivered work is in the
@@ -781,8 +785,8 @@ pub async fn marks_are_isolated_by_session_and_project<S: SessionStore>(store: &
 
 /// **Discovery needs nothing but the session store.**
 ///
-/// The revision-2 gap: a session whose every learner-store call failed was
-/// never registered, and once it went idle nothing found it. Here the turn
+/// A session whose every learner-store call failed would never be
+/// registered, and once it went idle nothing would find it. Here the turn
 /// marks its event and ends, no learner store exists at all, and a recovery
 /// task that knows nothing about the session still finds it, with the mark
 /// and every source event through it, from this store alone.

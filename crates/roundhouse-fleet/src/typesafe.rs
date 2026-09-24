@@ -603,8 +603,9 @@ impl SystemOneClient {
             // Absent and `null` read the same: no answer arrived under any
             // key, so the batch is empty rather than a distinct fault.
             None => BTreeMap::new(),
-            Some(raw) => serde_json::from_str(raw.get())
-                .map_err(|_| SignalError::MalformedAnswers)?,
+            Some(raw) => {
+                serde_json::from_str(raw.get()).map_err(|_| SignalError::MalformedAnswers)?
+            }
         };
         // The id set first, for the same reason [`Self::answer`] checks a
         // question's options before its distribution: a reply whose ids are not

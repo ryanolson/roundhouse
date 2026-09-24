@@ -73,8 +73,7 @@
 //! way to learn whether that earlier request actually had a free slot to
 //! place it in: a history that rode four tool markers renders the same
 //! segment count as one that rode none, and `plan` cannot tell them apart.
-//! See the fleet-redis-3 finding in the PR this module shipped with, and the
-//! `#[ignore]`d test beside it in `anthropic_messages.rs`, for the case this
+//! See the `#[ignore]`d test in `anthropic_messages.rs` for the case this
 //! misses and why closing it needs a fact this crate's ledger does not carry.
 
 use serde_json::Value;
@@ -112,8 +111,9 @@ pub(super) const CACHE_LOOKBACK_BLOCKS: usize = 20;
 /// request's own breakpoint, and (from a *different* segment count, the
 /// previous dispatch's) the block that dispatch would have marked. One
 /// function rather than the arithmetic written out twice is what keeps the
-/// two placements from drifting apart, which is the defect fleet-redis-3
-/// found when the second copy lived in `roundhouse-server`'s `engine.rs`.
+/// two placements from drifting apart -- a duplicated copy of this formula
+/// once did exactly that, when a second copy lived in `roundhouse-server`'s
+/// `engine.rs`.
 pub(super) fn penultimate(segment_count: usize) -> Option<usize> {
     segment_count.checked_sub(2)
 }

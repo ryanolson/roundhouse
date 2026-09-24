@@ -659,9 +659,9 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
 
     /// Hold the quote, or refuse. Answers what the ledger actually held.
     ///
-    /// **On the worker, never on a turn.** This is the round trip the serving
-    /// path used to await; moving it here is what makes the evaluation budget's
-    /// latency invisible to a response.
+    /// **On the worker, never on a turn.** Awaiting this round trip on the
+    /// serving path would put the evaluation budget's latency in front of a
+    /// response; running it here instead is what keeps it invisible.
     ///
     /// **Both of its ledger waits are under the call's own `deadline`**, and
     /// the second one is the easier to miss: a partial grant is handed back
@@ -727,9 +727,12 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
     ///
     /// Never propagates: a settle that cannot be applied is a warning and a
     /// skip, the same rule `judge.rs` is under. What that costs is one call's
-    /// spend unconfirmed and its hold left to lapse on the TTL — and, since this
-    /// answers [`SettlementAck::Unconfirmed`], the durable record says so instead of
-    /// reporting the charge as committed.
+    /// spend unconfirmed and its hold left to lapse on the TTL — and this
+    /// answers [`SettlementAck::Unconfirmed`] rather than reporting the charge
+    /// as committed, so a turn that claims the result before the retention
+    /// sweep drops it writes that honest state durably. A result the sweep
+    /// drops first carries this same `Unconfirmed` outcome nowhere at all:
+    /// only the original intent, with no answer and no cost, reaches the log.
     ///
     /// **Bounded by the call's own `deadline`, and running out of time answers
     /// the same [`SettlementAck::Unconfirmed`].** A settle abandoned at the deadline is one this

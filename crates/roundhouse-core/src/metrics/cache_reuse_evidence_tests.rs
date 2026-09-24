@@ -174,12 +174,11 @@ fn claude() -> Target {
 
 // --- the two findings, now carried by the vocabulary ----------------------
 
-/// **Finding 1, fixed.** A stated zero is evidence; silence is not.
-///
-/// Before `Usage::cache_read_source` the two were the same value — both
-/// decoders fill the count with a zero when the field is absent — so dividing
-/// it scored a silent upstream as a measured miss. The distinction now survives
-/// into the log, and the fold splits on it rather than on the number.
+/// A stated zero is evidence; silence is not, and `Usage::cache_read_source`
+/// is the fact the fold splits on rather than the count itself: both
+/// decoders fill the count with a zero when the field is absent, so
+/// splitting on the count alone would score a silent upstream as a measured
+/// miss.
 ///
 /// The stated zero pairs, which is the half that must not be lost to a rule
 /// that simply skipped every zero: a cold prefix a provider reported is exactly
@@ -227,8 +226,8 @@ fn a_stated_cache_zero_pairs_and_a_silent_provider_does_not() {
     assert_eq!(count(&seen, "predictions"), 2, "{seen}");
 }
 
-/// **Finding 2, fixed.** A local dispatch's credit is the router's own quote,
-/// and is excluded by provenance rather than by a special case.
+/// A local dispatch's credit is the router's own quote, and is excluded by
+/// provenance rather than by a special case.
 ///
 /// `Engine::local_stream` synthesizes `cached = isl - effective_prefill`, and
 /// the decision recorded `expected_prefill_tokens = effective_prefill`. The two

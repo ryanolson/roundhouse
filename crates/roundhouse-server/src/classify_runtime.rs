@@ -198,12 +198,12 @@ impl<R: ParkedRecord> Mailbox<R> {
 
     /// Hold a finished record until a turn with a writer takes it.
     ///
-    /// **Retention is its own clock, starting at `retain_until_ms`.** It used
-    /// to be the call's absolute expiry, and that was a defect the
-    /// hypothesis list named: a call that finished in the last second of its
-    /// life was swept before any turn could drain it, so every
-    /// slow-but-successful classification was thrown away. The call expiry
-    /// bounds *making* the call; this bounds *holding* its answer.
+    /// **Retention is its own clock, starting at `retain_until_ms`, deliberately
+    /// separate from the call's absolute expiry.** Sharing one clock would
+    /// sweep a call that finished in the last second of its life before any
+    /// turn could drain it, throwing away every slow-but-successful
+    /// classification. The call expiry bounds *making* the call; this bounds
+    /// *holding* its answer.
     async fn park(
         &self,
         session_id: SessionId,
@@ -422,11 +422,11 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     /// Render the bounded projection and prepare the request over it, or
     /// answer why this turn cannot be classified.
     ///
-    /// **One call rather than two.** `projection` and `prepare` used to be
-    /// separate pass-throughs to [`TypeSafeShadow`], and the engine's only
-    /// caller always ran them back to back — the projection has no other use
-    /// than feeding straight into `prepare`, so the seam bought nothing but a
-    /// second place for the ordering to be gotten wrong.
+    /// **One call rather than two separate pass-throughs to
+    /// [`TypeSafeShadow`].** The engine's only caller always runs them back
+    /// to back — the projection has no other use than feeding straight into
+    /// `prepare` — so splitting them would buy nothing but a second place
+    /// for the ordering to be gotten wrong.
     pub fn prepare(
         &self,
         source: ClassificationSource,
@@ -571,10 +571,11 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
     /// Spawn `work` on the executor, cancelled the instant this runtime's
     /// lifetime ends.
     ///
-    /// **The `subscribe` + `select!` pattern, owned once.** [`Self::spawn`]
-    /// and [`Self::repair`] each used to repeat it, and a copy that drifted
-    /// would be a worker that either raced its own cancellation check or
-    /// missed it. Subscribed here, before the task exists, so a `stop`
+    /// **The `subscribe` + `select!` pattern, owned once** rather than
+    /// repeated in both [`Self::spawn`] and [`Self::repair`]: two copies that
+    /// drifted apart would leave a worker that either raced its own
+    /// cancellation check or missed it. Subscribed here, before the task
+    /// exists, so a `stop`
     /// landing between this call and the task's first poll is still seen:
     /// `wait_for` answers on the value the receiver already holds and not
     /// only on a later change.
@@ -866,13 +867,12 @@ pub fn compose<T: Tokenizer + Send + Sync + 'static>(
 /// One deployment's classification lifetime, held for as long as it serves.
 ///
 /// **Ending it ends the runtime**, which is why this owns more than a task
-/// handle. It used to abort the sweep and nothing else, so the lifetime a
-/// deployment actually got left admission open and a worker on the wire running
-/// against an upstream nobody was waiting for any more;
-/// [`ClassificationRuntime::shutdown`] stopped both and nothing in production
-/// called it. The composition root holds this and never calls anything on it —
-/// the guarantee is in the drop, so it cannot be forgotten at one of the
-/// several places serving can end.
+/// handle: a handle whose drop only aborted the sweep would leave admission
+/// open and a worker on the wire running against an upstream nobody is
+/// waiting for any more. [`ClassificationRuntime::shutdown`] stops both, so
+/// the composition root holds this and never calls anything on it — the
+/// guarantee is in the drop, so it cannot be forgotten at one of the several
+/// places serving can end.
 pub struct Supervisor<T: Tokenizer> {
     sweep: tokio::task::JoinHandle<()>,
     runtime: Arc<ClassificationRuntime<T>>,

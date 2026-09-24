@@ -108,7 +108,7 @@ The mutation checks used `sed` to change one token, ran the suite, and used `sed
 **Tests first.**
 
 1. Remove the ignore from the evidence test. Its control stays live.
-2. `a_request_with_the_client_holding_four_tool_markers_still_sends_none`.
+2. `normalizing_four_riding_markers_still_spends_the_whole_allowance`.
 3. `a_request_with_three_riding_markers_keeps_the_penultimate_and_drops_the_previous`.
 4. `a_short_append_adds_no_second_marker`.
 5. `the_judge_quote_still_carries_no_cache_control`.
