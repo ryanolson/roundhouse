@@ -32,6 +32,7 @@ use roundhouse_core::routing::ledger::ProviderPricing;
 use roundhouse_fleet::typesafe::{DEFAULT_SYSTEM_ONE_BASE, SystemOneLimits};
 use serde::Deserialize;
 
+use crate::catalog_config::providers::is_http_url;
 use crate::classify_runtime::RuntimeLimits;
 use crate::typesafe_shadow::ShadowConfig;
 
@@ -201,6 +202,15 @@ impl ClassifyConfig {
         };
         if self.model.trim().is_empty() {
             return Err(invalid("model", "a pinned model id"));
+        }
+        // A base URL with no scheme reaches `reqwest` as a relative URL, and
+        // every call fails with a transport error after opening and
+        // releasing a hold rather than at boot where an operator can be
+        // pointed at the file. The catalog refuses a provider's `base_url`
+        // under the same rule; `is_http_url` is that one rule, not a second
+        // copy of it.
+        if !is_http_url(&self.base_url) {
+            return Err(invalid("base_url", "an absolute http:// or https:// URL"));
         }
         if self.auth.env.trim().is_empty() {
             return Err(invalid("auth.env", "the name of an environment variable"));

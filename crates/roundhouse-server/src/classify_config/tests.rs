@@ -240,6 +240,53 @@ fn a_prompt_cap_no_wider_than_the_truncation_marker_is_refused() {
     );
 }
 
+/// **A `base_url` with no scheme is refused at load, the same rule the
+/// catalog applies to a provider's own `base_url`.** Left unchecked, it loads
+/// fine and every call fails with a transport error after opening and
+/// releasing a hold — a runtime surprise this file's own doc says a boot
+/// check exists to prevent for every other load-bearing field.
+#[test]
+fn a_base_url_with_no_scheme_is_refused() {
+    for broken in [
+        with(
+            "\"base_url\": \"https://classifier.test/v1\",",
+            "\"base_url\": \"api.x.test/v1\",",
+        ),
+        with(
+            "\"base_url\": \"https://classifier.test/v1\",",
+            "\"base_url\": \"\",",
+        ),
+    ] {
+        let error =
+            ClassifyConfig::from_json(&broken, "<test>").expect_err("a schemeless URL is refused");
+        assert!(
+            matches!(
+                error,
+                ClassifyConfigError::Invalid {
+                    field: "base_url",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    // The control: a well-formed URL loads.
+    assert!(
+        ClassifyConfig::from_json(COMPLETE, "<test>").is_ok(),
+        "an ordinary https:// base_url must still load"
+    );
+    let loopback = with(
+        "\"base_url\": \"https://classifier.test/v1\",",
+        "\"base_url\": \"http://127.0.0.1:8080\",",
+    );
+    assert!(
+        ClassifyConfig::from_json(&loopback, "<test>").is_ok(),
+        "http:// must load too -- the classifier is as likely to be a \
+         loopback service as a hosted one"
+    );
+}
+
 /// An unknown key is a typo, and a typo in a file that governs egress is worth
 /// refusing rather than ignoring.
 #[test]

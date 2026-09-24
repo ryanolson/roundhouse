@@ -183,6 +183,16 @@ impl ProviderAuth {
     }
 }
 
+/// Whether `url` names a scheme `reqwest` can dispatch against.
+///
+/// Shared rather than copied: [`ClassifyConfig::validate`](crate::classify_config::ClassifyConfig)
+/// refuses the classifier's own `base_url` the same way a catalog provider's
+/// is refused here, and two independent spellings of "has a scheme" are two
+/// things that can silently drift apart on the next dialect this gains.
+pub(crate) fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
 impl ProviderConfig {
     /// Refuse a definition that cannot mean one thing.
     ///
@@ -195,7 +205,7 @@ impl ProviderConfig {
         // A base URL with no scheme reaches `reqwest` as a relative URL and
         // fails at the first dispatch of the first turn, per tenant, with a
         // message about a URL rather than about a config file.
-        if !(self.base_url.starts_with("http://") || self.base_url.starts_with("https://")) {
+        if !is_http_url(&self.base_url) {
             return Err(CatalogError::ProviderBaseUrl {
                 path: path.to_string(),
                 provider: name.to_string(),
