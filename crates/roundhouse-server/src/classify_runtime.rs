@@ -869,10 +869,10 @@ pub fn compose<T: Tokenizer + Send + Sync + 'static>(
 /// **Ending it ends the runtime**, which is why this owns more than a task
 /// handle: a handle whose drop only aborted the sweep would leave admission
 /// open and a worker on the wire running against an upstream nobody is
-/// waiting for any more. [`ClassificationRuntime::shutdown`] stops both, so
-/// the composition root holds this and never calls anything on it — the
-/// guarantee is in the drop, so it cannot be forgotten at one of the several
-/// places serving can end.
+/// waiting for any more. `Drop` aborts the sweep and calls
+/// [`ClassificationRuntime::stop`], so the composition root holds this and
+/// never calls anything on it — the guarantee is in the drop, so it cannot be
+/// forgotten at one of the several places serving can end.
 pub struct Supervisor<T: Tokenizer> {
     sweep: tokio::task::JoinHandle<()>,
     runtime: Arc<ClassificationRuntime<T>>,
