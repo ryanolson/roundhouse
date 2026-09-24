@@ -17,6 +17,12 @@
 //! the routine case behind the claim, not a ledger outage, and just as
 //! untested by the shape above. [`settlement_repair::YieldingLedger`] is
 //! what reproduces one without touching `typesafe_shadow` itself.
+//!
+//! Neither shape proves the withhold actually *lifts* once the debt it was
+//! for is repaid, either: a mutation that withholds unconditionally would
+//! still pass every assertion above it, since none of them ever asks the
+//! classifier again after the repair lands. The last turn appended to
+//! [`a_sessions_own_new_ticket_does_not_starve_its_owed_repair`] does.
 
 use super::settlement_repair::{SettleOnceFailingLedger, YieldingLedger};
 use super::*;
@@ -39,7 +45,7 @@ fn one_slot_config(base_url: &str) -> ClassifyConfig {
 /// claim is that this repeats *forever*, not just once.
 #[tokio::test]
 async fn a_sessions_own_new_ticket_does_not_starve_its_owed_repair() {
-    let (base_url, _upstream) = classifier_upstream().await;
+    let (base_url, upstream) = classifier_upstream().await;
     let classify = one_slot_config(&base_url);
     let ledger = SettleOnceFailingLedger::new();
     let runtime = compose(
@@ -121,6 +127,33 @@ async fn a_sessions_own_new_ticket_does_not_starve_its_owed_repair() {
         "a second, successful settle_grant for t1's own call must eventually \
          arrive -- a session's own repeated new tickets must not hold the \
          one slot away from the repair it already owes, turn after turn"
+    );
+
+    // **The withhold must lift once the debt it was for is gone.** Neither
+    // this test's loop above nor `settlement_repair.rs` would catch a
+    // withhold that stuck permanently once the entry that justified it left
+    // `unrepaired_settlements` -- so ask one more time, deliberately after
+    // the repair is already confirmed applied, and check the classifier is
+    // actually asked again under a call id nothing above used.
+    let calls_before_resuming = upstream.count();
+    turn("t6", "keep going still").await;
+    for _ in 0..300 {
+        if upstream.count() > calls_before_resuming {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        upstream.count() > calls_before_resuming,
+        "t6 must buy its own classification once the repair it might once \
+         have been withheld for is no longer owed"
+    );
+    let intents = intents_in(&*store, &session).await;
+    assert!(
+        intents
+            .iter()
+            .any(|intent| intent.call_id.to_string() != call_id),
+        "t6's own intent must carry a call id distinct from t1's repaired one"
     );
 }
 

@@ -263,8 +263,23 @@ impl roundhouse_core::control::SpendLedger for SettleOnceFailingLedger {
     ) -> Result<roundhouse_core::control::Grant, roundhouse_core::control::SpendError> {
         if self.open_grant_gate_armed.load(Ordering::SeqCst) {
             let ordinal = self.open_grant_ordinal.fetch_add(1, Ordering::SeqCst) + 1;
-            while self.released_through.load(Ordering::SeqCst) < ordinal {
-                self.open_grant_gate.notified().await;
+            // Registered before `released_through` is read, and enabled
+            // before that read too: a `Notified` armed only after the load
+            // would miss a `notify_waiters()` that lands in the gap between
+            // the two, and this gate is released from a different task than
+            // the one that reads `released_through` here, so that gap is
+            // real. `enable()` makes the wakeup pending as soon as the
+            // registration exists, which is what makes the subsequent load
+            // safe to trust either way -- true, and this loop exits; false,
+            // and the already-armed `Notified` still won't be missed.
+            loop {
+                let notified = self.open_grant_gate.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.released_through.load(Ordering::SeqCst) >= ordinal {
+                    break;
+                }
+                notified.await;
             }
         }
         self.inner.open_grant(request).await
