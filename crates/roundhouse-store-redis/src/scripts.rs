@@ -324,12 +324,19 @@ impl Scripts {
             .arg(identity.fencing_token);
         match &batch.mark {
             Some(mark) => {
-                // Positional and load-bearing: `APPEND_BODY` reads `KEYS[4]`
-                // as the marks hash and `KEYS[5]`/`KEYS[6]` as the marked and
-                // pending zsets by index, so this order must agree with
-                // `IndexKeys`' field order exactly — the marked and pending
-                // zsets carry the same type, so a swap here would pass the
-                // Lua type check and corrupt the wrong set silently.
+                // Positional: `APPEND_BODY` reads `KEYS[4]` as the marks hash
+                // and `KEYS[5]`/`KEYS[6]` as the marked and pending zsets, so
+                // this order must agree with `IndexKeys`' field order. The
+                // two zset positions are not load-bearing between
+                // themselves: the script applies the same check and the same
+                // `ZADD <key> 0 ARGV[3]` to both, so swapping which one is
+                // passed as KEYS[5] versus KEYS[6] leaves the same two keys
+                // holding the same member either way. Only the hash position
+                // is distinguishable, and only once its key already exists —
+                // `is_type_or_absent` accepts a key that has never been
+                // written, so a misplaced hash on a brand-new namespace
+                // passes the type check and is created with the wrong type
+                // by the write that follows.
                 for key in [
                     mark.index_keys.marks.as_str(),
                     mark.index_keys.marked.as_str(),
