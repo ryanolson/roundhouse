@@ -443,6 +443,59 @@ fn a_measured_local_curve_reaches_the_engine_config() {
     );
 }
 
+/// A misspelled local-latency key is silently ignored without
+/// `deny_unknown_fields`, which loads the slope at its default `0.0` and
+/// quotes every local worker flat with nothing in the file to say why -- the
+/// same defect class round 3 closed for the classify config (8b73291).
+#[test]
+fn a_misspelled_local_latency_key_is_refused_rather_than_silently_defaulted() {
+    let err = CatalogConfig::from_json(
+        &with_local_section(
+            r#",
+          "local_ttft_ms_per_prefil_token": 2.0"#,
+        ),
+        "test",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, CatalogError::Parse { .. }),
+        "a misspelled key must fail to load, not load with the slope at zero: {err}"
+    );
+}
+
+/// **CONTROL, not a defect.** Every field `FrontierModelSpec`,
+/// `ProviderPricing`, and `CacheModel` declare is required and carries no
+/// `#[serde(default)]`, so a misspelled field name inside a `models[]` entry
+/// is already refused as a missing field -- the same guarantee
+/// `deny_unknown_fields` gives the fields above, reached by a different
+/// mechanism and for a different reason: those fields default silently,
+/// these do not.
+#[test]
+fn a_misspelled_entry_field_is_already_refused_as_a_missing_field() {
+    let raw = r#"{
+      "models": [{
+        "provider": "openai",
+        "model": "gpt",
+        "wire_protocol": "openai_responses",
+        "cach_model": { "kind": "deterministic", "ttl_ms": 300000 },
+        "pricing": {
+          "input_per_mtok_usd": 1.0,
+          "cached_input_per_mtok_usd": 0.1,
+          "cache_write_per_mtok_usd": 0.0,
+          "output_per_mtok_usd": 4.0
+        },
+        "quality_prior": 0.7,
+        "base_ttft_ms": 300.0,
+        "ttft_ms_per_uncached_token": 0.001
+      }]
+    }"#;
+    let err = CatalogConfig::from_json(raw, "test").unwrap_err();
+    assert!(
+        matches!(err, CatalogError::Parse { .. }),
+        "`cache_model` has no default, so misspelling it must already fail to load: {err}"
+    );
+}
+
 /// A negative latency is refused for the same reason a negative rate is.
 ///
 /// A negative slope does not merely mis-quote: it makes a local worker look

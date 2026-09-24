@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
 use roundhouse_fleet::anthropic_messages::CacheLifetime;
@@ -45,6 +46,7 @@ pub const CATALOG_VAR: &str = "ROUNDHOUSE_CATALOG";
 
 /// A stated equivalence between one of our models and a hosted one.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CorrelaryConfig {
     /// The local model's name, as `EngineConfig::local_model` reports it.
     pub local_model: String,
@@ -58,7 +60,15 @@ pub struct CorrelaryConfig {
 
 /// What a deployment supplies.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogConfig {
+    /// The shipped example's own inline commentary (`examples/catalog.example.json`),
+    /// allowed by name and never read. The one exception to `deny_unknown_fields`
+    /// below: a file that teaches the format by writing prose into itself must not
+    /// trip the same guard that exists to catch an operator's typo elsewhere in it.
+    #[serde(rename = "$comment", default)]
+    #[allow(dead_code)]
+    comment: Option<Value>,
     /// Hosted models the router may choose between, with their prices.
     pub models: Vec<FrontierModelSpec>,
     /// Where each [`FrontierModelSpec::provider`] actually is, keyed by that
@@ -111,9 +121,10 @@ const PROVENANCE_FILE: &str = "quality-prior.provenance.json";
 /// attribution when the data is republished — and roundhouse republishes
 /// figures derived from it: the savings dashboard's routing saving is priced
 /// through the capability gate those priors feed. The fragment the tool emits
-/// cannot carry the attribution (a catalog entry is `deny_unknown_fields`, and
-/// inventing a field there would put somebody else's schema into every
-/// catalog), so the obligation lives in the paired provenance file. Reading it
+/// cannot carry the attribution -- inventing a field on [`FrontierModelSpec`]
+/// for one importer's provenance would put somebody else's schema into every
+/// catalog entry ever written, not just the imported ones -- so the
+/// obligation lives in the paired provenance file instead. Reading it
 /// here is what turns "keep the two files together" from an instruction into
 /// something the deployment does on the operator's behalf (M10 review G12).
 ///
