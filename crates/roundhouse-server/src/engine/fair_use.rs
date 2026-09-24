@@ -86,6 +86,8 @@
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::FairUseRefusal;
+#[cfg(test)]
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::ids::ResponseId;
 use roundhouse_core::now_ms;
 use roundhouse_core::session::Session;
@@ -323,6 +325,7 @@ mod tests {
     use axum::response::IntoResponse;
 
     use crate::engine::{EchoLocalExecutor, EngineConfig};
+    use crate::test_support::captured_warnings;
 
     use super::*;
 
@@ -398,6 +401,7 @@ mod tests {
                 Usage {
                     input_tokens: tokens,
                     cached_input_tokens: 0,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 0,
                     output_tokens: 0,
                     reasoning_tokens: 0,
@@ -460,57 +464,6 @@ mod tests {
              same 100 tokens would put this 150-token window over and refuse a \
              turn that had room"
         );
-    }
-
-    /// Everything `tracing::warn!` wrote during one closure, as text.
-    ///
-    /// The same capture point `main.rs`'s own suite keeps, and here for the
-    /// same reason: nothing else in this file reads what `tracing` emits, so
-    /// the single-node caution below could be deleted outright without a test
-    /// going red. The serialization and the interest-cache rebuild are not
-    /// tidiness — `with_default` installs a *thread-local* subscriber, and a
-    /// concurrent test evaluating this callsite under the no-op global
-    /// dispatcher caches "never interested" for it, which silently drops the
-    /// very line the assertion is about. See `main.rs`'s copy for the full
-    /// diagnosis.
-    fn captured_warnings(f: impl FnOnce()) -> String {
-        use std::io;
-        use std::sync::Mutex;
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for Buf {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for Buf {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-        let _serialized = ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let buf = Buf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
-        String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
     }
 
     /// **A ceiling this node learned about after boot still says "one node",

@@ -23,11 +23,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use roundhouse_core::control::{CredentialError, TurnCredential};
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
 };
 
+use crate::anthropic_messages::{CacheLifetime, DEFAULT_CACHE_TTL_MS};
 use crate::usage::WireProtocol;
 
 /// A frontier model we may route to.
@@ -56,11 +58,140 @@ pub struct FrontierModelSpec {
     pub ttft_ms_per_uncached_token: f64,
 }
 
+/// Why [`FrontierModelSpec::requested_cache_lifetime`] could not name a
+/// lifetime.
+///
+/// Its own small enum rather than the resolver returning [`FrontierError`]
+/// directly: a caller that matches *this* type is exhaustive by
+/// construction, so `catalog_config`'s boot-time mapping can refuse a third
+/// variant at compile time instead of falling through an `unreachable!` that
+/// only starts panicking once the resolver actually grows one. A dispatch caller
+/// that needs the wide error space restates this through
+/// [`FrontierModelSpec::cache_lifetime_error`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CacheLifetimeError {
+    /// A `Deterministic` TTL neither of the wire's two spellings means.
+    #[error(
+        "a {ttl_ms}ms cache lifetime, and Anthropic's Messages API has no spelling for it \
+         -- only the five-minute default (300000) and the explicit one-hour marker \
+         (3600000) exist"
+    )]
+    UnspellableTtl { ttl_ms: u64 },
+    /// An `InactivityDecay` ceiling past the wire's own undeclared default.
+    ///
+    /// Anthropic's Messages cache is deterministic, not automatic: the only
+    /// lever this dialect offers past the silent five-minute default is the
+    /// explicit `1h` marker `CacheModel::Deterministic` spells, not a decay
+    /// curve that keeps predicting warmth the longer a prefix goes unused.
+    /// A `max_ttl_ms` at or under the default is close enough to the wire's
+    /// own schedule to price; past it, the model keeps predicting a hit for
+    /// a stretch no marker asked the provider to hold.
+    #[error(
+        "an automatic cache retained up to {max_ttl_ms}ms, longer than the {default_ttl_ms}ms \
+         Anthropic's Messages API grants with no marker to ask for more -- this dialect's \
+         cache is deterministic, not automatic"
+    )]
+    UndeclaredDecay {
+        max_ttl_ms: u64,
+        default_ttl_ms: u64,
+    },
+}
+
 impl FrontierModelSpec {
     pub fn target(&self) -> Target {
         Target::Frontier {
             provider: self.provider.clone(),
             model: self.model.clone(),
+        }
+    }
+
+    /// Shared cache-lifetime source for turns and judge calls.
+    ///
+    /// **Dialect-aware, because the typed vocabulary is Anthropic's alone.**
+    /// Every other wire this catalog can name has no per-breakpoint lifetime
+    /// at all, so its quote carries [`CacheLifetime::Default`] too — the
+    /// honest answer to "what TTL does this wire ask for" on a dialect the
+    /// field means nothing to. On Messages itself, `Default` also covers
+    /// `Observed` and an `InactivityDecay` ceiling that fits inside the
+    /// wire's own undeclared five minutes; one deeper than that, or a
+    /// `Deterministic` TTL neither wire spelling means, is refused rather
+    /// than downgraded to it — see [`CacheLifetimeError`].
+    ///
+    /// Fallible only in theory for a spec built outside the server's
+    /// `catalog_config` validation — that boundary refuses an
+    /// `anthropic_messages` entry this resolver would refuse, so a spec
+    /// that reaches a real dispatch has already had this succeed once. A
+    /// hand-built spec that skipped validation is refused here rather than
+    /// silently priced at the default, which is exactly the failure this
+    /// type exists to close.
+    ///
+    /// **Both matches are spelled out, neither ends in a wildcard.** A
+    /// `WireProtocol` this crate cannot spell a `cache_control` for and a
+    /// `CacheModel` a future revision adds would each fall through a `_` arm
+    /// straight to `Default` — silently, the same failure this type exists
+    /// to close, just moved one match up. A variant added to either enum
+    /// fails to compile here until someone decides what it means.
+    pub fn requested_cache_lifetime(&self) -> Result<CacheLifetime, CacheLifetimeError> {
+        match self.wire_protocol {
+            WireProtocol::AnthropicMessages => match self.cache_model {
+                CacheModel::Deterministic { ttl_ms } => CacheLifetime::from_ttl_ms(ttl_ms)
+                    .ok_or(CacheLifetimeError::UnspellableTtl { ttl_ms }),
+                // Within the wire's own undeclared five minutes, a decay
+                // curve and the silent default agree closely enough to
+                // price. Past it, this dialect has no marker left to ask
+                // for more -- its cache is deterministic, not automatic --
+                // so a deeper ceiling keeps predicting a hit for a stretch
+                // nothing asked the provider to hold.
+                CacheModel::InactivityDecay { max_ttl_ms, .. }
+                    if max_ttl_ms <= DEFAULT_CACHE_TTL_MS =>
+                {
+                    Ok(CacheLifetime::Default)
+                }
+                CacheModel::InactivityDecay { max_ttl_ms, .. } => {
+                    Err(CacheLifetimeError::UndeclaredDecay {
+                        max_ttl_ms,
+                        default_ttl_ms: DEFAULT_CACHE_TTL_MS,
+                    })
+                }
+                // Never guessed at -- the router uses the target's reported
+                // overlap instead -- so there is no retention claim here for
+                // the wire's silent default to contradict.
+                CacheModel::Observed => Ok(CacheLifetime::Default),
+            },
+            // Neither dialect has `cache_control` vocabulary at all, so every
+            // cache model reads the same on them: no explicit lifetime.
+            WireProtocol::OpenAiChatCompletions | WireProtocol::OpenAiResponses => {
+                Ok(CacheLifetime::Default)
+            }
+        }
+    }
+
+    /// [`Self::requested_cache_lifetime`]'s refusal, restated in the wide
+    /// dispatch-error space a `FrontierClient` call returns.
+    ///
+    /// A dispatch caller (`engine.rs`, `judge.rs`) needs `FrontierError`
+    /// because that is what failover and `JudgeFailure::Abandoned` already
+    /// match on; `catalog_config`'s boot-time boundary does not; it maps
+    /// [`CacheLifetimeError`] directly so its match stays exhaustive. This
+    /// is the seam between the two: it carries the identity the narrower
+    /// type does not.
+    pub fn cache_lifetime_error(&self, error: CacheLifetimeError) -> FrontierError {
+        FrontierError::UnsupportedCacheLifetime {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            ttl_ms: error.ttl_ms(),
+        }
+    }
+}
+
+impl CacheLifetimeError {
+    /// The TTL, in milliseconds, this refusal is about — the deterministic
+    /// value the wire cannot spell, or the decay ceiling past what the wire
+    /// silently grants.
+    pub fn ttl_ms(&self) -> u64 {
+        match *self {
+            CacheLifetimeError::UnspellableTtl { ttl_ms } => ttl_ms,
+            CacheLifetimeError::UndeclaredDecay { max_ttl_ms, .. } => max_ttl_ms,
         }
     }
 }
@@ -291,6 +422,13 @@ pub enum FrontierChunk {
     Done {
         input_tokens: u64,
         cached_input_tokens: u64,
+        /// Where `cached_input_tokens` came from.
+        ///
+        /// Both wire decoders fill the count with a zero when the provider
+        /// omits the field, so the number alone cannot tell a cold prefix from
+        /// a silent upstream. Carried from the decoder rather than re-derived
+        /// downstream, because this is the only layer that saw the wire.
+        cache_read_source: CacheReadSource,
         /// Prompt tokens the provider wrote into its cache on this call.
         ///
         /// A *component* of `input_tokens`, exactly as `cached_input_tokens` is:
@@ -382,6 +520,7 @@ impl FrontierChunk {
         text: String,
         input_tokens: u64,
         cached_input_tokens: u64,
+        cache_read_source: CacheReadSource,
         output_tokens: u64,
         reasoning_tokens: u64,
     ) -> FrontierStream {
@@ -390,6 +529,10 @@ impl FrontierChunk {
             Ok(FrontierChunk::Done {
                 input_tokens,
                 cached_input_tokens,
+                // A parameter, unlike `cache_write_tokens` below: the callers
+                // that adapt a non-streaming backend do know whether the count
+                // they were handed came from a provider or from us.
+                cache_read_source,
                 // Not a parameter, so that the dozen call sites that adapt a
                 // non-streaming backend do not each have to answer a question
                 // none of them can: a backend handed token counts by its caller
@@ -456,6 +599,52 @@ pub struct FrontierQuote {
     /// each on a UTF-8 character boundary; anything else is refused by
     /// [`Self::segments`] rather than sliced.
     pub segment_boundaries: Vec<usize>,
+    /// How many items the *previous* request to this target rendered, if the
+    /// ledger remembers one — a ledger fact, not a guess about where that
+    /// request placed a marker.
+    ///
+    /// **A provider looks a bounded distance back from a breakpoint, not all
+    /// the way to the start of the prompt.** Anthropic checks at most twenty
+    /// block positions back from each marker, counting the marker itself
+    /// (platform.claude.com/docs/en/build-with-claude/prompt-caching). A turn
+    /// that appended twenty or more items since the last dispatch to the same
+    /// target therefore puts its one penultimate marker out of reach of the
+    /// entry the previous turn wrote, and reads nothing from a cache whose
+    /// bytes are still byte-identical. This field is what lets a client place a
+    /// second marker back where that entry lives.
+    ///
+    /// **A count, not a block index**, so the client that reads it derives
+    /// where that dispatch *would* mark with the exact same formula it uses
+    /// for the current request, rather than two crates each carrying their own
+    /// copy of "the penultimate block is `n - 2`" and risking the two
+    /// drifting apart. What no count can carry is whether
+    /// that earlier request actually had a free slot to place the marker in
+    /// — see `anthropic_messages::cache_markers`'s module doc for the case
+    /// this misses.
+    ///
+    /// Taken from the cache ledger's `TargetState::last_segment_count`, the
+    /// item count the previous dispatch to this target rendered — so it is a
+    /// fact about that target and is re-derived per failover attempt rather
+    /// than per turn. `None` means no prior dispatch is remembered, which
+    /// every caller that is not the turn path means: a side call has no
+    /// conversation to share a prefix with.
+    pub previous_segment_count: Option<usize>,
+    /// The cache lifetime this target's entry declares.
+    ///
+    /// Carried from [`FrontierModelSpec::cache_model`] through
+    /// [`FrontierModelSpec::requested_cache_lifetime`] so the TTL a client
+    /// asks the provider for and the TTL the ledger predicts retention on are
+    /// the same number, resolved into the wire's own typed vocabulary once
+    /// rather than compared as a raw millisecond count at every reader. A
+    /// second setting for the wire could disagree with the ledger, and the
+    /// router would then price a hit it never bought.
+    ///
+    /// [`CacheLifetime::Default`] means no explicit lifetime — the value
+    /// every non-Anthropic dialect carries, since the field means nothing to
+    /// them, and what a side call carries too: a check asks for its own
+    /// target's declared lifetime exactly as a turn does, through the same
+    /// reader.
+    pub cache_lifetime: CacheLifetime,
     /// Caller-supplied identity, independent of the cache-routing hint.
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
@@ -965,6 +1154,28 @@ pub enum FrontierError {
         got: &'static str,
         target: String,
     },
+    /// A target's catalog entry asks Anthropic's wire for a cache lifetime it
+    /// has no spelling for.
+    ///
+    /// Its own arm for the reason [`Self::UnsupportedDialect`] has one:
+    /// nothing reached an upstream, and nothing should. `CatalogConfig`'s own
+    /// validation refuses exactly this at boot, so a spec that reaches a real
+    /// dispatch has already had [`CacheLifetime::from_ttl_ms`] succeed once —
+    /// this arm exists for the spec that was built by hand rather than
+    /// parsed. Refusing beats guessing: a silent fallback to the default
+    /// lifetime would price the warmth an unspellable TTL never buys, which
+    /// is the defect this type exists to close.
+    #[error(
+        "`{provider}/{model}` asks its wire for a {ttl_ms}ms cache lifetime, and Anthropic's \
+         Messages API has no spelling for it -- only the five-minute default (300000) and the \
+         explicit one-hour marker (3600000) exist; refusing rather than silently falling back \
+         to the default and pricing a hit the wire was never asked to grant"
+    )]
+    UnsupportedCacheLifetime {
+        provider: String,
+        model: String,
+        ttl_ms: u64,
+    },
     /// The request never reached a model: DNS, connect, TLS, a reset — or the
     /// client gave up waiting.
     ///
@@ -1030,7 +1241,12 @@ impl FrontierError {
             // identically, and the ones that do not are the reason this refusal
             // exists. The remedy is a catalog or a client change, not a retry.
             | FrontierError::UntranslatableTools { .. }
-            | FrontierError::UnsupportedDialect { .. } => None,
+            | FrontierError::UnsupportedDialect { .. }
+            // A catalog TTL the wire cannot spell is the same class of
+            // mistake as an unserializable dialect: a second target sharing
+            // the same catalog entry fails identically, and the remedy is
+            // the catalog, not a retry.
+            | FrontierError::UnsupportedCacheLifetime { .. } => None,
         }
     }
 }
@@ -1162,6 +1378,9 @@ impl FrontierClient for EchoFrontierClient {
             self.reply.clone(),
             quote.prompt.len() as u64,
             0,
+            // This double states its counts, the cache read included, so its
+            // zero is a stated zero rather than a silence.
+            CacheReadSource::Provider,
             self.reply.len() as u64,
             0,
         ))
@@ -1237,6 +1456,11 @@ mod tests {
                 got: "anthropic_messages",
                 target: "anthropic/claude".into(),
             },
+            FrontierError::UnsupportedCacheLifetime {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+                ttl_ms: 600_000,
+            },
         ] {
             assert_eq!(
                 terminal.failover_class(),
@@ -1276,6 +1500,84 @@ mod tests {
         }
     }
 
+    /// **Closes the mutation hole a single body-level test leaves.** A
+    /// `.map_err(..)?` at either call site silently falling back to
+    /// `CacheLifetime::Default` on `Err` would still serialize a request that
+    /// looks ordinary — this table asserts the resolver's own return value,
+    /// which a body assertion downstream of a swallowed error cannot see.
+    #[test]
+    fn requested_cache_lifetime_resolves_every_dialect_and_cache_model_pair() {
+        let messages = |cache_model| FrontierModelSpec {
+            wire_protocol: WireProtocol::AnthropicMessages,
+            cache_model,
+            ..entry("anthropic", "claude")
+        };
+
+        assert_eq!(
+            messages(CacheModel::Deterministic { ttl_ms: 300_000 })
+                .requested_cache_lifetime()
+                .unwrap(),
+            CacheLifetime::Default
+        );
+        assert_eq!(
+            messages(CacheModel::Deterministic { ttl_ms: 3_600_000 })
+                .requested_cache_lifetime()
+                .unwrap(),
+            CacheLifetime::OneHour
+        );
+        assert!(matches!(
+            messages(CacheModel::Deterministic { ttl_ms: 600_000 }).requested_cache_lifetime(),
+            Err(CacheLifetimeError::UnspellableTtl { ttl_ms: 600_000 })
+        ));
+        assert_eq!(
+            messages(CacheModel::Observed)
+                .requested_cache_lifetime()
+                .unwrap(),
+            CacheLifetime::Default
+        );
+        // A decay ceiling at or under the wire's own undeclared five minutes
+        // is close enough to that schedule to price.
+        assert_eq!(
+            messages(CacheModel::InactivityDecay {
+                half_life_ms: 60_000,
+                max_ttl_ms: 300_000,
+                min_prefix_tokens: 1_024,
+            })
+            .requested_cache_lifetime()
+            .unwrap(),
+            CacheLifetime::Default
+        );
+        // **CORRECTNESS.** Past that default, Messages has no marker left to
+        // ask for more retention -- its cache is deterministic, not
+        // automatic -- so a deeper ceiling is refused rather than priced at
+        // the default the wire was never asked to extend.
+        assert!(matches!(
+            messages(CacheModel::InactivityDecay {
+                half_life_ms: 60_000,
+                max_ttl_ms: 600_000,
+                min_prefix_tokens: 1_024,
+            })
+            .requested_cache_lifetime(),
+            Err(CacheLifetimeError::UndeclaredDecay {
+                max_ttl_ms: 600_000,
+                default_ttl_ms: 300_000,
+            })
+        ));
+
+        // A dialect with no `cache_control` vocabulary at all reads the same
+        // lifetime regardless of what its cache model names -- 600000ms would
+        // refuse a Messages entry, and does not refuse this one.
+        let responses = FrontierModelSpec {
+            wire_protocol: WireProtocol::OpenAiResponses,
+            cache_model: CacheModel::Deterministic { ttl_ms: 600_000 },
+            ..entry("openrouter", "gpt")
+        };
+        assert_eq!(
+            responses.requested_cache_lifetime().unwrap(),
+            CacheLifetime::Default
+        );
+    }
+
     #[test]
     fn a_cold_frontier_prices_the_whole_prompt_as_prefill() {
         let catalog = catalog();
@@ -1297,7 +1599,7 @@ mod tests {
 
         let cold = catalog.quote(&ledger, 0, 50_000, 500).remove(0);
 
-        ledger.record(&catalog.models()[0].target(), 0, 50_000);
+        ledger.record(&catalog.models()[0].target(), 0, 50_000, 0);
         let warm = catalog.quote(&ledger, MINUTE, 50_000, 500).remove(0);
 
         assert_eq!(warm.expected_prefill_tokens, 0.0);
@@ -1311,7 +1613,7 @@ mod tests {
         let catalog = catalog();
         let mut ledger = CacheLedger::new();
         catalog.apply_to_ledger(&mut ledger);
-        ledger.record(&catalog.models()[0].target(), 0, 50_000);
+        ledger.record(&catalog.models()[0].target(), 0, 50_000, 0);
 
         let inside = catalog.quote(&ledger, 4 * MINUTE, 50_000, 500).remove(0);
         let outside = catalog.quote(&ledger, 6 * MINUTE, 50_000, 500).remove(0);
@@ -1380,6 +1682,8 @@ mod tests {
 
     fn quote_with(credential: TurnCredential) -> FrontierQuote {
         FrontierQuote {
+            previous_segment_count: None,
+            cache_lifetime: CacheLifetime::Default,
             target: Target::Frontier {
                 provider: "anthropic".into(),
                 model: "claude".into(),
@@ -1401,6 +1705,7 @@ mod tests {
 
     fn segmented(prompt: &str, boundaries: Vec<usize>) -> FrontierQuote {
         FrontierQuote {
+            previous_segment_count: None,
             prompt: prompt.to_string(),
             segment_boundaries: boundaries,
             ..quote_with(TurnCredential::Absent)
@@ -1709,6 +2014,7 @@ mod tests {
         dialect: WireProtocol,
     ) -> FrontierQuote {
         FrontierQuote {
+            previous_segment_count: None,
             tools,
             tool_choice,
             tools_dialect: Some(dialect),

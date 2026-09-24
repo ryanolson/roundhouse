@@ -83,6 +83,13 @@ e2e-codex = []
 # not optional here.
 e2e-claude = []
 
+# Compiles the live half of `tests/cache_probe.rs` — a real, budget-capped
+# spend against a real provider. Off by default and not in the
+# self-dev-dependency below, so a build with no key compiles a test binary
+# with nothing live in it. See `tests/cache_probe/live.rs` for the required
+# settings and the preflight that enforces them.
+e2e-frontier = []
+
 [dev-dependencies]
 # `test-support` is the fixed-plane `PlaneSource` above: it exists so the six
 # pre-M8 integration binaries keep mounting the routers with the planes they

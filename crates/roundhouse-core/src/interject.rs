@@ -279,7 +279,6 @@ mod tests {
         let side_call = SideCall {
             session_id: &session_id,
             id: &side_call_id,
-            at_seq: 1,
             principal: &principal,
             budget: None,
         };

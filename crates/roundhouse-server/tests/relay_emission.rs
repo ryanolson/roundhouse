@@ -84,6 +84,8 @@ fn decision(chosen: Target) -> DecisionRecord {
         Some(HOSTED)
     };
     DecisionRecord {
+        selection: None,
+        local_quote_skipped: None,
         attempts: Vec::new(),
         declared_baseline: None,
         chosen,
@@ -162,7 +164,7 @@ async fn store_with(
         });
     }
     store
-        .append_events(&lease, kinds)
+        .append_events(&lease, kinds, None)
         .await
         .expect("the fixture appends");
     store

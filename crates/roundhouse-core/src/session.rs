@@ -13,6 +13,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::classify::{
+    AvailableClassification, ClassificationIntent, ClassificationRecord, ClassificationRef,
+    ClassificationSettlementRepair, PriorTurnMetadata, UnconfirmedSettlement,
+};
 use crate::control::{Billing, BudgetCounts, FrontierHistory, Payer, Principal};
 use crate::event::{
     ControlRecord, IncompleteReason, NotRunReason, PlaceboTiming, SessionEvent, SessionEventKind,
@@ -23,6 +27,14 @@ use crate::item::{Item, Role};
 use crate::routing::{CacheLedger, DecisionRecord, DispatchAttempt, ProviderPricing, Target};
 use crate::store::{Lease, SessionStore, StoreError};
 use crate::validate::{Arm, EscalationOverrides, SteerAction};
+
+mod classification;
+mod review;
+
+use classification::ClassificationFold;
+use review::ReviewTracker;
+pub(crate) use review::{IntervalFacts, TurnEnd, TurnState};
+pub use review::{MAX_REVIEW_DECISIONS, MAX_REVIEW_TURNS, REVIEW_OUTCOME_WINDOW, ReviewOutcome};
 
 /// How many events to pull per replay batch.
 const REPLAY_BATCH: usize = 1024;
@@ -97,6 +109,15 @@ struct PendingRouting {
     /// [`DecisionRecord::budget_draw`], the last live read a settle used to
     /// make.
     budget_draw: Option<BudgetCounts>,
+    /// How many items the prompt this dispatch sent was rendered from.
+    ///
+    /// **Read at the `Routed` fold and carried, for the same reason the rate
+    /// card above is.** The log's order within one turn is `TurnStarted`, this
+    /// turn's input `ItemAppended`s, `Routed`, then the *output* items, then the
+    /// terminal event — so `items.len()` at the terminal fold counts blocks the
+    /// provider never saw, and a ledger filled from there would tell the next
+    /// request its cache entry sits further along the prompt than it does.
+    segment_count: u64,
 }
 
 /// A response that terminated, and everything needed to charge it for.
@@ -419,6 +440,28 @@ pub struct SessionState {
     /// occupant reads as "do not validate". See
     /// [`SessionEventKind::SessionCreated`]'s `arm`.
     pub(crate) arm: Option<Arm>,
+    /// Who this session's turns are charged to, as its first event recorded it.
+    ///
+    /// **The payer of record, and the only one a replay can trust.** Everything
+    /// that needs to know whose a session is reads it from `SessionCreated`
+    /// rather than from a side table, because a replay starts at seq 0 and so
+    /// sees it before any event that costs money. The evaluation-settlement
+    /// repair is the first reader that needs it *after* the fact: it re-drives a
+    /// charge for a call that finished long ago, and the live `Admission` in
+    /// front of the turn driving the repair is not evidence about who paid for
+    /// that call.
+    ///
+    /// Reusing it is sound because a session is bound to one principal on every
+    /// supported surface: `ControlPlane::Configured` prefixes session ids with
+    /// `{project}/{user}/` and gates every turn on `contains`, and
+    /// `ControlPlane::Open` resolves one fixed principal deployment-wide. So
+    /// the session principal *is* the classification payer, and a second
+    /// durable copy of it on every intent would be a second answer to a
+    /// question this event already answers.
+    ///
+    /// `None` for a log written before the field existed. A repair refuses
+    /// rather than guessing — see `Engine::repair_classification_settlements`.
+    pub(crate) principal: Option<Principal>,
     /// Billable tokens this session's turns have reported since the last
     /// validation, or since it opened.
     ///
@@ -511,6 +554,17 @@ pub struct SessionState {
     /// Set when the decision is committed and consumed at the terminal event,
     /// which is the one place every turn passes through exactly once.
     turn_intervened: bool,
+
+    // ---- Background classification. --------------------------------------
+    /// Outstanding intents, settled calls, usable classifications, unrepaired
+    /// settlements, and this deployment's own read of recent turns. See
+    /// [`classification`].
+    classification: ClassificationFold,
+
+    // ---- Frontier review intervals. --------------------------------------
+    /// The decisions no accepted review has covered yet, and the checkpoint
+    /// the next review must start from. See [`review`].
+    review: ReviewTracker,
 }
 
 /// A narrowing the validate loop asked for, with its remaining life.
@@ -589,12 +643,25 @@ impl SessionState {
                 // one thing that is *not* plain append order here: a turn's
                 // leading configuration run replaces the session's, at the
                 // head. See [`ConfigurationCursor`].
+                match is_turn_configuration(item) {
+                    true => self.review.configuration_appended(),
+                    false => self.review.history_appended(
+                        self.items.len() - self.configuration.len(),
+                        item.user_request().is_some(),
+                    ),
+                }
                 self.configuration.append(&mut self.items, item.clone());
             }
             SessionEventKind::TurnStarted {
                 turn_id,
                 response_id,
             } => {
+                self.review.turn_started(
+                    event.seq,
+                    self.turn_index,
+                    response_id,
+                    self.items.len() - self.configuration.len(),
+                );
                 self.turn_index += 1;
                 self.open_turns.insert(turn_id.clone(), response_id.clone());
                 // The configuration run is per turn: the items about to be
@@ -614,6 +681,16 @@ impl SessionState {
                 // per-dispatch vector cost (review finding G05).
                 self.frontier_history
                     .record(&decision.chosen, self.turn_index);
+                self.review.routed(
+                    event.seq,
+                    response_id,
+                    decision
+                        .selection
+                        .as_ref()
+                        .and_then(|selection| selection.objective.as_ref()),
+                    &self.items[..self.configuration.len()],
+                );
+                self.classification.routed(decision.selection.as_deref());
                 self.last_decision = Some(decision.clone());
                 // Held rather than recorded; see `pending_routings`.
                 self.pending_routings.insert(
@@ -625,6 +702,11 @@ impl SessionState {
                         payer: decision.payer,
                         billing: decision.billing,
                         budget_draw: decision.budget_draw,
+                        // Taken here and not at the terminal fold; see the
+                        // field. This turn's input is already folded in and its
+                        // output is not, so this is exactly the item list the
+                        // dispatch about to happen renders.
+                        segment_count: self.items.len() as u64,
                     },
                 );
             }
@@ -638,6 +720,14 @@ impl SessionState {
                 // provider stopped holding the prompt, which is what the TTL
                 // runs from — and only under the evidence rule documented on
                 // `pending_routings`.
+                self.review.ended(
+                    event.seq,
+                    response_id,
+                    match &event.kind {
+                        SessionEventKind::ResponseCompleted { .. } => TurnEnd::Completed,
+                        _ => TurnEnd::Incomplete,
+                    },
+                );
                 let routing = self.pending_routings.remove(response_id);
                 // Whether this response ever reached a provider, which is the
                 // same question `last_settlement` keys "owes nobody anything"
@@ -649,8 +739,12 @@ impl SessionState {
                         matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
                             || usage.input_tokens > 0;
                     if processed {
-                        self.ledger
-                            .record(&routing.target, event.at_ms, routing.isl_tokens);
+                        self.ledger.record(
+                            &routing.target,
+                            event.at_ms,
+                            routing.isl_tokens,
+                            routing.segment_count,
+                        );
                     }
                 }
 
@@ -758,6 +852,14 @@ impl SessionState {
                 });
             }
             SessionEventKind::ValidationDecided { arm, outcome, .. } => {
+                // Only a parsed verdict is a frontier checkpoint. Failures and
+                // the placebo arm asked nobody, so the interval stays open.
+                if let ValidationOutcome::Judged {
+                    verdict, interval, ..
+                } = outcome
+                {
+                    self.review.judged(event.seq, verdict, interval.as_deref());
+                }
                 // **The cooldown is spent by every decision; the cap and the
                 // budget are spent only by a decision that bought something.**
                 //
@@ -886,7 +988,21 @@ impl SessionState {
                     }
                 }
             }
-            SessionEventKind::SessionCreated { arm, .. } => self.arm = *arm,
+            SessionEventKind::SessionCreated { arm, principal, .. } => {
+                self.arm = *arm;
+                self.review
+                    .enable(arm.is_some_and(|arm| arm.consults_judge()));
+                self.principal = principal.clone();
+            }
+            SessionEventKind::ClassificationRequested { record } => {
+                self.classification.requested(record);
+            }
+            SessionEventKind::ClassificationRecorded { record } => {
+                self.classification.recorded(event.seq, record);
+            }
+            SessionEventKind::ClassificationSettlementRepaired { record } => {
+                self.classification.repaired(&record.call_id);
+            }
             // Money facts, folded by the metrics layer and not here. This
             // projection answers "what may this session do next", and what a
             // side call billed does not bear on that — the *decision* beside it
@@ -1028,6 +1144,125 @@ impl SessionState {
     /// accurate answer rather than an empty one.
     pub fn last_decision(&self) -> Option<&DecisionRecord> {
         self.last_decision.as_ref()
+    }
+
+    /// Classifications usable as features, oldest availability first.
+    pub fn classifications(&self) -> &[AvailableClassification] {
+        self.classification.available()
+    }
+
+    /// This deployment's own read of recent turns, oldest first.
+    ///
+    /// The other half of the projection's permitted prior context — see
+    /// [`PriorTurnMetadata`]. Bounded by the fold, so a caller cannot ask for
+    /// more of a session's history than the window holds.
+    pub fn prior_turns(&self) -> &[PriorTurnMetadata] {
+        self.classification.prior_turns()
+    }
+
+    /// Classifications that had landed by `seq`.
+    ///
+    /// **Takes a cutoff rather than answering "everything now", because a
+    /// routing decision must be explainable from what existed when it was
+    /// taken.** The engine captures its cutoff before selection; a result that
+    /// lands during the same turn therefore cannot enter that turn's evidence,
+    /// however quickly it arrives.
+    ///
+    /// The ordered prefix supports an exact count and reverse traversal without
+    /// scanning the older history to select the newest references.
+    pub fn classifications_through(
+        &self,
+        seq: u64,
+    ) -> impl DoubleEndedIterator<Item = &ClassificationRef> + ExactSizeIterator {
+        self.classification.through(seq)
+    }
+
+    /// Whether this session has accepted `call_id`'s answer.
+    ///
+    /// The delivery path uses this to avoid duplicate appends. Acceptance is
+    /// independent of ledger settlement: an unmatched result can remain in the
+    /// log without completing the intent or contributing a feature.
+    pub fn classification_settled(&self, call_id: &ResponseId) -> bool {
+        self.classification.settled(call_id)
+    }
+
+    /// Who this session's turns are charged to. See [`Self::principal`].
+    pub fn principal(&self) -> Option<&Principal> {
+        self.principal.as_ref()
+    }
+
+    /// Evaluation settlements the log says nobody has confirmed.
+    ///
+    /// Everything a repair needs and nothing it does not: the call's identity,
+    /// the amount the record holds, and the window the intent recorded. The
+    /// payer is [`Self::principal`] and is deliberately not repeated here.
+    ///
+    /// Borrowed and in arrival order, so a repair path that takes a bounded
+    /// prefix copies nothing it did not select and touches nothing it did not
+    /// take.
+    pub fn unrepaired_settlements(&self) -> impl ExactSizeIterator<Item = &UnconfirmedSettlement> {
+        self.classification.unrepaired()
+    }
+
+    /// Whether `call_id`'s settlement is still recorded as unrepaired.
+    ///
+    /// The repair delivery path uses this to avoid re-appending a
+    /// `ClassificationSettlementRepaired` the log already holds, the same way
+    /// [`Self::classification_settled`] guards a result.
+    pub fn is_settlement_unrepaired(&self, call_id: &ResponseId) -> bool {
+        self.classification.is_unrepaired(call_id)
+    }
+
+    /// Settlements visited during acknowledgement removal, excluding map
+    /// lookup comparisons. Test-only: a self-reported counter costs a
+    /// production field for a guard nothing outside this crate's own tests
+    /// reads.
+    #[cfg(test)]
+    pub(crate) fn unrepaired_settlements_examined(&self) -> u64 {
+        self.classification.unrepaired_examined()
+    }
+
+    /// Where the next review's interval starts: the `through_seq` of the last
+    /// accepted review, or `0` before any.
+    pub fn review_checkpoint(&self) -> u64 {
+        self.review.checkpoint()
+    }
+
+    /// Reviews whose coverage the fold accepted.
+    pub fn accepted_reviews(&self) -> u64 {
+        self.review.accepted()
+    }
+
+    /// Reviews whose coverage failed validation and moved nothing.
+    pub fn rejected_reviews(&self) -> u64 {
+        self.review.rejected()
+    }
+
+    /// The most recently accepted reviews, oldest first, bounded.
+    pub fn review_outcomes(&self) -> &[ReviewOutcome] {
+        self.review.outcomes()
+    }
+
+    /// `Routed` sequences no accepted review has covered, oldest first.
+    pub fn pending_review_decisions(&self) -> impl Iterator<Item = u64> + '_ {
+        self.review.pending()
+    }
+
+    /// The open interval as a review captured now would see it.
+    pub(crate) fn review_interval(&self) -> IntervalFacts<'_> {
+        self.review
+            .facts(&self.items[self.configuration.len()..], self.last_seq)
+    }
+
+    /// Calls with no result, which is the same thing as unknown answers.
+    ///
+    /// **The durable half of "a crash costs knowledge, not money twice".** A
+    /// successor folding this log finds the intent here and learns that a third
+    /// party may have been paid and what it answered is unrecoverable. Nothing
+    /// iterates this to dispatch anything — that is what makes "replay never
+    /// redispatches" a property of the code's shape rather than of a check.
+    pub fn outstanding_classifications(&self) -> impl Iterator<Item = &ClassificationIntent> {
+        self.classification.outstanding()
     }
 
     /// Rebuild a session's projection from its log, **taking no lease**.
@@ -1250,7 +1485,10 @@ impl<S: SessionStore> Session<S> {
         &mut self,
         kinds: Vec<SessionEventKind>,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        let events = self.store.append_events(&self.lease, kinds).await?;
+        // No learning mark yet: which events produce a learner entry is the
+        // later projection slice's decision (see `store::learning`), and a
+        // guessed mark here would make sessions pending that no learner reads.
+        let events = self.store.append_events(&self.lease, kinds, None).await?;
         for event in &events {
             self.state.apply(event);
         }
@@ -1547,6 +1785,72 @@ impl<S: SessionStore> Session<S> {
             provider_reported_cost_usd,
             stop_reason,
         });
+        self.commit(kinds).await?;
+        Ok(())
+    }
+
+    /// Commit the intent to classify a turn, before anything is sent.
+    ///
+    /// **The engine's own writer, under the lease it already holds.** A
+    /// background worker that opened a second writer would take the lease from
+    /// the turn that spawned it and fence a live session, so the split is
+    /// structural: the writer records the intent and the result, and the worker
+    /// only ever makes the call.
+    pub async fn record_classification_intent(
+        &mut self,
+        record: ClassificationIntent,
+    ) -> Result<(), SessionError> {
+        self.commit(vec![SessionEventKind::ClassificationRequested { record }])
+            .await?;
+        Ok(())
+    }
+
+    /// Deliver a whole turn's drain of background-classifier output in one
+    /// append: every result and every settlement-repair acknowledgement the
+    /// runtime is holding for this session, committed together.
+    ///
+    /// **One store round trip for the batch, not one per record.** Nothing
+    /// about this work needs to be serialized: the store assigns every event
+    /// in one `commit` contiguous sequence numbers atomically, exactly as
+    /// [`Self::begin_turn`] already relies on for a turn's own input items.
+    ///
+    /// **Typed parameters, not a raw `Vec<SessionEventKind>`.** `commit` is
+    /// private precisely so every public method states what it can append;
+    /// a public method accepting arbitrary kinds would be the first way to
+    /// append a `TurnStarted` from outside [`Self::begin_turn`]. Results are
+    /// committed ahead of repairs, deterministically, regardless of the order
+    /// the caller drained them in.
+    ///
+    /// **`Result<()>`, not the committed events.** `commit` is all-or-nothing,
+    /// so on `Ok` the ids the caller passed in are exactly the ids that
+    /// landed; a caller that needs to know which never has to read them back
+    /// out of the returned events. A commit that fails leaves the settlement
+    /// unrepaired in the fold and every result undelivered, so the next turn
+    /// drives them again — which costs one deduplicated ledger call and no
+    /// classifier request at all.
+    ///
+    /// An empty call commits nothing, the way [`Self::record_control`] skips
+    /// an empty record: a store round trip for zero events would be a cost
+    /// paid by every turn that follows a classified one.
+    pub async fn record_background_classification(
+        &mut self,
+        results: Vec<ClassificationRecord>,
+        repairs: Vec<ClassificationSettlementRepair>,
+    ) -> Result<(), SessionError> {
+        if results.is_empty() && repairs.is_empty() {
+            return Ok(());
+        }
+        let mut kinds = Vec::with_capacity(results.len() + repairs.len());
+        kinds.extend(
+            results
+                .into_iter()
+                .map(|record| SessionEventKind::ClassificationRecorded { record }),
+        );
+        kinds.extend(
+            repairs
+                .into_iter()
+                .map(|record| SessionEventKind::ClassificationSettlementRepaired { record }),
+        );
         self.commit(kinds).await?;
         Ok(())
     }

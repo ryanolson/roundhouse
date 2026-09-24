@@ -515,6 +515,8 @@ pub async fn decision() -> DecisionRecord {
         .expect("the router chooses from the set it was handed");
 
     DecisionRecord {
+        selection: None,
+        local_quote_skipped: None,
         chosen: chosen.target.clone(),
         rationale: chosen.rationale,
         policy: policy.name().to_string(),

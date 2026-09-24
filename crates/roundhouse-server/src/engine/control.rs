@@ -163,6 +163,16 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// of this store takes, and for the same reason it is acceptable: what is
     /// lost is precision in a brief, never a routing decision.
     pub(super) fn objective(&self, session_id: &SessionId, state: &SessionState) -> Objective {
+        self.declared_objective(session_id)
+            .unwrap_or_else(|| Objective::from_items(&state.items))
+    }
+
+    /// The objective the agent declared, if it declared one.
+    ///
+    /// The half of [`Self::objective`] a decision's objective stamp needs. The
+    /// fallback is the conversation's own request, which a review renders from
+    /// the log, so the stamp does not copy it.
+    pub(super) fn declared_objective(&self, session_id: &SessionId) -> Option<Objective> {
         self.control
             .as_ref()
             .and_then(|control| control.intent(session_id))
@@ -171,7 +181,6 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 plan_steps: intent.plan_steps,
                 done_when: intent.done_when,
             })
-            .unwrap_or_else(|| Objective::from_items(&state.items))
     }
 }
 

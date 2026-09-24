@@ -40,4 +40,10 @@ uuid = { workspace = true }
 test-support = []
 
 [dev-dependencies]
+# `test-support` exposes `store::contract` and `store::doubles` to this
+# crate's own `tests/` binaries, which link against the crate the same way an
+# external dependent would and so do not see anything gated on `cfg(test)`.
+# The same self-referential trick `roundhouse-server` and
+# `roundhouse-store-redis` use for the identical reason.
+roundhouse-core = { path = ".", features = ["test-support"] }
 tokio = { workspace = true }

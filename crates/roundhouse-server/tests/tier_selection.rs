@@ -33,6 +33,7 @@ use roundhouse_core::control::{
     Exhaustion, FrontierCadence, Grant, GrantRequest, MemorySpendLedger, Settled, Settlement,
     SpendError, SpendLedger, TurnPolicy,
 };
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent, Role};
@@ -137,6 +138,7 @@ impl FrontierClient for Scripted {
                 text.clone(),
                 quote.prompt.len() as u64,
                 0,
+                CacheReadSource::Provider,
                 text.len() as u64,
                 0,
             )),

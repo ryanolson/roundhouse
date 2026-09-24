@@ -62,7 +62,7 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::routing::{CacheModel, ProviderPricing};
 use roundhouse_core::store::{Lease, MemoryStore, SessionStore, StoreError};
-use roundhouse_core::validate::{BriefConfig, Objective, ValidationBrief};
+use roundhouse_core::validate::{BriefConfig, ControlCallDialect, Objective, ValidationBrief};
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
     FrontierQuote, FrontierStream, LocalFleet, StaticFrontierCatalog, WireProtocol,
@@ -86,6 +86,7 @@ use common::{
     MINUTE, Scripted, ScriptedFrontierClient, ScriptedTurns, ToolCallingFrontierClient, config,
     embedded_fleet, frontier_catalog, key, sha256_hex,
 };
+use roundhouse_core::event::CacheReadSource;
 
 /// What the echo provider answers with, and therefore what a turn says.
 const ANSWER: &str = "frontier answer";
@@ -536,6 +537,7 @@ impl FrontierClient for PartialThenFailClient {
             Ok(FrontierChunk::Done {
                 input_tokens: quote.prompt.len() as u64,
                 cached_input_tokens: 0,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 0,
                 output_tokens: CONTINUATION.len() as u64,
                 reasoning_tokens: 0,
@@ -611,6 +613,7 @@ impl FrontierClient for ToolCallThenTextClient {
                 Ok(FrontierChunk::Done {
                     input_tokens: quote.prompt.len() as u64,
                     cached_input_tokens: 0,
+                    cache_read_source: CacheReadSource::Provider,
                     cache_write_tokens: 0,
                     output_tokens: 8,
                     reasoning_tokens: 0,
@@ -625,6 +628,7 @@ impl FrontierClient for ToolCallThenTextClient {
             Ok(FrontierChunk::Done {
                 input_tokens: quote.prompt.len() as u64,
                 cached_input_tokens: 0,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 0,
                 output_tokens: F3_RETRY_REPLY.len() as u64,
                 reasoning_tokens: 0,
@@ -658,31 +662,17 @@ impl DropsFirstTerminalWrite {
     }
 }
 
+// `Delegating` is deliberately not `use`d in this file: fixtures throughout
+// call methods directly on a concrete double (`store.create_session(..)`),
+// and having both traits' same-named methods in scope at once would make
+// those calls ambiguous (E0034). Fully qualifying the trait here avoids that
+// without pushing disambiguation onto every call site instead.
 #[async_trait]
-impl SessionStore for DropsFirstTerminalWrite {
-    async fn create_session(
-        &self,
-        session_id: &SessionId,
-        model_policy: &str,
-    ) -> Result<bool, StoreError> {
-        self.inner.create_session(session_id, model_policy).await
-    }
+impl roundhouse_core::store::doubles::Delegating for DropsFirstTerminalWrite {
+    type Backend = MemoryStore;
 
-    async fn acquire_lease(
-        &self,
-        session_id: &SessionId,
-        node_id: &str,
-        ttl_ms: u64,
-    ) -> Result<Option<Lease>, StoreError> {
-        self.inner.acquire_lease(session_id, node_id, ttl_ms).await
-    }
-
-    async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
-        self.inner.renew_lease(lease, ttl_ms).await
-    }
-
-    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
-        self.inner.release_lease(lease).await
+    fn backend(&self) -> &MemoryStore {
+        &self.inner
     }
 
     // Delegated like every other read, and it has to be: the trait's default
@@ -699,6 +689,7 @@ impl SessionStore for DropsFirstTerminalWrite {
         &self,
         lease: &Lease,
         kinds: Vec<SessionEventKind>,
+        mark: Option<roundhouse_core::store::LearningMark>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
         let has_terminal = kinds.iter().any(|kind| {
             matches!(
@@ -717,20 +708,7 @@ impl SessionStore for DropsFirstTerminalWrite {
                 node_id: lease.node_id.clone(),
             });
         }
-        self.inner.append_events(lease, kinds).await
-    }
-
-    async fn read_events(
-        &self,
-        session_id: &SessionId,
-        after_seq: u64,
-        limit: usize,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        self.inner.read_events(session_id, after_seq, limit).await
-    }
-
-    async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
-        self.inner.last_seq(session_id).await
+        self.inner.append_events(lease, kinds, mark).await
     }
 }
 
@@ -1062,6 +1040,7 @@ impl FrontierClient for CacheReportingFrontierClient {
             Ok(FrontierChunk::Done {
                 input_tokens: 12_345,
                 cached_input_tokens: 9_000,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 500,
                 output_tokens: 7,
                 reasoning_tokens: 0,
@@ -4047,9 +4026,9 @@ fn the_one_recognizer_accepts_a_notice_the_length_heuristic_missed() {
         "F5: wire's tag-anchor rule does not care about length, and this is the          notice: {long_real_notice}"
     );
     assert!(
-        !is_budget_notice(&format!(
+        !is_budget_notice(
             "<env>You are an interactive agent</env>\n<total_tokens>1 left</total_tokens>"
-        )),
+        ),
         "and it still refuses the environment block that merely ends with the tag"
     );
 }
@@ -4184,8 +4163,8 @@ per_line_tests!(fn f4_control_the_captured_body_carries_a_real_system_prompt_pas
 ///
 /// Driven through the real `wire::canonicalize` on each line's real captured
 /// body and the real `ValidationBrief::build`, matching
-/// `validate::mod::consult`'s call shape exactly (same items, same
-/// `Objective::from_items`, same `BriefConfig::default()`), because the
+/// `validate::mod::consult`'s call shape exactly (same items, the Messages
+/// dialect, same `Objective::from_items`, same `BriefConfig::default()`), because the
 /// finding was about those two functions meeting.
 fn f4_the_judge_is_briefed_on_the_whole_leading_instruction_run(line: &CapturedLine) {
     let items =
@@ -4193,6 +4172,7 @@ fn f4_the_judge_is_briefed_on_the_whole_leading_instruction_run(line: &CapturedL
 
     let brief = ValidationBrief::build(
         &items,
+        ControlCallDialect::ClaudeMessages,
         Objective::from_items(&items),
         Vec::new(),
         BriefConfig::default(),

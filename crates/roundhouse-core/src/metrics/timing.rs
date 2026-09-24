@@ -1,0 +1,228 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! One response's clock, and the one accumulator both intervals it measures
+//! book into.
+//!
+//! Split out of `fold.rs` for [`Elapsed`]'s reason as much as
+//! [`super::cache_evidence`]'s: `fold.rs` is already the fold's busiest file,
+//! and a reader chasing what "first output" or "turn elapsed" actually means
+//! should not have to find it among the terminal arm's row bookkeeping.
+//!
+//! [`TurnClock::book`] writes into [`TurnTimings`], this module's own
+//! accumulator, rather than into `fold::Counters` directly, the way
+//! [`super::cache_evidence`]'s `CacheEvidence` is one field `Counters` holds
+//! with one `absorb` line. Writing straight against `Counters`' row layout
+//! would need an import of `fold` in a module `fold` also imports, which
+//! would put "what does timing mean" behind a read of the fold to find out.
+
+/// One outcome class's timing, folded down to a total and a count.
+///
+/// A total and a count rather than a mean: rows merge, sums add exactly, and
+/// a mean of means would weight a row that served three turns the same as
+/// one that served three hundred. One type for every class this fold times —
+/// first output, completed, incomplete — because writing the same three
+/// fields out by hand at each site leaves the sites free to drift onto
+/// different overflow rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Elapsed {
+    pub(super) ms_total: u64,
+    pub(super) samples: u64,
+    /// Terminals stamped before their own start.
+    ///
+    /// Counted rather than dropped: a silent drop makes a clock that moved
+    /// look identical to a deployment that measured nothing.
+    pub(super) rejected: u64,
+}
+
+impl Elapsed {
+    /// Fold one interval.
+    ///
+    /// `None` is a stamp that preceded its own start, and it lands in
+    /// [`Self::rejected`] rather than as a zero: a zero is a real answer here
+    /// — a turn that started and ended inside one millisecond — so spending
+    /// it on a clock that moved would make the two indistinguishable.
+    fn observe(&mut self, elapsed_ms: Option<u64>) {
+        match elapsed_ms {
+            Some(elapsed_ms) => {
+                // Saturating for the same reason `Self::absorb` is: a wrapped
+                // total would report a near-zero mean for the busiest
+                // deployment on the fleet, which is the one where the number
+                // matters most. One overflow rule for both write paths, so a
+                // row that saturated here does not panic or wrap the moment
+                // it is merged into a wider scope.
+                self.ms_total = self.ms_total.saturating_add(elapsed_ms);
+                self.samples += 1;
+            }
+            None => self.rejected += 1,
+        }
+    }
+
+    pub(super) fn absorb(&mut self, other: &Elapsed) {
+        self.ms_total = self.ms_total.saturating_add(other.ms_total);
+        self.samples += other.samples;
+        self.rejected += other.rejected;
+    }
+}
+
+/// How far the first-output interval has got.
+///
+/// Three states rather than two `Option`s: the first non-empty delta decides
+/// the answer once, and a later one must not move it or replace a refusal.
+enum FirstOutputState {
+    /// Nothing said yet.
+    Waiting,
+    /// Milliseconds from the start to the first non-empty delta.
+    Measured(u64),
+    /// That delta was stamped before the start, so there is nothing to fold.
+    Rejected,
+}
+
+impl FirstOutputState {
+    /// Fold this clock's contribution into a row's first-output tally.
+    ///
+    /// A turn that never spoke books nothing here — not a zero, which would
+    /// read as an instant answer — and this is the one place that decision
+    /// is made, rather than a tuple the caller has to remember to check.
+    fn book(&self, tally: &mut Elapsed) {
+        match self {
+            FirstOutputState::Measured(elapsed_ms) => tally.observe(Some(*elapsed_ms)),
+            FirstOutputState::Rejected => tally.observe(None),
+            FirstOutputState::Waiting => {}
+        }
+    }
+}
+
+/// The intervals one row's `book` calls accumulate: first output, and the
+/// terminal span split by whether the turn completed.
+///
+/// One field on `Counters`, one `absorb` line, the same shape
+/// [`super::cache_evidence::CacheEvidence`] holds its evidence in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TurnTimings {
+    pub(super) first_output: Elapsed,
+    /// Turn start to terminal event, over turns that completed. See
+    /// [`Self::incomplete_elapsed`] for why it is a separate pot.
+    pub(super) completed_elapsed: Elapsed,
+    /// Never merged with [`Self::completed_elapsed`]: a fast refusal and a
+    /// slow completed answer are both terminals, and one pot would let a
+    /// deployment improve its mean by failing faster.
+    ///
+    /// Undivided by reason, every
+    /// [`IncompleteReason`](crate::event::IncompleteReason) in one pot: which
+    /// failures compare against a completed turn is a reward question this
+    /// observation does not answer, so the reason stays on the event for a
+    /// later pass to split.
+    pub(super) incomplete_elapsed: Elapsed,
+}
+
+impl TurnTimings {
+    pub(super) fn absorb(&mut self, other: &TurnTimings) {
+        self.first_output.absorb(&other.first_output);
+        self.completed_elapsed.absorb(&other.completed_elapsed);
+        self.incomplete_elapsed.absorb(&other.incomplete_elapsed);
+    }
+}
+
+/// One open response's clock.
+///
+/// The start stamp outlives the first-output delta: two intervals share one
+/// origin, the first text a caller could see and the terminal event, and the
+/// second is decided at an event the first has long since passed. One map
+/// keyed by response ID, drained once at that event, is what keeps the two
+/// from drifting apart.
+pub(super) struct TurnClock {
+    /// This response's `TurnStarted` append stamp.
+    started_at_ms: u64,
+    first_output: FirstOutputState,
+}
+
+impl TurnClock {
+    /// A fresh clock, started at this response's `TurnStarted` stamp.
+    pub(super) fn started(at_ms: u64) -> Self {
+        Self {
+            started_at_ms: at_ms,
+            first_output: FirstOutputState::Waiting,
+        }
+    }
+
+    /// The first non-empty delta closes the interval; a later one must not
+    /// move it. Kept idempotent here rather than at the caller, which is
+    /// what lets [`super::fold::MetricsFold::apply`] call this on every
+    /// non-empty delta without checking `Waiting` itself.
+    pub(super) fn spoke_at(&mut self, at_ms: u64) {
+        if let FirstOutputState::Waiting = self.first_output {
+            self.first_output = match at_ms.checked_sub(self.started_at_ms) {
+                Some(elapsed) => FirstOutputState::Measured(elapsed),
+                None => FirstOutputState::Rejected,
+            };
+        }
+    }
+
+    /// Book both intervals this clock carries onto one row: first output,
+    /// and the terminal span in whichever outcome class the caller names.
+    ///
+    /// One call rather than two, so a caller cannot book one interval and
+    /// forget the other — the two are read off the same clock and always
+    /// move together.
+    pub(super) fn book(&self, timings: &mut TurnTimings, terminal_at_ms: u64, completed: bool) {
+        self.first_output.book(&mut timings.first_output);
+        let terminal_ms = terminal_at_ms.checked_sub(self.started_at_ms);
+        // Never the same pot. See `TurnTimings::completed_elapsed`.
+        match completed {
+            true => timings.completed_elapsed.observe(terminal_ms),
+            false => timings.incomplete_elapsed.observe(terminal_ms),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **`observe` saturates instead of wrapping.** The doc on the call site
+    /// names this deliberate: a wrapped total would report a near-zero mean
+    /// for the busiest deployment on the fleet, the one where the number
+    /// matters most. `u64::MAX` milliseconds is a stamp the log's own `u64`
+    /// timestamps can produce -- a terminal stamped near it against a turn
+    /// started at zero -- so this is a reachable total, not a hypothetical
+    /// one.
+    #[test]
+    fn observe_saturates_a_total_that_would_otherwise_wrap() {
+        let mut elapsed = Elapsed::default();
+        elapsed.observe(Some(u64::MAX));
+        elapsed.observe(Some(1));
+
+        assert_eq!(
+            elapsed.ms_total,
+            u64::MAX,
+            "a second interval pushes the total past u64::MAX, which must \
+             clamp rather than wrap back down near zero"
+        );
+        assert_eq!(elapsed.samples, 2, "both intervals are still counted");
+    }
+
+    /// **`absorb` saturates by the same rule `observe` does**, so a row that
+    /// saturated in one scope does not wrap the moment it is merged into a
+    /// wider one. Pinning this here keeps the two paths from drifting onto
+    /// different overflow rules.
+    #[test]
+    fn absorb_saturates_a_total_that_would_otherwise_wrap() {
+        let mut a = Elapsed {
+            ms_total: u64::MAX,
+            samples: 1,
+            rejected: 0,
+        };
+        let b = a;
+
+        a.absorb(&b);
+
+        assert_eq!(
+            a.ms_total,
+            u64::MAX,
+            "merging a saturated total into another must clamp rather than \
+             wrap back down near zero"
+        );
+        assert_eq!(a.samples, 2, "both sides' samples are still counted");
+    }
+}

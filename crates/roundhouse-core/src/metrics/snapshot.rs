@@ -14,6 +14,19 @@
 //! to be local *and* to have been billed is a row that can lie about the one
 //! number this whole feature exists to report.
 
+mod columns;
+mod cost;
+
+pub use columns::{
+    CacheReuseEvidence, FIRST_OUTPUT_BASIS, IntervalMetric, OBSERVED_CACHE_BASIS,
+    PREDICTED_CACHE_BASIS, TURN_ELAPSED_BASIS,
+};
+pub use cost::{
+    EVALUATION_PRICE_BASIS, EvaluationMetrics, EvaluationModelMetrics, EvaluationSettlement,
+    EvaluationTokens, EvaluationUnbooked, OBSERVED_COST_SCOPE, ObservedCost, SERVING_PRICE_BASIS,
+    ServingCostGaps,
+};
+
 use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
@@ -152,9 +165,19 @@ pub enum ModelAccounting {
         correlary: Correlary,
         /// Tokens this row served for a project whose money is a seat's.
         seat_tokens: TokenBreakdown,
+        /// Of this row's [`Coverage::estimated_calls`], how many were a
+        /// seat's. See the hosted arm's own field for why this is a count
+        /// beside `seat_tokens` rather than folded into it.
+        seat_estimated_calls: u64,
     },
     /// Issued to an external endpoint: bills real money.
     Frontier {
+        /// Whether the catalog held a rate for this row's `(provider, model)`.
+        ///
+        /// A configured zero rate can produce the same amount as missing
+        /// pricing. Gap counts and dashboard warnings need the lookup result
+        /// to distinguish them.
+        priced_by_catalog: bool,
         /// The sum of the two below.
         billed_usd: f64,
         /// Priced from counts the provider reported.
@@ -182,6 +205,11 @@ pub enum ModelAccounting {
         /// Zero on a deployment with no pass-through project, which is what
         /// keeps every pre-M7 row reading exactly as it did.
         seat_tokens: TokenBreakdown,
+        /// Of this row's [`Coverage::estimated_calls`], how many were a
+        /// seat's — priced nowhere and exact either way, so
+        /// [`ServingCostGaps`] has to subtract these back out rather than
+        /// publish the coverage figure whole.
+        seat_estimated_calls: u64,
     },
 }
 
@@ -193,6 +221,30 @@ pub struct ModelMetrics {
     pub calls: u64,
     pub tokens: TokenBreakdown,
     pub coverage: Coverage,
+    /// Absent when this row has neither a usable timing nor a refused one, so
+    /// every row written before this column existed serializes as it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_output: Option<IntervalMetric>,
+    /// Turn start to terminal, over the turns this row completed.
+    ///
+    /// Absent on the same rule `first_output` uses, and never added to
+    /// [`Self::incomplete_turn_elapsed`]: see `TurnTimings::completed_elapsed`
+    /// in the timing module for why one pot would reward failing faster.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_turn_elapsed: Option<IntervalMetric>,
+    /// The same interval over the turns this row did not complete.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_turn_elapsed: Option<IntervalMetric>,
+    /// Predicted against observed cache reuse, absent on the rule above.
+    ///
+    /// **Never summed across serving modes**, which [`ModelKey`]'s `mode` field
+    /// already holds by construction: a local row's prediction and a hosted
+    /// row's are stated against prompts assembled differently, so one mean over
+    /// both would be a ratio of two incomparable things.
+    ///
+    /// [`ModelKey`]: crate::metrics::ModelKey
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_reuse_evidence: Option<CacheReuseEvidence>,
     #[serde(flatten)]
     pub accounting: ModelAccounting,
 }
@@ -268,6 +320,20 @@ impl ModelMetrics {
         match self.accounting {
             ModelAccounting::Local { seat_tokens, .. }
             | ModelAccounting::Frontier { seat_tokens, .. } => seat_tokens,
+        }
+    }
+
+    /// Of this row's [`Coverage::estimated_calls`], how many were a seat's.
+    pub fn seat_estimated_calls(&self) -> u64 {
+        match self.accounting {
+            ModelAccounting::Local {
+                seat_estimated_calls,
+                ..
+            }
+            | ModelAccounting::Frontier {
+                seat_estimated_calls,
+                ..
+            } => seat_estimated_calls,
         }
     }
 }
@@ -423,6 +489,16 @@ pub struct MetricsSnapshot {
     /// reached a provider. The dashboard prints both, and `turns` exceeding
     /// `calls` is the shape of a deployment that has been failing over.
     pub turns: u64,
+    /// Terminals with a clock and no model row to carry it.
+    ///
+    /// Marks what the two `*_turn_elapsed` [`IntervalMetric`] columns
+    /// exclude — most often a turn refused before any dispatch, which stamps
+    /// `TurnStarted` and a terminal but never reaches routing — rather than
+    /// folding a correction back into either mean. Counts a terminal of
+    /// either outcome class, whether or not its interval was itself
+    /// measurable. Scoped like every other figure here: a tenant sees its
+    /// own.
+    pub unrouted_terminals: u64,
     /// Dispatches that reached a provider and were accounted for.
     pub calls: u64,
     pub tokens: TokenBreakdown,
@@ -438,6 +514,17 @@ pub struct MetricsSnapshot {
     /// Zero for every deployment with no pass-through project.
     pub seat_tokens: TokenBreakdown,
     pub savings: Savings,
+    /// What this deployment spent classifying its own turns.
+    ///
+    /// **Outside [`Savings`] and outside every token figure above.** A
+    /// classifier call bills a service this deployment chose to consult, under a
+    /// price the call itself recorded; the figures above are serving traffic
+    /// priced by the current catalog. They are two economies and the document
+    /// keeps them apart, which is what lets [`Self::observed_cost`] add them
+    /// while naming what it added.
+    pub evaluation: EvaluationMetrics,
+    /// Serving plus evaluation, with both price bases named.
+    pub observed_cost: ObservedCost,
     pub coverage: Coverage,
     /// Share of *calls* the provider accounted for.
     pub coverage_fraction: f64,
@@ -579,6 +666,7 @@ impl MetricsSnapshot {
             // handed. See `Counters::seat`.
             let priceable = counters.billed.total();
             let seat_tokens = TokenBreakdown::from_usage(counters.seat.total().tokens());
+            let seat_estimated_calls = counters.seat_estimated_calls;
 
             let accounting = match key.mode {
                 ServingMode::Frontier => {
@@ -610,6 +698,7 @@ impl MetricsSnapshot {
                     // `cached_input_tokens: 0`, so it contributes nothing here
                     // rather than a guess.
                     ModelAccounting::Frontier {
+                        priced_by_catalog: rate.is_some(),
                         billed_usd: billed.total(),
                         billed_measured_usd: billed.measured,
                         billed_estimated_usd: billed.estimated,
@@ -621,6 +710,7 @@ impl MetricsSnapshot {
                         cache_savings_usd: rate
                             .map_or(0.0, |r| r.pricing.cache_savings(priceable.tokens())),
                         seat_tokens,
+                        seat_estimated_calls,
                     }
                 }
                 ServingMode::Local => {
@@ -654,6 +744,7 @@ impl MetricsSnapshot {
                         shadow_usd: correlary.shadow_cost_pooled(&priceable),
                         correlary,
                         seat_tokens,
+                        seat_estimated_calls,
                     }
                 }
             };
@@ -664,6 +755,19 @@ impl MetricsSnapshot {
                 calls: counters.calls,
                 tokens,
                 coverage,
+                first_output: IntervalMetric::publish(
+                    &counters.timing.first_output,
+                    FIRST_OUTPUT_BASIS,
+                ),
+                completed_turn_elapsed: IntervalMetric::publish(
+                    &counters.timing.completed_elapsed,
+                    TURN_ELAPSED_BASIS,
+                ),
+                incomplete_turn_elapsed: IntervalMetric::publish(
+                    &counters.timing.incomplete_elapsed,
+                    TURN_ELAPSED_BASIS,
+                ),
+                cache_reuse_evidence: CacheReuseEvidence::publish(&counters.cache_reuse),
                 accounting,
             });
         }
@@ -710,16 +814,33 @@ impl MetricsSnapshot {
             },
         };
 
+        // Off the same scope the rows came from, so a tenant's document carries
+        // its own evaluation spend and its neighbours' is unreachable from it.
+        let evaluation = EvaluationMetrics::build(&fold.evaluation(scope));
+        // Added here and in no other place. `frontier_spend_usd` already holds
+        // every judge side call, on the model row that billed it, so an
+        // evaluation call that had also been folded as a side call would charge
+        // this deployment twice — which is why the classifier's own events are
+        // the only input to the half beside it.
+        let observed_cost = ObservedCost::build(
+            savings.frontier_spend_usd,
+            ServingCostGaps::of(&models, &totals.coverage),
+            &evaluation,
+        );
+
         Self {
             generated_at_ms,
             first_event_at_ms: view.totals.first_at_ms,
             last_event_at_ms: view.totals.last_at_ms,
             sessions: view.totals.sessions,
             turns: view.totals.turns,
+            unrouted_terminals: view.totals.unrouted_terminals,
             calls: totals.calls,
             tokens: totals.tokens,
             seat_tokens: totals.seat_tokens,
             savings,
+            evaluation,
+            observed_cost,
             coverage_fraction: totals.coverage.reported_fraction(),
             coverage_token_fraction: totals.coverage.reported_token_fraction(),
             coverage: totals.coverage,

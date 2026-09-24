@@ -136,15 +136,12 @@ impl StrictBlock {
     fn accepts(&self, delta: &StrictDelta) -> bool {
         matches!(
             (self, delta),
-            (StrictBlock::Text { .. }, StrictDelta::TextDelta { .. })
+            (StrictBlock::Text { .. }, StrictDelta::Text { .. })
                 | (
                     StrictBlock::Thinking { .. },
-                    StrictDelta::ThinkingDelta { .. } | StrictDelta::SignatureDelta { .. }
+                    StrictDelta::Thinking { .. } | StrictDelta::Signature { .. }
                 )
-                | (
-                    StrictBlock::ToolUse { .. },
-                    StrictDelta::InputJsonDelta { .. }
-                )
+                | (StrictBlock::ToolUse { .. }, StrictDelta::InputJson { .. })
         )
     }
 
@@ -166,12 +163,63 @@ impl StrictBlock {
 /// and this surface does not emit it; if it ever does, this enum is where that
 /// gets noticed.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum StrictDelta {
-    TextDelta { text: String },
-    InputJsonDelta { partial_json: String },
-    ThinkingDelta { thinking: String },
-    SignatureDelta { signature: String },
+    #[serde(rename = "text_delta")]
+    Text { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJson { partial_json: String },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    #[serde(rename = "signature_delta")]
+    Signature { signature: String },
+}
+
+#[cfg(test)]
+mod strict_delta_wire_tests {
+    use super::StrictDelta;
+
+    #[test]
+    fn each_pinned_wire_tag_deserializes_to_its_variant() {
+        assert_eq!(
+            serde_json::from_str::<StrictDelta>(r#"{"type":"text_delta","text":"hi"}"#).unwrap(),
+            StrictDelta::Text {
+                text: "hi".to_string()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<StrictDelta>(
+                r#"{"type":"input_json_delta","partial_json":"{}"}"#
+            )
+            .unwrap(),
+            StrictDelta::InputJson {
+                partial_json: "{}".to_string()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<StrictDelta>(r#"{"type":"thinking_delta","thinking":"hm"}"#)
+                .unwrap(),
+            StrictDelta::Thinking {
+                thinking: "hm".to_string()
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<StrictDelta>(r#"{"type":"signature_delta","signature":"sig"}"#)
+                .unwrap(),
+            StrictDelta::Signature {
+                signature: "sig".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_tag_outside_the_pinned_four_is_rejected() {
+        assert!(
+            serde_json::from_str::<StrictDelta>(r#"{"type":"citations_delta","citation":{}}"#)
+                .is_err(),
+            "citations_delta is absent from the pinned vocabulary and must stay refused"
+        );
+    }
 }
 
 /// The usage object, closed over the pinned property set.
@@ -579,11 +627,11 @@ impl StreamOracle {
             ));
         }
         match &delta {
-            StrictDelta::TextDelta { text } => {
+            StrictDelta::Text { text } => {
                 self.text.push_str(text);
                 self.block_text.entry(index).or_default().push_str(text);
             }
-            StrictDelta::InputJsonDelta { partial_json } => {
+            StrictDelta::InputJson { partial_json } => {
                 self.partial_json
                     .entry(index)
                     .or_default()

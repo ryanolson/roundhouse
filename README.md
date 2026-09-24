@@ -96,12 +96,9 @@ resumption (`starting_after`), reconnect replay for the bidirectional
 transports, and the routing audit trail.
 
 **Conversation items and the routing ledger are projections of that log**, not
-separately stored collections. There is one write path, so nothing can disagree
-after a crash — and `SessionStore` collapses to six methods as a result.
+separately stored collections. `SessionStore` supplies the shared append and replay path, lease management, and a durable index for learning recovery. The recovery index is implemented, but ordinary session writes do not yet populate it.
 
-**A single-writer lease with fencing.** Every mutating call takes a `Lease`. An
-owner that stalled, was partitioned, or died and came back fails its next append
-rather than interleaving with its successor.
+**A single-writer lease with fencing.** Event appends require a `Lease`. An owner that stalled, was partitioned, or died and came back fails its next append rather than interleaving with its successor. Learning-index acknowledgement and requeue use log-sequence checks, so recovery can run without owning the writer lease.
 
 **Incremental tokenization.** Routing on cache locality means knowing the
 prompt's block hashes before dispatch. Recomputing them each turn would cost
@@ -134,6 +131,13 @@ context, the difference between shipping a 400 KB array and a few kilobytes.
 The **select/reserve split** is what makes cross-provider routing possible at
 all: price the local option, compare it against a frontier model, and only book
 if local wins. An abandoned quote costs nothing; the pending selection expires.
+
+Pricing the local option is itself a realtime residency check over HTTP, on the
+path to first token, so the router makes it only when the answer could still
+move the decision — not when the client declared a toolbox no local worker can
+carry, and not when the principal's policy names no local target. The decision
+record says which of those it was, so "never asked" stays distinguishable from
+"asked and turned down".
 
 The reservation lifecycle (`prefill_complete` → `release`) is **mandatory** — a
 leaked reservation permanently inflates the router's view of a worker and
@@ -352,6 +356,21 @@ on this path, because the checker must never break the checked. What is not
 allowed is for the failure to be silent: a timed-out validator is marked, never
 free.
 
+Judge requests use a separate `{session_id}#validate` cache key. Messages requests mark the system prefix for caching and take the requested lifetime from the target's catalog entry. The brief remains outside that marker. Token estimation and transport use the same prepared prompt, including its separator. Reservations retain the configured cold-write estimate. Provider token counts can differ, and a cache marker does not guarantee a hit.
+
+**Each parsed review records the routing decisions it covered.** The interval ends when the validator captures the brief, before it calls the judge. Every failover dispatch is a separate decision. A bounded `## Reviewed turns` section shows the interval's turns, instructions, and objective. A complete on-track verdict gives positive feedback. A complete off-track verdict gives negative feedback, regardless of the delivered action. The label is unknown, and the validator leaves out the whole section, in these cases:
+
+- The section is larger than `ValidatorConfig::interval_section_bytes` (64 KiB by default).
+- The section holds content that it cannot show.
+- The interval holds a call to one of roundhouse's own control tools, or the result of one.
+- The instructions or objectives changed, or the log did not record them.
+- A covered turn never ended.
+- The tracking bound of the session overflowed.
+
+The brief withholds control-call arguments and results because they can contain routing details. In "Recent steps", a control call keeps its number and shows only its name. This filter does not remove an agent's restatement of those details in ordinary text.
+
+A judge that reports missing context also produces an unknown label. A parsed review starts a new interval even when its label is unknown. Failed, skipped, refused and placebo reviews leave the interval open. Replay checks interval continuity and decision membership within the tracking bounds. It trusts the validator's content-gap declarations; it does not reconstruct the original prompt. See `validate/interval.rs` and `session/review.rs`.
+
 **Three arms, stamped into the session at creation.** `Live` takes the action;
 `Shadow` runs the judge, logs everything and discards the action; `Placebo`
 runs no judge and intervenes anyway on deterministic timing — the control
@@ -407,8 +426,10 @@ deep the session is — scored by a port of Switchyard's coding-agent scorer.
 **No model call is involved anywhere in the decision**: it is a `tanh` over four
 numbers read out of the log the fold already holds, so an agent that starts
 looping is moved up a tier and one that just made its tests pass is moved back
-down, at no latency and no cost. (The judge that *does* call a model lives in
+down without an extra model request. (The judge that *does* call a model lives in
 the validate loop, which is a different surface.)
+
+Each routing event stores the local signals, extractor version, selector settings, admitted targets, and original fallback plan. Failover retains that selection snapshot while recording each dispatch's target separately. A later configuration change does not rewrite the stored evidence. Historical records without a snapshot remain unknown. The snapshot records admission's result, not enough information to rerun credential, cadence, and budget checks.
 
 Four properties of the lists are worth knowing before writing one:
 
@@ -962,6 +983,16 @@ every total, including the one billed to a client. Rows roll up twice: by
 attaches to, and by **serving mode** — local Dynamo versus a remote endpoint —
 which is what the savings argument turns on.
 
+Model rows in the metrics JSON also report `first_output`: mean milliseconds, sample count, rejected timestamp count, and basis `turn_start_to_first_output`. The interval runs from `TurnStarted` to the first nonempty durable text delta. It includes intervening routing and failover delay, but excludes work before the start event and delivery after the delta append. Missing observations produce no mean. Backward timestamps increment the rejection count. Scoped means use summed elapsed time and sample counts. The HTML dashboard does not yet display this field.
+
+The JSON fields `completed_turn_elapsed` and `incomplete_turn_elapsed` separate time to completed and incomplete responses. Both use basis `turn_start_to_terminal`, from the start append to the terminal append. Each reports a mean, sample count, and rejected timestamp count. The last routed target receives the interval, including routing and failover delay. These fields do not measure task success or time to solution.
+
+Terminal timing does not depend on billed usage. An incomplete response can have a timing sample and zero calls. A missing start produces no sample, and a backward terminal timestamp increments the rejection count. `unrouted_terminals` counts responses with a start but no routed target, within the selected scope. Those responses do not create model rows. The HTML dashboard does not yet display these fields.
+
+Model rows also report `cache_reuse_evidence` in the metrics JSON. This compares predicted and observed cache-reuse ratios for the same dispatches. The prediction uses the router's token count. The observation uses the provider's token count. Each row reports both bases, paired sample count, and mean observed-minus-predicted error. Negative error means that the router expected more reuse than the provider reported.
+
+Only explicit provider cache counts supply observations, including a reported zero. Missing counts, historical records without cache provenance, and locally derived counts supply no measured sample. Coverage counters distinguish these cases from invalid usage and unusable predictions. The last routed target receives the observation after failover. These observations do not establish cache pressure or answer quality. They do not yet update routing, and the HTML dashboard does not display them.
+
 ### What "dollars saved" actually claims
 
 Three figures, and they are not equally solid, so the dashboard never merges
@@ -1028,6 +1059,22 @@ record rather than from a rate card. Two independent estimates of one
 counterfactual should land near each other; when they do not, one of the two
 models is wrong, and that disagreement is worth more than either number alone.
 It is reported beside the total, never added into it.
+
+### Classifier evaluation costs
+
+The metrics JSON and dashboard report classifier costs separately from serving costs. The `evaluation` object distinguishes measured usage, unknown usage, pending intents, and calls refused before HTTP. Its `measured_usd` uses each call's recorded rates. It is not a provider invoice, and current catalog changes do not reprice it. Classifier tokens do not enter serving counters.
+
+Cost and settlement are separate observations. An unconfirmed settlement does not erase recorded usage or cost. A later repair updates the acknowledgement without adding another call or another charge. Missing usage and unanswered intents keep evaluation cost incomplete. Replayed events and duplicate results count once per session and call identity.
+
+The `evaluation.models` rows distinguish the requested model from the service-reported model. Missing reported identity stays unknown. The existing access rules apply: admin credentials see deployment totals, while turn credentials see their principal's totals.
+
+The `observed_cost` object adds catalog-priced serving spend and recorded classifier cost, with both price bases stated. Judge side calls remain in serving spend and count once. This sum is not an invoice or a measure of local hardware costs. Forwarded subscription seats remain outside the dollar amounts. `savings.total_usd` retains its existing meaning: cache savings plus routing savings.
+
+The `covers` field identifies the included costs as `hosted_serving_and_classifier_calls`. The `serving_gaps` object reports estimated usage, hosted model rows without a reported price, and locally served calls. Local calls contribute to `serving_gaps.local_calls` because this projection does not price GPU time. These counts can overlap and must not be added together.
+
+Hosted model rows expose `priced_by_catalog` to distinguish a configured zero rate from a missing catalog entry. Missing-price counts and dashboard warnings use this field. A zero-dollar total alone does not imply missing pricing.
+
+The combined `incomplete` flag includes serving gaps and incomplete evaluation cost. Complete classifier accounting therefore cannot make an incomplete serving total appear complete. On a deployment with local traffic, this flag remains true even with fully reported token usage. Use the individual gap counts to distinguish excluded hardware costs from missing usage or pricing.
 
 ### Usage has to be asked for
 
@@ -1108,6 +1155,14 @@ boot warning rather than a surprise found one turn at a time — the credential 
 turn actually authenticates with is still resolved per turn from the control
 plane's deployment/project/member tiers.
 
+**Local latency configuration.** The catalog accepts `local_base_ttft_ms` and `local_ttft_ms_per_prefill_token` alongside the hosted models' latency fields. They default to `60.0` ms and `0.0`. Negative values stop catalog loading.
+
+For a measured prefill rate, set the slope to `1000 / tokens_per_second`. The quote is the base plus that slope times Dynamo's effective prefill tokens. Leave the slope at zero until a measurement exists. The server loads these values into its engine configuration, but the current binary does not attach a local fleet.
+
+**Cache lifetime.** For an `anthropic_messages` target, `cache_model: {"kind": "deterministic", "ttl_ms": 3600000}` selects one-hour conversation cache markers. The catalog requires `cache_write_per_mtok_usd` to equal twice the input rate for that entry. The error names the required rate. This check also applies to Messages gateways, regardless of their configured provider name.
+
+Roundhouse sets existing tool cache markers to the same lifetime as its conversation markers. A one-hour target requests `1h`. Other targets omit the TTL field for the five-minute default. This prevents shorter tool markers from preceding longer conversation markers. Tool definitions, schema contents, marker positions, and the four-marker allowance remain unchanged.
+
 **Sourcing `quality_prior`.** `FrontierModelSpec::quality_prior` is
 configuration, not measurement, and `import-benchmarks` (a binary target in
 `roundhouse-fleet`, not linked into any shipped binary) is what lets that
@@ -1134,6 +1189,47 @@ the dashboard's savings figure. No file, no line, and never a boot failure —
 the catalog is named by an operator and load-or-die, while this one is
 discovered, and a discovered file must not be able to stop a deployment
 starting.
+
+**Background turn classification (implementation draft).** The binary reads optional JSON configuration from `ROUNDHOUSE_CLASSIFY_CONFIG`. Classification is off unless the file sets `enabled: true`. Enabled configuration specifies the model, prices, credential environment-variable name, evaluation budget, content limits, transport limits, and worker limits. The binary supplies a separate evaluation ledger.
+
+The configuration fields below are required unless a default is stated. An unreadable file or invalid configuration stops startup, including an unknown key at any depth — a misspelled field is refused rather than silently dropped. Disabled configuration is still parsed, but its credential is not resolved.
+
+| JSON field | Meaning |
+|---|---|
+| `enabled` | Enable background classification. Defaults to `false`. |
+| `revision` | Operator-assigned configuration revision, recorded with each intent. |
+| `model` | Requested model identifier, recorded separately from the model reported by the service. |
+| `base_url` | Classifier API root. Defaults to the TypeSafe API root. |
+| `auth.env` | Name of the environment variable that supplies the deployment credential. |
+| `pricing.input_per_mtok_usd`, `pricing.output_per_mtok_usd` | Configured input and output rates in dollars per million tokens. |
+| `expected_output_tokens` | Output-token estimate used for the budget quote. |
+| `caps.max_prior_classifications` | Maximum prior classifications carried in the projection. |
+| `caps.max_prior_turns` | Maximum prior local metadata entries carried in the projection. A cap of its own, sized independently of `caps.max_prior_classifications`. |
+| `caps.max_prompt_chars`, `caps.max_total_bytes` | Current-prompt character limit and rendered-projection byte limit. |
+| `transport.max_request_bytes`, `transport.max_response_bytes`, `transport.deadline_ms` | Transport size limits and network deadline. |
+| `executor.max_in_flight`, `executor.max_http_concurrency` | Capacity covering prompt capture through result retention, and the separate limit on concurrent HTTP calls. |
+| `executor.call_ttl_ms` | One execution expiry shared by queue wait, budget grant, HTTP, and settlement. |
+| `executor.result_retention_ms`, `executor.sweep_interval_ms` | Finished-result retention and cleanup interval. |
+| `budget.limit_usd`, `budget.window`, `budget.warn_at` | Evaluation ceiling, `total` or `monthly` window, and warning fraction. |
+| `budget.member_share` | Optional member fraction. Omission uses the pooled project budget. |
+
+The projection contains bounded prior turn metadata, available classifications, and current user text. Local-only sessions are excluded through the requirement for an admitted frontier target. The adapter asks three questions: request intent, complexity, and dependence on context. These classifications describe the turn; they do not establish answer quality.
+
+The engine records a classification intent and schedules background work. Results can become available to later turns. The current selector does not use these labels to learn a routing policy. Eight API tests cover imported and rewritten histories on Messages and Responses, with user-text and tool-result endings. They inspect outbound classifier bodies and stored fork histories. Independent mutation checks, review, and live provider validation remain pending.
+
+Background settlement repair uses the original call identity, recorded amount, recorded budget-window mode, and durable session principal. It makes no classifier request. Unconfirmed acknowledgements do not establish whether the ledger applied a charge. Each turn considers at most `max_in_flight` repair candidates. Runtime capacity and identity claims remain held through execution and acknowledgement delivery, including outstanding delivery handles.
+
+The engine reserves classification capacity before it captures the current prompt. Saturated or stopped classifiers skip that capture. The permit remains held during the serving turn, background execution, and result retention. Long serving turns can therefore reduce classification throughput at a fixed capacity. Routing snapshots select the newest bounded references without collecting the full classification history.
+
+Received envelopes retain the service-reported model independently of usable classification answers. Missing or malformed model metadata stays unknown. Ending the classifier lifetime stops admission and signals cancellation to its workers. Cancellation leaves unanswered intents with unknown outcomes because a request might already have reached the service.
+
+The adapter retains reported usage when classification answers are unusable. Missing or partial usage remains unknown. Budget estimates use the complete serialized request. The transport sends those checked bytes once, without retries, under configured size and duration limits.
+
+Evaluation calls settle by call identity, so completion order does not discard charges. Memory and Redis retain one completed identity per call across budget resets. Those identities have no expiry or compaction. A new attempt needs a fresh identity, while settlement replay uses the original identity. Serving turns retain their ordered session watermarks.
+
+The transport supports multiple choice questions in one request. It requires one valid answer per requested key and rejects unexpected answer keys. Empty question maps are refused before HTTP.
+
+The remaining work is tracked in `agent-docs/PLAN-routing-strategy-bandit.md`. Frontier review intervals, learned serving allocation, and promotion still require implementation and verification. Evaluation reporting is implemented in the draft and awaits independent verification.
 
 ### The same numbers, in NeMo Relay's formats
 
@@ -1247,7 +1343,7 @@ The first build clones `ai-dynamo/dynamo` to resolve the pinned Dynamo crates,
 so expect it to take a while; later builds reuse the cached checkout.
 
 That default run needs no GPUs, no worker processes, and no network: the
-selection plane runs inside the test binary. Two families are opted into
+selection plane runs inside the test binary. These families are opted into
 explicitly, because each reaches something the default run must not assume:
 
 - **Redis.** The store and spend-ledger contract suites are `#[ignore]`d. Set
@@ -1265,6 +1361,26 @@ explicitly, because each reaches something the default run must not assume:
   `ROUNDHOUSE_TEST_TOPHAM_BIN=$PWD/target/debug/topham`. That variable has no
   `PATH` fallback: `topham` is installed nowhere, so a bare name would resolve
   to whatever a developer happened to have.
+
+The cache probe also has an offline suite:
+
+```bash
+timeout 300 cargo test -p roundhouse-server --test cache_probe
+```
+
+The `e2e-frontier` feature adds a live cache probe that sends two turns to one configured Messages target. The second turn appends 20 items. The report keeps each turn's cache reads, writes, and usage provenance separate. Offline tests cover the shared driver, request markers, configured transport, and budget refusal. They do not establish provider cache behavior.
+
+To run the live probe, supply a catalog, a pinned `provider/model`, and a USD spend cap. The catalog must contain real prices and a deterministic cache model. Inject the key through `openv` into the variable named by the provider's `auth.env`. Check the pinned model's minimum cacheable prefix before the run. The fixture contains at least 8,192 words before its marker, but this is not a provider token count.
+
+```bash
+openv env ROUNDHOUSE_PROBE_CATALOG=/path/to/catalog.json \
+  ROUNDHOUSE_PROBE_MODEL='anthropic/<pinned-model-id>' \
+  ROUNDHOUSE_PROBE_LIMIT_USD='<approved-cap>' \
+  timeout 300 cargo test -p roundhouse-server --features e2e-frontier \
+    --test cache_probe live -- --nocapture
+```
+
+The live test has no `#[ignore]`. Enabling the feature includes it in an unfiltered test run. Missing configuration fails before dispatch. The project budget governs both turns, with 16 output tokens and a 30-second deadline per turn. A zero cache read remains a reported observation for investigation.
 
 ## What the tests establish
 
@@ -1290,10 +1406,7 @@ explicitly, because each reaches something the default run must not assume:
 - **A failed turn settles** — the response terminates with an incomplete event,
   the lease comes back immediately, and the same turn id is retryable without
   waiting out a TTL.
-- **Streaming is genuine** — deltas are durable in the log before the response
-  completes, a stream that breaks halfway commits its partial (which the ledger
-  reads as prefill evidence), and TTFT is derivable from the log: first delta
-  minus the routing decision that preceded it.
+- **Streaming is genuine** — deltas are durable before the response completes. A stream that breaks halfway commits its partial, which the ledger reads as prefill evidence. The metrics fold measures the interval from the turn start to the first nonempty text delta.
 - **A turn outlives its lease** — the heartbeat renews while the turn works, so
   a model call longer than the TTL commits instead of being fenced at its own
   finish line; a displaced owner still loses, and a hung provider settles at

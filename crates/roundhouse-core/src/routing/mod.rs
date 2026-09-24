@@ -33,12 +33,17 @@
 
 pub mod ledger;
 pub mod policy;
+pub mod selection;
 pub mod stage;
 
 pub use ledger::{CacheLedger, CacheModel, LedgerEntry, PooledUsage, ProviderPricing};
 pub use policy::{AffinityPolicy, EscalationPolicy};
+pub use selection::{
+    AffinityEvidence, FEATURE_EXTRACTOR_REVISION, LocalFeatures, SelectionSnapshot, SelectorBranch,
+    SelectorSnapshot, StageEvidence, StageOutcome,
+};
 pub use stage::{
-    DecisionSource, PickerMode, StagePolicy, Tier, TierRecipe, TierRecipeError, TurnSignals,
+    DecisionSource, Pick, PickerMode, StagePolicy, Tier, TierRecipe, TierRecipeError, TurnSignals,
 };
 
 use async_trait::async_trait;
@@ -98,9 +103,22 @@ impl Target {
                 model,
                 worker_id: _,
                 dp_rank: _,
-            } => format!("local/{model}"),
+            } => Self::local_policy_identity(model),
             Target::Frontier { provider, model } => format!("{provider}/{model}"),
         }
+    }
+
+    /// The identity above for a local worker nobody has picked yet.
+    ///
+    /// A router that wants to know whether a policy names its fleet at all has
+    /// to ask before a worker exists — the selector's answer is what names one
+    /// — and the answer is well defined because [`Self::policy_identity`]
+    /// deliberately drops `worker_id` and `dp_rank`. Spelled here rather than
+    /// formatted at the call site so the `local/` prefix has one definition:
+    /// two of them would let a caller's filter match a target the policy layer
+    /// spells differently.
+    pub fn local_policy_identity(model: &str) -> String {
+        format!("local/{model}")
     }
 
     /// Stable key for ledger lookups.
@@ -194,20 +212,12 @@ pub struct RoutingContext<'a> {
     /// passes [`TurnBudget::Unlimited`], which is the value that makes the
     /// budget axis a no-op rather than a ceiling that happens to be large.
     pub budget: &'a TurnBudget,
-    /// What the session's recent tool traffic says, computed once per turn from
-    /// the fold the engine already holds.
+    /// Local signals computed from committed exchanges for this turn.
     ///
-    /// **Derived data, not new state.** The extractor runs over the committed
-    /// exchanges, so a successor picking this session up computes the same
-    /// numbers from the same log; nothing is stored and nothing is asked of a
-    /// model. `None` is the first turn of a session — no exchanges, nothing to
-    /// read — and it scores exactly as an empty [`TurnSignals`] does, through
-    /// the ordinary arithmetic rather than through a special case.
-    ///
-    /// Turn-resolved like [`Self::budget`] and deliberately not
-    /// admission-resolved like [`Self::turn_policy`]: the signals change on
-    /// every exchange, and a value fixed for the session would score the tenth
-    /// turn on the first one's evidence.
+    /// The engine supplies and records the exact values, including an empty
+    /// set on the first turn. `None` means a caller supplied no signals, in
+    /// which case the stage policy uses an empty set. Each subsequent turn
+    /// computes new signals; replay preserves earlier selection snapshots.
     pub signals: Option<&'a TurnSignals>,
     /// This project's tier recipe, or `None` where it configured none.
     ///
@@ -291,25 +301,51 @@ impl<'a> Admitted<'a> {
     /// holds borrows into the caller's candidate slice — and the engine's own
     /// `UnresolvableTarget` is where that is already caught, against the
     /// authoritative set.
-    pub fn decide(&self, target: Target, rationale: String) -> Decision {
+    ///
+    /// **[`Decision::admitted`] is stamped here** for the same reason the budget
+    /// state is: this is where the resolution happened, and it is the only place
+    /// that still holds it. A reader asking `admissible` again would have to
+    /// invent a `max_load` — the calling policy's own tuning, which this type
+    /// has already applied and does not carry — and would miss the overflow
+    /// valve's pool entirely.
+    ///
+    /// **`selector` is required, not a struct-update override the caller adds
+    /// afterward.** Every builtin policy has one to give — the vocabulary in
+    /// [`selection`] has a branch for each — and a required argument is what
+    /// makes [`Decision::selector`] being `None` unreachable from this
+    /// constructor. The field stays an `Option` on the wire for records
+    /// written before it existed; no in-tree path produces `None` today.
+    pub fn decide(
+        &self,
+        target: Target,
+        rationale: String,
+        selector: SelectorSnapshot,
+    ) -> Decision {
         Decision {
             target,
             rationale: self.annotate(rationale),
             budget_state: self.budget_state,
             fallbacks: Vec::new(),
             source: None,
+            admitted: Some(self.pool.iter().map(|c| c.target.clone()).collect()),
+            selector: Some(selector),
         }
     }
 
-    /// [`Self::decide`] for a policy that picked a *tier*: the same three
-    /// coupled fields, plus the ordered second choices and the typed reason the
-    /// tier was picked.
+    /// [`Self::decide`] for a policy that picked a *tier*: the same coupled
+    /// fields, plus the ordered second choices and the evidence a stage
+    /// decision carries.
     ///
     /// A second constructor rather than two more arguments on `decide`, because
-    /// the two existing policies have neither answer to give — an
+    /// the two non-staged policies have neither answer to give — an
     /// `EscalationPolicy` audit turn has no ordered runner-up and no
     /// [`DecisionSource`], and making them pass `Vec::new()` and `None` would
     /// be asking two callers to disclaim a concept they do not have.
+    ///
+    /// **`source` is derived from `evidence`, not a separate argument.**
+    /// [`StageEvidence::source`] is the one place that rule lives; taking a
+    /// `DecisionSource` here as well would let a caller pass one that
+    /// disagrees with the evidence recorded beside it.
     ///
     /// `fallbacks` is not checked against [`Self::pool`], for the same reason
     /// `target` is not: the pool holds borrows into the caller's slice, and the
@@ -320,13 +356,14 @@ impl<'a> Admitted<'a> {
         &self,
         target: Target,
         fallbacks: Vec<Target>,
-        source: DecisionSource,
         rationale: String,
+        evidence: StageEvidence,
     ) -> Decision {
+        let source = evidence.source();
         Decision {
             fallbacks,
-            source: Some(source),
-            ..self.decide(target, rationale)
+            source,
+            ..self.decide(target, rationale, SelectorSnapshot::stage(evidence))
         }
     }
 
@@ -537,6 +574,19 @@ pub struct Decision {
     /// scoring and audit policies pick a *candidate*, not a tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<DecisionSource>,
+    /// The pool returned by this policy's admission call.
+    ///
+    /// Policies can use different load ceilings, and admission can reopen the
+    /// pool through budget overflow. The engine copies this result rather than
+    /// repeating admission. `None` means that evidence was not recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted: Option<Vec<Target>>,
+    /// Which builtin selector branch ran, and under what configuration.
+    ///
+    /// `None` where the branch is not one this module can name — see
+    /// [`SelectorSnapshot`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<SelectorSnapshot>,
 }
 
 /// The persisted form of a decision, written into the session event log.
@@ -717,6 +767,60 @@ pub struct DecisionRecord {
     /// decision bytes it wrote before failover existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<DispatchAttempt>,
+    /// Why this turn never asked the local fleet what it was holding.
+    ///
+    /// **"Not quoted" and "quoted and rejected" are different answers**, and a
+    /// dashboard that cannot tell them apart reports a fleet the router keeps
+    /// turning down when the truth is a fleet the router never asked. The
+    /// quote is a realtime residency check over HTTP on the path to first
+    /// token, so it is made only when its answer could still move the
+    /// decision; this is what that decision wrote down.
+    ///
+    /// `None` on a turn that *was* quoted, whatever the quote said, and also
+    /// on a deployment with no fleet configured — there was nothing to skip,
+    /// and a variant for it would be a second spelling of the absent fleet the
+    /// rest of the record already implies.
+    ///
+    /// Skipped on the wire when absent, and defaulted on the way in, so a log
+    /// written before this field existed still deserializes and a deployment
+    /// that always quotes writes the bytes it wrote before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_quote_skipped: Option<LocalQuoteSkip>,
+    /// The inputs, configuration, and original choice captured before dispatch.
+    ///
+    /// The engine records this on every routed dispatch. `None` means missing
+    /// evidence, including historical records written before this field existed.
+    /// Missing evidence is distinct from recorded empty local signals.
+    ///
+    /// Boxing the snapshot limits the size of every session event, including
+    /// events that carry no routing evidence. A present snapshot adds one
+    /// allocation; an absent snapshot needs none. `event_size.rs` checks sizes,
+    /// not allocation counts or throughput. Serde preserves the JSON shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<Box<SelectionSnapshot>>,
+}
+
+/// Why a turn's local residency check was not made.
+///
+/// Typed rather than a message, because the consumer is a projection and not a
+/// reader: these records are persisted, replayed and folded, and a
+/// `&'static str` written by one build is a string a later one has to match on
+/// to count anything. The variants are reachability facts — the same answer on
+/// every turn of every session that looks like this one — which is why a
+/// squeezed budget and a spent cadence are deliberately absent: both make a
+/// local route *more* likely, so skipping the quote under them would skip it
+/// exactly when it mattered most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalQuoteSkip {
+    /// The client declared a toolbox, and a local worker cannot carry one.
+    ///
+    /// The exclusion downstream in the engine is unconditional, so the quote
+    /// would have been thrown away on arrival.
+    ToolsDeclared,
+    /// This principal's policy names no local target, so a quote would have
+    /// produced a candidate the pre-`choose` filter drops.
+    PolicyAdmitsNoLocal,
 }
 
 /// One dispatch that failed and was fallen forward from.
@@ -982,6 +1086,7 @@ mod tests {
         // And a record written today round-trips its digest, or replaying a
         // log would report constraints that were never in force.
         let digested = DecisionRecord {
+            local_quote_skipped: None,
             turn_policy_digest: "0123456789abcdef".into(),
             ..record
         };
@@ -999,6 +1104,8 @@ mod tests {
         // deserializing, or an upgrade takes the deployment's routing history
         // with it.
         let record = DecisionRecord {
+            selection: None,
+            local_quote_skipped: None,
             chosen: Target::Frontier {
                 provider: "anthropic".into(),
                 model: "claude".into(),
@@ -1073,6 +1180,12 @@ mod tests {
         }"#;
         let recovered: DecisionRecord = serde_json::from_str(pre_m3).unwrap();
         assert_eq!(
+            recovered.local_quote_skipped, None,
+            "a log written before the residency call became a decision records \
+             no skip, which is the correct reading of it: every one of those \
+             turns really did ask the fleet"
+        );
+        assert_eq!(
             recovered.budget_state,
             BudgetState::Unconstrained,
             "a turn taken before budgets existed was taken under no budget, \
@@ -1130,6 +1243,7 @@ mod tests {
         // turn's absent basis, so a deployment that configures neither keeps
         // writing exactly the bytes it wrote before the two fields existed.
         let ordinary = DecisionRecord {
+            local_quote_skipped: None,
             payer: Payer::Deployment,
             budget_draw: None,
             withheld_providers: Vec::new(),

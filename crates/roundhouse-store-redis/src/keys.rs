@@ -193,6 +193,7 @@ impl KeyNamespace {
         Ok(Self(raw))
     }
 
+    /// The namespace as written, for [`build_key`] to open every key with.
     fn as_str(&self) -> &str {
         &self.0
     }

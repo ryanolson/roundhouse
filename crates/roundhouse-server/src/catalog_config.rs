@@ -1,15 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Deployment configuration for the catalog, the rate card, and the correlaries.
+//! Deployment configuration for the catalog, the rate card, the correlaries,
+//! and the local latency curve they are all compared against.
 //!
-//! One file, because these three are one fact seen from three angles. The
-//! catalog is what the router may choose between; the rate card is what those
-//! choices cost; the correlaries are what our own models stand in for when
-//! they are priced. Splitting them across separate configuration would let the
-//! price the router optimizes against drift from the price the dashboard
-//! reports saving, and those two numbers disagreeing is worse than either being
-//! wrong — it is unfalsifiable.
+//! One file, because these are one fact seen from several angles. The catalog
+//! is what the router may choose between; the rate card is what those choices
+//! cost; the correlaries are what our own models stand in for when they are
+//! priced; the local TTFT curve is the fourth axis of that same comparison,
+//! and it is here because every hosted entry already carries its own
+//! `base_ttft_ms` and `ttft_ms_per_uncached_token` — a deployment that
+//! configured the local side somewhere else would be writing the two halves of
+//! one comparison in two files. Splitting them would let the price the router
+//! optimizes against drift from the price the dashboard reports saving, and
+//! those two numbers disagreeing is worse than either being wrong — it is
+//! unfalsifiable.
 //!
 //! Prices are not in source, here or anywhere: rate cards change, and a
 //! constant in a binary goes stale silently. `roundhouse-fleet`'s
@@ -26,9 +31,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
-use roundhouse_fleet::{FrontierModelSpec, StaticFrontierCatalog};
+use roundhouse_fleet::anthropic_messages::CacheLifetime;
+use roundhouse_fleet::{CacheLifetimeError, FrontierModelSpec, StaticFrontierCatalog};
+
+use crate::engine::{DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
 
 pub use providers::{BUILT_IN_OPENAI, ProviderAuth, ProviderConfig, ProviderRoutes};
 
@@ -37,6 +46,7 @@ pub const CATALOG_VAR: &str = "ROUNDHOUSE_CATALOG";
 
 /// A stated equivalence between one of our models and a hosted one.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CorrelaryConfig {
     /// The local model's name, as `EngineConfig::local_model` reports it.
     pub local_model: String,
@@ -50,7 +60,15 @@ pub struct CorrelaryConfig {
 
 /// What a deployment supplies.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatalogConfig {
+    /// The shipped example's own inline commentary (`examples/catalog.example.json`),
+    /// allowed by name and never read. The one exception to `deny_unknown_fields`
+    /// below: a file that teaches the format by writing prose into itself must not
+    /// trip the same guard that exists to catch an operator's typo elsewhere in it.
+    #[serde(rename = "$comment", default)]
+    #[allow(dead_code)]
+    comment: Option<Value>,
     /// Hosted models the router may choose between, with their prices.
     pub models: Vec<FrontierModelSpec>,
     /// Where each [`FrontierModelSpec::provider`] actually is, keyed by that
@@ -76,6 +94,16 @@ pub struct CatalogConfig {
     /// How far apart two models' quality priors may be and still be compared.
     #[serde(default = "default_capability_band")]
     pub capability_band: f64,
+    /// Local latency floor in milliseconds. Uses the engine's default when omitted.
+    #[serde(default = "default_local_base_ttft_ms")]
+    pub local_base_ttft_ms: f64,
+    /// Milliseconds per effective prefill token, measured as `1000 / tokens_per_second`.
+    ///
+    /// Zero leaves the quote flat until the deployment has a prefill measurement.
+    /// Keeping local and hosted latency values here makes their comparison
+    /// inspectable in the same deployment configuration.
+    #[serde(default)]
+    pub local_ttft_ms_per_prefill_token: f64,
     /// The citation for imported `quality_prior`s, if a provenance file was
     /// found beside this catalog. Never read from the catalog JSON itself —
     /// see [`quality_prior_citation`].
@@ -93,9 +121,10 @@ const PROVENANCE_FILE: &str = "quality-prior.provenance.json";
 /// attribution when the data is republished — and roundhouse republishes
 /// figures derived from it: the savings dashboard's routing saving is priced
 /// through the capability gate those priors feed. The fragment the tool emits
-/// cannot carry the attribution (a catalog entry is `deny_unknown_fields`, and
-/// inventing a field there would put somebody else's schema into every
-/// catalog), so the obligation lives in the paired provenance file. Reading it
+/// cannot carry the attribution -- inventing a field on [`FrontierModelSpec`]
+/// for one importer's provenance would put somebody else's schema into every
+/// catalog entry ever written, not just the imported ones -- so the
+/// obligation lives in the paired provenance file instead. Reading it
 /// here is what turns "keep the two files together" from an instruction into
 /// something the deployment does on the operator's behalf (M10 review G12).
 ///
@@ -222,6 +251,10 @@ fn default_capability_band() -> f64 {
     DEFAULT_CAPABILITY_BAND
 }
 
+fn default_local_base_ttft_ms() -> f64 {
+    DEFAULT_LOCAL_BASE_TTFT_MS
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
     #[error("could not read catalog `{path}`: {source}")]
@@ -249,6 +282,59 @@ pub enum CatalogError {
         path: String,
         provider: String,
         model: String,
+    },
+    /// Carries the computed rate so the load error names the required value.
+    #[error(
+        "catalog `{path}`: `{model}` declares a one-hour cache. \
+         cache_write_per_mtok_usd must equal twice the input rate ({required}), got {declared}"
+    )]
+    OneHourWriteRate {
+        path: String,
+        model: String,
+        declared: f64,
+        required: f64,
+    },
+    /// A `deterministic` entry on `anthropic_messages` declares a TTL the wire
+    /// has no spelling for.
+    ///
+    /// Anthropic offers exactly two lifetimes: the five-minute default (no
+    /// `ttl` field) and an explicit one-hour marker. Anything else passed
+    /// this boundary silently: `AnthropicMessagesClient::body` fell back to
+    /// the default with no `ttl` at all, while `CacheLedger` kept modelling
+    /// the target as warm for the number the catalog declared — the router
+    /// pricing a cache hit the wire was never asked to grant.
+    #[error(
+        "catalog `{path}`: `{model}` declares a deterministic cache lifetime of {ttl_ms}ms on \
+         `anthropic_messages`, which has no spelling for it on the wire -- only the \
+         five-minute default (300000) and the explicit one-hour marker (3600000) exist. \
+         Routing on this entry would price a cache hit the wire is never asked to grant"
+    )]
+    UnsupportedCacheLifetime {
+        path: String,
+        model: String,
+        ttl_ms: u64,
+    },
+    /// An `inactivity_decay` entry on `anthropic_messages` models retention
+    /// past what the wire's own undeclared default grants.
+    ///
+    /// Anthropic's Messages cache is deterministic, not automatic: past the
+    /// silent five-minute default, the dialect's only lever is the explicit
+    /// `1h` marker `CacheModel::Deterministic` spells, not a decay curve.
+    /// A `max_ttl_ms` past the default therefore prices warmth this wire was
+    /// never asked to grant, for the same reason a `deterministic` TTL it
+    /// cannot spell is refused above.
+    #[error(
+        "catalog `{path}`: `{model}` models an automatic cache retained up to \
+         {max_ttl_ms}ms on `anthropic_messages`, past the {default_ttl_ms}ms the wire \
+         grants with no marker to ask for more. This dialect's cache is deterministic, \
+         not automatic -- use `cache_model.kind: \"deterministic\"` with an explicit \
+         `ttl_ms`, or lower `max_ttl_ms` to {default_ttl_ms} or below"
+    )]
+    UndeclaredCacheDecay {
+        path: String,
+        model: String,
+        max_ttl_ms: u64,
+        default_ttl_ms: u64,
     },
     #[error("catalog `{path}`: `{model}` has {field} = {value}, but {expected}")]
     InvalidValue {
@@ -392,8 +478,9 @@ impl CatalogConfig {
     /// file accepted. Making the ambiguity unrepresentable is what keeps the
     /// stated invariant true rather than merely usually true.
     ///
-    /// Every check here is about a value that changes a dollar figure or gates
-    /// a comparison. Non-finite prices are deliberately absent: JSON has no
+    /// Every check here is about a value that changes a dollar figure, gates a
+    /// comparison, or moves a route — the local latency curve is the third of
+    /// those. Non-finite prices are deliberately absent: JSON has no
     /// `NaN` literal and `serde_json` refuses a float it cannot represent, so
     /// parsing has already rejected them and a guard here would be dead code
     /// dressed as diligence.
@@ -467,6 +554,57 @@ impl CatalogConfig {
                 }
             }
             unit_interval(path, &label, "quality_prior", spec.quality_prior)?;
+
+            // `requested_cache_lifetime` is the one place "which deterministic
+            // TTLs Anthropic's wire can spell, and how far an automatic decay
+            // may model retention" is decided — its own doc says a variant
+            // added to either `WireProtocol` or `CacheModel` fails to compile
+            // there until someone decides what it means. Calling it here,
+            // rather than re-deriving the same rule by hand, is what keeps
+            // that compile-time protection real: a hand-written `==` copy
+            // would not fail to compile on a new variant, it would silently
+            // accept it. The match below is over `CacheLifetimeError`'s own
+            // two variants rather than the wide `FrontierError`, so it too
+            // is exhaustive -- a third refusal the resolver grows fails to
+            // compile here instead of panicking at boot through a wildcard
+            // arm.
+            let lifetime = spec
+                .requested_cache_lifetime()
+                .map_err(|error| match error {
+                    CacheLifetimeError::UnspellableTtl { ttl_ms } => {
+                        CatalogError::UnsupportedCacheLifetime {
+                            path: path.to_string(),
+                            model: label.clone(),
+                            ttl_ms,
+                        }
+                    }
+                    CacheLifetimeError::UndeclaredDecay {
+                        max_ttl_ms,
+                        default_ttl_ms,
+                    } => CatalogError::UndeclaredCacheDecay {
+                        path: path.to_string(),
+                        model: label.clone(),
+                        max_ttl_ms,
+                        default_ttl_ms,
+                    },
+                })?;
+
+            // A single write rate must match the lifetime requested on the
+            // wire. Only `anthropic_messages` plus `Deterministic{ONE_HOUR_MS}`
+            // resolves to `OneHour` (see `requested_cache_lifetime`'s match),
+            // so testing the resolved lifetime already scopes this to the
+            // dialect that has an hour to ask for.
+            let one_hour_write = 2.0 * spec.pricing.input_per_mtok_usd;
+            if lifetime == CacheLifetime::OneHour
+                && spec.pricing.cache_write_per_mtok_usd != one_hour_write
+            {
+                return Err(CatalogError::OneHourWriteRate {
+                    path: path.to_string(),
+                    model: label.clone(),
+                    declared: spec.pricing.cache_write_per_mtok_usd,
+                    required: one_hour_write,
+                });
+            }
         }
 
         // Every definition judged before any entry is resolved against it, so
@@ -531,6 +669,30 @@ impl CatalogConfig {
                     local_model: correlary.local_model.clone(),
                     provider: correlary.provider.clone(),
                     model: correlary.model.clone(),
+                });
+            }
+        }
+
+        // The local half of the latency curve, held to the rule its hosted
+        // half is held to above. A negative floor or slope does not merely
+        // mis-quote: it makes a local worker look *faster* the more it has to
+        // prefill, so the router hands its longest cold contexts to the one
+        // target no provider bill ever arrives to contradict, and the
+        // dashboard reports every miss as a saving.
+        for (field, value) in [
+            ("local_base_ttft_ms", self.local_base_ttft_ms),
+            (
+                "local_ttft_ms_per_prefill_token",
+                self.local_ttft_ms_per_prefill_token,
+            ),
+        ] {
+            if value < 0.0 {
+                return Err(CatalogError::InvalidValue {
+                    path: path.to_string(),
+                    model: "<catalog>".to_string(),
+                    field,
+                    value,
+                    expected: "rates and latencies cannot be negative",
                 });
             }
         }
@@ -613,358 +775,20 @@ pub fn from_env() -> Result<Option<CatalogConfig>, CatalogError> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use roundhouse_core::metrics::{Correlary, PricedBasis};
-
-    const SAMPLE: &str = r#"{
-      "providers": {
-        "anthropic": {
-          "base_url": "https://api.anthropic.test/v1",
-          "routes": { "messages": "/messages" },
-          "auth": { "env": "ANTHROPIC_API_KEY" }
-        }
-      },
-      "models": [
-        {
-          "provider": "anthropic",
-          "model": "claude-sonnet",
-          "wire_protocol": "anthropic_messages",
-          "cache_model": { "kind": "deterministic", "ttl_ms": 300000 },
-          "pricing": {
-            "input_per_mtok_usd": 3.0,
-            "cached_input_per_mtok_usd": 0.3,
-            "cache_write_per_mtok_usd": 3.75,
-            "output_per_mtok_usd": 15.0
-          },
-          "quality_prior": 0.62,
-          "base_ttft_ms": 350.0,
-          "ttft_ms_per_uncached_token": 0.002
-        }
-      ],
-      "correlaries": [
-        {
-          "local_model": "llama",
-          "provider": "anthropic",
-          "model": "claude-sonnet",
-          "note": "within 2 points on our internal eval"
-        }
-      ],
-      "local_quality": { "llama": 0.62 },
-      "capability_band": 0.05
-    }"#;
-
-    #[test]
-    fn a_catalog_configures_the_router_and_the_dashboard_from_one_rate_card() {
-        let config = CatalogConfig::from_json(SAMPLE, "test").unwrap();
-        let catalog = config.catalog();
-        assert_eq!(catalog.models().len(), 1);
-
-        let metrics = config.metrics_config();
-        let reference = &metrics.pricing.references()[0];
-        assert_eq!(
-            reference.pricing,
-            catalog.models()[0].pricing,
-            "the price the dashboard reports must be the price the router chose on"
-        );
-        assert_eq!(metrics.pricing.capability_band(), 0.05);
-    }
-
-    #[test]
-    fn a_declared_correlary_survives_into_the_metrics_config() {
-        let config = CatalogConfig::from_json(SAMPLE, "test").unwrap();
-        let metrics = config.metrics_config();
-
-        let correlary = metrics
-            .pricing
-            .resolve("llama", 0.62, None, &HashMap::new(), None);
-        assert_eq!(correlary.reference().unwrap().model, "claude-sonnet");
-        match &correlary {
-            Correlary::Priced {
-                basis: PricedBasis::Declared { note },
-                ..
-            } => assert!(note.contains("internal eval"), "the note is shown verbatim"),
-            other => panic!("expected a declared basis, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn optional_fields_fall_back_to_documented_defaults() {
-        let minimal = r#"{
-          "models": [{
-            "provider": "openai",
-            "model": "gpt",
-            "wire_protocol": "openai_chat_completions",
-            "cache_model": {
-              "kind": "inactivity_decay",
-              "half_life_ms": 300000,
-              "max_ttl_ms": 3600000,
-              "min_prefix_tokens": 1024
-            },
-            "pricing": {
-              "input_per_mtok_usd": 1.0,
-              "cached_input_per_mtok_usd": 0.1,
-              "cache_write_per_mtok_usd": 0.0,
-              "output_per_mtok_usd": 4.0
-            },
-            "quality_prior": 0.7,
-            "base_ttft_ms": 300.0,
-            "ttft_ms_per_uncached_token": 0.001
-          }]
-        }"#;
-        let config = CatalogConfig::from_json(minimal, "test").unwrap();
-        assert!(config.correlaries.is_empty());
-        assert_eq!(config.capability_band, DEFAULT_CAPABILITY_BAND);
-        assert_eq!(config.default_local_quality, 0.5);
-    }
-
-    #[test]
-    fn an_empty_catalog_is_refused_rather_than_started_with() {
-        let error = CatalogConfig::from_json(r#"{ "models": [] }"#, "test").unwrap_err();
-        assert!(matches!(error, CatalogError::Empty { .. }));
-    }
-
-    /// One entry, parameterized on the two fields the provider cross-checks
-    /// read, and nothing else — so a refusal below is unambiguously about the
-    /// provider and not about a price or a prior.
-    fn one_entry(providers: &str, provider: &str, wire_protocol: &str) -> String {
-        format!(
-            r#"{{
-              "providers": {providers},
-              "models": [{{
-                "provider": "{provider}",
-                "model": "flagship",
-                "wire_protocol": "{wire_protocol}",
-                "cache_model": {{ "kind": "deterministic", "ttl_ms": 300000 }},
-                "pricing": {{
-                  "input_per_mtok_usd": 1.0,
-                  "cached_input_per_mtok_usd": 0.1,
-                  "cache_write_per_mtok_usd": 0.0,
-                  "output_per_mtok_usd": 4.0
-                }},
-                "quality_prior": 0.7,
-                "base_ttft_ms": 300.0,
-                "ttft_ms_per_uncached_token": 0.001
-              }}]
-            }}"#
-        )
-    }
-
-    /// **P1/P2's boot cross-check, the config half.**
-    ///
-    /// A `provider` string is what the client registry is keyed by, so an
-    /// entry naming one nothing defines is a routing decision with no transport
-    /// behind it. Refusing it here — at load, before a session exists — is what
-    /// makes `an_unknown_provider_is_refused_at_boot_not_at_first_dispatch`
-    /// true of the whole process rather than of one composition site.
-    #[test]
-    fn an_entry_naming_an_undefined_provider_is_refused_at_load() {
-        let error =
-            CatalogConfig::from_json(&one_entry("{}", "openrouter", "openai_responses"), "test")
-                .expect_err("a provider nothing defines has no client to dispatch through");
-        assert!(
-            matches!(&error, CatalogError::UndefinedProvider { provider, .. }
-                if provider == "openrouter"),
-            "{error}"
-        );
-        // And the refusal points at the two ways out, because an operator
-        // holding it is deciding between them.
-        let message = error.to_string();
-        assert!(
-            message.contains("\"providers\"") && message.contains("openai"),
-            "{message}"
-        );
-
-        // CONTROL 1: the same entry with the definition present validates, so
-        // the refusal is about the missing definition and not about the name.
-        CatalogConfig::from_json(
-            &one_entry(
-                r#"{ "openrouter": { "base_url": "https://openrouter.ai/api/v1",
-                     "routes": { "responses": "/responses" },
-                     "auth": { "env": "OPENROUTER_API_KEY" } } }"#,
-                "openrouter",
-                "openai_responses",
-            ),
-            "test",
-        )
-        .expect("a defined provider is routable");
-
-        // CONTROL 2: the implicit `openai` provider still needs no section at
-        // all. This is the backward-compatibility promise in executable form —
-        // every catalog written before M10.1 is exactly this shape.
-        CatalogConfig::from_json(&one_entry("{}", "openai", "openai_responses"), "test")
-            .expect("the built-in provider needs no definition");
-    }
-
-    /// **Thermo-nuclear review G15, reachability half.** The boundary refuses
-    /// a `provider` naming nothing, and it refuses a provider missing a route
-    /// for its entry's dialect — but nothing here refuses a `providers` map
-    /// that explicitly redefines the key `openai`. That means the scenario
-    /// `an_explicit_openai_definition_says_it_is_taking_over_from_the_variables`
-    /// (in `main.rs`) exercises is one an operator can actually reach through
-    /// a parsed catalog file, not just through `frontier_clients` called
-    /// directly: nothing here stops them writing `"providers": {"openai":
-    /// {...}}` next to `ROUNDHOUSE_OPENAI_API_BASE` and getting no refusal, no
-    /// warning, and a silently shadowed variable.
-    #[test]
-    fn an_explicit_openai_provider_entry_validates_unremarked() {
-        CatalogConfig::from_json(
-            &one_entry(
-                r#"{ "openai": { "base_url": "https://openai-relay.internal/v1",
-                     "routes": { "responses": "/responses" },
-                     "auth": { "env": "OPENAI_RELAY_KEY" } } }"#,
-                "openai",
-                "openai_responses",
-            ),
-            "test",
-        )
-        .expect(
-            "the config boundary has no check that would refuse a `providers.openai` entry, \
-             which is what makes the shadowing in `frontier_clients` reachable from a file an \
-             operator actually writes rather than only from a hand-built HashMap",
-        );
-    }
-
-    /// A definition that cannot carry one of its own entries.
-    ///
-    /// The failure this prevents is quiet in the worst way: the provider
-    /// exists, the client is built, the request is serialized — and there is no
-    /// path to POST it to, so the entry is unroutable for reasons that look
-    /// like an outage at the far end.
-    #[test]
-    fn a_provider_with_no_route_for_its_entrys_dialect_is_refused_at_load() {
-        let responses_only = r#"{ "openrouter": {
-            "base_url": "https://openrouter.ai/api/v1",
-            "routes": { "responses": "/responses" },
-            "auth": { "env": "OPENROUTER_API_KEY" } } }"#;
-
-        let error = CatalogConfig::from_json(
-            &one_entry(responses_only, "openrouter", "anthropic_messages"),
-            "test",
-        )
-        .expect_err("a dialect with no route has nowhere to be sent");
-        assert!(
-            matches!(
-                &error,
-                CatalogError::ProviderMissingRoute { dialect, field, .. }
-                    if *dialect == "anthropic_messages" && *field == "messages"
-            ),
-            "{error}"
-        );
-        // Named the way the file spells it, so the remedy is a field an
-        // operator can find rather than a dialect they already wrote.
-        assert!(error.to_string().contains("routes.messages"), "{error}");
-
-        // CONTROL: the identical provider serving the identical entry over the
-        // dialect it *did* declare. One field different, and it validates —
-        // which is what makes the refusal above about the route rather than
-        // about OpenRouter or about `anthropic_messages`.
-        CatalogConfig::from_json(
-            &one_entry(responses_only, "openrouter", "openai_responses"),
-            "test",
-        )
-        .expect("the declared dialect is routable");
-    }
-
-    #[test]
-    fn a_malformed_catalog_names_the_file_it_could_not_parse() {
-        let error = CatalogConfig::from_json("{ not json", "/etc/roundhouse.json").unwrap_err();
-        assert!(error.to_string().contains("/etc/roundhouse.json"));
-    }
-
-    /// G17 (M10 review): the `catalog.example.json` `$comment` spends eleven
-    /// lines warning that a tilde-alias (`~deepseek/deepseek-v4-flash-latest`)
-    /// is a rolling pointer OpenRouter may re-point at any time, and that the
-    /// catalog "has no mechanism to re-resolve it later" — but `validate`
-    /// never inspects the shape of `spec.model` at all, so that discipline is
-    /// prose, not a check. This asserts the load refuses a tilde-alias id,
-    /// which is what "has no mechanism to re-resolve it later" has to mean if
-    /// the rule mattered enough to state.
-    ///
-    /// **Refusal, provider-scoped.** The ruling on G17 was between refuse, warn
-    /// and accept; refuse is what the three neighbouring identity checks already
-    /// do, and the scope is `openrouter` alone because `~` is a marker in that
-    /// provider's id vocabulary and nobody else's — see
-    /// [`ROLLING_ALIAS_PROVIDER`]. The controls below are what keep this from
-    /// becoming a blanket shape rule over every provider's ids.
-    #[test]
-    fn a_rolling_alias_is_named_at_load() {
-        /// One entry, parameterized on the two fields this check reads. The
-        /// definition below is named after whichever provider the entry claims,
-        /// so a provider rename moves both halves together and the controls
-        /// differ from the probe in exactly the string under test.
-        fn one_model(provider: &str, model: &str) -> String {
-            format!(
-                r#"{{
-                  "providers": {{ "{provider}": {{
-                    "base_url": "https://openrouter.ai/api/v1",
-                    "routes": {{ "responses": "/responses" }},
-                    "auth": {{ "env": "OPENROUTER_API_KEY" }}
-                  }} }},
-                  "models": [{{
-                    "provider": "{provider}",
-                    "model": "{model}",
-                    "wire_protocol": "openai_responses",
-                    "cache_model": {{ "kind": "deterministic", "ttl_ms": 300000 }},
-                    "pricing": {{
-                      "input_per_mtok_usd": 1.0,
-                      "cached_input_per_mtok_usd": 0.1,
-                      "cache_write_per_mtok_usd": 0.0,
-                      "output_per_mtok_usd": 4.0
-                    }},
-                    "quality_prior": 0.7,
-                    "base_ttft_ms": 300.0,
-                    "ttft_ms_per_uncached_token": 0.001
-                  }}]
-                }}"#
-            )
-        }
-
-        let error = CatalogConfig::from_json(
-            &one_model("openrouter", "~deepseek/deepseek-v4-flash-latest"),
-            "test",
-        )
-        .expect_err(
-            "a rolling-pointer model id mis-prices every turn after OpenRouter re-points it, \
-             same as a duplicate identity or an off-scale prior",
-        );
-        assert!(
-            matches!(
-                &error,
-                CatalogError::RollingModelAlias { model, .. }
-                    if model == "~deepseek/deepseek-v4-flash-latest"
-            ),
-            "{error}"
-        );
-        // The remedy in the message, not just the diagnosis: an operator reads
-        // this in a boot log and needs the id to paste and then date.
-        assert!(
-            error
-                .to_string()
-                .contains("deepseek/deepseek-v4-flash-latest`"),
-            "the refusal must end in the id with the marker gone: {error}"
-        );
-
-        // CONTROL 1: the same provider with the full dated id the example's own
-        // `$comment` tells an operator to write. One character different, and it
-        // loads — which is what makes the refusal about the alias marker rather
-        // than about OpenRouter or about slashes in an id.
-        CatalogConfig::from_json(
-            &one_model("openrouter", "deepseek/deepseek-v4-flash-0731"),
-            "test",
-        )
-        .expect("a frozen dated snapshot is exactly what this check is asking for");
-
-        // CONTROL 2: the identical alias-shaped id under a provider that is not
-        // OpenRouter. `~` means "whatever is newest" in one provider's id
-        // vocabulary and is an ordinary character everywhere else, so refusing
-        // it here would be this boundary inventing a rule for a file it cannot
-        // read — see `ROLLING_ALIAS_PROVIDER`.
-        CatalogConfig::from_json(
-            &one_model("some-other-gateway", "~deepseek/deepseek-v4-flash-latest"),
-            "test",
-        )
-        .expect("another provider's ids are opaque strings and not ours to shape-check");
+/// Apply the catalog's local latency values to the engine defaults.
+///
+/// The no-catalog path uses the same defaults as an omitted field. Keeping this
+/// composition beside the loader lets tests exercise it without booting a server.
+pub fn engine_config(config: Option<&CatalogConfig>) -> EngineConfig {
+    let Some(config) = config else {
+        return EngineConfig::default();
+    };
+    EngineConfig {
+        local_base_ttft_ms: config.local_base_ttft_ms,
+        local_ttft_ms_per_prefill_token: config.local_ttft_ms_per_prefill_token,
+        ..EngineConfig::default()
     }
 }
+
+#[cfg(test)]
+mod tests;

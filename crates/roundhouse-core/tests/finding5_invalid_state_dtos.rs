@@ -22,6 +22,7 @@
 //! What *is* still runtime-testable is the deserialization ingress, which is
 //! where an incoherent value could arrive from outside the crate's control.
 
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{Accounting, Usage};
 use roundhouse_core::metrics::{
     Correlary, MetricsConfig, ModelAccounting, PricedBasis, ReferenceModel, ServingMode,
@@ -54,6 +55,7 @@ fn usage(input: u64, output: u64) -> Usage {
         output_tokens: output,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
+        cache_read_source: CacheReadSource::Unreported,
     }
 }
 
@@ -192,6 +194,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
             reason: "nothing comparable".into(),
         },
         seat_tokens: Default::default(),
+        seat_estimated_calls: 0,
     };
     let row = roundhouse_core::metrics::ModelMetrics {
         provider: "dynamo".into(),
@@ -199,6 +202,10 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
         calls: 3,
         tokens: Default::default(),
         coverage: Default::default(),
+        first_output: None,
+        completed_turn_elapsed: None,
+        incomplete_turn_elapsed: None,
+        cache_reuse_evidence: None,
         accounting: local,
     };
 
@@ -214,12 +221,18 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
         calls: 1,
         tokens: Default::default(),
         coverage: Default::default(),
+        first_output: None,
+        completed_turn_elapsed: None,
+        incomplete_turn_elapsed: None,
+        cache_reuse_evidence: None,
         accounting: ModelAccounting::Frontier {
+            priced_by_catalog: true,
             billed_usd: 4.0,
             billed_measured_usd: 3.0,
             billed_estimated_usd: 1.0,
             cache_savings_usd: 0.5,
             seat_tokens: Default::default(),
+            seat_estimated_calls: 0,
         },
     };
     assert_eq!(hosted.mode(), ServingMode::Frontier);

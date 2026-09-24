@@ -46,7 +46,7 @@
 use redis::Value;
 use redis::aio::ConnectionManager;
 
-use roundhouse_core::control::{LedgerState, SpendError};
+use roundhouse_core::control::{LedgerState, SettlementKey, SpendError};
 
 /// Lua helpers shared by all three scripts: truncating integer division (the
 /// civil-calendar algorithm assumes Rust's `/` on `i64`, which truncates
@@ -279,22 +279,28 @@ local state = state_for(p.committed + p.held + granted,
 return {'OK', fmtusd(granted), state}
 ";
 
-/// `KEYS[1]` account, `KEYS[2]` holds, `KEYS[3]` watermarks.
-/// `ARGV`: user, session_id, seq, response_id, actual_usd, now_ms, window
-/// mode.
+/// `KEYS[1]` account, `KEYS[2]` holds, `KEYS[3]` watermarks, `KEYS[4]` settled
+/// calls.
+/// `ARGV`: user, key mode (`watermark`/`call`), session_id, seq, response_id,
+/// actual_usd, now_ms, window mode.
 ///
-/// Idempotent by `(session_id, seq)` through the watermark hash, in the same
-/// round trip that releases the hold and applies the spend — the Redis half
-/// of the rule `roundhouse_core::metrics::MetricsFold` states for itself.
+/// Idempotent under the caller's
+/// [`SettlementKey`](roundhouse_core::control::SettlementKey), in the same
+/// round trip that releases the hold and applies the spend. `watermark` is the
+/// Redis half of the rule `roundhouse_core::metrics::MetricsFold` states for
+/// itself; `call` tests membership of a set that is never expired, so an
+/// evaluation call settles exactly once however late its duplicate arrives and
+/// whatever that duplicate claims it cost.
 const SETTLE_GRANT_BODY: &str = r"
-local account_key, holds_key, watermarks_key = KEYS[1], KEYS[2], KEYS[3]
+local account_key, holds_key, watermarks_key, settled_calls_key = KEYS[1], KEYS[2], KEYS[3], KEYS[4]
 local user = ARGV[1]
-local session_id = ARGV[2]
-local seq = tonumber(ARGV[3])
-local response_id = ARGV[4]
-local actual_usd = tonumber(ARGV[5])
-local now_ms = tonumber(ARGV[6])
-local mode = ARGV[7]
+local key_mode = ARGV[2]
+local session_id = ARGV[3]
+local seq = tonumber(ARGV[4])
+local response_id = ARGV[5]
+local actual_usd = tonumber(ARGV[6])
+local now_ms = tonumber(ARGV[7])
+local mode = ARGV[8]
 
 -- No limit and no member ceiling: a settle applies a realized amount and
 -- releases a hold, and never asks what was left. It still rolls the window and
@@ -302,13 +308,24 @@ local mode = ARGV[7]
 -- no-sweeper crash story.
 local p = roll_and_read(account_key, holds_key, mode, now_ms, user, nil, nil)
 
-local watermark = tonumber(redis.call('HGET', watermarks_key, session_id)) or 0
-if seq <= watermark then
-  -- The replay case, and the ordinary one: every open of a session re-drives
-  -- its terminal events through here. Nothing may change.
+-- Has this settlement already been applied, and claim it if not. Both arms are
+-- keyed lookups: neither reads back the history it claims against, and `SADD`
+-- reports whether the member was new so the test and the claim arrive together.
+local already_settled
+if key_mode == 'call' then
+  already_settled = redis.call('SADD', settled_calls_key, response_id) == 0
+else
+  local watermark = tonumber(redis.call('HGET', watermarks_key, session_id)) or 0
+  already_settled = seq <= watermark
+  if not already_settled then redis.call('HSET', watermarks_key, session_id, seq) end
+end
+
+if already_settled then
+  -- The replay case, and the ordinary one. Nothing may change — in particular
+  -- no hold is released, because the hold standing under this id may belong to
+  -- a re-grant rather than to the settled call.
   return {'NOOP', fmtusd(p.committed), fmtusd(0.0)}
 end
-redis.call('HSET', watermarks_key, session_id, seq)
 
 local raw = redis.call('HGET', holds_key, response_id)
 local held = 0.0
@@ -379,7 +396,8 @@ pub(crate) enum SettleOutcome {
         committed_usd: f64,
         released_usd: f64,
     },
-    /// `(session_id, seq)` was at or below the watermark.
+    /// The settlement's key says it had already been applied: `(session_id,
+    /// seq)` at or below the watermark, or a call already in the settled set.
     NoOp { committed_usd: f64 },
 }
 
@@ -417,9 +435,15 @@ pub(crate) struct SettleGrantArgs<'a> {
     pub(crate) account_key: &'a str,
     pub(crate) holds_key: &'a str,
     pub(crate) watermarks_key: &'a str,
+    pub(crate) settled_calls_key: &'a str,
     pub(crate) user: &'a str,
-    pub(crate) session_id: &'a str,
-    pub(crate) seq: u64,
+    /// The typed idempotency key, encoded into the wire's `(mode,
+    /// session_id, seq)` triple only at the `.arg()` call site in
+    /// [`Scripts::settle_grant`] — the one place that speaks the script's
+    /// own contract. Carrying the encoded form here instead would make
+    /// `("call", "sess", 7)` and `("watermark", "", 0)` representable,
+    /// which nothing on the Rust side means to send.
+    pub(crate) key: &'a SettlementKey,
     pub(crate) response_id: &'a str,
     pub(crate) actual_usd: f64,
     pub(crate) now_ms: u64,
@@ -489,14 +513,27 @@ impl Scripts {
         conn: &mut ConnectionManager,
         args: SettleGrantArgs<'_>,
     ) -> Result<SettleOutcome, SpendError> {
+        // One script for both modes, the unused half of the key travelling
+        // as a sentinel: a second script would be a second copy of the
+        // window roll, the hold release and the commit, which are identical
+        // either way. Encoded here, at the one place that speaks the
+        // script's wire contract, rather than carried pre-encoded on `args`.
+        let (key_mode, session_id, seq) = match args.key {
+            SettlementKey::SessionWatermark { session_id, seq } => {
+                ("watermark", session_id.as_str(), *seq)
+            }
+            SettlementKey::OncePerCall => ("call", "", 0),
+        };
         let reply: Vec<Value> = self
             .settle_grant
             .key(args.account_key)
             .key(args.holds_key)
             .key(args.watermarks_key)
+            .key(args.settled_calls_key)
             .arg(args.user)
-            .arg(args.session_id)
-            .arg(args.seq)
+            .arg(key_mode)
+            .arg(session_id)
+            .arg(seq)
             .arg(args.response_id)
             .arg(args.actual_usd)
             .arg(args.now_ms)

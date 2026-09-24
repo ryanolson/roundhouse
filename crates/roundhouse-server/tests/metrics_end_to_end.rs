@@ -23,13 +23,14 @@ use roundhouse_core::metrics::{
 };
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{
-    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
+    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierQuote,
+    FrontierStream, LocalFleet,
 };
 use roundhouse_server::test_support::engine_over_echo;
-use roundhouse_server::{Admission, Engine, EngineConfig};
+use roundhouse_server::{Admission, Engine};
 
 mod common;
-use common::{config, frontier_catalog};
+use common::{LOCAL_MODEL, config, embedded_fleet, frontier_catalog};
 
 /// The catalog's own prices, so the dashboard and the router agree by
 /// construction rather than by a second copy kept in step by hand.
@@ -272,6 +273,118 @@ async fn the_live_numbers_match_a_cold_rebuild_from_the_log() {
         live.savings.frontier_spend_usd, rebuilt.savings.frontier_spend_usd,
         "the money must fold out of the log too"
     );
+
+    // The two turn-elapsed columns fold out of the log like everything above.
+    // Compared as a projection of every row rather than field by field, so a
+    // column added to one side of the fold and not the other is caught here
+    // rather than by whoever reads the dashboard afterwards.
+    let elapsed_columns = |snapshot: &MetricsSnapshot| {
+        snapshot
+            .models
+            .iter()
+            .map(|row| {
+                let column = |c: &Option<roundhouse_core::metrics::IntervalMetric>| {
+                    c.as_ref()
+                        .map(|c| (c.mean_ms, c.samples, c.rejected, c.basis))
+                };
+                (
+                    row.provider.clone(),
+                    row.model.clone(),
+                    column(&row.completed_turn_elapsed),
+                    column(&row.incomplete_turn_elapsed),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        elapsed_columns(&live),
+        elapsed_columns(&rebuilt),
+        "a turn's elapsed interval is two log stamps, so a rebuild must \
+         reproduce it exactly rather than approximately"
+    );
+    // Replay must preserve cache evidence and coverage. Compare the ratios
+    // with a tolerance because aggregation order can affect floating-point sums.
+    let cache_counts = |snapshot: &MetricsSnapshot| {
+        snapshot
+            .models
+            .iter()
+            .map(|row| {
+                (
+                    row.provider.clone(),
+                    row.model.clone(),
+                    row.cache_reuse_evidence.as_ref().map(|c| {
+                        (
+                            c.samples,
+                            c.predictions,
+                            c.unusable_prediction,
+                            c.measured_cache_reads,
+                            c.unverifiable_cache_read,
+                            c.invalid_usage,
+                            c.unusable_usage,
+                            c.predicted_basis,
+                            c.observed_basis,
+                        )
+                    }),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        cache_counts(&live),
+        cache_counts(&rebuilt),
+        "the prediction is on the `Routed` record and the evidence census is on \
+         the terminal usage, so a replay of both must reach the same answer"
+    );
+    for (live_row, rebuilt_row) in live.models.iter().zip(rebuilt.models.iter()) {
+        let means = |row: &roundhouse_core::metrics::ModelMetrics| {
+            row.cache_reuse_evidence.as_ref().map(|c| {
+                [
+                    c.predicted_mean_ratio,
+                    c.observed_mean_ratio,
+                    c.mean_signed_error,
+                ]
+            })
+        };
+        for (a, b) in means(live_row)
+            .unwrap_or_default()
+            .iter()
+            .zip(means(rebuilt_row).unwrap_or_default().iter())
+        {
+            match (a, b) {
+                (Some(a), Some(b)) => assert!(
+                    (a - b).abs() < 1e-12,
+                    "{} differs between a live fold and a rebuild: {a} vs {b}",
+                    live_row.model
+                ),
+                (a, b) => assert_eq!(a, b, "{}", live_row.model),
+            }
+        }
+    }
+    // The same non-vacuity guard the intervals get: these turns went through
+    // the real engine, so at least one row carries a real prediction. Without
+    // this the equality above would hold between two absences.
+    assert!(
+        live.models.iter().any(|row| row
+            .cache_reuse_evidence
+            .as_ref()
+            .is_some_and(|c| c.samples > 0)),
+        "the echo double states its cache read, so four engine-driven turns \
+         pair a prediction with a stated count: {:?}",
+        cache_counts(&live)
+    );
+    assert_eq!(live.unrouted_terminals, rebuilt.unrouted_terminals);
+    // Without this the equality above would hold between two absences, which is
+    // the shape a broken observation takes rather than the shape a working one
+    // takes: these turns were driven through the real engine and completed.
+    assert!(
+        live.models.iter().any(|row| row
+            .completed_turn_elapsed
+            .as_ref()
+            .is_some_and(|c| c.samples > 0)),
+        "four engine-driven turns completed, so at least one row carries a \
+         real completed interval: {:?}",
+        elapsed_columns(&live)
+    );
 }
 
 /// Local traffic with no comparable hosted model contributes no saving.
@@ -282,24 +395,25 @@ async fn the_live_numbers_match_a_cold_rebuild_from_the_log() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_traffic_with_no_correlary_is_reported_unpriced() {
     let store = Arc::new(MemoryStore::new());
+    // A registered fleet, not just a local-model name: without one the router
+    // never has a local candidate to consider, and every turn below would
+    // silently route to the frontier client instead.
     let engine = engine_over_echo(
         Arc::clone(&store),
         frontier_catalog(),
         Arc::new(EchoFrontierClient::new("frontier answer")),
-        EngineConfig {
-            local_model: "tiny-7b".to_string(),
-            ..config()
-        },
-    );
+        config(),
+    )
+    .with_fleet(embedded_fleet().await as Arc<dyn LocalFleet>);
     let session = SessionId::new("s-unpriced");
     run_turns(&engine, &session, 1).await;
 
-    // The catalog's only hosted model is far above a 7B's capability, so
-    // nothing passes the gate.
+    // The catalog's only hosted model is far above the local model's
+    // capability, so nothing passes the gate.
     let config = MetricsConfig::new(ShadowPricing::new(
         frontier_catalog().shadow_pricing().references().to_vec(),
     ))
-    .with_local_quality("tiny-7b", 0.30);
+    .with_local_quality(LOCAL_MODEL, 0.30);
     let snapshot = engine.metrics().snapshot(&config, 0);
 
     let local: Vec<_> = snapshot
@@ -307,11 +421,32 @@ async fn local_traffic_with_no_correlary_is_reported_unpriced() {
         .iter()
         .filter(|m| m.mode() == ServingMode::Local)
         .collect();
+    assert!(
+        !local.is_empty(),
+        "the turn above routed to the local model; an empty row set would \
+         make every assertion below vacuous"
+    );
     for model in local {
         assert_eq!(
             model.shadow_usd(),
             0.0,
             "a model with no defensible stand-in must not be shadow-priced"
+        );
+        assert!(model.calls > 0, "the turn above must have reached this row");
+        // `Engine::local_stream` tags its credit `CacheReadSource::Derived`,
+        // which is priceable but never a provider measurement — this is the
+        // real engine path exercising that, not a hand-built `Usage`.
+        let evidence = model
+            .cache_reuse_evidence
+            .as_ref()
+            .expect("a local row observed the terminal and must publish evidence");
+        assert_eq!(
+            evidence.samples, 0,
+            "a local row's credit is the router's own quote, so it must never pair"
+        );
+        assert!(
+            evidence.unverifiable_cache_read > 0,
+            "a Derived credit must count as unverifiable, not measured"
         );
     }
 }

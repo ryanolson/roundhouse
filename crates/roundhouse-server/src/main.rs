@@ -64,10 +64,11 @@ use roundhouse_mcp::ControlStore;
 use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
 use roundhouse_server::{
-    Backends, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations, DirectoryError,
-    EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig, REDIS_NAMESPACE_VAR,
-    REDIS_VAR, admin_api, catalog_config, control_config, http, mcp_api, messages_api, metrics_api,
-    relay_api, resolve_namespace, responses_api, shared_backend,
+    Backends, CLASSIFY_VAR, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations,
+    DirectoryError, EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig,
+    REDIS_NAMESPACE_VAR, REDIS_VAR, admin_api, catalog_config, classify_config, classify_runtime,
+    control_config, http, mcp_api, messages_api, metrics_api, relay_api, resolve_namespace,
+    responses_api, shared_backend,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -642,6 +643,20 @@ async fn main() -> anyhow::Result<()> {
     };
     let metrics_config = Arc::new(metrics_config);
 
+    // Resolve both sides of the local/hosted latency comparison from this catalog.
+    let engine_config = catalog_config::engine_config(config.as_ref());
+
+    // Background turn classification, off unless a file says otherwise. Read
+    // beside the catalog and the control plane because it is the same kind of
+    // decision and fails the same way: a file that is named and unreadable stops
+    // the process rather than starting one that classifies nothing and says so
+    // nowhere. An *absent* variable is the shipped state.
+    //
+    // Composed and logged later, after `shared_backend::open` and before the
+    // bind — see the composition below for why "read the file" and "compose
+    // the runtime" are two different moments now.
+    let classify = classify_config::from_env()?;
+
     // The registry, built here rather than inside `serve` because it is the
     // third boot cross-check and boot checks belong together: an operator
     // reading this log sees the catalog load, the providers resolve, and the
@@ -810,6 +825,65 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("fair-use windows are configured; rolling ceilings are enforced");
     }
 
+    // Background classification, over the *evaluation* ledger and never the
+    // serving one. The decision of whether there is a runtime at all is
+    // `classify_runtime::compose`'s, in the library, for the reason
+    // `shared_backend::open` gives about wiring inside a `[[bin]]`: this site
+    // wires what it returns and re-derives no part of the choice.
+    //
+    // **Composed here, before the bind, so a configuration error in it is
+    // caught before `serve` ever logs "roundhouse listening."** An enabled
+    // file with no credential is a configuration error the same way an
+    // unreadable catalog or control-plane file is, and every other boot
+    // refusal in this function stops the process before it opens a socket.
+    // This is what makes `compose`'s own doc, which claims exactly this
+    // posture, true.
+    let classifier: Option<Arc<classify_runtime::ClassificationRuntime<ByteTokenizer>>> = classify
+        .as_ref()
+        .map(|(path, config)| {
+            classify_runtime::compose(
+                path,
+                config,
+                Arc::clone(backends.evaluation_spend()),
+                ByteTokenizer,
+                &process_env,
+            )
+        })
+        .transpose()?
+        .flatten();
+    // The supervisor is this deployment's classification lifetime, held for
+    // the life of `main` (`serve` is the rest of this function's body, awaited
+    // below). Dropping it is what ends the runtime: the sweep stops,
+    // admission closes, and any worker still on the wire is cancelled.
+    // Nothing here calls it — serving can end at more than one place, and a
+    // guarantee spelled as a call is one that can be forgotten at the others.
+    // Bound to a real name and not `_`: the latter drops the value at the end
+    // of this statement, which would stop the runtime before a single turn
+    // used it.
+    let _supervisor = classifier.as_ref().map(|runtime| runtime.supervise());
+    // Logged from `compose`'s own result rather than from `config.enabled`
+    // directly, so this line can only ever claim what actually composed.
+    match (&classify, classifier.is_some()) {
+        (Some((path, config)), true) => tracing::info!(
+            path = %path,
+            model = %config.model,
+            revision = config.revision,
+            "turn classification is enabled; bounded prior metadata and the current \
+             prompt of sessions with an admitted frontier target are sent to the \
+             configured classifier, on a separate evaluation budget"
+        ),
+        (Some((path, _)), false) => tracing::info!(
+            path = %path,
+            "a turn-classification configuration is present and not enabled; no turn \
+             content leaves this deployment"
+        ),
+        (None, _) => tracing::info!(
+            var = CLASSIFY_VAR,
+            "no turn classification configured; no turn content leaves this deployment \
+             for a classifier"
+        ),
+    }
+
     let addr: SocketAddr = std::env::var(ADDR_VAR)
         .unwrap_or_else(|_| DEFAULT_ADDR.to_string())
         .parse()?;
@@ -843,6 +917,8 @@ async fn main() -> anyhow::Result<()> {
                 judge,
                 reachable,
                 metrics_config,
+                engine_config,
+                classifier,
                 listener,
             )
             .await
@@ -865,6 +941,8 @@ async fn main() -> anyhow::Result<()> {
                 judge,
                 reachable,
                 metrics_config,
+                engine_config,
+                classifier,
                 listener,
             )
             .await
@@ -888,6 +966,9 @@ async fn main() -> anyhow::Result<()> {
 /// opposite ends of it: the surface writes an agent's overlay and the engine
 /// spends it at the start of the next turn.
 ///
+/// The catalog supplies the engine's local latency values. This function adds
+/// the control plane's experiment salt without replacing those values.
+///
 /// **The steer used to be the second half of that sentence and is not any
 /// more.** Until M10.0 the engine deposited a correction's payload here and the
 /// surface served it to `fetch_steer`; the correction is a conversation item now
@@ -906,6 +987,8 @@ async fn serve<S: SessionStore>(
     judge: Option<FrontierModelSpec>,
     reachable: Vec<Candidate>,
     metrics_config: Arc<MetricsConfig>,
+    engine_config: EngineConfig,
+    classifier: Option<Arc<classify_runtime::ClassificationRuntime<ByteTokenizer>>>,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let control = Arc::new(ControlStore::new());
@@ -957,7 +1040,8 @@ async fn serve<S: SessionStore>(
             .await
             .arm_salt()
             .to_string(),
-        ..EngineConfig::default()
+        // Preserve the catalog's latency values when adding the control-plane salt.
+        ..engine_config
     };
 
     let booted_plane = directory.plane(roundhouse_core::now_ms()).await;
@@ -991,6 +1075,13 @@ async fn serve<S: SessionStore>(
     // the same decision.
     .with_fair_use_ledger(fair_use)
     .with_control_store(Arc::clone(&control));
+
+    // Composed and its supervisor taken in `main`, before the bind — see the
+    // composition site for why. This is just wiring what the caller already
+    // decided, the same posture the catalog and the control plane take.
+    if let Some(classifier) = classifier {
+        engine = engine.with_classifier(classifier);
+    }
 
     // The validator is installed only where there is a judge to install it
     // around, and the boot check above has already refused the configuration
@@ -1117,6 +1208,7 @@ mod tests {
     use roundhouse_server::control_config::crosscheck::{
         refuse_policies_that_admit_nothing, refuse_promises_of_a_local_fallback,
     };
+    use roundhouse_server::test_support::captured_warnings;
 
     fn plane_with_policy(policy: serde_json::Value) -> ControlPlane {
         plane_with(policy, serde_json::Value::Null)
@@ -1333,6 +1425,8 @@ mod tests {
                 wire_protocol,
                 prompt: "hi".into(),
                 segment_boundaries: Vec::new(),
+                previous_segment_count: None,
+                cache_lifetime: roundhouse_fleet::anthropic_messages::CacheLifetime::Default,
                 session_id: None,
                 thread_id: None,
                 prompt_cache_key: "sess".into(),
@@ -1562,75 +1656,6 @@ mod tests {
             uniform.for_provider("openrouter").unwrap(),
             uniform.for_provider("anything-at-all").unwrap()
         ));
-    }
-
-    /// Everything `tracing::warn!` wrote during one closure, as text.
-    ///
-    /// `frontier_clients` cannot refuse a provider with no key anywhere — it is
-    /// not where keys live, per its own doc comment — so a missing credential
-    /// has nowhere to go but a boot-time warning. Nothing else in this suite
-    /// reads what `tracing` emits, which is exactly why M10.1 refute's item 15
-    /// found this warning silenceable without turning a single test red: no
-    /// capture point existed. This is that point.
-    fn captured_warnings(f: impl FnOnce()) -> String {
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
-
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for Buf {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for Buf {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
-        // **One capture at a time, and not for tidiness.** `with_default`
-        // installs a *thread-local* subscriber, and installing one makes
-        // `tracing` reconsider its callsite interest cache against the global
-        // dispatcher — which in a test binary is nobody. A reconsideration that
-        // lands while another test is mid-capture can cache "nothing is
-        // interested" for the very callsite that test is asserting on, and its
-        // warning silently never arrives: the guard goes red for a reason that
-        // has nothing to do with the code under test, on one run in some
-        // hundreds. Seen for real once G15 gave this helper a second caller.
-        // The cost is microseconds of serialized test time; the alternative is
-        // an intermittently green guard, which enforces nothing and gets
-        // re-diagnosed from scratch by whoever meets it next.
-        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-        let _serialized = ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let buf = Buf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        // Rebuilding the interest cache *inside* the thread-local default is
-        // the second half of the serialization above. The merge that brought
-        // more uncaptured `frontier_clients` callers into this binary made the
-        // poisoned-cache case go from one-in-hundreds to two-in-three: a
-        // concurrent test evaluating the warn callsite under the no-op global
-        // dispatcher caches "never interested", and this capture then records
-        // the info line but not the warning it exists to assert on. Rebuilding
-        // while our subscriber is the active default re-evaluates every
-        // callsite against a dispatcher that wants them.
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            f()
-        });
-        String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
     }
 
     /// **A provider with a definition and no key anywhere warns at boot.**

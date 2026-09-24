@@ -13,6 +13,7 @@
 //! Validation only — no fix is applied here.
 
 use roundhouse_core::control::BudgetState;
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{Accounting, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_core::metrics::{MetricsFold, MetricsSnapshot, Scope};
@@ -90,6 +91,7 @@ fn one_mtok_of_uncached_input() -> Usage {
     Usage {
         input_tokens: 1_000_000,
         cached_input_tokens: 0,
+        cache_read_source: CacheReadSource::Provider,
         // Zero so "uncached" in this fixture's name stays literally true: a
         // cache write is uncached input the provider also kept, and this test
         // reads a rate back out of a dollar figure.
@@ -112,6 +114,8 @@ fn one_frontier_call(usage: Usage) -> Vec<SessionEvent> {
             kind: SessionEventKind::Routed {
                 response_id: response.clone(),
                 decision: DecisionRecord {
+                    selection: None,
+                    local_quote_skipped: None,
                     chosen: target(),
                     rationale: "test".into(),
                     policy: "test".into(),

@@ -116,7 +116,14 @@ serde = { version = "1", features = ["derive", "rc"] }
 # Cargo features are unified crate-wide, so a transitive dependency enabling it
 # changes this crate's `Map` too. Re-check `ItemContent::render` and the prefix
 # admission it feeds before accepting such a dependency.
-serde_json = "1"
+#
+# `raw_value` is on for `roundhouse-fleet/src/typesafe.rs`: the TypeSafe
+# envelope's `answers` field is held as an unparsed `RawValue` so a malformed
+# or numerically extreme answer batch fails to parse only when that field is
+# actually read, not while the envelope itself is being deserialized -- which
+# is what lets a reported `usage` beside it survive. Independent of
+# `preserve_order` and does not affect it.
+serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 thiserror = "2.0.17"
 # The client-launch config generator (`roundhouse-server/src/codex_launch.rs`)

@@ -54,6 +54,7 @@
 
 use async_trait::async_trait;
 
+use crate::routing::selection::{AffinityEvidence, SelectorSnapshot};
 use crate::routing::{Decision, RoutingContext, RoutingError, RoutingPolicy};
 
 /// Normalize a set of values to 0.0..=1.0 by min-max.
@@ -204,6 +205,17 @@ impl RoutingPolicy for AffinityPolicy {
                 ctx.isl_tokens,
                 hit_ratio * 100.0,
             ),
+            // The tuning that produced `best_score`, recorded beside the
+            // choice it produced. Weights are a process's boot configuration
+            // and nothing in the log names them otherwise, so a turn scored
+            // under an earlier tuning is indistinguishable from one scored
+            // under this one without it.
+            SelectorSnapshot::affinity(AffinityEvidence {
+                prefill_weight: self.weights.prefill,
+                cost_weight: self.weights.cost,
+                ttft_weight: self.weights.ttft,
+                max_load: self.max_load,
+            }),
         ))
     }
 }
@@ -283,6 +295,12 @@ impl RoutingPolicy for EscalationPolicy {
                 "audit turn (every {}); escalated to highest quality prior {:.2}",
                 self.audit_every, best.quality_prior
             ),
+            // Stamped on the audit branch only. A delegated turn returns the
+            // inner policy's decision untouched, carrying that policy's own
+            // evidence — which is the honest answer, because that is the code
+            // that chose. An arm here would report an escalation on a turn
+            // that never escalated.
+            SelectorSnapshot::escalation_audit(self.audit_every),
         ))
     }
 }
@@ -542,34 +560,57 @@ mod tests {
         };
         let scored =
             "score 0.0000 over 3 candidate(s); expected prefill 500 of 10000 tokens (95% cached)";
+        // Nothing in this fixture narrows admission — `TurnPolicy::unrestricted`,
+        // an unlimited budget, and neither policy passing a `max_load` — so
+        // every arm's pool is the whole quoted fleet in quote order.
+        let whole_fleet: Vec<Target> = candidates
+            .iter()
+            .map(|candidate| candidate.target.clone())
+            .collect();
         // The two fields M10 added, pinned empty on every arm rather than
         // spread through four literals: neither policy here picks a tier, so
         // neither has a runner-up to fall forward to or a source to state, and
         // a decision from one of them that acquired either would be dispatching
         // twice for a turn M1 dispatched once.
-        let unstaged = |target: Target, rationale: &str| Decision {
+        //
+        // The evidence fields are the arm's own, and that is what makes them
+        // worth comparing here rather than exempting: the audit branch is the
+        // one arm whose selector differs, and an implementation that stamped
+        // the delegated affinity evidence on it would report the escalation as
+        // an ordinary scored turn.
+        let unstaged = |target: Target, rationale: &str, selector: SelectorSnapshot| Decision {
             target,
             rationale: rationale.into(),
             budget_state: BudgetState::Unconstrained,
             fallbacks: Vec::new(),
             source: None,
+            admitted: Some(whole_fleet.clone()),
+            selector: Some(selector),
+        };
+        let shipped_affinity = || {
+            SelectorSnapshot::affinity(AffinityEvidence {
+                prefill_weight: 1.0,
+                cost_weight: 0.5,
+                ttft_weight: 0.25,
+                max_load: None,
+            })
         };
 
         for (label, decision, expected) in [
             (
                 "affinity, ordinary turn",
                 choose(&affinity, &candidates, 1).await,
-                unstaged(warm_local.clone(), scored),
+                unstaged(warm_local.clone(), scored, shipped_affinity()),
             ),
             (
                 "escalation, ordinary turn",
                 choose(&escalation, &candidates, 1).await,
-                unstaged(warm_local.clone(), scored),
+                unstaged(warm_local.clone(), scored, shipped_affinity()),
             ),
             (
                 "affinity, audit-numbered turn",
                 choose(&affinity, &candidates, 4).await,
-                unstaged(warm_local, scored),
+                unstaged(warm_local, scored, shipped_affinity()),
             ),
             (
                 "escalation, audit turn",
@@ -580,6 +621,7 @@ mod tests {
                         model: "claude".into(),
                     },
                     "audit turn (every 4); escalated to highest quality prior 0.95",
+                    SelectorSnapshot::escalation_audit(4),
                 ),
             ),
         ] {

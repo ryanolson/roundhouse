@@ -60,6 +60,7 @@ pub mod brief;
 pub mod control_call;
 pub mod exchange;
 pub mod handoff;
+pub mod interval;
 pub mod prompt;
 pub mod tool_signals;
 pub mod trigger;
@@ -81,14 +82,22 @@ use crate::item::Item;
 use crate::routing::Target;
 
 pub use arm::{Arm, ArmShares, placebo_intervenes};
-pub use brief::{BriefConfig, BriefStep, Objective, ValidationBrief, trailing_user_request};
+pub use brief::{
+    BriefConfig, BriefStep, Objective, StepContent, ValidationBrief, trailing_user_request,
+};
 pub use control_call::{
     CONTROL_TOOL_DELIMITER, CONTROL_TOOL_NAMES, CONTROL_TOOL_NAMESPACE, ControlCallDialect,
     flat_control_call_name, is_control_call_on, is_flat_control_call, task_exchanges_on,
 };
 pub use exchange::{Exchange, exchanges, exec_exit_code, tool_output_body};
 pub use handoff::{EXAMPLE_HANDOFF_NOTE, HANDOFF_MARKER, append_handoff_note};
-pub use prompt::judge_system_prompt;
+use interval::IntervalCapture;
+pub use interval::{
+    CoverageGap, DEFAULT_INTERVAL_SECTION_BYTES, INTERVAL_SECTION_HEADING, IntervalLabel,
+    IntervalReview, ObjectiveVersion, REVIEW_RULE_REVISION, ReviewedDecision, label_for,
+    prompt_digest,
+};
+pub use prompt::{PROMPT_SEPARATOR, judge_system_prompt};
 pub use tool_signals::{
     CRITICAL, DEFAULT_RECENT_WINDOW, ERROR_SEVERITY_THRESHOLD, ErrorSeverity, HARD,
     PURE_BASH_STREAK_LENGTH, PureBashStreak, ResultSeverity, SOFT, ToolSignals, classify_body,
@@ -177,16 +186,6 @@ pub struct SideCall<'a> {
     /// because the money question is asked *first* — a hold has to be keyed
     /// before there is an answer to key it by.
     pub id: &'a SideCallId,
-    /// Where in the checked session's log this check is being made.
-    ///
-    /// The turn's own position, read after its `TurnStarted` and before
-    /// anything a check could cause — so it rises with every turn of the
-    /// session and is the same number a replay would compute. That makes it the
-    /// idempotency key a settle needs: a ledger keyed on `(session, seq)`
-    /// requires one that only goes up, and a wall clock or a process-local
-    /// counter would either regress across nodes or reset on restart, silently
-    /// dropping a settle in both cases.
-    pub at_seq: u64,
     pub principal: &'a Principal,
     /// The payer's ceiling, or `None` when the membership has no budget.
     ///
@@ -221,8 +220,10 @@ pub struct SideCall<'a> {
 ///   can refuse, that refusing costs the turn nothing, and that what a check
 ///   spends reaches the ledger afterwards: a budget that is only ever *read*
 ///   answers the same way on the first check and the thousandth, so it is not
-///   a ceiling. [`SideCall::id`] and [`SideCall::at_seq`] are what an
-///   implementation keys the hold and its settle by.
+///   a ceiling. [`SideCall::id`] is what an implementation keys the hold by and
+///   the identity its settle is deduplicated under — a check shares no ordering
+///   with the other calls under its session, so a settle keyed by log position
+///   would read one of them as a replay of another.
 /// - **Never the cache ledger.** A judge prompt is not a prefix of the
 ///   conversation, and feeding it to the ledger would falsely warm that target
 ///   for the next real turn.
@@ -481,11 +482,18 @@ pub const DEFAULT_PLACEBO_RATE: f64 = 0.25;
 /// The deployment half: how often to ask, how much to show, how much review may
 /// be in flight, and what assignment hashes against. Nothing here is a tenancy
 /// decision — see [`ValidationTerms`] for the half that is.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ValidatorConfig {
     pub trigger: TriggerConfig,
     pub brief: BriefConfig,
     pub review: ReviewLimits,
+    /// The byte bound on the reviewed-turns section. See
+    /// [`DEFAULT_INTERVAL_SECTION_BYTES`].
+    ///
+    /// This bound is separate from [`BriefConfig`] because it bounds a
+    /// different thing. `BriefConfig` trims fields of the classic brief. This
+    /// bound decides whether the section is shown at all, and it never trims.
+    pub interval_section_bytes: usize,
     /// The salt placebo timing hashes against, which is the same
     /// deployment-wide salt arm assignment uses.
     ///
@@ -496,6 +504,18 @@ pub struct ValidatorConfig {
     /// the one composition site, because the two hashes happen on opposite
     /// sides of the seam and neither can reach the other's configuration.
     pub arm_salt: String,
+}
+
+impl Default for ValidatorConfig {
+    fn default() -> Self {
+        Self {
+            trigger: TriggerConfig::default(),
+            brief: BriefConfig::default(),
+            review: ReviewLimits::default(),
+            interval_section_bytes: DEFAULT_INTERVAL_SECTION_BYTES,
+            arm_salt: String::new(),
+        }
+    }
 }
 
 /// The occupant of the interjection seam.
@@ -659,13 +679,28 @@ impl Validator {
 
         let brief = ValidationBrief::build(
             &context.state.items,
+            context.dialect,
             context.objective.clone(),
             fired.facts().map(str::to_string).collect(),
             self.config.brief,
         );
+        // Coverage is captured before the await and the verdict is attached to
+        // this snapshot afterwards. Reconstructing it from the state after the
+        // call could name decisions the judge never saw.
+        let interval = IntervalCapture::of(
+            context.state,
+            &context.objective,
+            context.dialect,
+            self.config.interval_section_bytes,
+        );
+        let mut prompt = brief.render();
+        if let Some(section) = &interval.section {
+            prompt.push_str(section);
+        }
+        let digest = prompt_digest(judge_system_prompt(), &prompt);
         let answer = self
             .judge
-            .consult(&context.side_call, judge_system_prompt(), &brief.render())
+            .consult(&context.side_call, judge_system_prompt(), &prompt)
             .await;
 
         let answer = match answer {
@@ -740,6 +775,10 @@ impl Validator {
                 );
             }
         };
+        // A parsed verdict is the only checkpoint. Its label is read from the
+        // verdict here, before the action map, because what the map or the arm
+        // does with it says nothing about what the judge concluded.
+        let interval = interval.into_review(digest, &verdict);
         // Clamped against the turn's own ceiling before it is recorded, so the
         // log holds the narrowing the membership's policy leaves standing
         // rather than the one the map asked for. This is the occupant's read of
@@ -762,6 +801,7 @@ impl Validator {
                 side_call_id,
                 verdict,
                 action: action.clone(),
+                interval: Some(Box::new(interval)),
             },
             Some(action),
         )

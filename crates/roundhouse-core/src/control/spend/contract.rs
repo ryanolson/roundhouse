@@ -37,9 +37,12 @@
 //! the suite because the same "both backends answer one list" argument is what
 //! makes it worth having.
 
+pub mod settlement;
+
 use crate::control::budget::{Allocation, Budget, BudgetWindow, Exhaustion};
 use crate::control::spend::{
-    BalanceQuery, BudgetTerms, GrantRequest, LedgerState, Settlement, SpendError, SpendLedger,
+    BalanceQuery, BudgetTerms, GrantRequest, LedgerState, Settlement, SettlementKey, SpendError,
+    SpendLedger,
 };
 use crate::control::{Principal, ProjectId};
 use crate::ids::{ResponseId, SessionId};
@@ -127,14 +130,14 @@ const AUGUST_18: u64 = 1_787_011_200_000;
 /// 2026-09-01T00:00:00Z: the next month boundary after [`AUGUST_18`].
 const SEPTEMBER_1: u64 = 1_788_220_800_000;
 
-/// Dollars compare to the cent, not to the bit. Every backend accumulates
+/// Dollars compare within a millionth of a dollar, not to the bit. Every backend accumulates
 /// through floating-point addition, and a Lua implementation will not round the
 /// same way a Rust one does; a contract that demanded bit equality would be
 /// asserting an implementation detail rather than a balance.
 #[track_caller]
 pub fn assert_usd(actual: f64, expected: f64, what: &str) {
     assert!(
-        (actual - expected).abs() < 1e-6,
+        (actual - expected).abs() < super::GRANT_TOLERANCE_USD,
         "{what}: expected ${expected}, got ${actual}"
     );
 }
@@ -182,6 +185,8 @@ fn request(
     }
 }
 
+/// A serving turn's settle: idempotent by this principal's session watermark.
+///
 /// Takes the whole [`BudgetTerms`] and hands the settle only the window it
 /// reads, so the tests below keep saying "under these terms" while the type
 /// keeps carrying one field.
@@ -195,8 +200,10 @@ fn settlement(
 ) -> Settlement {
     Settlement {
         principal: principal.clone(),
-        session_id: SessionId::new(format!("sess_{}", principal.user)),
-        seq,
+        key: SettlementKey::SessionWatermark {
+            session_id: SessionId::new(format!("sess_{}", principal.user)),
+            seq,
+        },
         response_id: ResponseId::new(response_id),
         actual_usd,
         window: terms.budget.window,
@@ -741,15 +748,7 @@ pub async fn a_non_finite_request_is_refused_through_the_trait<L: SpendLedger>(l
 
 pub async fn a_monthly_window_resets_committed_at_its_boundary<L: SpendLedger>(ledger: &L) {
     let ada = fresh_principal("ada");
-    let monthly = BudgetTerms {
-        budget: Budget {
-            limit_usd: 10.0,
-            window: BudgetWindow::Monthly,
-            on_exhaustion: Exhaustion::degrade_with_overflow(),
-            warn_at: 0.8,
-        },
-        allocation: Allocation::Pooled,
-    };
+    let monthly = settlement::monthly_terms(10.0);
 
     ledger
         .settle_grant(settlement(&ada, "r1", 1, 10.0, &monthly, AUGUST_18))
@@ -889,9 +888,9 @@ macro_rules! spend_ledger_contract_suite {
     ($make:expr $(,)?) => {
         $crate::spend_ledger_contract_suite!(@list () $make);
     };
-    // The single list. Both public arms land here, so gated and ungated
-    // backends cannot drift apart in coverage. The recursion that turns this
-    // list into one `#[tokio::test]` per name is
+    // The single list, in two invocations. Both public arms land here, so
+    // gated and ungated backends cannot drift apart in coverage. The
+    // recursion that turns each list into one `#[tokio::test]` per name is
     // [`__contract_suite!`](crate::__contract_suite), shared with the other
     // three families (M14.1 review, F6).
     (@list $attrs:tt $make:expr) => {
@@ -909,6 +908,15 @@ macro_rules! spend_ledger_contract_suite {
             a_non_finite_request_is_refused_through_the_trait,
             a_monthly_window_resets_committed_at_its_boundary,
             share_allocations_summing_past_one_are_accepted_and_the_project_limit_still_binds,
+        );
+        // The `OncePerCall` settlement mode, from its own child module: a
+        // backend that runs the session-watermark half of the contract runs
+        // this half too, on the `store::contract::learning` precedent.
+        $crate::__contract_suite!(ledger, $crate::control::spend::contract::settlement, $attrs, $make;
+            two_background_calls_under_one_session_settle_in_either_order,
+            a_settled_call_can_never_be_settled_again,
+            settled_calls_are_distinguished_by_call_and_by_project,
+            the_two_settlement_modes_do_not_share_an_identity,
         );
     };
 }

@@ -61,6 +61,8 @@
 //! trips its records through the same JSON envelope a deployment writes to
 //! Redis.
 
+pub mod classification;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -695,6 +697,54 @@ impl DirectoryStore for ScriptedDirectoryStore {
         let inner = self.inner.read().await;
         inner.version().await
     }
+}
+
+/// Everything `tracing::warn!` wrote during one closure, as text.
+///
+/// Capture is serialized process-wide and rebuilds the callsite interest
+/// cache inside the thread-local subscriber `with_default` installs: a
+/// callsite first evaluated under the no-op global dispatcher caches "never
+/// interested," and without the rebuild the very line under test is dropped
+/// rather than captured. Consolidated from three call sites (`main.rs`,
+/// `engine/fair_use.rs`, `typesafe_shadow/tests/accounting.rs`) that carried
+/// identical copies for want of a shared reach.
+pub fn captured_warnings(f: impl FnOnce()) -> String {
+    use std::io;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for Buf {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for Buf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _serialized = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let buf = Buf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
+    String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
 }
 
 #[cfg(test)]
