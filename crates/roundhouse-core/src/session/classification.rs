@@ -93,9 +93,12 @@ impl ClassificationFold {
     ///
     /// **Folded, never re-dispatched.** A replay reaches this and learns that
     /// a call was committed to; it does not make one. Holding the intent is
-    /// what lets the engine refuse to buy a second answer for a turn that
-    /// already has one outstanding, and what lets a reader say "this turn's
-    /// classification, and its cost, are unknown" instead of saying nothing.
+    /// what lets [`Self::recorded`] check the result's turn and response
+    /// against the request it claims to answer before accepting it, what
+    /// lets a late settlement still be joined to the budget window it was
+    /// reserved under, and what lets a reader say "this turn's
+    /// classification, and its cost, are unknown" instead of saying nothing
+    /// when the call never got a result before a crash.
     pub(crate) fn requested(&mut self, record: &ClassificationIntent) {
         self.outstanding
             .insert(record.call_id.clone(), record.clone());
