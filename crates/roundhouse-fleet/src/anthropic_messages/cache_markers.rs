@@ -143,6 +143,10 @@ pub(super) struct MarkerPlan {
 
 impl MarkerPlan {
     /// The furthest block this plan marks — where the cached prefix ends.
+    ///
+    /// Always `penultimate` today, because [`plan`] keeps a reach-back marker
+    /// only when it is strictly earlier. The `max` states the meaning, so a
+    /// later placement rule cannot silently make this wrong.
     pub(super) fn last(&self) -> Option<usize> {
         self.penultimate.max(self.previous)
     }

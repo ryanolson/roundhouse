@@ -342,7 +342,7 @@ impl From<Vec<Item>> for TurnInput {
 /// makes it one thing.** Every field here is a fact the client stated that no
 /// projection of the log can recover, that the router does not price on, and
 /// that exists solely to be written onto [`FrontierQuote`] — so they travel from
-/// [`Engine::run_turn`] down through `dispatch`, `plan` and `connect` together
+/// [`Engine::run_turn`] down through `dispatch`, `plan` and `frontier_quote` together
 /// or not at all, and adding the fourth is one line rather than four signatures.
 ///
 /// [`TurnInput::declared_baseline`] is deliberately *not* here despite being a
@@ -2813,7 +2813,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// the transmitted one the same fact.
     ///
     /// Fallible in the ways it always was, and the caller defers the error to
-    /// [`Self::connect`] so it still lands after the record, as before.
+    /// [`Self::connect_frontier`] so it still lands after the record, as before.
     #[allow(clippy::too_many_arguments)]
     fn frontier_quote(
         &self,
@@ -2841,14 +2841,12 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // nothing else — this build has no way to tell a locally served model
         // about a toolbox at all.
         //
-        // **That second gap is now closed at routing rather than tolerated
-        // here** (M11.2a, F2): `plan` drops every local candidate from a
-        // tool-declaring turn before the policy filter and fails the turn with
-        // `EngineError::NoToolCapableTarget` when nothing else remains, so the
-        // `Target::Local` arm of `connect` is unreachable with `declarations.tools`
-        // set. It stays unread rather than growing an assertion, because the
-        // invariant belongs to the routing decision and restating it as a panic
-        // here would put a second, weaker copy of it in the dispatch path.
+        // **That second gap is closed at routing** (M11.2a, F2): `plan` drops
+        // every local candidate from a tool-declaring turn before the policy
+        // filter, and fails the turn with `EngineError::NoToolCapableTarget`
+        // when nothing else remains. So only a frontier target ever reaches
+        // this function with `declarations.tools` set. The invariant stays in
+        // the routing decision, not restated here as an assertion.
         declarations: &ClientDeclarations,
     ) -> Result<FrontierQuote, ConnectFailure> {
         // The dialect travels with the request. A client cannot ask the
