@@ -312,7 +312,7 @@ impl SelectionSnapshot {
     /// The caller must capture both the features and the classification
     /// references before selection — a reference gathered afterwards could name
     /// a result that landed during this very turn, which is exactly the
-    /// backdating [`ClassificationRef::available_seq`] exists to make impossible.
+    /// backdating [`crate::classify::ClassificationRef::available_seq`] exists to make impossible.
     pub fn of(
         decision: &Decision,
         features: LocalFeatures,
