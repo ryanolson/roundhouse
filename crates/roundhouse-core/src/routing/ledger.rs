@@ -870,6 +870,17 @@ mod tests {
         );
     }
 
+    /// **Replay compatibility, one generation further back.** A record
+    /// written before segment counts existed carries only the call time and
+    /// the prefix. It must still load, with no block structure known.
+    #[test]
+    fn a_target_state_without_a_segment_count_loads() {
+        let oldest = r#"{"last_call_at_ms":0,"last_prefix_tokens":10000}"#;
+        let state: TargetState = serde_json::from_str(oldest).unwrap();
+        assert_eq!(state.last_segment_count, 0);
+        assert_eq!(state.last_block_marker, None);
+    }
+
     /// **Replay compatibility.** A ledger record written before placements
     /// were recorded loads with none, and predicts exactly what it did
     /// before: the whole previous prompt, capped by the current one.

@@ -22,7 +22,9 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierModelSpec, StaticFrontierCatalog, WireProtocol,
 };
 use roundhouse_server::test_support::frontier_spec;
-use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor};
+use roundhouse_server::{
+    Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor, TurnInput,
+};
 
 /// The stable first item, long enough that the prefix it caches is most of
 /// the first request and the unmarked final item is still worth pricing.
@@ -32,6 +34,15 @@ const SECOND: &str = "the first question, which only the next turn's marker coul
 
 /// Two turns against a one-entry catalog, and the `Routed` decision of each.
 async fn two_turns(spec: FrontierModelSpec) -> (DecisionRecord, DecisionRecord) {
+    two_turns_declaring(spec, None).await.0
+}
+
+/// As [`two_turns`], with `tools` declared on the first turn, and the engine's
+/// own token count of that toolbox.
+async fn two_turns_declaring(
+    spec: FrontierModelSpec,
+    tools: Option<serde_json::Value>,
+) -> ((DecisionRecord, DecisionRecord), u64) {
     let store = Arc::new(MemoryStore::new());
     let engine = Engine::new(
         Arc::clone(&store),
@@ -50,11 +61,17 @@ async fn two_turns(spec: FrontierModelSpec) -> (DecisionRecord, DecisionRecord) 
         .create_session(&session_id)
         .await
         .expect("the session opens");
+    let toolbox_tokens = engine.declaration_tokens(tools.as_ref(), None);
+    let mut first_turn: TurnInput = vec![Item::user_text(FIRST), Item::user_text(SECOND)].into();
+    if tools.is_some() {
+        first_turn.tools = tools;
+        first_turn.tools_dialect = Some(WireProtocol::AnthropicMessages);
+    }
     engine
         .run_turn(
             &session_id,
             TurnId::new("t1"),
-            vec![Item::user_text(FIRST), Item::user_text(SECOND)],
+            first_turn,
             &Admission::open(),
         )
         .await
@@ -82,7 +99,7 @@ async fn two_turns(spec: FrontierModelSpec) -> (DecisionRecord, DecisionRecord) 
     assert_eq!(decisions.len(), 2, "one dispatch per turn: {decisions:?}");
     let second = decisions.pop().expect("two decisions");
     let first = decisions.pop().expect("two decisions");
-    (first, second)
+    ((first, second), toolbox_tokens)
 }
 
 /// **P2, end to end.** The first Anthropic dispatch marks block 0 (two items,
@@ -149,5 +166,34 @@ async fn a_responses_target_records_no_marker_and_keeps_the_whole_prompt_predict
         (second.expected_cost_usd - expected).abs() < 1e-9,
         "quoted {}, expected {expected}",
         second.expected_cost_usd,
+    );
+}
+
+/// **The toolbox is part of the prefix a block marker caches.** Anthropic
+/// renders tools ahead of the messages, so a marker on block 0 caches the tool
+/// declarations and that block together. A recorded prefix without the
+/// toolbox would under-state the warm prefix of every tool-declaring turn.
+#[tokio::test]
+async fn a_marked_prefix_includes_the_declared_toolbox() {
+    let spec = frontier_spec("anthropic", "claude", WireProtocol::AnthropicMessages);
+    let tools = serde_json::json!([{
+        "name": "read_file",
+        "description": "Read a file from the workspace",
+        "input_schema": { "type": "object", "properties": { "path": { "type": "string" } } }
+    }]);
+    let ((first, _), toolbox_tokens) = two_turns_declaring(spec, Some(tools)).await;
+
+    assert!(
+        toolbox_tokens > 0,
+        "the premise: the toolbox has a token count"
+    );
+    let marked_block = Item::user_text(FIRST).render().len() as u64;
+    assert_eq!(
+        first.block_marker,
+        Some(BlockMarker::Placed {
+            segment: 0,
+            prefix_tokens: toolbox_tokens + marked_block,
+        }),
+        "the recorded prefix is the toolbox plus the marked block"
     );
 }
