@@ -2892,7 +2892,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             // one-sided — and a frontier settle prices from the
             // provider's own reported usage anyway.
             //
-            // The local branch of `connect` takes the token *buffer* rather
+            // `connect_local` takes the token *buffer* rather
             // than a string and is left undecorated: re-tokenizing a
             // decorated prompt would desynchronize the buffer from the
             // block hashes the fleet routes on, which is a real cost for
@@ -2951,7 +2951,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             // the config has no idea what the client asked for.
             output_token_cap: declarations.output_token_cap,
             // **What makes the turn agentic**, and cloned rather than
-            // moved because `connect` may run more than once: a dispatch
+            // moved because this runs once per dispatch attempt: a dispatch
             // that fails over to a second target has to send the same
             // toolbox, or the fallback answers a different question from
             // the one the client asked. Verbatim from the client, for
