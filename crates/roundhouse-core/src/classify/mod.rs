@@ -630,7 +630,9 @@ pub struct UnconfirmedSettlement {
 }
 
 impl UnconfirmedSettlement {
-    /// Whether this settlement is a debt worth a repair.
+    /// Whether this settlement owes real money: what places it ahead in the
+    /// repair order and what makes a session withhold its next ticket. Every
+    /// entry is still repaired, zero-dollar releases included.
     ///
     /// **One rule for two questions.** The engine withholds a session's next
     /// classification ticket when any entry owes, and the fold schedules

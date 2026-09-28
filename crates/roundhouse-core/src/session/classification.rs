@@ -233,8 +233,9 @@ impl ClassificationFold {
         self.settled.contains(call_id)
     }
 
-    /// Evaluation settlements the log says nobody has confirmed, in arrival
-    /// order. See [`super::SessionState::unrepaired_settlements`].
+    /// Evaluation settlements the log says nobody has confirmed, positive
+    /// amounts first and arrival order within each group. See
+    /// [`super::SessionState::unrepaired_settlements`].
     pub(crate) fn unrepaired(&self) -> impl ExactSizeIterator<Item = &UnconfirmedSettlement> {
         self.unrepaired.iter()
     }

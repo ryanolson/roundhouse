@@ -338,6 +338,13 @@ pub(super) struct EvaluationFold {
     /// them would drop a second tenant's spend. Results and repairs are
     /// delivered by the session's own writer (`Engine::deliver_classifier_output`
     /// reads the runtime by session id), so the join never has to cross one.
+    ///
+    /// **Grows with classified calls for the life of the process.** A
+    /// `Closed` entry is kept so that a result appended again is counted as a
+    /// duplicate rather than booked twice. Nothing expires it, the same
+    /// posture `MemorySpendLedger`'s settled-call set documents. A restart
+    /// frees it, and a compaction hook would need to prove that no result for
+    /// the call can arrive again.
     calls: HashMap<(SessionId, ResponseId), CallState>,
     by_principal: BTreeMap<PrincipalKey, EvaluationAccumulator>,
 }
