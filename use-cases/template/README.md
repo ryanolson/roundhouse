@@ -95,7 +95,7 @@ SPDX-License-Identifier: Apache-2.0
 DYNAMO_CLONE=/path/to/dynamo ./use-cases/TODO_NAME/pull_model.sh pull
 
 # 2. Start etcd + nats (Dynamo worker discovery)
-docker compose -f /path/to/dynamo/deploy/docker-compose.yml up -d
+docker compose -f /path/to/dynamo/dev/docker-compose.yml up -d
 
 # 3. Serve the model
 ./use-cases/TODO_NAME/serve_model.sh serve

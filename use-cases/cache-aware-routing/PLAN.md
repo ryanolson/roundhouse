@@ -64,7 +64,7 @@ ssh -L 8080:localhost:8080 user@your-gpu-cluster-node
 | `INFERENCE_API_KEY` | NVIDIA NIM API key — from Vault / `.env` |
 | Real model ID in `catalog.json` | Exact string sent on the wire as `"model"` |
 | Real pricing in `catalog.json` | From openrouter.ai for the chosen model |
-| *(Shape B only)* etcd + nats | `docker compose -f /path/to/dynamo/deploy/docker-compose.yml up -d` |
+| *(Shape B only)* etcd + nats | `docker compose -f /path/to/dynamo/dev/docker-compose.yml up -d` |
 | *(Shape B only)* Dynamo from pinned rev `ac7b7513` | `pip install -e /path/to/dynamo/python/dynamo` |
 | *(Shape B only)* Qwen weights downloaded | `./use-cases/cache-aware-routing/pull_model.sh pull` |
 
@@ -160,7 +160,7 @@ Score moves from 15/24 → 18/24.
 
 **Cluster setup (one-time, "Needs deployment" gap):**
 1. SSH into the GPU cluster node.
-2. Start etcd + nats: `docker compose -f /path/to/dynamo/deploy/docker-compose.yml up -d`
+2. Start etcd + nats: `docker compose -f /path/to/dynamo/dev/docker-compose.yml up -d`
 3. Download weights: `DYNAMO_CLONE=/path/to/dynamo ./use-cases/cache-aware-routing/pull_model.sh pull`
 4. Serve Qwen: `./use-cases/cache-aware-routing/serve_model.sh serve` (or the equivalent from your Dynamo clone)
    — this publishes KV events on ZMQ `:20080` with `BLOCK_SIZE=64` and `PYTHONHASHSEED=0`.

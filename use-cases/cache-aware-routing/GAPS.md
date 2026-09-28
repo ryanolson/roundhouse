@@ -206,7 +206,7 @@ Validated hands-on on a real GPU box (1× NVIDIA H100 80GB — **not** the ≥2-
   use case needs real concurrency at 32B, `Qwen/Qwen2.5-Coder-14B-Instruct` (documented fallback,
   ~28 GB weights) is where the headroom comes back.
 - **What this does and does not close**: Dynamo (`dynamo.frontend` + `dynamo.vllm`) is now genuinely
-  installable and (pending the 32B/14B outcome above) serving real weights on real hardware, with
+  installable and serving real weights (32B, per the bullet above) on real hardware, with
   etcd + nats up via `dev/docker-compose.yml`. This closes the "Dynamo worker not running" half of
   the P1 row above. It does **not** close "real `LocalExecutor` not implemented" or "`roundhouse-
   server` binary does not wire `LocalFleet`" — those are still open, unbuilt, Rust-side gaps; nothing

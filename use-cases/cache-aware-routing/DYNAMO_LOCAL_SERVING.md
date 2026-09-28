@@ -74,7 +74,7 @@ cd ~/dynamo
 git checkout ac7b7513790ef1d619b46f805aea03c9f21200ba
 ```
 
-Re-check this rev against `Cargo.toml:37-45` in this repo before reusing these steps later —
+Re-check this rev against `Cargo.toml:46-54` in this repo before reusing these steps later —
 if the pin has moved, re-verify against the new rev's own build docs (CLAUDE.md: "synergy
 dependencies are watched, not just pinned").
 
@@ -190,9 +190,11 @@ because the corpus prefix was already resident from session 1 (Tax B). See `READ
 - **Not a roundhouse routing test.** The `curl` above talks to Dynamo's own frontend on `:8000`,
   never touching roundhouse. roundhouse has no `LocalExecutor` that can call this worker yet.
 - **Not multi-GPU / tensor-parallel.** Validated at `TP=1` only.
-- **Not a KV-cache-hit measurement.** No repeat-prefix turns were sent in this smoke test, so
-  the ZMQ KV-event stream was never exercised end to end — only confirmed to be configured and
-  bound without error.
+- **Not a KV-event-stream test.** The cache-hit numbers above come from vLLM's own HTTP
+  `usage.prompt_tokens_details.cached_tokens` (via `run_local.py`), not from the ZMQ KV-event
+  stream on `:20080`. Nothing subscribed to that stream, so it is confirmed only to be configured
+  and bound without error — the `EmbeddedFleet` block-hash indexing that would consume it is
+  still unexercised.
 
 See `GAPS.md`'s 2026-09-23 addendum for the full record and `INTEGRATION.md` for the options on
 closing the `LocalExecutor` / `EmbeddedFleet`-wiring gap this document does not touch.

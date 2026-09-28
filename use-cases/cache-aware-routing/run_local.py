@@ -133,7 +133,9 @@ def run_session(label: str, system_prompt: str, turns: list[str]) -> dict:
             return totals
         usage = result["usage"]
         in_tok = int(usage.get("prompt_tokens", 0))
-        cached = int(usage.get("prompt_tokens_details", {}).get("cached_tokens", 0) or 0)
+        # `or {}`, not a `.get` default: a server with prompt-token details off
+        # sends the key as an explicit null, which a default does not cover.
+        cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0)
         out_tok = int(usage.get("completion_tokens", 0))
         pct = (100.0 * cached / in_tok) if in_tok else 0.0
         totals["input"] += in_tok
