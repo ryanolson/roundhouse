@@ -25,6 +25,8 @@ The final workspace run at `5fba49d` passed 1801 tests, with 0 failures, 141 exi
 
 **Re-scope, 2026-09-23.** PR #18 ships the implemented rows below. The unfinished rows are follow-up PRs from `main`. See the dated addendum in `synergies/typesafe-selector-and-cache-affinity.md`.
 
+**Settlement repair window, 2026-09-28 (owner decision).** A settlement repair now settles under the budget window configured when it runs. It no longer uses the window that the intent recorded. This reverses the 2026-09-22 note that a window-drift test "does not justify a policy change". That earlier test did not cross a month boundary after the mode change. Review round 6 found the defect (F1). The ledger keeps one account per project and rolls it under the mode that a settle names, before its duplicate check. A repair that named `Monthly` after a switch to `Total` reset the lifetime balance at the next month boundary. The test `a_repair_after_a_window_mode_change_keeps_the_live_windows_committed_spend` failed on the old code in both cases. A first charge left $0.05 of $5.05, and a duplicate left $0 of $5.05. The fix is in `7567070`.
+
 The transport and observation checkpoints do not complete the owner's routing vision. This table includes interval source `1658633` on 2026-09-22. Eight independent mutations were caught, and the full workspace suite passed 2173 tests with 149 existing ignores. See `REVIEW-frontier-interval-feedback.md` for evidence and limits. Dated checkpoints below retain earlier results.
 
 | Requirement | Remaining implementation or evidence |
