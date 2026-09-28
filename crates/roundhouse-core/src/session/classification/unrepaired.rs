@@ -48,19 +48,19 @@ impl UnrepairedSettlements {
     /// zero-dollar ones, so a real debt is never scheduled behind a
     /// zero-dollar release that merely arrived first.
     ///
-    /// **The same predicate `owes_settlement` uses** (`usd > 0.0`), so the
-    /// question "does this session owe a repair" and the question "which
-    /// entry does the repair loop offer first" can never disagree about a
-    /// single settlement.
-    fn priority(usd: f64, arrival: u64) -> PriorityKey {
-        (usd <= 0.0, arrival)
+    /// **The same predicate `owes_settlement` uses**
+    /// ([`UnconfirmedSettlement::owes`]), so the question "does this session
+    /// owe a repair" and the question "which entry does the repair loop offer
+    /// first" can never disagree about a single settlement.
+    fn priority(settlement: &UnconfirmedSettlement, arrival: u64) -> PriorityKey {
+        (!settlement.owes(), arrival)
     }
 
     /// Record a settlement whose result said nobody acknowledged the charge.
     pub(super) fn push(&mut self, settlement: UnconfirmedSettlement) {
         let arrival = self.next;
         self.next += 1;
-        let key = Self::priority(settlement.usd, arrival);
+        let key = Self::priority(&settlement, arrival);
         // Keep both maps paired even if a caller replaces a pending identity.
         if let Some(previous) = self.index.insert(settlement.call_id.clone(), key) {
             self.entries.remove(&previous);
@@ -230,6 +230,22 @@ mod tests {
                 "eval_zero_3".to_string(),
             ]
         );
+    }
+
+    /// **Scheduling order and the withhold predicate are one rule.** An entry
+    /// sorts into the positive group exactly when it owes a repair, for every
+    /// amount a record can carry -- NaN included, where two hand-written
+    /// comparisons (`<= 0.0` here, `> 0.0` there) would disagree.
+    #[test]
+    fn an_entry_sorts_first_exactly_when_it_owes_a_repair() {
+        for usd in [0.0, -0.0, 1e-9, -1.0, 0.02, f64::NAN] {
+            let entry = settlement("eval_any", usd);
+            assert_eq!(
+                UnrepairedSettlements::priority(&entry, 0).0,
+                !entry.owes(),
+                "usd = {usd}"
+            );
+        }
     }
 
     /// Interior removal must preserve oldest-first scheduling.

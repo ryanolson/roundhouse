@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use roundhouse_core::classify::UnconfirmedSettlement;
 use roundhouse_core::classify::projection::PromptCapture;
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::Principal;
@@ -303,7 +304,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         session
             .state()
             .unrepaired_settlements()
-            .any(|settlement| settlement.usd > 0.0)
+            .any(UnconfirmedSettlement::owes)
     }
 
     /// Schedule a bounded batch of unconfirmed settlements.

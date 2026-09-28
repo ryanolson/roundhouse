@@ -629,6 +629,18 @@ pub struct UnconfirmedSettlement {
     pub usd: f64,
 }
 
+impl UnconfirmedSettlement {
+    /// Whether this settlement is a debt worth a repair.
+    ///
+    /// **One rule for two questions.** The engine withholds a session's next
+    /// classification ticket when any entry owes, and the fold schedules
+    /// owing entries ahead of the rest. Two hand-written comparisons would
+    /// disagree on NaN, where both `<= 0.0` and `> 0.0` are false.
+    pub fn owes(&self) -> bool {
+        self.usd > 0.0
+    }
+}
+
 /// A classification a decision could see, named rather than copied.
 ///
 /// **A reference, because the record is immutable and the log already holds
