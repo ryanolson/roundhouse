@@ -369,3 +369,12 @@ On 2026-09-28 the owner delegated the open decisions: "make the best decisions y
 14. **Arms and background sampling.** Keep strategy arms, not target arms. Background evaluation uses a configured sampling rate, not a value-of-information policy.
 
 **Still needs the owner:** approval of each live C2 run, and the merge of PR #18. Owner rule, 2026-09-28: live-provider testing costs less than $20 USD per session, and C2 runs only on machines that the owner chooses. No live run starts without the owner's approval of that run.
+
+## Addendum (2026-09-28): Jev as a scout for the learner
+
+The owner chose option (b) and accepted the delegated rulings above. This addendum amends the 2026-09-21 rule that classifications are features and never rewards. The reward is still the frontier-review interval. Jev never supplies a reward.
+
+1. **One more question.** The background classification call asks one more choice question: which tier Jev would pick for the turn, `capable` or `efficient`. The same request carries it, so it adds no call and no separate latency. The answer is recorded with the classification, together with Jev's confidence.
+2. **Agreement comparison.** The metrics document reports, for each project, how often the served tier matches Jev's pick. For disagreements it also reports how the covering frontier review labeled the interval. This data tells the owner whether Jev is worth what it costs.
+3. **Cold-start prior.** Until a learner key has enough review evidence, Jev's recommended tier supplies the starting quality belief for the strategies on that key. Review evidence replaces the prior as it accumulates: the prior counts as a fixed small number of pseudo-observations, and real intervals outweigh it quickly. The prior never overrides a hard constraint, and it never becomes a reward.
+4. **Coverage limit.** Local-only sessions never reach Jev, so they get no prior and no comparison. The learner treats them with the `rules` route until review evidence exists.
