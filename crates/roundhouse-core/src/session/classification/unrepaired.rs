@@ -106,13 +106,11 @@ impl UnrepairedSettlements {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::BudgetWindow;
 
     fn settlement(call_id: &str, usd: f64) -> UnconfirmedSettlement {
         UnconfirmedSettlement {
             call_id: ResponseId::new(call_id),
             usd,
-            window: BudgetWindow::Total,
         }
     }
 

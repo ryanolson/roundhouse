@@ -332,11 +332,6 @@ async fn a_repair_resolves_its_settlement_and_creates_no_feature() {
         .expect("the settle the fold held");
     assert_eq!(unconfirmed.usd, 0.000_017);
     assert_eq!(
-        unconfirmed.window,
-        BudgetWindow::Monthly,
-        "the window comes off the intent, which is the only place it exists"
-    );
-    assert_eq!(
         before.principal(),
         Some(&roundhouse_core::control::Principal::new("acme", "ada")),
         "and the payer comes off the session's first event"

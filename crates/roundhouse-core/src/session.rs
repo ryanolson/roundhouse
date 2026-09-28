@@ -1193,13 +1193,14 @@ impl SessionState {
 
     /// Evaluation settlements the log says nobody has confirmed.
     ///
-    /// Everything a repair needs and nothing it does not: the call's identity,
-    /// the amount the record holds, and the window the intent recorded. The
-    /// payer is [`Self::principal`] and is deliberately not repeated here.
+    /// Everything a repair needs and nothing it does not: the call's identity
+    /// and the amount the record holds. The payer is [`Self::principal`] and
+    /// is deliberately not repeated here; the budget window is the one
+    /// configured when the repair runs (see [`UnconfirmedSettlement`]).
     ///
-    /// Borrowed and in arrival order, so a repair path that takes a bounded
-    /// prefix copies nothing it did not select and touches nothing it did not
-    /// take.
+    /// Borrowed, positive amounts first and oldest first within each group,
+    /// so a repair path that takes a bounded prefix copies nothing it did not
+    /// select and touches nothing it did not take.
     pub fn unrepaired_settlements(&self) -> impl ExactSizeIterator<Item = &UnconfirmedSettlement> {
         self.classification.unrepaired()
     }

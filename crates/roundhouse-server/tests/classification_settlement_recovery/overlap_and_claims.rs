@@ -143,8 +143,8 @@ async fn overlapping_turns_must_not_duplicate_a_repair_still_in_flight() {
         )
         .await
         .unwrap();
-    seed_unconfirmed_settlement(&store, &lease, gated_call, 1, 0.05).await;
-    seed_unconfirmed_settlement(&store, &lease, other_call, 2, 0.07).await;
+    seed_unconfirmed_settlement(&store, &lease, gated_call, 1, 0.05, BudgetWindow::Total).await;
+    seed_unconfirmed_settlement(&store, &lease, other_call, 2, 0.07, BudgetWindow::Total).await;
     store.release_lease(&lease).await.unwrap();
 
     let ledger = GatedRepairLedger::new(gated_call);

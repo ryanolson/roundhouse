@@ -64,7 +64,15 @@ async fn a_long_outage_backlog_is_drained_at_a_bounded_rate_per_turn() {
         .await
         .unwrap();
     for i in 1..=BACKLOG {
-        seed_unconfirmed_settlement(&store, &lease, &format!("eval_backlog_{i}"), i, 0.01).await;
+        seed_unconfirmed_settlement(
+            &store,
+            &lease,
+            &format!("eval_backlog_{i}"),
+            i,
+            0.01,
+            BudgetWindow::Total,
+        )
+        .await;
     }
     store.release_lease(&lease).await.unwrap();
 
@@ -162,7 +170,15 @@ async fn a_long_outage_backlog_bounds_what_a_turn_retains_and_copies() {
         .await
         .unwrap();
     for i in 1..=BACKLOG {
-        seed_unconfirmed_settlement(&store, &lease, &format!("eval_bounds_{i}"), i, 0.01).await;
+        seed_unconfirmed_settlement(
+            &store,
+            &lease,
+            &format!("eval_bounds_{i}"),
+            i,
+            0.01,
+            BudgetWindow::Total,
+        )
+        .await;
     }
     store.release_lease(&lease).await.unwrap();
 
@@ -293,7 +309,15 @@ async fn seed_backlog(
         .await
         .unwrap();
     for i in 1..=backlog {
-        seed_unconfirmed_settlement(store, &lease, &format!("eval_{prefix}_{i}"), i, 0.01).await;
+        seed_unconfirmed_settlement(
+            store,
+            &lease,
+            &format!("eval_{prefix}_{i}"),
+            i,
+            0.01,
+            BudgetWindow::Total,
+        )
+        .await;
     }
     store.release_lease(&lease).await.unwrap();
 }

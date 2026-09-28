@@ -611,6 +611,15 @@ pub struct ClassificationSettlementRepair {
 /// record of a settled call that a later edit could put out of step with the
 /// first. It exists so the repair path takes one value rather than re-deriving
 /// the join between an intent and its result at each of its callers.
+///
+/// **No budget window.** A repair settles under the window configured when it
+/// runs, the same rule the serving settle follows. Replaying the window the
+/// intent recorded looks more faithful and is not: the ledger keeps one
+/// account per project, not per window mode, and rolls it under whatever mode
+/// a settle names before it checks for a duplicate. A repair naming `Monthly`
+/// after the operator switched to `Total` would delete the lifetime balance at
+/// the next month boundary, even when the ledger then answered that it
+/// already held the call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnconfirmedSettlement {
     /// The identity the hold was taken under and the settle deduplicates by.
@@ -618,10 +627,6 @@ pub struct UnconfirmedSettlement {
     /// The amount the durable result recorded. See
     /// [`EvaluationSpend::unconfirmed_settlement_usd`].
     pub usd: f64,
-    /// The window the *intent* recorded, so a repair lands against the same
-    /// kind of period the grant was judged under rather than against whatever
-    /// the configuration says now.
-    pub window: BudgetWindow,
 }
 
 /// A classification a decision could see, named rather than copied.

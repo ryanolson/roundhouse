@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Claim 5: a repaired charge lands on the session's own payer and its own
-//! budget window, never a live account's.
+//! Claim 5: a repaired charge lands on the session's own payer, under the
+//! budget window configured when the repair runs.
 
 use super::*;
 
@@ -47,7 +47,15 @@ async fn a_configured_tenants_charge_is_recovered_onto_its_own_account() {
         )
         .await
         .unwrap();
-    seed_unconfirmed_settlement(&store, &lease, "eval_tenant_payer", 1, 0.05).await;
+    seed_unconfirmed_settlement(
+        &store,
+        &lease,
+        "eval_tenant_payer",
+        1,
+        0.05,
+        BudgetWindow::Total,
+    )
+    .await;
     store.release_lease(&lease).await.unwrap();
 
     let restarted =
@@ -126,7 +134,15 @@ async fn a_session_with_no_recorded_payer_is_never_repaired() {
         )
         .await
         .unwrap();
-    seed_unconfirmed_settlement(&store, &lease, "eval_no_payer", 1, 0.05).await;
+    seed_unconfirmed_settlement(
+        &store,
+        &lease,
+        "eval_no_payer",
+        1,
+        0.05,
+        BudgetWindow::Total,
+    )
+    .await;
     store.release_lease(&lease).await.unwrap();
 
     let deployment =
@@ -201,108 +217,143 @@ async fn control_the_rig_classifies_its_first_turn_through_a_frontier_target() {
     );
 }
 
-/// **Production repairs under the window the original intent recorded, and
-/// this test is a passing regression pin of that -- not evidence that a
-/// "live window" repair is needed.**
+/// **A repair after a window-mode change settles under the window configured
+/// now, so it cannot reset spend committed under that window.**
 ///
-/// The requirements this stage inherited are explicit that the recorded
-/// window is the contract to preserve: `TypeSafeShadow::repair_settlement`
-/// settles with `window: settlement.window`, the amount the intent carried at
-/// call time, on the documented rule that the live rate card and a repair's
-/// own window are both out of scope for the same reason ("a repaired charge
-/// that disagreed with the charge it replaced is drift nobody can see without
-/// reading both"). This test drives that production code path unchanged and
-/// it passes: the $5 committed under `Total` after the operator switched
-/// `classify.budget.window` survives the Monthly-window repair that follows
-/// it.
+/// The account key is per project, not per window mode, and both ledgers roll
+/// an account under whatever mode a settle names *before* they check whether
+/// the call was already settled. A repair that replayed the mode its intent
+/// recorded would therefore roll a live `Total` account onto a `Monthly`
+/// boundary the moment a month had passed, deleting the lifetime balance --
+/// and it would do so even when the ledger then answers `applied: false`,
+/// because the roll comes first. Both sides of that are driven here:
 ///
-/// **Why it survives is a fact about this fixture's touch order, not a
-/// general property of replaying a stale window.**
-/// `ProjectAccount::settle_time` rolls `committed_usd` to zero only when the
-/// window it is handed computes a start strictly later than
-/// `window_started_ms`'s current high-water mark -- and the classifying
-/// turn's own grant, made under the *original* Monthly config before the
-/// operator ever switched anything, is the first ledger touch this account
-/// ever sees. That call already advances `window_started_ms` to the current
-/// month. The later Total-mode $5 leaves it there (`Total` always computes a
-/// start of `0`), so when the repair replays `Monthly` in the same calendar
-/// month, `window_start_ms(Monthly, now)` equals the mark already set and
-/// nothing resets. A account whose *first-ever* ledger touch were the Monthly
-/// repair itself -- e.g. one that had only ever seen `Total`-window spend
-/// before this repair -- would roll: see
-/// [`open_question_a_repair_can_still_roll_an_account_whose_first_ledger_touch_it_is`],
-/// a ledger-level demonstration of exactly that, reported as an open
-/// question this stage does not resolve. Nothing here changes production.
+/// - `BeforeApply`: the repair is the call's first charge, so it adds to the
+///   balance and must add only its own amount.
+/// - `AfterApply`: the call was already charged in the earlier month, so the
+///   repair is a duplicate and must leave the balance exactly where it was.
+///
+/// **The log is seeded, not produced by a classifying turn.** Every turn ends
+/// by driving repairs, so a first deployment that made the call would leave
+/// its own repair worker in flight under its own `Monthly` configuration, and
+/// that worker -- not the restarted process -- could be the settle that rolls
+/// the account. A real restart does not carry the old process's tasks over;
+/// seeding is what makes the restarted `Total` process the only repairer.
 #[tokio::test]
-async fn a_repair_does_not_roll_a_live_account_onto_the_window_its_intent_recorded() {
-    let (base_url, _upstream) = classifier_upstream(ANSWER).await;
-    // The call is made, and its intent recorded, under a *monthly* window.
-    let monthly = monthly_config(&base_url);
-    let store = Arc::new(MemoryStore::new());
-    let ledger = RiggedLedger::new(FailMode::BeforeApply);
-    let session = SessionId::new("sess_window_drift");
-    let principal = Principal::default_open();
+async fn a_repair_after_a_window_mode_change_keeps_the_live_windows_committed_spend() {
+    for mode in [FailMode::BeforeApply, FailMode::AfterApply] {
+        let (base_url, _upstream) = classifier_upstream(ANSWER).await;
+        let total = config(&base_url);
+        let terms = total.budget_terms();
+        let monthly_terms = monthly_config(&base_url).budget_terms();
+        let store = Arc::new(MemoryStore::new());
+        let ledger = RiggedLedger::new(mode);
+        let session = SessionId::new("sess_window_mode_change");
+        let principal = Principal::default_open();
+        let call_id = ResponseId::new("eval_window_mode_change");
+        let usd = 0.05;
 
-    let (_call_id, usd) =
-        a_session_with_an_unconfirmed_settlement(&store, &ledger, &monthly, &session).await;
-
-    // The operator switches the evaluation budget to a total window, and the
-    // project accrues spend under it.
-    let total = config(&base_url);
-    let terms = total.budget_terms();
-    ledger
-        .commit_unrelated(&principal, terms.budget.window, 5.0)
+        // The log a `Monthly`-configured process left: a call whose result
+        // says nobody acknowledged its settle.
+        store.create_session(&session, "affinity").await.unwrap();
+        let lease = store
+            .acquire_lease(&session, "node_window_mode_setup", 60_000)
+            .await
+            .expect("a lease read")
+            .expect("an unheld session");
+        store
+            .append_events(
+                &lease,
+                vec![SessionEventKind::SessionCreated {
+                    model_policy: "affinity".into(),
+                    principal: Some(principal.clone()),
+                    arm: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        seed_unconfirmed_settlement(
+            &store,
+            &lease,
+            call_id.as_str(),
+            1,
+            usd,
+            BudgetWindow::Monthly,
+        )
         .await;
-    assert_eq!(
-        ledger.committed_usd(&principal, &terms).await,
-        5.0,
-        "the premise: the project has committed spend in the window that is \
-         open now"
-    );
+        store.release_lease(&lease).await.unwrap();
 
-    let restarted = deployment(&store, &ledger, &total).await;
-    let committed = drive_until_committed(
-        &restarted,
-        &session,
-        &ledger,
-        &principal,
-        &terms,
-        5.0 + usd,
-        &["t3", "t4"],
-    )
-    .await;
+        // And the ledger side of that call, this month, under `Monthly`: the
+        // settle whose acknowledgement never came back (applied or not, per
+        // `mode`), and the account read that marks this month as the one its
+        // balance belongs to.
+        let original = ledger
+            .settle_grant(Settlement {
+                principal: principal.clone(),
+                key: SettlementKey::OncePerCall,
+                response_id: call_id.clone(),
+                actual_usd: usd,
+                window: monthly_terms.budget.window,
+                now_ms: roundhouse_core::now_ms(),
+            })
+            .await;
+        assert!(original.is_err(), "{mode:?}: the premise is a lost settle");
+        ledger.committed_usd(&principal, &monthly_terms).await;
 
-    assert_eq!(
-        committed,
-        5.0 + usd,
-        "the $5 committed under Total survives this repair's Monthly settle"
-    );
+        // The operator switches to `Total`, and the project spends under it.
+        ledger
+            .commit_unrelated(&principal, terms.budget.window, 5.0)
+            .await;
+        let before = ledger.committed_usd(&principal, &terms).await;
+
+        // Two months on, a restarted `Total` process drives the repair.
+        ledger.skew(62 * 24 * 60 * 60 * 1_000);
+        let restarted = deployment(&store, &ledger, &total).await;
+        let repaired =
+            drive_until_repaired_for(&restarted, &store, &session, &call_id, &["t1", "t2", "t3"])
+                .await;
+        assert_eq!(repaired, 1, "{mode:?}: the repair must be acknowledged");
+
+        let expected = match mode {
+            FailMode::BeforeApply => before + usd,
+            _ => before,
+        };
+        let committed = ledger.committed_usd(&principal, &terms).await;
+        assert!(
+            (committed - expected).abs() < 1e-9,
+            "{mode:?}: the Total window held {before} before the repair and \
+             must hold {expected} after it, but holds {committed} -- a repair \
+             that settles under the Monthly mode its intent recorded rolls the \
+             account onto a month boundary and deletes the lifetime balance"
+        );
+        if mode == FailMode::AfterApply {
+            assert!(
+                ledger.deduplicated(call_id.as_str()),
+                "the control: the AfterApply repair really was a duplicate, \
+                 so any change to the balance came from the roll alone"
+            );
+        }
+    }
 }
 
-/// **Open question, not a production defect this stage resolves: a repair
-/// can still roll an account whose first-ever ledger touch it is.**
+/// **The control for the test above: the ledger itself rolls an account under
+/// whatever window a settle names.**
 ///
-/// Unlike [`a_repair_does_not_roll_a_live_account_onto_the_window_its_intent_recorded`],
-/// nothing here touches this account under `Monthly` before the repair does.
 /// `Total`-mode spend lands first -- `window_start_ms(Total, _)` is always
-/// `0`, so it leaves `window_started_ms` at its initial `0` -- and the
-/// Monthly-window settle that follows is the account's first look at a
-/// nonzero window start. `ProjectAccount::settle_time` reads that as the
-/// window having rolled and zeroes `committed_usd` before applying the
-/// settle.
+/// `0`, so it leaves `window_started_ms` at its initial `0` -- and a
+/// `Monthly` settle that follows is the account's first look at a nonzero
+/// window start. `ProjectAccount::settle_time` reads that as the window
+/// having rolled and zeroes `committed_usd` before applying the settle.
 ///
-/// A production sequence that reaches this: a project whose evaluation
-/// spend has only ever been committed under `Total` (or under `Monthly` in
-/// an earlier calendar month whose watermark a `Total`-only stretch since
-/// then never revisited) gets its first `Monthly`-window repair. This is a
-/// ledger-level demonstration to make that reachable and named, not an
-/// engine-level reproduction and not a fix -- both the engine path and the
-/// right resolution (window-mode changes are an operator action already
-/// outside a repair's remit; whether repair should carry a mode marker, or
-/// whether this is simply the existing window-change contract working as
-/// specified) are for whoever picks this up next to decide.
+/// This is why a repair must name the live window rather than the one its
+/// intent recorded, and it is what keeps
+/// [`a_repair_after_a_window_mode_change_keeps_the_live_windows_committed_spend`]
+/// from being tautological: if the ledger stopped rolling on a named window,
+/// that test would pass whichever window the repair named, and this one
+/// would fail first.
 #[tokio::test]
-async fn open_question_a_repair_can_still_roll_an_account_whose_first_ledger_touch_it_is() {
+async fn the_ledger_rolls_an_account_under_whatever_window_a_settle_names() {
     let ledger = RiggedLedger::new(FailMode::Never);
     let principal = Principal::default_open();
     let total_terms = config("http://127.0.0.1:1").budget_terms();
@@ -317,8 +368,8 @@ async fn open_question_a_repair_can_still_roll_an_account_whose_first_ledger_tou
         "the premise: this account's only ledger touch so far is under Total"
     );
 
-    // The account's first-ever Monthly settle -- what a repair whose intent
-    // recorded a Monthly window would send, if this were its first touch. A
+    // The account's first-ever Monthly settle -- what a repair that replayed
+    // a recorded Monthly window would send after a switch to Total. A
     // distinct response id: `commit_unrelated` always names the same one, and
     // `SettlementKey::OncePerCall` would read a second call under it as the
     // same settle repeated rather than a fresh one.

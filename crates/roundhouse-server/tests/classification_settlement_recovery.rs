@@ -460,12 +460,17 @@ async fn repairs<S: SessionStore>(store: &Arc<S>, session: &SessionId) -> Vec<se
 /// see [`a_session_with_an_unconfirmed_settlement`] — directly, so the
 /// restarted deployment those tests build finds every settlement already
 /// unrepaired and none of them touched yet.
+///
+/// `window` is the budget window the seeded intent records — the mode the
+/// process that made the call was configured with, which a repair must not
+/// replay.
 async fn seed_unconfirmed_settlement(
     store: &MemoryStore,
     lease: &Lease,
     call_id: &str,
     turn_index: u64,
     usd: f64,
+    window: BudgetWindow,
 ) {
     let source_response_id = ResponseId::new(format!("resp_src_{turn_index}"));
     let intent = ClassificationIntent {
@@ -493,7 +498,7 @@ async fn seed_unconfirmed_settlement(
             requested_usd: usd,
             hold_ttl_ms: 65_000,
             budget_limit_usd: 25.0,
-            budget_window: BudgetWindow::Total,
+            budget_window: window,
             member_ceiling_usd: None,
             warn_at: 0.8,
         },
@@ -649,9 +654,14 @@ async fn drive_until_repaired_for<S: SessionStore + Send + Sync + 'static>(
 /// the result already delivered into the durable log.
 ///
 /// Returns the store, the session, the call's identity and its measured price.
-/// The deployment that produced it is **dropped before returning**: everything
-/// after this point has only the log and the ledger, which is exactly the state
-/// a restarted process finds.
+/// The deployment that produced it is **dropped before returning**, but that
+/// is not the whole of a restart. `t2` ends, like every turn, by driving
+/// repairs, and dropping the deployment stops admission without aborting a
+/// repair worker already spawned. That worker settles under *this*
+/// deployment's configuration at the test's next yield, so a caller that
+/// changes the configuration before the restart — the budget window, say —
+/// cannot tell which process made the settle it observes. Such a test seeds
+/// the log with [`seed_unconfirmed_settlement`] instead.
 async fn a_session_with_an_unconfirmed_settlement(
     store: &Arc<MemoryStore>,
     ledger: &Arc<RiggedLedger>,

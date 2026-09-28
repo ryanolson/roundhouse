@@ -18,8 +18,8 @@ use super::*;
 ///
 /// The classifier answered and billed; the settle never reached the accounting.
 /// A successor process replaying this log has everything it needs — the call's
-/// identity, its payer, the price the record holds and the window the intent
-/// recorded — and must put the charge where the first process could not.
+/// identity, its payer and the price the record holds — and must put the
+/// charge where the first process could not, under the window configured now.
 #[tokio::test]
 async fn a_settlement_that_failed_before_application_recovers_after_a_restart() {
     let (base_url, upstream) = classifier_upstream(ANSWER).await;
@@ -707,7 +707,7 @@ async fn a_failed_repair_acknowledgement_append_stays_retryable() {
         )
         .await
         .unwrap();
-    seed_unconfirmed_settlement(&store.inner, &lease, call_id, 1, 0.05).await;
+    seed_unconfirmed_settlement(&store.inner, &lease, call_id, 1, 0.05, BudgetWindow::Total).await;
     store.release_lease(&lease).await.unwrap();
 
     // Armed before any turn runs, so the very first repair this deployment

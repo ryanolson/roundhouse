@@ -543,12 +543,21 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
     /// there is no answer to buy, only accounting to finish.
     ///
     /// **Every input comes off the durable record**, which is what makes this
-    /// safe to run arbitrarily late. The amount is the one the result carried,
-    /// the window is the one the intent recorded, and the identity is the one
-    /// the hold was opened under; the live rate card is deliberately not in
-    /// scope, the same rule `engine::spend::settled_cost_usd` is under and for
-    /// the same reason — a repaired charge that disagreed with the charge it
-    /// replaced is drift nobody can see without reading both.
+    /// safe to run arbitrarily late. The amount is the one the result carried
+    /// and the identity is the one the hold was opened under; the live rate
+    /// card is deliberately not in scope, the same rule
+    /// `engine::spend::settled_cost_usd` is under and for the same reason — a
+    /// repaired charge that disagreed with the charge it replaced is drift
+    /// nobody can see without reading both.
+    ///
+    /// **`window` is the exception, and it is the live one.** The ledger keeps
+    /// one account per project whatever the window mode, and rolls it under
+    /// the mode a settle names before it checks for a duplicate. Replaying the
+    /// mode the intent recorded would let a repair that crossed an operator's
+    /// `Monthly`-to-`Total` switch roll the live `Total` account at the next
+    /// month boundary and delete its lifetime balance — even when the ledger
+    /// then answered that it already held the call. The serving settle uses
+    /// the live window for the same reason.
     ///
     /// `None` means the ledger did not answer and the settlement stays
     /// unrepaired, to be driven again by a later turn. That costs one more
@@ -560,6 +569,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         principal: &Principal,
         session_id: &SessionId,
         settlement: &UnconfirmedSettlement,
+        window: BudgetWindow,
         deadline: tokio::time::Instant,
     ) -> Option<bool> {
         match self
@@ -570,7 +580,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
                 // be dropped as a replay and the drop would look like success.
                 &settlement.call_id,
                 settlement.usd,
-                settlement.window,
+                window,
                 // The operation clock, not the original call's. A settle
                 // applies a realized amount at the moment it is applied, so a
                 // first charge recovered after a window reset lands in the

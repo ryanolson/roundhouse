@@ -644,7 +644,13 @@ impl<T: Tokenizer + Send + Sync + 'static> ClassificationRuntime<T> {
             tokio::time::Instant::now() + std::time::Duration::from_millis(self.limits.call_ttl_ms);
         let Some(applied) = self
             .shadow
-            .repair_settlement(&principal, &session_id, &settlement, deadline)
+            .repair_settlement(
+                &principal,
+                &session_id,
+                &settlement,
+                self.terms.budget.window,
+                deadline,
+            )
             .await
         else {
             // No answer. The settlement stays unrepaired in the log, so a later

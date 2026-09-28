@@ -77,9 +77,10 @@ pub(crate) struct ClassificationFold {
     /// compete for the same repair attempt.
     ///
     /// Folded here rather than re-derived at the repair site because the join
-    /// it needs is not available later: the amount is on the *result* and the
-    /// window is on the *intent*, and the intent is consumed the moment its
-    /// result arrives.
+    /// it needs is not available later: the amount is on the *result*, the
+    /// intent says whether the result answers a call this session actually
+    /// held a grant for, and the intent is consumed the moment its result
+    /// arrives.
     unrepaired: UnrepairedSettlements,
     /// What this deployment's own extractor made of recent turns.
     ///
@@ -100,8 +101,8 @@ impl ClassificationFold {
     /// a call was committed to; it does not make one. Holding the intent is
     /// what lets [`Self::recorded`] check the result's turn and response
     /// against the request it claims to answer before accepting it, what
-    /// lets a late settlement still be joined to the budget window it was
-    /// reserved under, and what lets a reader say "this turn's
+    /// lets a late settlement still be joined to the intent that opened its
+    /// hold, and what lets a reader say "this turn's
     /// classification, and its cost, are unknown" instead of saying nothing
     /// when the call never got a result before a crash.
     pub(crate) fn requested(&mut self, record: &ClassificationIntent) {
@@ -126,11 +127,12 @@ impl ClassificationFold {
             return;
         }
         // Joined here because this is the last moment both halves are
-        // in hand: the amount is on the result and the window is on the
-        // intent, and the next line consumes the intent. A repair site
-        // that tried to re-derive this would find the intent gone.
+        // in hand: the amount is on the result, and only a result that
+        // answers a recorded intent opened a hold worth settling. The next
+        // line consumes the intent, so a repair site that tried to
+        // re-derive this would find it gone.
         let intent = self.outstanding.remove(&record.call_id);
-        if let (Some(intent), Some(usd)) = (
+        if let (Some(_), Some(usd)) = (
             intent,
             record
                 .outcome
@@ -140,7 +142,6 @@ impl ClassificationFold {
             self.unrepaired.push(UnconfirmedSettlement {
                 call_id: record.call_id.clone(),
                 usd,
-                window: intent.reservation.budget_window,
             });
         }
         self.settled.insert(record.call_id.clone());
