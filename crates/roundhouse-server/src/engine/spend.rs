@@ -604,6 +604,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
             .record_routing(
                 &response_id,
                 DecisionRecord {
+                    block_marker: None,
                     selection: None,
                     local_quote_skipped: None,
                     chosen: Target::Frontier {

@@ -1426,7 +1426,7 @@ mod tests {
                 wire_protocol,
                 prompt: "hi".into(),
                 segment_boundaries: Vec::new(),
-                previous_segment_count: None,
+                previous_marker: roundhouse_fleet::PreviousMarker::Unmarked,
                 cache_lifetime: roundhouse_fleet::anthropic_messages::CacheLifetime::Default,
                 session_id: None,
                 thread_id: None,

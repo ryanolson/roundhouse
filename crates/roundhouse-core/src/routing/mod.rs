@@ -36,7 +36,7 @@ pub mod policy;
 pub mod selection;
 pub mod stage;
 
-pub use ledger::{CacheLedger, CacheModel, LedgerEntry, PooledUsage, ProviderPricing};
+pub use ledger::{BlockMarker, CacheLedger, CacheModel, LedgerEntry, PooledUsage, ProviderPricing};
 pub use policy::{AffinityPolicy, EscalationPolicy};
 pub use selection::{
     AffinityEvidence, FEATURE_EXTRACTOR_REVISION, LocalFeatures, SelectionSnapshot, SelectorBranch,
@@ -798,6 +798,22 @@ pub struct DecisionRecord {
     /// not allocation counts or throughput. Serde preserves the JSON shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<Box<SelectionSnapshot>>,
+    /// Where this dispatch's request put its own conversation cache marker,
+    /// for a target whose dialect caches only where it is told.
+    ///
+    /// **Recorded here because nothing later can recover it.** Placement
+    /// depends on how many markers the client's forwarded tools already carry,
+    /// and the toolbox is not in the log. The session fold carries this into
+    /// the cache ledger's `TargetState::last_block_marker`, the same way it
+    /// carries the item count this decision was taken over, and both the next
+    /// quote's warm prefix and the next request's reach-back marker are read
+    /// from there. See [`BlockMarker`].
+    ///
+    /// `None` for a dialect that places no markers and for every log written
+    /// before this field existed. Skipped on the wire when absent, so such a
+    /// deployment writes the decision bytes it wrote before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_marker: Option<BlockMarker>,
 }
 
 /// Why a turn's local residency check was not made.
@@ -1104,6 +1120,7 @@ mod tests {
         // deserializing, or an upgrade takes the deployment's routing history
         // with it.
         let record = DecisionRecord {
+            block_marker: None,
             selection: None,
             local_quote_skipped: None,
             chosen: Target::Frontier {
@@ -1179,6 +1196,11 @@ mod tests {
             "turn_policy_digest": "4ec325a715649c8e"
         }"#;
         let recovered: DecisionRecord = serde_json::from_str(pre_m3).unwrap();
+        assert_eq!(
+            recovered.block_marker, None,
+            "a log written before marker placements were recorded records none, \
+             and the ledger reads that as the whole-prompt prediction it made then"
+        );
         assert_eq!(
             recovered.local_quote_skipped, None,
             "a log written before the residency call became a decision records \

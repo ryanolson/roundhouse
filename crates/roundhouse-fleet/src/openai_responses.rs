@@ -557,7 +557,7 @@ mod tests {
 
     fn quote(credential: TurnCredential, wire_protocol: WireProtocol) -> FrontierQuote {
         FrontierQuote {
-            previous_segment_count: None,
+            previous_marker: crate::frontier::PreviousMarker::Unmarked,
             cache_lifetime: crate::anthropic_messages::CacheLifetime::Default,
             target: Target::Frontier {
                 provider: "openai".into(),

@@ -226,8 +226,9 @@ async fn a_check_keeps_its_own_key_and_borrows_no_conversation_breakpoint() {
 
     assert_eq!(quote.prompt_cache_key, "acme/ada/main#validate");
     assert_eq!(
-        quote.previous_segment_count, None,
-        "the conversation's segment history does not belong to the judge prompt"
+        quote.previous_marker,
+        roundhouse_fleet::PreviousMarker::Unmarked,
+        "the conversation's marker history does not belong to the judge prompt"
     );
     assert_eq!(
         quote.output_token_cap,

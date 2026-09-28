@@ -652,8 +652,8 @@ impl<T: Tokenizer + Clone> FleetJudge<T> {
             prompt: prepared.text,
             // Messages can mark the system prefix without marking the brief.
             segment_boundaries: prepared.boundaries,
-            // The conversation's own segment history belongs to a different prompt.
-            previous_segment_count: None,
+            // The conversation's own marker history belongs to a different prompt.
+            previous_marker: roundhouse_fleet::PreviousMarker::Unmarked,
             // The judge and turn path use the same target lifetime source.
             cache_lifetime,
             // The isolation, and the one line of this file that would be

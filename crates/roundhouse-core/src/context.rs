@@ -183,6 +183,11 @@ pub struct ContextAssembler<T: Tokenizer> {
     tokenizer: T,
     items: Vec<Item>,
     buffer: TokenBuffer,
+    /// The buffer's length after each item was pushed, so `item_token_ends[k]`
+    /// is the token count of items `0..=k`. Kept as items arrive rather than
+    /// re-encoded on demand: a caller asking how long a cached prefix was
+    /// would otherwise tokenize the conversation a second time per turn.
+    item_token_ends: Vec<usize>,
 }
 
 impl<T: Tokenizer> ContextAssembler<T> {
@@ -191,6 +196,7 @@ impl<T: Tokenizer> ContextAssembler<T> {
             tokenizer,
             items: Vec::new(),
             buffer: TokenBuffer::new(block_size),
+            item_token_ends: Vec::new(),
         }
     }
 
@@ -210,7 +216,20 @@ impl<T: Tokenizer> ContextAssembler<T> {
     pub fn push(&mut self, item: Item) -> usize {
         let tokens = self.tokenizer.encode(&item.render());
         self.items.push(item);
-        self.buffer.append(&tokens)
+        let completed = self.buffer.append(&tokens);
+        self.item_token_ends.push(self.buffer.isl_tokens());
+        completed
+    }
+
+    /// How many tokens items `0..=index` occupy in [`Self::buffer`], or `None`
+    /// past the last item.
+    ///
+    /// The length of the prefix a cache marker on block `index` caches, in the
+    /// units the ledger and every quote count in — the local tokenizer's, not
+    /// the provider's, which is the same approximation `isl_tokens` already
+    /// makes for a frontier prompt.
+    pub fn tokens_through(&self, index: usize) -> Option<usize> {
+        self.item_token_ends.get(index).copied()
     }
 
     pub fn items(&self) -> &[Item] {
@@ -444,6 +463,25 @@ mod tests {
         assembler.push(Item::user_text("again"));
         let (_, boundaries) = assembler.rendered_with_boundaries();
         assert_eq!(boundaries, vec!["<|user|>hello".len()]);
+    }
+
+    /// The prefix through an item is the buffer's length when that item was
+    /// pushed — a running sum of per-item encodings, never a re-encoding of
+    /// the joined render, which a BPE could merge differently.
+    #[test]
+    fn tokens_through_an_item_is_the_buffer_length_when_it_was_pushed() {
+        let mut assembler = ContextAssembler::new(ByteTokenizer, BLOCK);
+        assert_eq!(assembler.tokens_through(0), None);
+
+        assembler.push(Item::user_text("hello"));
+        assembler.push(Item::user_text("again, longer"));
+        assert_eq!(assembler.tokens_through(0), Some("<|user|>hello".len()));
+        assert_eq!(
+            assembler.tokens_through(1),
+            Some(assembler.buffer().isl_tokens()),
+            "the last item's end is the whole buffer"
+        );
+        assert_eq!(assembler.tokens_through(2), None, "past the last item");
     }
 
     #[test]

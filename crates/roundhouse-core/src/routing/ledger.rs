@@ -11,8 +11,11 @@
 //! The append-only property of a session makes this tractable. Within one
 //! session we send the whole conversation every turn, so whatever we sent to a
 //! target last time is a *prefix* of what we are about to send. The expected
-//! cached portion is therefore `p_hit(elapsed) * last_prefix_tokens`, and the
-//! only hard part is `p_hit`.
+//! cached portion is therefore `p_hit(elapsed) * warm_prefix`, and the only
+//! hard part is `p_hit`. For a provider that caches on its own the warm prefix
+//! is the whole previous prompt; for one that caches only where a request put
+//! a marker it is the prefix through the last marker that request carried —
+//! a fact recorded at dispatch, see [`BlockMarker`].
 //!
 //! That property breaks if the context is compacted or truncated — dropping
 //! early turns makes the old prompt no longer a prefix of the new one, and the
@@ -335,12 +338,43 @@ impl PooledUsage {
     }
 }
 
+/// Where a dispatch to a target that caches only on explicit markers put its
+/// own block marker.
+///
+/// **A fact recorded at dispatch time, because it cannot be derived later.**
+/// Anthropic caches nothing a request did not mark, and the request's
+/// conversation marker competes with the client's forwarded tool markers for
+/// four slots. So the same item count can have written an entry at its
+/// penultimate block or written none at all, depending on a toolbox the log
+/// does not keep. A ledger that assumed the first reached back, on the next
+/// turn, for an entry that was never made (fleet-redis-3), and priced the
+/// whole previous request as warm when the provider had cached only up to the
+/// marker (P2).
+///
+/// Only a marker-placing dialect records one. A dialect that caches without
+/// being told — the Responses API, a local worker — records nothing, and its
+/// prediction stays the whole previous prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BlockMarker {
+    /// The request placed no conversation marker: the prompt was too short to
+    /// have a stable prefix, or the forwarded tools had spent the allowance.
+    /// Nothing in the conversation was written to the cache.
+    Unplaced,
+    /// The request's last conversation marker sat on block `segment`, and the
+    /// prefix it cached — the tools, then every item through that block — was
+    /// `prefix_tokens` long, in the same units as `isl_tokens`.
+    Placed { segment: u64, prefix_tokens: u64 },
+}
+
 /// What we last sent to a target.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TargetState {
     pub last_call_at_ms: u64,
     /// Prompt length of that call, and therefore the longest prefix that could
-    /// still be warm.
+    /// still be warm — the whole of the prediction for a target that caches
+    /// on its own, and only its upper bound for one that caches where it is
+    /// told (see [`Self::last_block_marker`]).
     pub last_prefix_tokens: u64,
     /// How many conversation items that call rendered, and therefore how many
     /// content blocks a block-slicing client cut it into.
@@ -351,13 +385,48 @@ pub struct TargetState {
     /// a much longer prompt names a position the previous write cannot be
     /// reached from — a miss on bytes that are still identical. The count is
     /// what a later request needs to work out where that write landed, and it
-    /// reaches the wire as `FrontierQuote::previous_segment_count`.
+    /// reaches the wire through `FrontierQuote::previous_marker` — but only for
+    /// a record without [`Self::last_block_marker`], whose marker position has
+    /// to be inferred from the count as `n - 2`.
     ///
     /// `#[serde(default)]` so a ledger snapshot written before this field
     /// existed still loads, and reads as "no block structure known" — which
     /// costs exactly the single-marker behaviour that was there before.
     #[serde(default)]
     pub last_segment_count: u64,
+    /// Where that call's own block marker went, for a target that caches only
+    /// on explicit markers.
+    ///
+    /// **What bounds the warm prefix on such a target**, where
+    /// [`Self::last_prefix_tokens`] only caps it: the provider cached through
+    /// the last marker it was sent and not a token further, so the final item
+    /// of that call — never marked — is billed as a write on the next turn,
+    /// not a read. And what tells the next request whether there is an entry
+    /// to reach back for at all; see [`BlockMarker`].
+    ///
+    /// `None` for a dialect that caches without markers and for a record
+    /// written before this field existed. `#[serde(default)]` so such a
+    /// snapshot still loads and predicts exactly what it did before: the
+    /// whole previous prompt, capped by the current one.
+    #[serde(default)]
+    pub last_block_marker: Option<BlockMarker>,
+}
+
+impl TargetState {
+    /// The longest prefix of that call the provider could still hold.
+    fn cacheable_prefix_tokens(&self) -> u64 {
+        match self.last_block_marker {
+            None => self.last_prefix_tokens,
+            // Zero rather than the tools alone, although forwarded tool
+            // markers may well have cached the toolbox: the ledger does not
+            // know how much of the prefix the tools were, and a quote that
+            // errs must err towards the more expensive route.
+            Some(BlockMarker::Unplaced) => 0,
+            Some(BlockMarker::Placed { prefix_tokens, .. }) => {
+                prefix_tokens.min(self.last_prefix_tokens)
+            }
+        }
+    }
 }
 
 /// One recorded dispatch, projected from the session event log.
@@ -405,13 +474,25 @@ impl CacheLedger {
     /// and carried here, not re-read at the terminal fold: by then the output
     /// items of the same turn have been appended, and a count read there would
     /// describe a longer prompt than the one the provider cached.
-    pub fn record(&mut self, target: &Target, at_ms: u64, isl_tokens: u64, segment_count: u64) {
+    ///
+    /// `block_marker` is where that dispatch placed its own conversation
+    /// marker, recorded on the `Routed` decision by the engine that built the
+    /// request; `None` for a dialect that places none.
+    pub fn record(
+        &mut self,
+        target: &Target,
+        at_ms: u64,
+        isl_tokens: u64,
+        segment_count: u64,
+        block_marker: Option<BlockMarker>,
+    ) {
         self.state.insert(
             target.ledger_key(),
             TargetState {
                 last_call_at_ms: at_ms,
                 last_prefix_tokens: isl_tokens,
                 last_segment_count: segment_count,
+                last_block_marker: block_marker,
             },
         );
     }
@@ -430,12 +511,17 @@ impl CacheLedger {
     }
 
     /// Expected number of prompt tokens served from cache.
+    ///
+    /// The warm prefix is what the provider could have cached from the last
+    /// call to `target`: the whole prompt for a target that caches on its own,
+    /// and only the prefix through the last marker for one that caches where
+    /// it is told — see [`TargetState::last_block_marker`].
     pub fn expected_cached_tokens(&self, target: &Target, now_ms: u64, isl_tokens: u64) -> f64 {
         let Some(state) = self.state_for(target) else {
             return 0.0;
         };
         // The warm prefix cannot exceed what we are about to send.
-        let prefix = state.last_prefix_tokens.min(isl_tokens);
+        let prefix = state.cacheable_prefix_tokens().min(isl_tokens);
         let elapsed = now_ms.saturating_sub(state.last_call_at_ms);
         let (model, _) = self.model_for(target);
         model.hit_probability(elapsed, prefix) * prefix as f64
@@ -680,7 +766,7 @@ mod tests {
             CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
             ProviderPricing::free(),
         );
-        ledger.record(&target, 0, 4_000, 0);
+        ledger.record(&target, 0, 4_000, 0, None);
 
         // Prompt shrank below what we last sent; only the overlap can be warm.
         assert_eq!(
@@ -691,6 +777,125 @@ mod tests {
         assert_eq!(
             ledger.expected_cached_tokens(&target, MINUTE, 9_000),
             4_000.0
+        );
+    }
+
+    /// **P2.** A target that caches only where it is told cached the previous
+    /// request through its last marker and no further, so the next quote's
+    /// warm prefix is that marker's prefix — never the whole previous prompt,
+    /// whose final item was never marked and is billed as a write.
+    #[test]
+    fn a_marked_dispatch_is_warm_only_through_its_last_marker() {
+        let mut ledger = CacheLedger::new();
+        let target = frontier("anthropic");
+        ledger.register(
+            &target,
+            CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
+            CLAUDE,
+        );
+        // A 10k-token request whose marker sat on block 4, 7k tokens in: the
+        // last 3k — the final item — were sent but never cached.
+        let marker = BlockMarker::Placed {
+            segment: 4,
+            prefix_tokens: 7_000,
+        };
+        ledger.record(&target, 0, 10_000, 6, Some(marker));
+
+        let warm = ledger.expected_cached_tokens(&target, MINUTE, 12_000);
+        assert_eq!(
+            warm, 7_000.0,
+            "warm through the marker, not through the previous request's 10k"
+        );
+        // And the cost carries the unmarked 3k plus the new 2k as writes.
+        let cost = ledger.estimate_cost_usd(&target, MINUTE, 12_000, 0);
+        let expected = CLAUDE.price_tokens(5_000.0, 7_000.0, 0.0);
+        assert!((cost - expected).abs() < 1e-12, "cost {cost} vs {expected}");
+    }
+
+    /// **CONTROL.** A target that caches without markers records no
+    /// placement, and keeps the whole previous prompt as its warm prefix.
+    #[test]
+    fn a_dispatch_with_no_recorded_marker_keeps_the_whole_prompt_prediction() {
+        let mut ledger = CacheLedger::new();
+        let target = frontier("openai");
+        ledger.register(
+            &target,
+            CacheModel::InactivityDecay {
+                half_life_ms: 5 * MINUTE,
+                max_ttl_ms: 60 * MINUTE,
+                min_prefix_tokens: 1_024,
+            },
+            CLAUDE,
+        );
+        ledger.record(&target, 0, 10_000, 6, None);
+        assert_eq!(ledger.expected_cached_tokens(&target, 0, 12_000), 10_000.0);
+    }
+
+    /// A dispatch recorded as marking no block wrote nothing to the cache, so
+    /// the next quote predicts no warm prefix at all — the toolbox included,
+    /// because the ledger cannot tell how much of the prefix it was and a
+    /// quote that errs must err expensive.
+    #[test]
+    fn a_dispatch_that_placed_no_marker_predicts_no_warm_prefix() {
+        let mut ledger = CacheLedger::new();
+        let target = frontier("anthropic");
+        ledger.register(
+            &target,
+            CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
+            CLAUDE,
+        );
+        ledger.record(&target, 0, 10_000, 6, Some(BlockMarker::Unplaced));
+        assert_eq!(ledger.expected_cached_tokens(&target, MINUTE, 12_000), 0.0);
+    }
+
+    /// A marker's prefix larger than the prompt that carried it is not a
+    /// warm prefix anyone could hold; the previous prompt still caps it.
+    #[test]
+    fn a_marker_prefix_is_capped_by_the_prompt_that_carried_it() {
+        let mut ledger = CacheLedger::new();
+        let target = frontier("anthropic");
+        ledger.register(
+            &target,
+            CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
+            CLAUDE,
+        );
+        let marker = BlockMarker::Placed {
+            segment: 4,
+            prefix_tokens: 50_000,
+        };
+        ledger.record(&target, 0, 10_000, 6, Some(marker));
+        assert_eq!(
+            ledger.expected_cached_tokens(&target, MINUTE, 12_000),
+            10_000.0
+        );
+    }
+
+    /// **Replay compatibility.** A ledger record written before placements
+    /// were recorded loads with none, and predicts exactly what it did
+    /// before: the whole previous prompt, capped by the current one.
+    #[test]
+    fn a_target_state_without_a_marker_field_loads_and_predicts_as_before() {
+        let old = r#"{"last_call_at_ms":0,"last_prefix_tokens":10000,"last_segment_count":6}"#;
+        let state: TargetState = serde_json::from_str(old).unwrap();
+        assert_eq!(state.last_block_marker, None);
+
+        let mut ledger = CacheLedger::new();
+        let target = frontier("anthropic");
+        ledger.register(
+            &target,
+            CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
+            CLAUDE,
+        );
+        ledger.record(
+            &target,
+            state.last_call_at_ms,
+            state.last_prefix_tokens,
+            state.last_segment_count,
+            state.last_block_marker,
+        );
+        assert_eq!(
+            ledger.expected_cached_tokens(&target, MINUTE, 12_000),
+            10_000.0
         );
     }
 
@@ -715,7 +920,7 @@ mod tests {
         assert!((cold - (100_000.0 * 3.75e-6 + 500.0 * 15e-6)).abs() < 1e-9);
 
         // Seen a minute ago with a 100k prefix: reads at the cached rate.
-        ledger.record(&target, 0, 100_000, 0);
+        ledger.record(&target, 0, 100_000, 0, None);
         let warm = ledger.estimate_cost_usd(&target, MINUTE, 100_000, 500);
         assert!((warm - (100_000.0 * 0.3e-6 + 500.0 * 15e-6)).abs() < 1e-9);
         assert!(warm < cold, "a warm prefix must be cheaper than a cold one");
@@ -730,7 +935,7 @@ mod tests {
             CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
             ProviderPricing::free(),
         );
-        ledger.record(&target, 0, 50_000, 0);
+        ledger.record(&target, 0, 50_000, 0, None);
         assert!(ledger.expected_cached_tokens(&target, MINUTE, 50_000) > 0.0);
 
         ledger.invalidate();
@@ -746,7 +951,7 @@ mod tests {
             CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
             ProviderPricing::free(),
         );
-        ledger.record(&target, 0, 10_000, 0);
+        ledger.record(&target, 0, 10_000, 0, None);
 
         assert_eq!(
             ledger.expected_cached_tokens(&target, 4 * MINUTE, 10_000),

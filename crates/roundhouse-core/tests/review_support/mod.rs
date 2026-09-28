@@ -96,6 +96,7 @@ pub fn declared(goal: &str) -> Objective {
 /// `objective` the way the engine stamps its selection snapshot.
 pub fn decision(turn_index: u64, objective: Option<ObjectiveVersion>) -> DecisionRecord {
     DecisionRecord {
+        block_marker: None,
         selection: Some(Box::new(SelectionSnapshot {
             features: LocalFeatures {
                 extractor_revision: 1,
