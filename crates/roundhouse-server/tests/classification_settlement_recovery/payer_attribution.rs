@@ -234,11 +234,11 @@ async fn control_the_rig_classifies_its_first_turn_through_a_frontier_target() {
 ///   repair is a duplicate and must leave the balance exactly where it was.
 ///
 /// **The log is seeded, not produced by a classifying turn.** Every turn ends
-/// by driving repairs, so a first deployment that made the call would leave
-/// its own repair worker in flight under its own `Monthly` configuration, and
-/// that worker -- not the restarted process -- could be the settle that rolls
-/// the account. A real restart does not carry the old process's tasks over;
-/// seeding is what makes the restarted `Total` process the only repairer.
+/// by driving repairs, so a first deployment that made the call can settle it
+/// under its own `Monthly` configuration before it is shut down. That turns a
+/// `BeforeApply` first charge into a duplicate, and makes the restarted
+/// `Total` process something other than the only repairer. Seeding the log
+/// and driving the original settle by hand fixes both.
 #[tokio::test]
 async fn a_repair_after_a_window_mode_change_keeps_the_live_windows_committed_spend() {
     for mode in [FailMode::BeforeApply, FailMode::AfterApply] {

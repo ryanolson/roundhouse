@@ -654,14 +654,17 @@ async fn drive_until_repaired_for<S: SessionStore + Send + Sync + 'static>(
 /// the result already delivered into the durable log.
 ///
 /// Returns the store, the session, the call's identity and its measured price.
-/// The deployment that produced it is **dropped before returning**, but that
-/// is not the whole of a restart. `t2` ends, like every turn, by driving
-/// repairs, and dropping the deployment stops admission without aborting a
-/// repair worker already spawned. That worker settles under *this*
-/// deployment's configuration at the test's next yield, so a caller that
-/// changes the configuration before the restart — the budget window, say —
-/// cannot tell which process made the settle it observes. Such a test seeds
-/// the log with [`seed_unconfirmed_settlement`] instead.
+/// The deployment that produced it is **shut down and dropped before
+/// returning**: everything after this point has only the log and the ledger,
+/// which is exactly the state a restarted process finds.
+///
+/// **The shutdown is load-bearing, not tidiness.** `t2` ends, like every turn,
+/// by driving repairs, and `Deployment` holds no `Supervisor`, so a plain drop
+/// stops nothing. The repair worker `t2` spawned would keep running and settle
+/// under *this* deployment's configuration at the test's next yield — and a
+/// restart test would then be unable to tell which process made the settle it
+/// observes. `ClassificationRuntime::shutdown` aborts that worker, the way a
+/// real process exit would.
 async fn a_session_with_an_unconfirmed_settlement(
     store: &Arc<MemoryStore>,
     ledger: &Arc<RiggedLedger>,
@@ -683,6 +686,7 @@ async fn a_session_with_an_unconfirmed_settlement(
         results[0].1.outcome.committed_usd().is_none(),
         "the premise: nothing confirms this charge yet"
     );
+    first.runtime.shutdown().await;
     drop(first);
     (call_id, usd)
 }
