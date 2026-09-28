@@ -18,8 +18,10 @@
 //! One quote-reading exception sits on that path, and it is the only one: an
 //! efficient pick whose head costs *more* for this turn than some admitted
 //! capable target yields to it, because a tier that exists to save cost has
-//! nothing left to argue when it is the expensive option. See the guard inside
-//! `resolve` and [`DecisionSource::CostGuard`].
+//! nothing left to argue when it is the expensive option. A guarded turn's
+//! fallbacks are the other capable members that also quote below the
+//! efficient head, then the efficient tier, then the rest of the capable
+//! tier. See the guard inside `resolve` and [`DecisionSource::CostGuard`].
 //!
 //! # Attribution
 //!
@@ -597,6 +599,11 @@ enum Resolved<'a> {
     /// A tier served, one way or another: the ordered pool [`StageOutcome`]
     /// describes, head first.
     ///
+    /// `ordered` is one tier's pool on every arm but the cost guard's, whose
+    /// fallbacks span both tiers (see the guard in `StagePolicy::resolve`).
+    /// `served` names the tier of the head, which is what the rationale and
+    /// the evidence describe.
+    ///
     /// `served` is total over this arm, read directly off the branch that
     /// produced it rather than re-derived from `outcome` by matching all
     /// four `StageOutcome` arms a second time -- `outcome` spells the served
@@ -626,10 +633,10 @@ impl StagePolicy {
     /// put it back. Walking the recipe rather than the pool is what makes the
     /// *order* the operator's rather than the quoter's.
     ///
-    /// The cost guard in `resolve` is the one place a quote reorders anything,
-    /// and it reorders *which tier serves* rather than this list: it picks the
-    /// first capable member cheaper than the efficient head and leaves the rest
-    /// of the tier behind it exactly as this function ordered them.
+    /// The cost guard in `resolve` is the one place a quote reorders anything.
+    /// It never reorders *within* a tier: it splits the capable tier by one
+    /// comparison against the efficient head, and each part keeps the order
+    /// this function gave it.
     fn tier_pool<'a>(
         recipe: &TierRecipe,
         tier: Tier,
@@ -723,12 +730,29 @@ impl StagePolicy {
                      so it takes the turn on cost as well as on function"
                 );
                 let displaced = head.target.policy_identity();
-                // Rotated rather than truncated so the rest of the capable
-                // tier stays behind it in the recipe's order: a guarded
-                // turn's fallbacks are a capable turn's fallbacks.
-                let mut ordered = capable;
-                let winner = ordered.remove(cheaper);
-                ordered.insert(0, winner);
+                // **Fallbacks by the same comparison that picked the winner.**
+                // First every capable member that also quotes below the
+                // efficient head (the winner leads them: `position` above
+                // found the first member this same predicate keeps),
+                // then the efficient tier the pick named, then the capable
+                // members that quote at or above the head, each part in
+                // recipe order. The rule used to be "a guarded turn's
+                // fallbacks are a capable turn's fallbacks", which let a
+                // failover from the cheap winner go straight to the most
+                // expensive capable member and never try the efficient tier
+                // at all -- a failover that raised the bill past the head the
+                // guard had just refused for costing too much (2026-09-28
+                // ruling 4). A capable member that quotes no less than the
+                // head dominates nothing, so it has no claim to go ahead of
+                // the tier the pick named.
+                let (cheaper_capable, dearer_capable): (Vec<_>, Vec<_>) = capable
+                    .into_iter()
+                    .partition(|candidate| candidate.expected_cost_usd < head.expected_cost_usd);
+                let ordered: Vec<&Candidate> = cheaper_capable
+                    .into_iter()
+                    .chain(picked)
+                    .chain(dearer_capable)
+                    .collect();
                 return Resolved::Tier {
                     served: Tier::Capable,
                     outcome: StageOutcome::CostGuard { displaced },
@@ -951,11 +975,23 @@ impl RoutingPolicy for StagePolicy {
             }
             StageOutcome::Served { .. } | StageOutcome::DegradedPastRecipe { .. } => {}
         }
+        // A guarded turn's fallbacks span both tiers (see `resolve`), and the
+        // sentence says so rather than calling them one tier's. Names of the
+        // tiers only, no prices, for the reason the clauses above give.
         if !fallbacks.is_empty() {
-            rationale.push_str(&format!(
-                "; {} fallback(s) in the same tier",
-                fallbacks.len()
-            ));
+            match &evidence.outcome {
+                StageOutcome::CostGuard { .. } => rationale.push_str(&format!(
+                    "; {} fallback(s): cheaper {} targets, then the {} tier, then the rest of the {} tier",
+                    fallbacks.len(),
+                    served.label(),
+                    pick.tier.label(),
+                    served.label(),
+                )),
+                _ => rationale.push_str(&format!(
+                    "; {} fallback(s) in the same tier",
+                    fallbacks.len()
+                )),
+            }
         }
 
         Ok(admitted.decide_staged(
@@ -2071,8 +2107,13 @@ mod tests {
     /// A single-member capable fixture cannot tell the two apart, and taking
     /// the head would let the guard serve a target pricier than the one it
     /// displaced — which is the defect it exists to prevent, arrived at from
-    /// the other side. The fallbacks stay the rest of the capable tier in the
-    /// recipe's order, so the log reads as the capable-tier turn it is.
+    /// the other side.
+    ///
+    /// **And the failover after it is the efficient tier, not `sol`.** This is
+    /// the review-round-6 example: a failover from `nova` used to go to the
+    /// rest of the capable tier, so the next hop was the most expensive thing
+    /// here and `luna` — the tier the pick named, and cheaper than `sol` — was
+    /// never tried (2026-09-28 ruling 4).
     #[tokio::test]
     async fn the_guard_serves_the_first_capable_target_that_is_cheaper_not_the_tier_head() {
         let candidates = vec![
@@ -2096,8 +2137,75 @@ mod tests {
         );
         assert_eq!(
             decision.fallbacks,
-            vec![candidates[0].target.clone()],
-            "and the rest of the capable tier is behind it, in the recipe's order"
+            vec![candidates[2].target.clone(), candidates[0].target.clone()],
+            "the efficient tier fails over first, and the capable member that \
+             quotes above the efficient head comes last"
+        );
+    }
+
+    /// **Every capable member cheaper than the efficient head goes ahead of the
+    /// efficient tier, in recipe order; every other one goes behind it.**
+    ///
+    /// Four capable members: `sol` quotes above the head, `nova` and `vega`
+    /// below it, and `orion` exactly at it. Strictly below is the guard's own
+    /// rule, so the tie is not a cheaper member and waits behind the efficient
+    /// tier with `sol`. The winner is still the first cheaper member, `nova`.
+    #[tokio::test]
+    async fn a_guarded_turn_fails_over_to_cheaper_capable_members_then_the_efficient_tier() {
+        let recipe = TierRecipe::new(
+            vec![
+                "openai/sol".into(),
+                "openai/nova".into(),
+                "openai/orion".into(),
+                "openai/vega".into(),
+            ],
+            vec!["openai/luna".into(), "openai/io".into()],
+            PickerMode::EfficientFirst,
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        .unwrap();
+        let candidates = vec![
+            hosted("sol", 0.95, 0.90),
+            hosted("nova", 0.90, 0.04),
+            hosted("orion", 0.88, 0.12),
+            hosted("vega", 0.85, 0.08),
+            hosted("luna", 0.70, 0.12),
+            hosted("io", 0.65, 0.20),
+        ];
+        let fixture = Fixture::open()
+            .with_recipe(recipe)
+            .with_signals(deescalating());
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+
+        assert_eq!(
+            (decision.target.clone(), decision.source),
+            (
+                candidates[1].target.clone(),
+                Some(DecisionSource::CostGuard)
+            ),
+            "{}",
+            decision.rationale
+        );
+        let named = |i: usize| candidates[i].target.clone();
+        assert_eq!(
+            decision.fallbacks,
+            // vega (cheaper capable), luna and io (the efficient tier, in
+            // recipe order), then sol and orion (the rest of the capable
+            // tier, in recipe order).
+            vec![named(3), named(4), named(5), named(0), named(2)],
+            "{}",
+            decision.rationale
+        );
+        assert!(
+            !decision.rationale.contains("in the same tier")
+                && decision.rationale.contains("then the weak tier"),
+            "fallbacks that span both tiers must not be described as one tier's: {}",
+            decision.rationale
+        );
+        assert!(
+            !decision.rationale.contains('$'),
+            "and the sentence still carries no price: {}",
+            decision.rationale
         );
     }
 
