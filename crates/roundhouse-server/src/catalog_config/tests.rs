@@ -443,6 +443,53 @@ fn a_measured_local_curve_reaches_the_engine_config() {
     );
 }
 
+/// **The router's capability gate and the dashboard's read one local prior.**
+/// The dashboard prices the local model at the catalog's `local_quality` entry,
+/// or its `default_local_quality` when the model has none. A router left at the
+/// built-in prior would admit local under a `min_quality` policy the catalog
+/// was written to keep it out of, while the dashboard priced it as the weaker
+/// model the file declared.
+#[test]
+fn the_catalogs_local_quality_prior_reaches_the_engine_config() {
+    let local_model = EngineConfig::default().local_model;
+
+    let declared = CatalogConfig::from_json(
+        &with_local_section(&format!(
+            r#",
+          "local_quality": {{ "{local_model}": 0.3 }}"#
+        )),
+        "test",
+    )
+    .unwrap();
+    assert_eq!(
+        engine_config(Some(&declared)).local_quality_prior,
+        0.3,
+        "the prior the catalog declares for the engine's own local model"
+    );
+
+    let defaulted = CatalogConfig::from_json(
+        &with_local_section(
+            r#",
+          "local_quality": { "some_other_model": 0.9 },
+          "default_local_quality": 0.45"#,
+        ),
+        "test",
+    )
+    .unwrap();
+    assert_eq!(
+        engine_config(Some(&defaulted)).local_quality_prior,
+        0.45,
+        "a model the catalog names no prior for takes the catalog's default, \
+         the same fallback the dashboard applies"
+    );
+
+    // The control: no catalog keeps the built-in prior.
+    assert_eq!(
+        engine_config(None).local_quality_prior,
+        EngineConfig::default().local_quality_prior
+    );
+}
+
 /// A misspelled local-latency key is silently ignored without
 /// `deny_unknown_fields`, which loads the slope at its default `0.0` and
 /// quotes every local worker flat with nothing in the file to say why -- the

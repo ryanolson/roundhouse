@@ -775,18 +775,32 @@ pub fn from_env() -> Result<Option<CatalogConfig>, CatalogError> {
     }
 }
 
-/// Apply the catalog's local latency values to the engine defaults.
+/// Apply the catalog's local latency values and local quality prior to the
+/// engine defaults.
 ///
 /// The no-catalog path uses the same defaults as an omitted field. Keeping this
 /// composition beside the loader lets tests exercise it without booting a server.
+///
+/// **The prior is resolved the way [`CatalogConfig::metrics_config`] hands it to
+/// the dashboard**: the engine's own local model's `local_quality` entry, else
+/// `default_local_quality`. The router's capability gate and the dashboard's
+/// then read one number. Left at the built-in prior, the router would admit
+/// local under a `min_quality` policy the catalog was written to keep it out
+/// of, while the dashboard priced it as the weaker model the file declared.
 pub fn engine_config(config: Option<&CatalogConfig>) -> EngineConfig {
+    let defaults = EngineConfig::default();
     let Some(config) = config else {
-        return EngineConfig::default();
+        return defaults;
     };
     EngineConfig {
+        local_quality_prior: config
+            .local_quality
+            .get(&defaults.local_model)
+            .copied()
+            .unwrap_or(config.default_local_quality),
         local_base_ttft_ms: config.local_base_ttft_ms,
         local_ttft_ms_per_prefill_token: config.local_ttft_ms_per_prefill_token,
-        ..EngineConfig::default()
+        ..defaults
     }
 }
 

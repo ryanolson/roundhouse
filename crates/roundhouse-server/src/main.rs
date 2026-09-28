@@ -643,7 +643,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let metrics_config = Arc::new(metrics_config);
 
-    // Resolve both sides of the local/hosted latency comparison from this catalog.
+    // Resolve the local latency curve and quality prior from this catalog, so
+    // the router and the dashboard compare local against the same numbers.
     let engine_config = catalog_config::engine_config(config.as_ref());
 
     // Background turn classification, off unless a file says otherwise. Read
