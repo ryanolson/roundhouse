@@ -7,7 +7,7 @@
 //! carried on the quote, so the ledger's retention prediction and the marker on
 //! the wire cannot name different numbers.
 //!
-//! This binary owns the engine half of that join: what `connect` puts on the
+//! This binary owns the engine half of that join: what `frontier_quote` puts on the
 //! `FrontierQuote` for a chosen target. The wire half — what
 //! `AnthropicMessagesClient::body` serializes from the field — is asserted in
 //! `roundhouse-fleet`, where `body` is reachable.
@@ -163,7 +163,7 @@ async fn an_automatic_cache_model_puts_no_lifetime_on_the_quote() {
 
 /// **CORRECTNESS (fleet-redis-2, dispatch-time).** A spec that skipped
 /// `CatalogConfig`'s own boot refusal of an unspellable Messages TTL still
-/// must not reach a socket -- `connect` resolves the lifetime before it
+/// must not reach a socket -- `frontier_quote` resolves the lifetime before it
 /// builds the quote, and a turn that cannot resolve one is refused, not
 /// dispatched at the wire's own five-minute default.
 #[tokio::test]

@@ -582,8 +582,10 @@ pub enum PreviousMarker {
     /// The previous request's last conversation marker sat on block `index`,
     /// as recorded when it was dispatched.
     Block(usize),
-    /// Only the previous request's item count is known — a ledger record
-    /// written before placements were.
+    /// Only the previous request's item count is known: a ledger record
+    /// written before placements were, or any record of a dialect that caches
+    /// without markers (which never records one). Only the Anthropic client
+    /// reads this, so the second source never reaches a wire.
     Inferred { segment_count: usize },
 }
 

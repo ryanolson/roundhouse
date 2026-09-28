@@ -2567,7 +2567,13 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             // Asked of the quote itself, so the placement recorded is the one
             // sent. The prefix a marker caches is the toolbox and then every
             // item through the marked block. A quote that cannot be built
-            // records nothing — it fails in `connect` before anything is sent.
+            // records nothing — it fails in `connect_frontier` before anything
+            // is sent. `.ok()` is safe only because `marker_placement` and
+            // `body()` make exactly the same fallible calls (`segments()` and
+            // `tools_for`): a placement that errs is a request that is never
+            // sent. A new fallible step in `body()` must be added to
+            // `marker_placement` too, or this records nothing for a request
+            // that goes out.
             let block_marker = match &frontier_quote {
                 Some(Ok(quote)) => quote.marker_placement().ok().and_then(|placement| {
                     placement.block_marker(|index| {
@@ -2699,22 +2705,28 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 .await?;
 
             let started = Instant::now();
-            match self
-                .connect(
-                    &target,
-                    &assembler,
-                    local_quote.as_ref(),
-                    frontier_quote,
-                    // The *conversation's* count, not the request's: the only
-                    // consumer below is the local path, which receives the
-                    // prompt buffer and no toolbox at all, so handing it the
-                    // tools-inclusive number would report input the worker never
-                    // saw and subtract a prefill it never did (F4).
-                    conversation_tokens,
-                    deadline_at,
-                )
-                .await
-            {
+            // One match on the dispatch's kind: `frontier_quote` is `Some`
+            // exactly for a frontier target, because it was built from the
+            // same match above.
+            let connected = match frontier_quote {
+                Some(quote) => self.connect_frontier(&target, quote, deadline_at).await,
+                None => {
+                    self.connect_local(
+                        &target,
+                        &assembler,
+                        local_quote.as_ref(),
+                        // The *conversation's* count, not the request's: the
+                        // local worker receives the prompt buffer and no
+                        // toolbox at all, so handing it the tools-inclusive
+                        // number would report input the worker never saw and
+                        // subtract a prefill it never did (F4).
+                        conversation_tokens,
+                        deadline_at,
+                    )
+                    .await
+                }
+            };
+            match connected {
                 Ok(stream) => {
                     opened = Some(stream);
                     break;
@@ -2972,89 +2984,87 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         Ok(quote)
     }
 
-    /// Open a stream to one target. Decides nothing, records nothing.
+    /// Open a stream to a local worker. Decides nothing, records nothing.
     ///
-    /// Split out of [`Self::plan`] so the failover loop reads as a loop over
-    /// targets rather than as a loop wrapped around a two-armed match, and — the
-    /// load-bearing half — so that the one place a [`FrontierError`] is still
-    /// typed is the place that has to classify it. Once `EngineError::from`
-    /// swallows the variant, "was this worth another target" is a question about
-    /// a string.
-    async fn connect(
+    /// No failover arm, deliberately — see the loop in `plan`. A local
+    /// failure is a fleet fact, and the router's load axis is where a second
+    /// worker is chosen.
+    async fn connect_local(
         &self,
         target: &Target,
         assembler: &ContextAssembler<T>,
         local_quote: Option<&LocalQuote>,
-        // The request a frontier target is sent, built by the caller before it
-        // recorded this dispatch — see `Self::frontier_quote` for why there —
-        // and `None` for a local target. An `Err` is surfaced here rather than
-        // there, so a quote that cannot be built still fails the dispatch
-        // *after* its `Routed` was written, where it always has.
-        frontier_quote: Option<Result<FrontierQuote, ConnectFailure>>,
         // The conversation's own token count — deliberately *not* the turn's
-        // tools-inclusive `isl_tokens`. Only the local arm reads it, and a local
-        // worker is sent the prompt buffer alone; see the call site (F4).
+        // tools-inclusive `isl_tokens`; see the call site (F4).
         conversation_tokens: usize,
         deadline_at: Instant,
     ) -> Result<FrontierStream, ConnectFailure> {
-        match target {
-            // No failover arm, deliberately — see the loop in `plan`. A local
-            // failure is a fleet fact, and the router's load axis is where a
-            // second worker is chosen.
-            Target::Local { .. } => {
-                let quote = local_quote.ok_or_else(|| {
-                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
-                })?;
-                let fleet = self.fleet.as_ref().ok_or_else(|| {
-                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
-                })?;
-                self.local_stream(
-                    fleet,
-                    quote,
-                    assembler.buffer().tokens(),
-                    conversation_tokens,
-                    deadline_at,
-                )
-                .await
-                .map_err(ConnectFailure::terminal)
-            }
-            Target::Frontier { .. } => {
-                let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
-                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
-                })?;
-                let quote = frontier_quote.unwrap_or_else(|| {
-                    Err(ConnectFailure::terminal(EngineError::UnresolvableTarget(
-                        target.clone(),
-                    )))
-                })?;
-                // **The registry is resolved from the spec, not from the
-                // process.** `spec.provider` is the same string the catalog's
-                // boundary cross-checked against the `providers` section at
-                // load, which is what makes this lookup total on a booted
-                // deployment rather than a place a turn can discover a
-                // misconfiguration. Resolving it here rather than at `choose`
-                // keeps one rule: a client is picked by the target that was
-                // chosen, never by a target that might have been.
-                let client = self
-                    .frontier_clients
-                    .for_provider(&spec.provider)
-                    .map_err(|error| ConnectFailure::terminal(EngineError::from(error)))?;
-                // Not `bounded`, and that is the one line the whole failover
-                // rests on: `bounded` converts through `EngineError::from`,
-                // which erases the variant this classification reads. The
-                // deadline is applied here by hand so the `FrontierError`
-                // survives long enough to be asked whether it is worth another
-                // target — and a deadline strike is deliberately terminal, since
-                // there is by definition no time left to try anywhere else.
-                match tokio::time::timeout_at(deadline_at, client.execute(&quote)).await {
-                    Ok(Ok(stream)) => Ok(stream),
-                    Ok(Err(error)) => Err(ConnectFailure {
-                        class: error.failover_class(),
-                        error: EngineError::Frontier(error),
-                    }),
-                    Err(_) => Err(ConnectFailure::terminal(self.deadline_struck())),
-                }
-            }
+        let quote = local_quote.ok_or_else(|| {
+            ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+        })?;
+        let fleet = self.fleet.as_ref().ok_or_else(|| {
+            ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+        })?;
+        self.local_stream(
+            fleet,
+            quote,
+            assembler.buffer().tokens(),
+            conversation_tokens,
+            deadline_at,
+        )
+        .await
+        .map_err(ConnectFailure::terminal)
+    }
+
+    /// Open a stream to a frontier target. Decides nothing, records nothing.
+    ///
+    /// Split out of [`Self::plan`] so the failover loop reads as a loop over
+    /// targets, and — the load-bearing half — so that the one place a
+    /// [`FrontierError`] is still typed is the place that has to classify it.
+    /// Once `EngineError::from` swallows the variant, "was this worth another
+    /// target" is a question about a string.
+    ///
+    /// `quote` is the request the caller built before it recorded this
+    /// dispatch — see [`Self::frontier_quote`] for why there. An `Err` is
+    /// surfaced here rather than there, so a quote that cannot be built still
+    /// fails the dispatch *after* its `Routed` was written, where it always
+    /// has.
+    async fn connect_frontier(
+        &self,
+        target: &Target,
+        quote: Result<FrontierQuote, ConnectFailure>,
+        deadline_at: Instant,
+    ) -> Result<FrontierStream, ConnectFailure> {
+        let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
+            ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+        })?;
+        let quote = quote?;
+        // **The registry is resolved from the spec, not from the
+        // process.** `spec.provider` is the same string the catalog's
+        // boundary cross-checked against the `providers` section at
+        // load, which is what makes this lookup total on a booted
+        // deployment rather than a place a turn can discover a
+        // misconfiguration. Resolving it here rather than at `choose`
+        // keeps one rule: a client is picked by the target that was
+        // chosen, never by a target that might have been.
+        let client = self
+            .frontier_clients
+            .for_provider(&spec.provider)
+            .map_err(|error| ConnectFailure::terminal(EngineError::from(error)))?;
+        // Not `bounded`, and that is the one line the whole failover
+        // rests on: `bounded` converts through `EngineError::from`,
+        // which erases the variant this classification reads. The
+        // deadline is applied here by hand so the `FrontierError`
+        // survives long enough to be asked whether it is worth another
+        // target — and a deadline strike is deliberately terminal, since
+        // there is by definition no time left to try anywhere else.
+        match tokio::time::timeout_at(deadline_at, client.execute(&quote)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(error)) => Err(ConnectFailure {
+                class: error.failover_class(),
+                error: EngineError::Frontier(error),
+            }),
+            Err(_) => Err(ConnectFailure::terminal(self.deadline_struck())),
         }
     }
 

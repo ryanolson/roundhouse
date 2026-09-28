@@ -870,6 +870,27 @@ mod tests {
         );
     }
 
+    /// **The durable shape of a marker, pinned byte for byte.** The Redis
+    /// store serializes every `Routed` event, and a renamed field, a dropped
+    /// tag, or a reordered variant would stop every Anthropic session's log
+    /// from replaying. The in-memory store keeps structs and would not notice.
+    #[test]
+    fn a_block_marker_serializes_to_its_pinned_shape_and_back() {
+        for (marker, json) in [
+            (
+                BlockMarker::Placed {
+                    segment: 4,
+                    prefix_tokens: 7000,
+                },
+                r#"{"kind":"placed","segment":4,"prefix_tokens":7000}"#,
+            ),
+            (BlockMarker::Unplaced, r#"{"kind":"unplaced"}"#),
+        ] {
+            assert_eq!(serde_json::to_string(&marker).unwrap(), json);
+            assert_eq!(serde_json::from_str::<BlockMarker>(json).unwrap(), marker);
+        }
+    }
+
     /// **Replay compatibility, one generation further back.** A record
     /// written before segment counts existed carries only the call time and
     /// the prefix. It must still load, with no block structure known.

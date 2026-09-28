@@ -729,7 +729,7 @@ mod tests {
     /// arrives on the Messages surface with twenty-four
     /// `{name, description, input_schema}` declarations, and routing sends it to
     /// one of `catalog.example.json`'s four `openai_responses` entries because
-    /// that entry is cheaper. `plan` reads no dialect, `connect` copies the
+    /// that entry is cheaper. `plan` reads no dialect, `frontier_quote` copies the
     /// client's raw JSON onto the quote, and this client used to put whatever
     /// `tools` held under the wire body's `"tools"` key unexamined — so the
     /// upstream got a tool array with no `type` and no `parameters`, 400'd, and
