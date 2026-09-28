@@ -159,11 +159,23 @@ impl StageEvidence {
     /// computed a second time by the caller and carried next to it hoping the
     /// two agree. A cost guard moved the decision off the scorer's own
     /// answer, so it names itself; a recipe degrade served no tier at all, so
-    /// it names none; every other arm is exactly what the scorer picked.
+    /// it names none; a signal that picked the cheap tier and found it empty
+    /// did not pick the capable tier that served, so it is the fall-open
+    /// [`DecisionSource::Ambiguous`] names; every other arm is exactly what
+    /// the scorer picked.
+    ///
+    /// The fallthrough arm matters because the handoff note gates on this
+    /// value. Carried through, a `Dimensions` de-escalation would have the
+    /// note tell the capable model the previous steps were in trouble when
+    /// the signals said the opposite — the same reason `CostGuard` is not
+    /// signal-driven.
     pub fn source(&self) -> Option<DecisionSource> {
         match self.outcome {
             StageOutcome::CostGuard { .. } => Some(DecisionSource::CostGuard),
             StageOutcome::DegradedPastRecipe { .. } => None,
+            StageOutcome::PickedTierEmpty {
+                served: Tier::Capable,
+            } if self.pick.source.is_signal_driven() => Some(DecisionSource::Ambiguous),
             StageOutcome::Served { .. } | StageOutcome::PickedTierEmpty { .. } => {
                 Some(self.pick.source)
             }

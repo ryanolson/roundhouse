@@ -190,7 +190,9 @@ pub enum DecisionSource {
     TestsPassed,
     /// The scorer, above the configured confidence threshold.
     Dimensions,
-    /// Nothing was decisive, so the picker's default tier took the turn.
+    /// Nothing decisive chose the tier that served: the picker's default tier
+    /// took the turn, or a signal picked the cheap tier, it admitted nothing,
+    /// and the capable tier took the turn in its place.
     Ambiguous,
     /// The picked tier was [`Tier::Efficient`] and an admitted capable target
     /// quoted *lower* for this turn than the efficient tier's head, so the
@@ -2184,6 +2186,54 @@ mod tests {
             "the fallthrough must report the capable tier it actually \
              served, not the efficient tier the pick fell through: {}",
             decision.rationale
+        );
+    }
+
+    /// **A scorer that picked the cheap tier did not pick the capable tier
+    /// that served when the cheap one admitted nothing.** The decision's
+    /// source is what the handoff-note gate reads, and `Dimensions` is
+    /// signal-driven in both directions; carried through a fallthrough, it
+    /// would have the note tell the capable model the previous steps were in
+    /// trouble when the signals said the opposite. The same argument
+    /// `DecisionSource::is_signal_driven` makes for `CostGuard`.
+    #[tokio::test]
+    async fn a_cheap_pick_that_fell_through_to_the_capable_tier_is_not_signal_driven() {
+        let recipe = TierRecipe::new(
+            vec!["openai/sol".into()],
+            vec!["openai/luna".into()],
+            PickerMode::EfficientFirst,
+            0.3,
+        )
+        .unwrap();
+        // Writing and nothing else: the scorer de-escalates with confidence.
+        let writing = TurnSignals {
+            tools: ToolSignals {
+                recent_write_count: 3,
+                severity: 0.0,
+                ..Default::default()
+            },
+            turn_depth: 1,
+        };
+        let pick = pick_tier(&writing, PickerMode::EfficientFirst, 0.3);
+        assert_eq!(
+            (pick.tier, pick.source),
+            (Tier::Efficient, DecisionSource::Dimensions),
+            "the premise: the scorer itself picked the cheap tier"
+        );
+
+        // `luna` is not in the pool, so the efficient tier admits nothing.
+        let candidates = vec![hosted("sol", 0.95, 0.90)];
+        let fixture = Fixture::open().with_recipe(recipe).with_signals(writing);
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+
+        assert_eq!(decision.target, candidates[0].target, "sol serves");
+        assert!(
+            !decision
+                .source
+                .is_some_and(DecisionSource::is_signal_driven),
+            "no signal chose the capable tier, so the source must not be one \
+             the handoff note narrates: {:?}",
+            decision.source
         );
     }
 }
