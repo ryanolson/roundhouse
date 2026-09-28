@@ -1067,7 +1067,7 @@ It is reported beside the total, never added into it.
 
 The metrics JSON and dashboard report classifier costs separately from serving costs. The `evaluation` object distinguishes measured usage, unknown usage, pending intents, and calls refused before HTTP. Its `measured_usd` uses each call's recorded rates. It is not a provider invoice, and current catalog changes do not reprice it. Classifier tokens do not enter serving counters.
 
-Cost and settlement are separate observations. An unconfirmed settlement does not erase recorded usage or cost. A later repair updates the acknowledgement without adding another call or another charge. Missing usage and unanswered intents keep evaluation cost incomplete. Replayed events and duplicate results count once per session and call identity.
+Cost and settlement are separate observations. An unconfirmed settlement does not erase recorded usage or cost. A later repair updates the acknowledgement without adding another call or another charge. The settlement `committed_usd` includes the estimates booked for calls with unknown usage; `measured_usd` does not. Missing usage and unanswered intents keep evaluation cost incomplete. Replayed events and duplicate results count once per session and call identity.
 
 The `evaluation.models` rows distinguish the requested model from the service-reported model. Missing reported identity stays unknown. The existing access rules apply: admin credentials see deployment totals, while turn credentials see their principal's totals.
 
@@ -1162,6 +1162,8 @@ plane's deployment/project/member tiers.
 
 For a measured prefill rate, set the slope to `1000 / tokens_per_second`. The quote is the base plus that slope times Dynamo's effective prefill tokens. Leave the slope at zero until a measurement exists. The server loads these values into its engine configuration, but the current binary does not attach a local fleet.
 
+**Fleet residency bound.** The catalog also accepts `fleet_quote_deadline_ms`, which defaults to `500`. It bounds the Dynamo residency call on a turn that has an admitted hosted target. If the fleet returns an error or does not answer in time, the turn drops the local candidate, routes among its hosted targets, and records `local_quote_skipped` as `fleet_error` or `fleet_timeout`. A turn whose policy admits only local targets does not use this bound: it waits up to the turn deadline, and a fleet failure still fails the turn, so a local-only session never goes to a hosted model.
+
 **Cache lifetime.** For an `anthropic_messages` target, `cache_model: {"kind": "deterministic", "ttl_ms": 3600000}` selects one-hour conversation cache markers. The catalog requires `cache_write_per_mtok_usd` to equal twice the input rate for that entry. The error names the required rate. This check also applies to Messages gateways, regardless of their configured provider name.
 
 Roundhouse sets existing tool cache markers to the same lifetime as its conversation markers. A one-hour target requests `1h`. Other targets omit the TTL field for the five-minute default. This prevents shorter tool markers from preceding longer conversation markers. Tool definitions, schema contents, marker positions, and the four-marker allowance remain unchanged.
@@ -1226,7 +1228,7 @@ The engine reserves classification capacity before it captures the current promp
 
 Received envelopes retain the service-reported model independently of usable classification answers. Missing or malformed model metadata stays unknown. Ending the classifier lifetime stops admission and signals cancellation to its workers. Cancellation leaves unanswered intents with unknown outcomes because a request might already have reached the service.
 
-The adapter retains reported usage when classification answers are unusable. Missing or partial usage remains unknown. Budget estimates use the complete serialized request. The transport sends those checked bytes once, without retries, under configured size and duration limits.
+The adapter retains reported usage when classification answers are unusable. Missing or partial usage remains unknown. Budget estimates use the complete serialized request. The transport sends those checked bytes once, without retries, under configured size and duration limits. A call that returns no usage settles the evaluation ledger at the grant's estimate when the request may have reached the service: a transport error after the send, a timeout, an oversized or unparseable reply, or a reply without usage. A call that never connected, or that the service refused with an error status, settles at zero. The record keeps the usage unknown and stores the amount it settled, and a settlement repair sends that same amount.
 
 Evaluation calls settle by call identity, so completion order does not discard charges. Memory and Redis retain one completed identity per call across budget resets. Those identities have no expiry or compaction. A new attempt needs a fresh identity, while settlement replay uses the original identity. Serving turns retain their ordered session watermarks.
 
