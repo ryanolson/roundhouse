@@ -37,7 +37,7 @@ use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
 use roundhouse_fleet::anthropic_messages::CacheLifetime;
 use roundhouse_fleet::{CacheLifetimeError, FrontierModelSpec, StaticFrontierCatalog};
 
-use crate::engine::{DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
+use crate::engine::{DEFAULT_FLEET_QUOTE_DEADLINE_MS, DEFAULT_LOCAL_BASE_TTFT_MS, EngineConfig};
 
 pub use providers::{BUILT_IN_OPENAI, ProviderAuth, ProviderConfig, ProviderRoutes};
 
@@ -104,6 +104,11 @@ pub struct CatalogConfig {
     /// inspectable in the same deployment configuration.
     #[serde(default)]
     pub local_ttft_ms_per_prefill_token: f64,
+    /// How long a turn waits for the fleet's residency answer, in ms, before
+    /// it routes among its hosted targets without a local quote. Uses the
+    /// engine's default when omitted.
+    #[serde(default = "default_fleet_quote_deadline_ms")]
+    pub fleet_quote_deadline_ms: u64,
     /// The citation for imported `quality_prior`s, if a provenance file was
     /// found beside this catalog. Never read from the catalog JSON itself —
     /// see [`quality_prior_citation`].
@@ -253,6 +258,10 @@ fn default_capability_band() -> f64 {
 
 fn default_local_base_ttft_ms() -> f64 {
     DEFAULT_LOCAL_BASE_TTFT_MS
+}
+
+fn default_fleet_quote_deadline_ms() -> u64 {
+    DEFAULT_FLEET_QUOTE_DEADLINE_MS
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -775,8 +784,8 @@ pub fn from_env() -> Result<Option<CatalogConfig>, CatalogError> {
     }
 }
 
-/// Apply the catalog's local latency values and local quality prior to the
-/// engine defaults.
+/// Apply the catalog's local latency values, local quality prior, and fleet
+/// residency bound to the engine defaults.
 ///
 /// The no-catalog path uses the same defaults as an omitted field. Keeping this
 /// composition beside the loader lets tests exercise it without booting a server.
@@ -800,6 +809,7 @@ pub fn engine_config(config: Option<&CatalogConfig>) -> EngineConfig {
             .unwrap_or(config.default_local_quality),
         local_base_ttft_ms: config.local_base_ttft_ms,
         local_ttft_ms_per_prefill_token: config.local_ttft_ms_per_prefill_token,
+        fleet_quote_deadline_ms: config.fleet_quote_deadline_ms,
         ..defaults
     }
 }

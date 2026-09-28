@@ -28,8 +28,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use roundhouse_core::context::{ContextAssembler, Tokenizer};
 use roundhouse_core::control::{
-    Billing, CredentialError, FairUseError, FairUseLedger, MemoryFairUseLedger, MemorySpendLedger,
-    SpendError, SpendLedger, TurnCredential, TurnPolicy,
+    Billing, CredentialError, FairUseError, FairUseLedger, FrontierHistory, MemoryFairUseLedger,
+    MemorySpendLedger, SpendError, SpendLedger, TurnCredential, TurnPolicy,
 };
 use roundhouse_core::event::{
     Accounting, CacheReadSource, IncompleteReason, SessionObserver, Usage,
@@ -461,6 +461,13 @@ impl LocalExecutor for EchoLocalExecutor {
 /// this one would change every local quote on a file nobody edited.
 pub const DEFAULT_LOCAL_BASE_TTFT_MS: f64 = 60.0;
 
+/// How long a turn waits for the fleet's residency answer before routing
+/// without it, in ms.
+///
+/// Named for the same reason as [`DEFAULT_LOCAL_BASE_TTFT_MS`]: the catalog
+/// can set it, and its "unset" default must be this one.
+pub const DEFAULT_FLEET_QUOTE_DEADLINE_MS: u64 = 500;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Identity presented to the session lease.
@@ -490,6 +497,16 @@ pub struct EngineConfig {
     /// `1000 / tokens_per_second` into its catalog; see
     /// `catalog_config::engine_config`.
     pub local_ttft_ms_per_prefill_token: f64,
+    /// The residency call's own bound, inside the turn's.
+    ///
+    /// A turn that has an admitted hosted target to fall back to waits this
+    /// long for the fleet's answer and then routes without it, recording
+    /// [`LocalQuoteSkip::FleetTimeout`]. Without it a slow selector costs a
+    /// turn that was never going local up to the whole `turn_deadline_ms`,
+    /// which is time to solution nothing measured. A turn with nowhere else
+    /// to go is not held to it (see `Engine::local_quote`). Settable from the
+    /// catalog; see `catalog_config::engine_config`.
+    pub fleet_quote_deadline_ms: u64,
     pub expected_output_tokens: u32,
     /// Bounds the model work of a single turn.
     ///
@@ -525,6 +542,7 @@ impl Default for EngineConfig {
             local_quality_prior: 0.6,
             local_base_ttft_ms: DEFAULT_LOCAL_BASE_TTFT_MS,
             local_ttft_ms_per_prefill_token: 0.0,
+            fleet_quote_deadline_ms: DEFAULT_FLEET_QUOTE_DEADLINE_MS,
             expected_output_tokens: 256,
             turn_deadline_ms: 120_000,
             arm_salt: String::new(),
@@ -2105,23 +2123,37 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         //
         // See `Engine::local_quote_skip` for why an HTTP round trip is worth
         // making or is not.
-        let local_quote_skipped = self.local_quote_skip(declarations, admission);
-        let local_quote = match (&self.fleet, &local_quote_skipped) {
-            (Some(fleet), None) => {
-                self.bounded(
-                    deadline_at,
-                    fleet.price(&FleetQuery::for_buffer(
+        // The hosted quotes first: they are local arithmetic over the ledger,
+        // and whether the fleet's residency call may fail open depends on
+        // whether any of them is somewhere this turn could go instead.
+        let frontier_quotes = self.frontier_catalog.quote(
+            session.ledger(),
+            now_ms(),
+            isl_tokens as u64,
+            self.config.expected_output_tokens as u64,
+        );
+        let (local_quote, local_quote_skipped) =
+            match (&self.fleet, self.local_quote_skip(declarations, admission)) {
+                (Some(fleet), None) => {
+                    let query = FleetQuery::for_buffer(
                         assembler.buffer(),
                         self.config.local_model.clone(),
                         self.config.routing_group.clone(),
                         Some(self.config.expected_output_tokens),
                         Some(session.session_id().to_string()),
-                    )),
-                )
-                .await?
-            }
-            _ => None,
-        };
+                    );
+                    let can_fail_open = frontier_quotes.iter().any(|candidate| {
+                        hosted_fallback_admitted(
+                            admission,
+                            &session.state().frontier_history,
+                            candidate,
+                        )
+                    });
+                    self.local_quote(fleet.as_ref(), &query, deadline_at, can_fail_open, session)
+                        .await?
+                }
+                (_, skipped) => (None, skipped),
+            };
 
         let mut candidates: Vec<Candidate> = Vec::new();
         if let Some(quote) = &local_quote {
@@ -2131,12 +2163,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 self.config.local_ttft_ms_per_prefill_token,
             ));
         }
-        candidates.extend(self.frontier_catalog.quote(
-            session.ledger(),
-            now_ms(),
-            isl_tokens as u64,
-            self.config.expected_output_tokens as u64,
-        ));
+        candidates.extend(frontier_quotes);
 
         // --- a tool-declaring turn cannot go to a local worker ---------------
         //
@@ -3127,6 +3154,69 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         ))
     }
 
+    /// Ask the fleet what it holds for this turn, failing open within a bound
+    /// when the turn has a hosted target to go to instead.
+    ///
+    /// **C3, ruled 2026-09-28 (ruling 5 in
+    /// `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`).** The
+    /// residency call is an HTTP round trip on the path to first token. A
+    /// fleet error used to fail the turn, and a silent fleet held it for the
+    /// whole turn deadline, even when a hosted target was admitted and the
+    /// local answer could only have been one option among several: a failed
+    /// turn that could have been served costs time to solution, and nothing
+    /// measured it. So when `can_fail_open`, the call gets its own bound —
+    /// `fleet_quote_deadline_ms`, or the turn deadline if that is sooner — and
+    /// an error or a timeout drops the local candidate and names why.
+    ///
+    /// **A turn with nowhere else to go keeps the old path exactly**: the turn
+    /// deadline, and the fleet's error as the turn's. "Nowhere else" is
+    /// decided by `hosted_fallback_admitted` before the call, which sees the
+    /// policy, the credentials and the cadence but not the budget grant; see
+    /// its doc for the gap that leaves. Failing open there would
+    /// route a local-only session to a hosted model its policy does not
+    /// admit, which is the egress the policy exists to prevent; and cutting
+    /// its call at the short bound would only turn a slow turn into a failed
+    /// one, since nothing is waiting to take it.
+    ///
+    /// If the turn deadline is what ends the wait, the turn fails with it
+    /// either way: a hosted dispatch would start already out of time.
+    async fn local_quote(
+        &self,
+        fleet: &dyn LocalFleet,
+        query: &FleetQuery,
+        deadline_at: Instant,
+        can_fail_open: bool,
+        session: &Session<S>,
+    ) -> Result<(Option<LocalQuote>, Option<LocalQuoteSkip>), EngineError> {
+        if !can_fail_open {
+            return Ok((self.bounded(deadline_at, fleet.price(query)).await?, None));
+        }
+        let own_bound = Instant::now() + Duration::from_millis(self.config.fleet_quote_deadline_ms);
+        let bound = own_bound.min(deadline_at);
+        match tokio::time::timeout_at(bound, fleet.price(query)).await {
+            Ok(Ok(quote)) => Ok((quote, None)),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    %error,
+                    session_id = %session.session_id(),
+                    "the fleet's residency call failed; routing this turn among its \
+                     hosted targets without a local quote"
+                );
+                Ok((None, Some(LocalQuoteSkip::FleetError)))
+            }
+            Err(_) if bound == deadline_at => Err(self.deadline_struck()),
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %session.session_id(),
+                    bound_ms = self.config.fleet_quote_deadline_ms,
+                    "the fleet's residency call did not answer inside its bound; \
+                     routing this turn among its hosted targets without a local quote"
+                );
+                Ok((None, Some(LocalQuoteSkip::FleetTimeout)))
+            }
+        }
+    }
+
     /// Run one model-facing future under the turn deadline.
     async fn bounded<T2, E, F>(&self, deadline_at: Instant, future: F) -> Result<T2, EngineError>
     where
@@ -3141,6 +3231,35 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
 
     fn deadline_struck(&self) -> EngineError {
         EngineError::TurnDeadline(self.config.turn_deadline_ms)
+    }
+}
+
+/// Whether a quoted hosted candidate is somewhere this turn could be served
+/// if the local quote is lost.
+///
+/// Three of the filters the turn applies before a hosted target can serve: the
+/// policy's `permits`, a credential that reaches the provider, and the
+/// frontier cadence over this session's history (`admits` is `permits` plus
+/// the cadence). A policy check alone would let a session with no credential
+/// for any hosted provider swap the fleet's error for a credential one, and
+/// would cut the residency call short on a turn whose spent cadence makes the
+/// local answer the only one it can take.
+///
+/// **Not the budget.** The grant is opened after quoting, because its size
+/// depends on the quoted set, so a spent `degrade_to_local` budget is not
+/// known here. A turn in that state still fails open at the short bound, and a
+/// fleet slower than the bound then leaves it without the local candidate the
+/// budget would have routed to.
+fn hosted_fallback_admitted(
+    admission: &Admission,
+    history: &FrontierHistory,
+    candidate: &Candidate,
+) -> bool {
+    match &candidate.target {
+        Target::Frontier { provider, .. } => {
+            admission.policy.admits(candidate, history) && admission.credentials.reaches(provider)
+        }
+        Target::Local { .. } => false,
     }
 }
 
@@ -3166,7 +3285,7 @@ async fn replay_output<S: SessionStore>(
 mod tests {
     use super::*;
     use roundhouse_core::context::ByteTokenizer;
-    use roundhouse_core::control::{FrontierHistory, TargetFilter, TurnBudget};
+    use roundhouse_core::control::{TargetFilter, TurnBudget};
     use roundhouse_core::ids::SessionId;
     use roundhouse_core::routing::{AffinityPolicy, RoutingContext};
 

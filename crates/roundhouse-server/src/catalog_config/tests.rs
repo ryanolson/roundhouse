@@ -443,6 +443,58 @@ fn a_measured_local_curve_reaches_the_engine_config() {
     );
 }
 
+/// **The residency call's own bound is the catalog's to set.** C3, ruled
+/// 2026-09-28: a turn with a hosted target to fall back to waits this long for
+/// the fleet and then routes without a local quote.
+#[test]
+fn the_catalogs_fleet_quote_deadline_reaches_the_engine_config() {
+    let config = CatalogConfig::from_json(
+        &with_local_section(
+            r#",
+          "fleet_quote_deadline_ms": 250"#,
+        ),
+        "test",
+    )
+    .unwrap();
+    assert_eq!(config.fleet_quote_deadline_ms, 250);
+    assert_eq!(
+        engine_config(Some(&config)).fleet_quote_deadline_ms,
+        250,
+        "the deployment's bound, not the built-in one"
+    );
+}
+
+/// **CONTROL.** A catalog that says nothing about the bound, and no catalog at
+/// all, both run on the engine's documented 500 ms.
+#[test]
+fn an_unset_fleet_quote_deadline_is_the_engine_default_of_500_ms() {
+    assert_eq!(EngineConfig::default().fleet_quote_deadline_ms, 500);
+    let config = CatalogConfig::from_json(&with_local_section(""), "test").unwrap();
+    assert_eq!(
+        engine_config(Some(&config)).fleet_quote_deadline_ms,
+        EngineConfig::default().fleet_quote_deadline_ms
+    );
+    assert_eq!(
+        engine_config(None).fleet_quote_deadline_ms,
+        EngineConfig::default().fleet_quote_deadline_ms
+    );
+}
+
+/// A misspelled bound is refused rather than loaded at the default, for the
+/// reason the local-latency keys are.
+#[test]
+fn a_misspelled_fleet_quote_deadline_key_is_refused() {
+    let err = CatalogConfig::from_json(
+        &with_local_section(
+            r#",
+          "fleet_quote_deadine_ms": 250"#,
+        ),
+        "test",
+    )
+    .unwrap_err();
+    assert!(matches!(err, CatalogError::Parse { .. }), "{err}");
+}
+
 /// **The router's capability gate and the dashboard's read one local prior.**
 /// The dashboard prices the local model at the catalog's `local_quality` entry,
 /// or its `default_local_quality` when the model has none. A router left at the
