@@ -176,10 +176,10 @@ mod tests {
     }
 
     /// **A positive amount is never scheduled behind a zero-dollar entry
-    /// that merely arrived first.** A zero-dollar release is the routine
-    /// result of a call whose own deadline fired before an answer came
-    /// back, not a rare failure — oldest-arrival-only order would let a
-    /// wall of these delay the one entry that is an actual debt, one
+    /// that merely arrived first.** A zero-dollar release is what a refused
+    /// call leaves behind when its settle goes unacknowledged, and a flaky
+    /// upstream refuses many — oldest-arrival-only order would let a wall of
+    /// these delay the one entry that is an actual debt, one
     /// `max_in_flight`-sized turn at a time.
     #[test]
     fn a_positive_amount_precedes_every_zero_dollar_entry_that_arrived_before_it() {

@@ -388,6 +388,7 @@ fn unknown_usage(call: &str, turn_index: u64, source: &str) -> ClassificationRec
             spend: EvaluationSpend::Unknown {
                 granted_usd: 2.0,
                 settled: SettlementAck::Committed,
+                submitted_usd: 0.0,
             },
             reported_model: None,
         },

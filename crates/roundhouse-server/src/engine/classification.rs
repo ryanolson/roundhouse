@@ -74,14 +74,12 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// leaves that permit free for the repair; once the ledger confirms and
     /// the acknowledgement is delivered, the next turn classifies again.
     ///
-    /// A zero-dollar unrepaired settlement is not a debt, and reaches this
-    /// drain routinely: the outer call deadline firing before any answer
-    /// comes back submits a release at zero, and a settle attempted against
-    /// that same, already-elapsed deadline ends `Unconfirmed` the same way a
-    /// slow backend answer would. Withholding a ticket for that would starve
-    /// this session's own classification at the very steady state described
-    /// above, over an entry that owes nothing and that never queues ahead of
-    /// a real one: `ClassificationRuntime::repair_batch` offers a positive
+    /// A zero-dollar unrepaired settlement is not a debt: a call refused
+    /// before it could be billed — a connection never made, an error status
+    /// — submits a release at zero, and a settle that then goes unanswered
+    /// ends `Unconfirmed`. Withholding a ticket for that would starve this
+    /// session's own classification over an entry that owes nothing and that
+    /// never queues ahead of a real one: `ClassificationRuntime::repair_batch` offers a positive
     /// amount before any zero-dollar entry, however much longer the
     /// zero-dollar entry has been waiting. [`Self::owes_settlement`] is what
     /// keeps the two cases apart.
@@ -287,12 +285,16 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// real money, as opposed to one that only released a hold and is
     /// waiting on an acknowledgement.
     ///
-    /// A zero-dollar entry reaches `unrepaired_settlements` routinely, not on
-    /// some rare failure path: any settle attempted against a deadline that
-    /// has already elapsed — the ordinary shape of a call whose outer
-    /// deadline fired before an answer came back — ends `Unconfirmed`, and
-    /// `EvaluationSpend::unconfirmed_settlement_usd` reports that release as
-    /// `Some(0.0)`. That entry lapses on its own once the hold's TTL passes;
+    /// A zero-dollar entry is a call refused before it could be billed — a
+    /// connection never made, an error status — whose release went
+    /// unacknowledged; `EvaluationSpend::unconfirmed_settlement_usd` reports
+    /// it as `Some(0.0)`. A call whose outer deadline fired before an answer
+    /// came back is *not* one: it may have been billed, so it books the
+    /// grant's estimate, and when that settle runs against the same
+    /// already-elapsed deadline and ends `Unconfirmed` the entry owes the
+    /// estimate and withholds this session's next ticket until it is
+    /// repaired. A zero-dollar entry lapses on its own once the hold's TTL
+    /// passes;
     /// it is not a debt, and it never delays a positive entry's repair —
     /// `ClassificationRuntime::repair_batch` offers every positive amount
     /// before any zero-dollar one, so a real debt is never left waiting

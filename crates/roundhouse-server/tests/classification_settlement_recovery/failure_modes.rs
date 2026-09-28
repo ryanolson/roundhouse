@@ -228,16 +228,17 @@ async fn repeated_replay_after_recovery_charges_once_and_buys_no_second_call() {
     );
 }
 
-/// **A call whose usage the service never reported recovers as a release, and
-/// never as a measured zero cost.**
+/// **A call whose usage the service never reported recovers at the estimate
+/// it booked, and never as a measured cost.**
 ///
 /// The answer arrived without a usage block. What that call billed is exactly
-/// what this deployment does not know, so the settle is a zero-dollar *release*
-/// of the hold — and the durable record must go on saying the accounting is
-/// unknown. A recovery that recorded a measured zero would book a billed call
-/// as free, which is the one accounting lie the whole module exists to prevent.
+/// what this deployment does not know, so the settle books the grant's
+/// estimate (2026-09-28 ruling 3) — and the durable record must go on saying
+/// the accounting is unknown. The repair re-drives the amount the record says
+/// was submitted: a zero would hand back money the call may have spent, and a
+/// measured figure would invent a number nobody reported.
 #[tokio::test]
-async fn missing_usage_recovers_as_a_release_and_never_as_a_measured_zero() {
+async fn missing_usage_recovers_at_the_booked_estimate_and_never_as_a_measured_cost() {
     let (base_url, upstream) = classifier_upstream(ANSWER_WITHOUT_USAGE).await;
     let config = config(&base_url);
     let store = Arc::new(MemoryStore::new());
@@ -256,23 +257,31 @@ async fn missing_usage_recovers_as_a_release_and_never_as_a_measured_zero() {
 
     let before = results(&store, &session).await;
     assert_eq!(before.len(), 1);
-    assert!(
-        matches!(
-            before[0].1.outcome.spend().expect("a call was attempted"),
-            EvaluationSpend::Unknown { .. }
-        ),
-        "the premise: the service reported no usage, so the spend is unknown"
-    );
+    let booked = match before[0].1.outcome.spend().expect("a call was attempted") {
+        EvaluationSpend::Unknown {
+            granted_usd,
+            submitted_usd,
+            ..
+        } => {
+            assert_eq!(
+                submitted_usd, granted_usd,
+                "the settle booked the grant's estimate"
+            );
+            *submitted_usd
+        }
+        other => panic!("the premise: the service reported no usage, got {other:?}"),
+    };
+    assert!(booked > 0.0, "a real estimate, not a release: {booked}");
 
     let restarted = deployment(&store, &ledger, &config).await;
     let found = drive_until_repaired(&restarted, &store, &session, &["t3", "t4"]).await;
 
-    assert_eq!(found.len(), 1, "the release is acknowledged durably too");
+    assert_eq!(found.len(), 1, "the booking is acknowledged durably too");
     assert_eq!(
         ledger.committed_usd(&principal, &terms).await,
-        0.0,
-        "a release commits nothing -- and this zero is the ledger's, not a \
-         price anybody derived"
+        booked,
+        "the repair commits exactly what the first settle submitted -- the \
+         record's amount, not one anybody re-derived"
     );
     let after = results(&store, &session).await;
     assert!(

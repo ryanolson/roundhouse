@@ -311,18 +311,43 @@ pub enum EvaluationSpend {
         granted_usd: f64,
         settled: SettlementAck,
     },
-    /// Usage was absent or incomplete. A release at zero was *submitted*, which
-    /// is how a hold is released and not a claim that the call was free — and
-    /// whether it landed is [`SettlementAck`]'s to say, not this arm's. See
+    /// Usage was absent or incomplete, so nobody here can name what the call
+    /// cost. Whether the settle that was submitted landed is
+    /// [`SettlementAck`]'s to say, not this arm's. See
     /// [`SettlementAck::Unconfirmed`].
     Unknown {
         granted_usd: f64,
         settled: SettlementAck,
+        /// The amount the settle submitted: the grant's estimate when the
+        /// request may have reached the service, zero when it provably did
+        /// not.
+        ///
+        /// **Recorded, because a repair must re-drive exactly this.** The
+        /// settle is deduplicated per call, so a repair that re-derived the
+        /// amount — from the failure reason, or from the live rule — would be
+        /// a second answer to what the first settle charged, and the two
+        /// disagree the moment the rule changes. A record written before this
+        /// field existed settled at zero, which is what the default reads it
+        /// as; skipped on the wire at zero so those records keep their bytes.
+        #[serde(default, skip_serializing_if = "is_zero_usd")]
+        submitted_usd: f64,
     },
 }
 
+/// Whether a recorded amount is exactly zero, for `skip_serializing_if`.
+fn is_zero_usd(usd: &f64) -> bool {
+    *usd == 0.0
+}
+
 impl EvaluationSpend {
-    /// What this deployment committed, and `None` where nobody can say.
+    /// The measured price this deployment committed, and `None` where there
+    /// is no measured price or nothing confirms it landed.
+    ///
+    /// **Measured only.** An acknowledged [`Self::Unknown`] answers `None`
+    /// even when its settle booked the grant's estimate: that estimate is a
+    /// ledger booking, not a cost anybody measured, and it is read through
+    /// [`Self::submitted_usd`]. The metrics fold's settlement `committed_usd`
+    /// counts both, so the two names answer different questions on purpose.
     ///
     /// `Measured` with an unconfirmed settle answers `None` on purpose: the
     /// call billed, and nothing this deployment holds confirms the charge was
@@ -348,23 +373,26 @@ impl EvaluationSpend {
     /// reader able to say which was right. There is one pricing authority for a
     /// settled call and it is the record this reads.
     ///
-    /// The zero on the [`Self::Unknown`] arm is a *release* and not a price:
-    /// the service billed an amount nobody here can name, so the hold is handed
-    /// back and the record goes on saying the accounting is unknown. Answering
-    /// a measured zero instead would book a billed call as free, which is the
-    /// one accounting lie this vocabulary exists to prevent.
+    /// On the [`Self::Unknown`] arm that amount is `submitted_usd`, and it is
+    /// a *booking*, not a price: the grant's estimate for a request that may
+    /// have been billed, or zero for one that provably never left. Either way
+    /// the record goes on saying the accounting is unknown. A repair that
+    /// re-drove zero for a booked estimate would hand back money the call may
+    /// have spent, which is the bias that makes the evaluation arm look
+    /// cheaper than it is.
     pub fn unconfirmed_settlement_usd(&self) -> Option<f64> {
+        match self.settled() {
+            SettlementAck::Unconfirmed => Some(self.submitted_usd()),
+            SettlementAck::Committed => None,
+        }
+    }
+
+    /// The amount this call's settle submitted to the ledger, acknowledged
+    /// or not: the measured price, or an unknown-usage call's booking.
+    pub fn submitted_usd(&self) -> f64 {
         match self {
-            Self::Measured {
-                usd,
-                settled: SettlementAck::Unconfirmed,
-                ..
-            } => Some(*usd),
-            Self::Unknown {
-                settled: SettlementAck::Unconfirmed,
-                ..
-            } => Some(0.0),
-            _ => None,
+            Self::Measured { usd, .. } => *usd,
+            Self::Unknown { submitted_usd, .. } => *submitted_usd,
         }
     }
 
@@ -522,8 +550,11 @@ pub enum ClassificationOutcome {
         #[serde(default)]
         reported_model: Option<String>,
     },
-    /// No envelope came back. The worker submitted a release at zero.
-    /// [`SettlementAck`] records whether the ledger acknowledged it.
+    /// No usable envelope came back. The worker submitted the grant's
+    /// estimate when the request may have reached the service, and a release
+    /// at zero when it provably did not; the spend's `submitted_usd` says
+    /// which, and [`SettlementAck`] records whether the ledger acknowledged
+    /// it.
     Failed {
         reason: String,
         spend: EvaluationSpend,

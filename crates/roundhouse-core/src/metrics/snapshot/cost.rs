@@ -67,16 +67,19 @@ impl From<&EvaluationCallTally> for EvaluationTokens {
 /// does not erase the usage that was billed, so `unconfirmed_usd` is money this
 /// deployment knows it owes and cannot yet prove it committed —
 /// `committed_usd + unconfirmed_usd` agrees with
-/// [`EvaluationMetrics::measured_usd`] up to the rounding of two independently
-/// ordered float sums over the same addends. `unconfirmed_usd` is exactly zero
-/// once nothing is open; that identity is bit-exact and pinned by
-/// `evaluation_tests.rs`.
+/// [`EvaluationMetrics::measured_usd`] plus the estimates booked for
+/// unknown-usage calls, up to the rounding of two independently ordered float
+/// sums over the same addends. The estimates are ledger bookings and never
+/// enter `measured_usd`, which is what keeps `cost_incomplete` honest.
+/// `unconfirmed_usd` is exactly zero once nothing is open; that identity is
+/// bit-exact and pinned by `evaluation_tests.rs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct EvaluationSettlement {
     /// Calls that reached a service and whose settle the ledger answered for,
     /// at the call or through a later repair.
     pub acknowledged_calls: u64,
-    /// The measured share of those calls, in dollars.
+    /// What the ledger acknowledged for those calls, in dollars: the measured
+    /// price, or the grant's estimate for a call whose usage never arrived.
     pub committed_usd: f64,
     /// Calls whose settle nobody has answered for. See
     /// [`SettlementAck::Unconfirmed`](crate::classify::SettlementAck::Unconfirmed):

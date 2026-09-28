@@ -265,8 +265,21 @@ pub enum SystemOneError {
         limit_bytes: usize,
         actual_bytes: usize,
     },
-    #[error("the service could not be reached (timed out: {timed_out})")]
-    Transport { message: String, timed_out: bool },
+    /// The HTTP exchange failed below the status line.
+    ///
+    /// `sent` says whether the request may have reached the service, and it is
+    /// what the caller's accounting turns on: `false` only when no connection
+    /// was ever established (or no client existed), which is the one transport
+    /// failure that provably bought nothing. Anything later — a reset after
+    /// the write, a body cut off mid-stream — may have been billed, and
+    /// reading it as free is the bias that makes an evaluation look cheaper
+    /// than it is.
+    #[error("the service could not be reached (timed out: {timed_out}, sent: {sent})")]
+    Transport {
+        message: String,
+        timed_out: bool,
+        sent: bool,
+    },
     /// The status, and deliberately not the body. See the module note.
     #[error("the service answered {status}")]
     Status { status: u16 },
@@ -359,6 +372,7 @@ impl SystemOneClient {
             .map_err(|source| SystemOneError::Transport {
                 message: format!("could not build an HTTP client: {source}"),
                 timed_out: false,
+                sent: false,
             })?;
         let base = base.into();
         Ok(Self {
@@ -464,9 +478,13 @@ impl SystemOneClient {
         .await
         .map_err(|_| SystemOneError::DeadlineExceeded)?
         .map_err(|source| SystemOneError::Transport {
-            // `timed_out` first: `without_url` consumes the error, and fields
-            // evaluate in the order they are written.
+            // `timed_out` and `sent` first: `without_url` consumes the error,
+            // and fields evaluate in the order they are written.
             timed_out: source.is_timeout(),
+            // `is_connect` is the only reqwest classification that proves no
+            // request bytes left: every later failure happened on a
+            // connection that may already have carried the whole body.
+            sent: !source.is_connect(),
             // A `reqwest` error's `Display` carries the URL, and a base URL is
             // deployment configuration that can hold a tenant id or a gateway
             // token in a query string. Stripped rather than trusted: the
@@ -509,6 +527,8 @@ impl SystemOneClient {
         while let Some(piece) = pieces.next().await {
             let piece = piece.map_err(|source| SystemOneError::Transport {
                 timed_out: source.is_timeout(),
+                // A status line already arrived, so the request was received.
+                sent: true,
                 // Stripped for the same reason as the send path above.
                 message: source.without_url().to_string(),
             })?;
@@ -539,6 +559,7 @@ impl SystemOneClient {
                     SystemOneError::Transport {
                         message: "the resolved key cannot be put in a header value".to_string(),
                         timed_out: false,
+                        sent: false,
                     }
                 })?;
                 value.set_sensitive(true);

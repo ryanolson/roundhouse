@@ -150,9 +150,10 @@ pub(super) struct EvaluationCounters {
     pub(super) intents: u64,
     /// Every accepted result: measured, unknown-usage and refused alike.
     pub(super) all: EvaluationCallTally,
-    /// Measured dollars whose settle this scope has an answer for, added
-    /// exactly once each: at the record, when the settle already arrived
-    /// committed, or at the repair that later closes it (see
+    /// Dollars whose settle this scope has an answer for -- the measured
+    /// price, or an unknown-usage call's booked estimate -- added exactly
+    /// once each: at the record, when the settle already arrived committed,
+    /// or at the repair that later closes it (see
     /// [`EvaluationFold::repaired`]). Never derived by subtracting an open
     /// amount from `measured_usd` -- that subtraction would leave a float
     /// residue behind once the open set empties, so committed dollars are
@@ -206,7 +207,7 @@ impl EvaluationCounters {
         self.all.calls - self.all.refused_calls - open_calls
     }
 
-    /// Measured dollars whose settle this scope has an answer for.
+    /// Dollars whose settle this scope has an answer for. See the field.
     pub(super) fn committed_usd(&self) -> f64 {
         self.committed_usd
     }
@@ -430,10 +431,12 @@ impl EvaluationFold {
         let row = self.by_principal.entry(payer.clone()).or_default();
         row.counters.all.book(spend);
         row.counters.by_model.entry(model).or_default().book(spend);
-        // The amount a repair would re-drive, which is the record's own: a zero
-        // on the unknown-usage arm is a *release* and not a price. Keyed into
-        // `open` under the same key `calls` uses, so `repaired` can find it
-        // by identity without a second lookup path.
+        // The amount a repair would re-drive, which is the record's own: on
+        // the unknown-usage arm that is what the settle submitted -- the
+        // grant's estimate, or a zero release for a call that never left --
+        // and never a price. Keyed into `open` under the same key `calls`
+        // uses, so `repaired` can find it by identity without a second lookup
+        // path.
         let state = match spend.filter(|spend| spend.settled() == SettlementAck::Unconfirmed) {
             Some(spend) => {
                 let usd = spend.unconfirmed_settlement_usd().unwrap_or_default();
@@ -443,10 +446,14 @@ impl EvaluationFold {
             // Already answered for at record time -- a settle that arrived
             // committed needs no later repair, so its dollars join
             // `committed_usd` right here rather than waiting on an event
-            // that will never come. `Unknown` spend has no dollars to book:
-            // `committed_usd` is Some(_) only off `Measured`.
+            // that will never come. The dollars are what the settle
+            // submitted, the same amount `repaired` would move out of `open`:
+            // an unknown-usage call's booked estimate counts once it is
+            // acknowledged, whichever path the acknowledgement took, or the
+            // committed figure would hang on whether one ledger reply
+            // arrived.
             None => {
-                if let Some(usd) = spend.and_then(EvaluationSpend::committed_usd) {
+                if let Some(usd) = spend.map(EvaluationSpend::submitted_usd) {
                     row.counters.committed_usd += usd;
                 }
                 CallState::Closed

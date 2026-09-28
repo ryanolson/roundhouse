@@ -246,3 +246,75 @@ fn a_row_nobody_has_tallied_must_not_count_an_open_call_as_acknowledged() {
          row must not report it as acknowledged"
     );
 }
+
+/// An unknown-usage result that booked the grant's estimate, settled as
+/// `settled` says.
+fn booked_estimate_result(
+    call_id: &str,
+    estimate: f64,
+    settled: SettlementAck,
+) -> ClassificationRecord {
+    ClassificationRecord {
+        call_id: ResponseId::new(call_id),
+        source_turn_index: 1,
+        source_response_id: ResponseId::new("r1"),
+        completed_at_ms: 1_000,
+        outcome: ClassificationOutcome::Failed {
+            reason: "deadline_exceeded".to_string(),
+            spend: EvaluationSpend::Unknown {
+                granted_usd: estimate,
+                settled,
+                submitted_usd: estimate,
+            },
+        },
+    }
+}
+
+/// **A booked estimate counts as committed whether its acknowledgement came
+/// with the result or through a repair.**
+///
+/// A repair moves the open amount into `committed_usd`, and that amount is
+/// what the settle submitted — the estimate, for a call whose usage never
+/// arrived. The same call acknowledged first time must land the same dollars,
+/// or the dashboard's committed figure would depend on whether one ledger
+/// reply arrived, and would under-count exactly the calls ruling 3 books.
+#[test]
+fn a_booked_estimate_is_committed_the_same_whether_acknowledged_first_time_or_repaired() {
+    let committed_first_time = {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.push(SessionEventKind::ClassificationRequested {
+            record: classify_intent("c1", 1, "r1"),
+        });
+        log.push(SessionEventKind::ClassificationRecorded {
+            record: booked_estimate_result("c1", 0.25, SettlementAck::Committed),
+        });
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        fold.evaluation(Scope::Deployment).counters.committed_usd()
+    };
+    let repaired = {
+        let mut log = LogBuilder::new("s1");
+        log.created(Some(principal("acme", "ada")));
+        log.push(SessionEventKind::ClassificationRequested {
+            record: classify_intent("c1", 1, "r1"),
+        });
+        log.push(SessionEventKind::ClassificationRecorded {
+            record: booked_estimate_result("c1", 0.25, SettlementAck::Unconfirmed),
+        });
+        log.push(SessionEventKind::ClassificationSettlementRepaired {
+            record: repair("c1"),
+        });
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        fold.evaluation(Scope::Deployment).counters.committed_usd()
+    };
+    assert_eq!(
+        repaired, 0.25,
+        "a repair commits the amount the record booked"
+    );
+    assert_eq!(
+        committed_first_time, repaired,
+        "the first-time acknowledgement must commit what the repair would have"
+    );
+}

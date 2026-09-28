@@ -254,11 +254,12 @@ async fn a_missing_axis_supplies_no_classification_at_all() {
     );
 }
 
-/// Accounting that did not fully arrive is unknown. The hold is still released
-/// at zero — that is how a hold is closed — but nothing reports a free call,
-/// and the signal that did arrive survives.
+/// Accounting that did not fully arrive is unknown. The settle books the
+/// grant's estimate — the call was billed at an amount nobody reported, and
+/// zero is the one guess known to be low — but nothing reports a measured
+/// cost, and the signal that did arrive survives.
 #[tokio::test]
-async fn unreported_usage_releases_the_hold_without_claiming_a_free_call() {
+async fn unreported_usage_books_the_estimate_without_claiming_a_measured_cost() {
     let (addr, up) = upstream(ANSWER_PARTIAL_USAGE).await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
@@ -293,7 +294,8 @@ async fn unreported_usage_releases_the_hold_without_claiming_a_free_call() {
                 *spend,
                 EvaluationSpend::Unknown {
                     granted_usd: 1_000.0,
-                    settled: SettlementAck::Committed
+                    settled: SettlementAck::Committed,
+                    submitted_usd: 1_000.0,
                 },
                 "a half-reported spend is unknown accounting; a measured zero \
                  here books a billed call as free"
@@ -303,9 +305,9 @@ async fn unreported_usage_releases_the_hold_without_claiming_a_free_call() {
     }
     assert_eq!(
         ledger.settled(),
-        vec![0.0],
-        "the hold is released, which is not the same statement as the call \
-         having been free"
+        vec![1_000.0],
+        "the estimate is booked, which is not the same statement as the call \
+         having cost exactly that"
     );
 }
 
@@ -395,10 +397,10 @@ fn a_rejected_settle_is_recorded_as_rejected_and_names_the_call() {
     assert!(!warned.contains(KEY), "nor the deployment's key:\n{warned}");
 }
 
-/// A call that produced no envelope has unknown accounting and a reason that
-/// names the failure class without quoting the service.
+/// A reply that did not parse has unknown accounting, books the estimate, and
+/// carries a reason that names the failure class without quoting the service.
 #[tokio::test]
-async fn a_failed_call_releases_its_hold_with_unknown_accounting() {
+async fn a_malformed_reply_books_the_estimate_with_unknown_accounting() {
     let (addr, _up) = upstream("<html>502</html>").await;
     let ledger = RecordingLedger::granting(1_000.0);
     let credential = credential();
@@ -418,10 +420,11 @@ async fn a_failed_call_releases_its_hold_with_unknown_accounting() {
             spend: EvaluationSpend::Unknown {
                 granted_usd: 1_000.0,
                 settled: SettlementAck::Committed,
+                submitted_usd: 1_000.0,
             },
         }
     );
-    assert_eq!(ledger.settled(), vec![0.0]);
+    assert_eq!(ledger.settled(), vec![1_000.0]);
 }
 
 /// **A prepared call that is never executed reserves nothing.**

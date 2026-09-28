@@ -115,6 +115,7 @@ fn no_error_carries_a_credential_or_a_prompt() {
         SystemOneError::Transport {
             message: "connection refused".into(),
             timed_out: false,
+            sent: false,
         },
     ];
     for error in &errors {
