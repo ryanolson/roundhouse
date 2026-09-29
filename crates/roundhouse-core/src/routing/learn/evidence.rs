@@ -308,7 +308,9 @@ pub enum CostCorrection {
     NoPredictedReuse,
     /// Fewer measured pairs than `cache_min_samples`.
     TooFewSamples,
-    /// A local target: its quote is the residency answer, not a ledger model.
+    /// A local target. Its quote is the residency answer, at the configured
+    /// capacity price when there is one, and it has no ledger model to
+    /// re-price a shortfall against.
     NotFrontier,
 }
 
@@ -465,6 +467,17 @@ pub struct ReadView {
     /// The project's overhead from `TurnStarted` to the served `Routed`, the
     /// third term of the latency model.
     pub overhead: LatencySum,
+}
+
+impl ReadView {
+    /// The operational counters of `target`, found by its policy identity.
+    ///
+    /// Identity rather than ledger key, because the counters are per recipe
+    /// target: every worker of one local model shares one residual.
+    pub fn target(&self, target: &Target) -> Option<&TargetOps> {
+        let identity = target.policy_identity();
+        self.targets.iter().find(|ops| ops.target == identity)
+    }
 }
 
 /// Quality counts and Jev answers at one key.
