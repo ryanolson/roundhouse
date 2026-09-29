@@ -126,9 +126,9 @@ mod tests {
     #[test]
     fn the_dialect_namespace_has_one_spelling() {
         use crate::validate::ControlCallDialect;
-        // The literal both old spellings carried (`DIALECT_NAMESPACE` in the
-        // server's `messages_api::wire`, `MESSAGES_SESSION_SEGMENT` in
-        // `validate::control_call`), so every key already stored reads back
+        // The literal both old spellings carried (one private constant in the
+        // server's `messages_api::wire`, one in `validate::control_call`, both
+        // deleted in favour of this), so every key already stored reads back
         // under the same dialect after the move.
         assert_eq!(MESSAGES_DIALECT_NAMESPACE, "anthropic_messages");
         // The reader agrees with it as a whole segment, which is how it

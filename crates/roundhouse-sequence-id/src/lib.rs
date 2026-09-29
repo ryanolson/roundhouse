@@ -8,7 +8,7 @@
 //!   KV key: every sub-agent of one Codex root shares it.
 //! - **The label**, the lineage name before qualification ([`label`]). Its
 //!   values are today's, byte for byte — [`messages_label`] is the Messages
-//!   rung that `messages_api::wire::session_key` used to be, and the Responses
+//!   rung the server's `session_key` used to be, and the Responses
 //!   rungs are the label half of `RequestContext::from_request`.
 //! - **The client's own compaction signals** ([`client_signals`],
 //!   [`content_marker`]), read only as exact literals.

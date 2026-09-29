@@ -3,17 +3,18 @@
 
 //! The label a request names, captured before the derivation moves.
 //!
-//! Both surfaces turn a request into a conversation label today, in two
-//! separate places: [`session_key`] for Claude Messages and
-//! [`RequestContext::from_request`] plus [`RequestContext::conversation_key`]
-//! for Responses. The derivation is about to move into the
-//! `roundhouse-sequence-id` crate, and "the move changed no label" is only a
-//! claim until something has recorded what the labels were. This module
-//! records them *first*, from today's code, into
-//! `tests/fixtures/golden-labels.json`; the same test then keeps asserting the
-//! file, so the move is provably behavior-preserving and every later change to
-//! a label is a reviewed diff of that file rather than a silent re-binding of
-//! live sessions to new conversations.
+//! Both surfaces used to turn a request into a conversation label in two
+//! separate places: the Messages wire module's `session_key` for Claude
+//! Messages and [`RequestContext::from_request`] plus
+//! [`RequestContext::conversation_key`] for Responses. The derivation has since moved into the
+//! `roundhouse-sequence-id` crate, and "the move changed no label" was only a
+//! claim until something had recorded what the labels were. This module
+//! recorded them *first*, from the pre-move code, into
+//! `tests/fixtures/golden-labels.json`; the same test keeps asserting the
+//! file, now through [`claimed_label`] and `from_request` — the handlers' own
+//! calls into the crate — so the move is provably behavior-preserving and
+//! every later change to a label is a reviewed diff of that file rather than a
+//! silent re-binding of live sessions to new conversations.
 //!
 //! **What is pinned.** Every Claude Messages body under `tests/fixtures/`,
 //! once with no headers and once under each captured header set (so the
@@ -51,7 +52,8 @@ use serde_json::Value;
 
 use super::RequestContext;
 use crate::http::ApiError;
-use crate::messages_api::wire::{CreateMessageParams, session_key};
+use crate::messages_api::claimed_label;
+use crate::messages_api::wire::{CreateMessageParams, canonicalize};
 
 const BLESS_ENV: &str = "ROUNDHOUSE_BLESS_GOLDEN_LABELS";
 
@@ -191,7 +193,7 @@ fn messages_cases() -> Vec<MessageCase> {
         for (headers_id, headers) in std::iter::once(&anonymous).chain(&sets) {
             cases.push(MessageCase {
                 id: format!("messages/{body_id}/{headers_id}"),
-                label: session_key(headers, &params),
+                label: messages_label(headers, &params),
             });
         }
     }
@@ -207,12 +209,23 @@ fn messages_cases() -> Vec<MessageCase> {
     );
     cases.push(MessageCase {
         id: format!("messages/{body_id}-without-metadata/no-headers"),
-        label: session_key(
+        label: messages_label(
             &HeaderMap::new(),
             &serde_json::from_value(anonymous_body).expect("a Messages body"),
         ),
     });
     cases
+}
+
+/// The handler's label for one request, over the items the handler would hold.
+///
+/// The items are canonicalized rather than left empty so the view is the one
+/// the handler builds: no rung reads them today, and a derivation that started
+/// to would be pinned by this file instead of passing because the test fed it
+/// nothing.
+fn messages_label(headers: &HeaderMap, params: &CreateMessageParams) -> Option<String> {
+    let items = canonicalize(params).expect("a captured Messages body canonicalizes");
+    claimed_label(headers, params, &items).expect("a Messages request is never refused a label")
 }
 
 /// One Responses request: raw header bytes (so a non-ASCII value can be built)

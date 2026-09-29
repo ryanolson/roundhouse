@@ -5,7 +5,10 @@
 //!
 //! Pure translation, no state, mirroring
 //! [`responses_api::wire`](crate::responses_api): what a request's JSON means
-//! as canonical [`Item`]s, and which session it names. The endpoint and its
+//! as canonical [`Item`]s. Which session it names is not decided here: that is
+//! `roundhouse_sequence_id::label`, one derivation for both surfaces, so the
+//! Messages rungs and the Responses rungs cannot drift apart in two modules
+//! that each thought the other's spelling was a detail. The endpoint and its
 //! follower live in the parent module; the frames going the other way live in
 //! [`emit`](super::emit).
 //!
@@ -46,7 +49,6 @@
 //! mechanism cannot cover it: a configuration run is leading by construction and
 //! this item is trailing.
 
-use axum::http::HeaderMap;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -56,56 +58,6 @@ use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_fleet::anthropic_messages::wire::ContentBlock;
 
 use crate::http::ApiError;
-
-/// The header Claude Code names its session with.
-///
-/// Confirmed live on every inference request at 2.1.247 (§5.5 ¶2): a fresh UUID
-/// per invocation unless `CLAUDE_CODE_SESSION_ID` is set, stable across
-/// `--continue`. It is read first because it is the clean seam — no body
-/// parsing, and the value is the session id rather than something the session
-/// id has to be dug out of.
-pub const SESSION_HEADER: &str = "x-claude-code-session-id";
-
-/// The header a Task-tool subagent identifies itself with.
-///
-/// A subagent runs inside the parent's process and inherits the parent's
-/// session id, so without this the two interleave their turns on one log — and
-/// because neither one's resent history contains the other's items, every
-/// alternating turn diverges and forks. Read here rather than guessed at from
-/// the body, and treated as *part of the name* rather than as a reason to open
-/// an anonymous session: a subagent is a conversation of its own that a later
-/// turn of the same subagent should continue.
-pub const AGENT_HEADER: &str = "x-claude-code-agent-id";
-
-/// The namespace every session name this surface derives lives in.
-///
-/// **Cross-dialect continuation is not a feature** (M11.1 review, F6). A
-/// Messages client names its conversation with a header or a `metadata.user_id`
-/// and a Responses client names its own with `prompt_cache_key`; both are
-/// arbitrary client-chosen strings, and
-/// [`ControlPlane::qualify`](crate::control_config::ControlPlane) puts them in
-/// one namespace per principal. Two clients of one principal that happen to
-/// choose the same string are then not two conversations but one contested one
-/// — and since their histories were never going to agree, *every* alternating
-/// turn looks like an edited resend and forks, dropping the control store's
-/// overlay, intent, steer and binding records for the generation it leaves
-/// behind each time.
-///
-/// A prefix rather than a second namespace argument on `qualify`, because this
-/// is a fact about *this dialect's* names and not about the principal: the
-/// Responses surface's keys are unchanged, so no session minted before this
-/// existed moves. The shared `turn_id_for` deliberately stays shared — a turn
-/// id is a content hash and two dialects hashing one conversation differently
-/// would each be idempotent alone and neither across a chained deployment that
-/// serves one and dispatches the other.
-const DIALECT_NAMESPACE: &str = "anthropic_messages";
-
-/// The separator in the *older* `metadata.user_id` shape.
-///
-/// `user_<hex>_account_<uuid>_session_<uuid>`. Neither hex nor a UUID contains
-/// an underscore, so the marker occurs at most once and taking the first split
-/// is unambiguous.
-const USER_ID_SESSION_MARKER: &str = "_session_";
 
 // ---------------------------------------------------------------------------
 // The request
@@ -201,122 +153,6 @@ pub struct InputMessage {
 pub struct Metadata {
     #[serde(default)]
     pub user_id: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Session naming
-// ---------------------------------------------------------------------------
-
-/// Which session this request names, or `None` for an anonymous one.
-///
-/// Plan R5's order exactly: the header, then the session component of
-/// `metadata.user_id` in both shapes it has shipped in, then the whole
-/// `user_id`, then nothing.
-///
-/// **The fallbacks are not defensive padding; each answers a real client.** The
-/// header is absent from v2.1.42 and present at 2.1.247, so a deployment whose
-/// users have not updated is served by the second rung. `user_id` changed shape
-/// between those versions — an underscore-delimited string became a JSON object
-/// string (§5.5 ¶1) — and `claude-code-router`'s `_session_` split, which the
-/// evidence cites, does not parse the newer one; reading both is what keeps one
-/// client session on one roundhouse session across a client upgrade. The whole
-/// string is kept when neither shape parses because a name we do not recognise
-/// is still a name, and hashing it into an anonymous session would throw away a
-/// warm prefix for no gain.
-///
-/// The last rung exists for a bare `curl`, not for Claude Code: every version
-/// read sends `user_id` on every request, so the product path never reaches it.
-/// It is `None` rather than a 4xx because a client with no session is asking for
-/// one turn, and answering it costs nothing.
-///
-/// Every rung that *does* name something is scoped by
-/// [`DIALECT_NAMESPACE`] and by the calling agent, so a name is only ever
-/// shared with another turn of the same dialect and the same agent. See
-/// [`scoped`].
-pub fn session_key(headers: &HeaderMap, params: &CreateMessageParams) -> Option<String> {
-    let agent = headers
-        .get(AGENT_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if let Some(named) = headers
-        .get(SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(scoped(named, agent));
-    }
-    params
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.user_id.as_deref())
-        .map(str::trim)
-        .filter(|user_id| !user_id.is_empty())
-        .map(|user_id| scoped(&session_component(user_id), agent))
-}
-
-/// A client-chosen name, in the namespace it is allowed to collide inside.
-///
-/// Two dimensions, and neither is decoration:
-///
-/// **The dialect**, for the reason [`DIALECT_NAMESPACE`] gives — a Messages
-/// session id and a Responses `prompt_cache_key` that read the same are not the
-/// same conversation.
-///
-/// **The agent**, because the Task tool runs a subagent inside the parent's own
-/// process, and the client-surface evidence has it inheriting the parent's
-/// session id. Two agents appending to one log interleave two conversations
-/// neither of them can then resend, so each turn diverges from what the other
-/// left and forks. Joining the agent id makes them siblings: the parent keeps
-/// `…/{session}` and each subagent gets `…/{session}/agent/{id}`, which is one
-/// conversation each and a name a later turn of the same subagent reaches
-/// again.
-///
-/// The parent's own name is deliberately *not* re-spelled when the header is
-/// absent, so a deployment whose clients never send it sees exactly the names
-/// it saw before — and the subagent's name keeps the parent's session id as a
-/// visible prefix, which is what makes the relationship readable in a store
-/// listing rather than only in this function.
-///
-/// `#` is avoided on purpose: [`Conversations`](crate::conversations) spells a
-/// fork generation `{key}#g{n}`, and a client-chosen name that could mint a
-/// string of that shape would let one conversation address another's
-/// generation.
-fn scoped(session: &str, agent: Option<&str>) -> String {
-    match agent {
-        Some(agent) => format!("{DIALECT_NAMESPACE}/{session}/agent/{agent}"),
-        None => format!("{DIALECT_NAMESPACE}/{session}"),
-    }
-}
-
-/// The session component of a `metadata.user_id`, in either shipped shape.
-///
-/// Never `None`: an unrecognised shape yields the whole string, which is the
-/// third rung of R5's order. Trimmed at each rung because a value that differs
-/// only in whitespace between two turns would bind two sessions to one
-/// conversation.
-pub fn session_component(user_id: &str) -> String {
-    // The 2.1.247 shape: `user_id` is itself a JSON-encoded object.
-    if let Ok(Value::Object(fields)) = serde_json::from_str::<Value>(user_id)
-        && let Some(session_id) = fields.get("session_id").and_then(Value::as_str)
-        && !session_id.trim().is_empty()
-    {
-        return session_id.trim().to_string();
-    }
-    // The pre-2.1.247 shape.
-    if let Some((_, session_id)) = user_id.split_once(USER_ID_SESSION_MARKER)
-        && !session_id.trim().is_empty()
-    {
-        return session_id.trim().to_string();
-    }
-    // Trimmed here too, so this function is right on its own rather than only
-    // when reached through [`session_key`], which trims before it calls. A
-    // whitespace-only difference between two turns of one conversation would
-    // otherwise bind them to two sessions and lose the warm prefix — the exact
-    // failure the whole prefix-admission design exists to avoid, arriving
-    // through the one rung nobody thinks about.
-    user_id.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -764,12 +600,13 @@ mod tests {
     /// The dialect a session written through *this* surface is folded under.
     ///
     /// Named once rather than spelled at each assertion, and pinned to the keys
-    /// this module actually mints by
-    /// [`the_session_key_this_surface_mints_folds_under_the_messages_dialect`]
-    /// — which is the join the fold depends on: the engine reads the dialect
-    /// off the session key, so a key shape this module changed without telling
-    /// `ControlCallDialect::of_session_key` would silently put every Messages
-    /// session back on the other surface's recognizer (M12 review, F8).
+    /// this surface actually mints by `roundhouse-sequence-id`'s
+    /// `the_session_key_this_surface_mints_folds_under_the_messages_dialect`,
+    /// which moved there with the derivation — the join the fold depends on:
+    /// the engine reads the dialect off the session key, so a key shape the
+    /// label changed without telling `ControlCallDialect::of_session_key` would
+    /// silently put every Messages session back on the other surface's
+    /// recognizer (M12 review, F8).
     const MESSAGES_DIALECT: ControlCallDialect = ControlCallDialect::ClaudeMessages;
 
     /// What a *leading* system block canonicalizes to.
@@ -789,17 +626,6 @@ mod tests {
 
     fn params(body: Value) -> CreateMessageParams {
         serde_json::from_value(body).expect("the fixture is a well-formed request")
-    }
-
-    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for (name, value) in pairs {
-            headers.insert(
-                axum::http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
-                value.parse().expect("a header value"),
-            );
-        }
-        headers
     }
 
     /// The 2.1.247 body, canonicalized.
@@ -1058,44 +884,6 @@ mod tests {
             "a client tool literally named `status` is not roundhouse's own call \
              on a surface that never drops the namespace: {exchanges:#?}"
         );
-    }
-
-    /// The engine reads a session's dialect off its key, and this is where the
-    /// two meet (M12 review, F8).
-    ///
-    /// Asserted over every key shape [`session_key`] can mint — the header
-    /// form, both `user_id` forms, the body form, and each of those with an
-    /// agent tail — rather than over one sample, because the fold's correctness
-    /// rests on *all* of them being recognisable and a sampled test would pass
-    /// while one shape quietly resolved to the Responses recognizer.
-    #[test]
-    fn the_session_key_this_surface_mints_folds_under_the_messages_dialect() {
-        let keys = [
-            session_key(
-                &headers(&[(SESSION_HEADER, "header-session")]),
-                &params(json!({ "messages": [] })),
-            ),
-            session_key(
-                &headers(&[(SESSION_HEADER, "s1"), (AGENT_HEADER, "agent-7")]),
-                &params(json!({ "messages": [] })),
-            ),
-            session_key(
-                &HeaderMap::new(),
-                &params(json!({
-                    "messages": [],
-                    "metadata": { "user_id": "user_9f3a_account_c0ffee_session_deadbeef" }
-                })),
-            ),
-        ];
-        for key in keys {
-            let key = key.expect("each of these names a session");
-            assert_eq!(
-                ControlCallDialect::of_session_key(&key),
-                MESSAGES_DIALECT,
-                "`{key}` is a key this surface mints, so the fold must read it \
-                 as the Messages surface"
-            );
-        }
     }
 
     /// Control for the above: the flat-namespaced spelling of the same tool
@@ -1541,153 +1329,6 @@ mod tests {
         assert_eq!(
             none.iter().map(|item| item.role).collect::<Vec<_>>(),
             vec![Role::User, Role::System],
-        );
-    }
-
-    /// **The header wins, then either `user_id` shape, then the whole string.**
-    ///
-    /// One test for the whole order because the order *is* the ruling, and the
-    /// interesting failures are precedence failures: a reader that prefers
-    /// `user_id` binds a subagent's turns to its parent's session, and a reader
-    /// that handles only one `user_id` shape re-keys every session the day a
-    /// user upgrades their client.
-    #[test]
-    fn the_session_key_follows_r5s_order() {
-        let live_user_id = r#"{"device_id":"a1b2","account_uuid":"","session_id":"11111111-2222-3333-4444-555555555555"}"#;
-        let with_metadata =
-            |user_id: &str| params(json!({ "messages": [], "metadata": { "user_id": user_id } }));
-
-        // 1. The header, even when `user_id` names a different session.
-        assert_eq!(
-            session_key(
-                &headers(&[(SESSION_HEADER, "header-session")]),
-                &with_metadata(live_user_id)
-            )
-            .as_deref(),
-            Some("anthropic_messages/header-session")
-        );
-        // 2a. The 2.1.247 JSON-object shape.
-        assert_eq!(
-            session_key(&HeaderMap::new(), &with_metadata(live_user_id)).as_deref(),
-            Some("anthropic_messages/11111111-2222-3333-4444-555555555555")
-        );
-        // 2b. The older underscore shape, which the JSON parse does not reach.
-        assert_eq!(
-            session_key(
-                &HeaderMap::new(),
-                &with_metadata("user_9f3a_account_c0ffee_session_deadbeef")
-            )
-            .as_deref(),
-            Some("anthropic_messages/deadbeef")
-        );
-        // 3. A shape neither rung recognises is still a name.
-        assert_eq!(
-            session_key(&HeaderMap::new(), &with_metadata("just-a-name")).as_deref(),
-            Some("anthropic_messages/just-a-name")
-        );
-        // 4. Nothing at all.
-        assert_eq!(
-            session_key(&HeaderMap::new(), &params(json!({ "messages": [] }))),
-            None
-        );
-    }
-
-    /// The degenerate `user_id` shapes each fall through to the next rung.
-    #[test]
-    fn a_user_id_that_names_no_session_falls_through_to_itself() {
-        // JSON, but not an object.
-        assert_eq!(session_component("[1,2]"), "[1,2]");
-        assert_eq!(session_component("42"), "42");
-        // An object with no `session_id`, and one whose `session_id` is blank.
-        let no_session = r#"{"device_id":"a1b2"}"#;
-        assert_eq!(session_component(no_session), no_session);
-        let blank = r#"{"session_id":"   "}"#;
-        assert_eq!(session_component(blank), blank);
-        // The marker with nothing after it.
-        assert_eq!(
-            session_component("user_9f3a_session_"),
-            "user_9f3a_session_"
-        );
-        // Whitespace never distinguishes two turns of one conversation.
-        assert_eq!(session_component("  padded  "), "padded");
-        assert_eq!(session_component(r#"{"session_id":"  abc  "}"#), "abc");
-    }
-
-    /// An empty header value is absent, not a session named "".
-    #[test]
-    fn a_blank_session_header_falls_through_to_the_body() {
-        assert_eq!(
-            session_key(
-                &headers(&[(SESSION_HEADER, "   ")]),
-                &params(json!({ "messages": [], "metadata": { "user_id": "from-body" } }))
-            )
-            .as_deref(),
-            Some("anthropic_messages/from-body")
-        );
-        assert_eq!(
-            session_key(
-                &headers(&[(SESSION_HEADER, "")]),
-                &params(json!({ "messages": [] }))
-            ),
-            None
-        );
-    }
-
-    /// **Every derived name carries its dialect, and its agent when there is
-    /// one** (M11.1 review, F6).
-    ///
-    /// Two collisions this closes, both of which forked a session on *every*
-    /// alternating turn rather than once: a Responses `prompt_cache_key` that
-    /// reads the same as a Messages session id under one principal, and a
-    /// Task-tool subagent that inherits its parent's session id. Neither is an
-    /// edited conversation; both were two conversations sharing a log, which is
-    /// the one thing prefix admission can never reconcile.
-    ///
-    /// The last assertion is the one that keeps this cheap: with no agent
-    /// header the parent's name gains nothing beyond the dialect, so a
-    /// deployment whose clients never send it is unaffected.
-    #[test]
-    fn a_derived_name_carries_its_dialect_and_its_agent() {
-        let body = params(json!({ "messages": [] }));
-
-        assert_eq!(
-            session_key(&headers(&[(SESSION_HEADER, "s1")]), &body).as_deref(),
-            Some("anthropic_messages/s1"),
-        );
-        assert_eq!(
-            session_key(
-                &headers(&[(SESSION_HEADER, "s1"), (AGENT_HEADER, "agent-7")]),
-                &body
-            )
-            .as_deref(),
-            Some("anthropic_messages/s1/agent/agent-7"),
-        );
-        // The agent joins a `user_id`-derived name too: the rung a name came
-        // from is not a reason to scope it differently.
-        assert_eq!(
-            session_key(
-                &headers(&[(AGENT_HEADER, "agent-7")]),
-                &params(json!({ "messages": [], "metadata": { "user_id": "from-body" } }))
-            )
-            .as_deref(),
-            Some("anthropic_messages/from-body/agent/agent-7"),
-        );
-        // A blank agent header is absent, not an agent named "": otherwise a
-        // client that sent the header empty would get a session of its own that
-        // no later turn could name again.
-        assert_eq!(
-            session_key(
-                &headers(&[(SESSION_HEADER, "s1"), (AGENT_HEADER, "  ")]),
-                &body
-            )
-            .as_deref(),
-            Some("anthropic_messages/s1"),
-        );
-        // A name a Responses client could choose can no longer reach a Messages
-        // session, whatever it spells.
-        assert_ne!(
-            session_key(&headers(&[(SESSION_HEADER, "shared")]), &body).as_deref(),
-            Some("shared"),
         );
     }
 

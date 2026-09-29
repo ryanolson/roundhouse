@@ -4885,6 +4885,7 @@ dependencies = [
  "roundhouse-fleet",
  "roundhouse-mcp",
  "roundhouse-relay",
+ "roundhouse-sequence-id",
  "roundhouse-server",
  "roundhouse-store-redis",
  "serde",

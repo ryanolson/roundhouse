@@ -4,8 +4,8 @@
 //! Labels: the lineage name a request claims, before qualification.
 //!
 //! **Moved, not rewritten.** Every value here is the one the server derived
-//! before this crate existed — the Messages rungs from
-//! `messages_api::wire::session_key`, `scoped` and `session_component`, the
+//! before this crate existed — the Messages rungs from the server's Messages
+//! wire module (`session_key`, `scoped` and `session_component`), the
 //! Responses rungs from `RequestContext::from_request` and `conversation_key`.
 //! A label is the key the store holds a conversation's log under, so a label
 //! that changed spelling in the move would not fail anything: it would open a
@@ -119,7 +119,7 @@ pub fn label(view: &RequestView<'_>) -> Result<Labeled, LabelError> {
 ///
 /// Every rung that does name something is scoped by the dialect and by the
 /// calling agent, so a name is only ever shared with another turn of the same
-/// dialect and the same agent. See [`scoped`].
+/// dialect and the same agent. See `scoped`.
 pub fn messages_label(headers: &HeaderMap, metadata_user_id: Option<&str>) -> Option<String> {
     messages_rung(headers, metadata_user_id).map(|label| label.name)
 }

@@ -5,6 +5,9 @@
 
 use axum::http::HeaderMap;
 use roundhouse_core::item::{Item, Role};
+use roundhouse_sequence_id::{
+    LabelError, LabelSource, Labeled, RequestView, Surface, client_session, label,
+};
 use sha2::{Digest, Sha256};
 
 use crate::http::ApiError;
@@ -17,43 +20,95 @@ pub struct RequestContext {
     pub prompt_cache_key: String,
     pub prefix_fingerprint: String,
     pub window_id: Option<String>,
+    /// The lineage name `roundhouse_sequence_id::label` gave, kept as given.
+    ///
+    /// Stored rather than re-derived from the fields above, because
+    /// re-deriving it would be a second copy of the crate's precedence — the
+    /// exact duplication the move exists to remove — and the day the two
+    /// disagreed, the log would be keyed by one and reported by the other.
+    label: String,
 }
 
 impl RequestContext {
+    /// The Responses surface's adapter over `roundhouse_sequence_id::label`.
+    ///
+    /// The name is the crate's; what stays here is the `x-codex-window-id`
+    /// refusal and the content fingerprint, neither of which names anything.
+    ///
+    /// **The refusal order is the one this function always had** — a bad
+    /// `session-id`, then a bad `thread-id`, then a bad window, then no name —
+    /// because a client that sends two bad headers is told about the first one,
+    /// and moving the derivation must not change which. `label` checks the two
+    /// naming headers and never looks at the window, so its header refusal
+    /// returns first, the window is checked next, and only then does an
+    /// unnamed request get its 422. Checking the window before calling `label`
+    /// would report a blank window ahead of a blank `session-id`; checking it
+    /// only on success would report "no name" ahead of a blank window. The
+    /// golden capture's combined-invalid cases pin the first;
+    /// `an_unnamed_request_with_a_bad_window_is_refused_for_the_window` pins
+    /// the second, which the capture has no case for.
     pub(crate) fn from_request(
         headers: &HeaderMap,
         cache_key: Option<&str>,
         items: &[Item],
     ) -> Result<Self, ApiError> {
-        let session_id = header(headers, "session-id")?;
-        let thread_id = header(headers, "thread-id")?;
+        let view = RequestView {
+            surface: Surface::OpenAiResponses,
+            headers,
+            items,
+            tools: None,
+            metadata_user_id: None,
+            prompt_cache_key: cache_key,
+        };
+        let labeled = match label(&view) {
+            Err(invalid @ LabelError::InvalidHeader(_)) => return Err(label_refusal(invalid)),
+            labeled => labeled,
+        };
         let window_id = header(headers, "x-codex-window-id")?;
+        // A fingerprint can be shared by unrelated conversations. It cannot
+        // supply the missing identity of an append-only history — which is
+        // why `label` refuses rather than falling back to it. `Anonymous` is a
+        // Messages answer the crate never gives this surface; if it ever did,
+        // it is still no name here, and refusing it keeps the one rule.
+        let named = match labeled {
+            Ok(Labeled::Named(named)) => named,
+            Ok(Labeled::Anonymous) => return Err(label_refusal(LabelError::Unnamed)),
+            Err(error) => return Err(label_refusal(error)),
+        };
+        // `label` reads `thread-id` before `session-id`, so a thread present is
+        // the thread that named the request: its value is the name, as sent.
+        let thread_id = (named.source == LabelSource::CodexThread).then(|| named.name.clone());
+        // Lenient where `label` is strict, but `label` has already refused a
+        // malformed `session-id`, so here the two read the same bytes.
+        let session_id = client_session(&view);
         let prefix_fingerprint = prefix_fingerprint(items);
         let cache_key = cache_key.filter(|key| !key.is_empty());
-        // A fingerprint can be shared by unrelated conversations. It cannot
-        // supply the missing identity of an append-only history.
-        if session_id.is_none() && thread_id.is_none() && cache_key.is_none() {
-            return Err(ApiError::unprocessable(
-                "a `thread-id`, `session-id`, or `prompt_cache_key` is required to name the conversation",
-            ));
-        }
         Ok(Self {
             session_id,
             thread_id,
             prompt_cache_key: cache_key.unwrap_or(&prefix_fingerprint).to_owned(),
             prefix_fingerprint,
             window_id,
+            label: named.name,
         })
     }
 
     pub(crate) fn conversation_key(&self) -> &str {
-        self.thread_id
-            .as_deref()
-            .or(self.session_id.as_deref())
-            .unwrap_or(&self.prompt_cache_key)
+        &self.label
     }
 }
 
+/// A label refusal, as the 422 this server has always sent for it.
+///
+/// One mapping for both surfaces. `LabelError`'s texts are this server's bodies
+/// from before the move, verbatim, so a client that parses the refusal sees
+/// what it saw; the status and code are chosen here, because an HTTP status is
+/// the server's business and not the pure crate's.
+pub(crate) fn label_refusal(error: LabelError) -> ApiError {
+    ApiError::unprocessable(error.to_string())
+}
+
+/// The window header's check, the one refusal `label` does not make.
 fn header(headers: &HeaderMap, name: &str) -> Result<Option<String>, ApiError> {
     headers
         .get(name)
@@ -112,6 +167,39 @@ mod tests {
             prefix_fingerprint(&items),
             prefix_fingerprint(&[Item::system_text("changed"), Item::user_text("first")])
         );
+    }
+
+    /// **A bad window outranks a missing name**, as it did before the move.
+    ///
+    /// The golden capture's combined-invalid cases all carry a bad naming
+    /// header, so they pin `label`'s refusals ahead of the window but not the
+    /// window ahead of `Unnamed`: an adapter that checked the window only once
+    /// a name was found passes the whole capture. This is the case it misses.
+    #[tokio::test]
+    async fn an_unnamed_request_with_a_bad_window_is_refused_for_the_window() {
+        let items = [Item::user_text("first")];
+        for window in [" ", ""] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-codex-window-id", window.parse().unwrap());
+            for cache_key in [None, Some("")] {
+                let error = RequestContext::from_request(&headers, cache_key, &items)
+                    .expect_err("neither a name nor a usable window");
+                let response = axum::response::IntoResponse::into_response(error);
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY
+                );
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    body["error"]["message"],
+                    "`x-codex-window-id` must be a non-empty ASCII header",
+                    "window {window:?}, cache key {cache_key:?}"
+                );
+            }
+        }
     }
 
     #[test]

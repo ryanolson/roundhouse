@@ -28,6 +28,7 @@ roundhouse-mcp = { workspace = true }
 # composition root that mounts a router over it. See `src/relay_api.rs`.
 roundhouse-relay = { workspace = true }
 roundhouse-store-redis = { workspace = true }
+roundhouse-sequence-id = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

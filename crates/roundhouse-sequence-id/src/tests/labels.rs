@@ -5,8 +5,8 @@ use http::{HeaderMap, HeaderValue};
 use roundhouse_core::item::Item;
 
 use crate::{
-    Label, LabelError, LabelSource, Labeled, RequestView, Surface, client_session, label,
-    messages_label,
+    CLAUDE_AGENT_HEADER, CLAUDE_SESSION_HEADER, Label, LabelError, LabelSource, Labeled,
+    RequestView, Surface, client_session, label, messages_label, session_component,
 };
 
 pub(super) fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -241,4 +241,191 @@ fn every_fixture_body_is_named_by_its_user_id() {
             "{name}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Moved from the server's `messages_api::wire`, names kept. Each asserted
+// today's `session_key`; `messages_label` is that function without the
+// server's request type, so the assertions are the same and only the call
+// changed — which is the point of moving them rather than rewriting them.
+// ---------------------------------------------------------------------------
+
+/// The engine reads a session's dialect off its key, and this is where the
+/// two meet (M12 review, F8).
+///
+/// Asserted over every key shape [`messages_label`] can mint — the header
+/// form, the `user_id` form, and the header form with an agent tail — rather
+/// than over one sample, because the fold's correctness rests on *all* of them
+/// being recognisable and a sampled test would pass while one shape quietly
+/// resolved to the Responses recognizer. Here rather than in core because the
+/// join is between two crates: this one mints the keys and core's
+/// `ControlCallDialect::of_session_key` reads them, and the one namespace
+/// constant is what they now share instead of two spellings and a hope.
+#[test]
+fn the_session_key_this_surface_mints_folds_under_the_messages_dialect() {
+    use roundhouse_core::validate::ControlCallDialect;
+
+    let keys = [
+        messages_label(&headers(&[(CLAUDE_SESSION_HEADER, "header-session")]), None),
+        messages_label(
+            &headers(&[
+                (CLAUDE_SESSION_HEADER, "s1"),
+                (CLAUDE_AGENT_HEADER, "agent-7"),
+            ]),
+            None,
+        ),
+        messages_label(
+            &HeaderMap::new(),
+            Some("user_9f3a_account_c0ffee_session_deadbeef"),
+        ),
+    ];
+    for key in keys {
+        let key = key.expect("each of these names a session");
+        assert_eq!(
+            ControlCallDialect::of_session_key(&key),
+            ControlCallDialect::ClaudeMessages,
+            "`{key}` is a key this surface mints, so the fold must read it \
+             as the Messages surface"
+        );
+    }
+}
+
+/// **The header wins, then either `user_id` shape, then the whole string.**
+///
+/// One test for the whole order because the order *is* the ruling, and the
+/// interesting failures are precedence failures: a reader that prefers
+/// `user_id` binds a subagent's turns to its parent's session, and a reader
+/// that handles only one `user_id` shape re-keys every session the day a
+/// user upgrades their client.
+#[test]
+fn the_session_key_follows_r5s_order() {
+    let live_user_id = r#"{"device_id":"a1b2","account_uuid":"","session_id":"11111111-2222-3333-4444-555555555555"}"#;
+
+    // 1. The header, even when `user_id` names a different session.
+    assert_eq!(
+        messages_label(
+            &headers(&[(CLAUDE_SESSION_HEADER, "header-session")]),
+            Some(live_user_id)
+        )
+        .as_deref(),
+        Some("anthropic_messages/header-session")
+    );
+    // 2a. The 2.1.247 JSON-object shape.
+    assert_eq!(
+        messages_label(&HeaderMap::new(), Some(live_user_id)).as_deref(),
+        Some("anthropic_messages/11111111-2222-3333-4444-555555555555")
+    );
+    // 2b. The older underscore shape, which the JSON parse does not reach.
+    assert_eq!(
+        messages_label(
+            &HeaderMap::new(),
+            Some("user_9f3a_account_c0ffee_session_deadbeef")
+        )
+        .as_deref(),
+        Some("anthropic_messages/deadbeef")
+    );
+    // 3. A shape neither rung recognises is still a name.
+    assert_eq!(
+        messages_label(&HeaderMap::new(), Some("just-a-name")).as_deref(),
+        Some("anthropic_messages/just-a-name")
+    );
+    // 4. Nothing at all.
+    assert_eq!(messages_label(&HeaderMap::new(), None), None);
+}
+
+/// The degenerate `user_id` shapes each fall through to the next rung.
+#[test]
+fn a_user_id_that_names_no_session_falls_through_to_itself() {
+    // JSON, but not an object.
+    assert_eq!(session_component("[1,2]"), "[1,2]");
+    assert_eq!(session_component("42"), "42");
+    // An object with no `session_id`, and one whose `session_id` is blank.
+    let no_session = r#"{"device_id":"a1b2"}"#;
+    assert_eq!(session_component(no_session), no_session);
+    let blank = r#"{"session_id":"   "}"#;
+    assert_eq!(session_component(blank), blank);
+    // The marker with nothing after it.
+    assert_eq!(
+        session_component("user_9f3a_session_"),
+        "user_9f3a_session_"
+    );
+    // Whitespace never distinguishes two turns of one conversation.
+    assert_eq!(session_component("  padded  "), "padded");
+    assert_eq!(session_component(r#"{"session_id":"  abc  "}"#), "abc");
+}
+
+/// An empty header value is absent, not a session named "".
+#[test]
+fn a_blank_session_header_falls_through_to_the_body() {
+    assert_eq!(
+        messages_label(
+            &headers(&[(CLAUDE_SESSION_HEADER, "   ")]),
+            Some("from-body")
+        )
+        .as_deref(),
+        Some("anthropic_messages/from-body")
+    );
+    assert_eq!(
+        messages_label(&headers(&[(CLAUDE_SESSION_HEADER, "")]), None),
+        None
+    );
+}
+
+/// **Every derived name carries its dialect, and its agent when there is
+/// one** (M11.1 review, F6).
+///
+/// Two collisions this closes, both of which forked a session on *every*
+/// alternating turn rather than once: a Responses `prompt_cache_key` that
+/// reads the same as a Messages session id under one principal, and a
+/// Task-tool subagent that inherits its parent's session id. Neither is an
+/// edited conversation; both were two conversations sharing a log, which is
+/// the one thing prefix admission can never reconcile.
+///
+/// The last assertion is the one that keeps this cheap: with no agent
+/// header the parent's name gains nothing beyond the dialect, so a
+/// deployment whose clients never send it is unaffected.
+#[test]
+fn a_derived_name_carries_its_dialect_and_its_agent() {
+    assert_eq!(
+        messages_label(&headers(&[(CLAUDE_SESSION_HEADER, "s1")]), None).as_deref(),
+        Some("anthropic_messages/s1"),
+    );
+    assert_eq!(
+        messages_label(
+            &headers(&[
+                (CLAUDE_SESSION_HEADER, "s1"),
+                (CLAUDE_AGENT_HEADER, "agent-7")
+            ]),
+            None
+        )
+        .as_deref(),
+        Some("anthropic_messages/s1/agent/agent-7"),
+    );
+    // The agent joins a `user_id`-derived name too: the rung a name came
+    // from is not a reason to scope it differently.
+    assert_eq!(
+        messages_label(
+            &headers(&[(CLAUDE_AGENT_HEADER, "agent-7")]),
+            Some("from-body")
+        )
+        .as_deref(),
+        Some("anthropic_messages/from-body/agent/agent-7"),
+    );
+    // A blank agent header is absent, not an agent named "": otherwise a
+    // client that sent the header empty would get a session of its own that
+    // no later turn could name again.
+    assert_eq!(
+        messages_label(
+            &headers(&[(CLAUDE_SESSION_HEADER, "s1"), (CLAUDE_AGENT_HEADER, "  ")]),
+            None
+        )
+        .as_deref(),
+        Some("anthropic_messages/s1"),
+    );
+    // A name a Responses client could choose can no longer reach a Messages
+    // session, whatever it spells.
+    assert_ne!(
+        messages_label(&headers(&[(CLAUDE_SESSION_HEADER, "shared")]), None).as_deref(),
+        Some("shared"),
+    );
 }
