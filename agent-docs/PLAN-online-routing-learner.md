@@ -130,7 +130,7 @@ Files this plan creates, now built: `crates/roundhouse-core/src/routing/learn/` 
 
 M9 built `crates/roundhouse-server/src/learner_recovery.rs`, with `routing_composition.rs`, `engine/learning/delivery.rs` and `control_config/learner_recovery.rs` beside it.
 
-Files this plan creates, still pending: `crates/roundhouse-core/src/routing/learn/offline.rs` and `crates/roundhouse-server/src/bin/learner-calibrate/` (M10).
+M10 built `crates/roundhouse-core/src/routing/learn/offline.rs` with `learn/offline/`, `crates/roundhouse-server/src/learner_calibrate.rs`, and `crates/roundhouse-server/src/bin/learner-calibrate/`.
 
 ## 6. Milestones
 
@@ -522,7 +522,7 @@ Owner approval is also required for: the merge of PR #18, which every milestone 
 | M7 Redis learner store | L4 | implemented on `ai/learner-m7-redis`, awaiting review | |
 | M8 configuration, engine path, delivery, metrics | L5 part 1 | implemented on `ai/learner-m8-engine`, awaiting review | |
 | M9 startup, recovery task, audit | L5 part 2 | implemented on `ai/learner-m9-startup`, awaiting review | |
-| M10 calibrator and promotion report | L7 | not started | |
+| M10 calibrator and promotion report | L7 | implemented on `ai/learner-m10-calibrator`, awaiting review | |
 | M11 live enablement | L8 | owner procedure | |
 
 L3b, the source-side index, is done at `6a9eb07` and ships in PR #18. M5 connects `Session::commit` to it.
@@ -934,3 +934,74 @@ Every other outage source (a genuine `Unavailable`, a real timeout, an actual ba
 - **Item 3's mechanism is accepted.** The error kind cannot separate a RESP protocol failure from a client-side decode failure, because both raise `ErrorKind::Parse`. Decoding to `Value` first and mapping only the local conversion to `CorruptLog` keeps a real protocol failure an outage.
 - **A pending or marked member that is not UTF-8 is an outage, by rule.** The governing rule holds a session when the fault can be attributed to a valid session. A member that is not a valid `SessionId` names no session. It is corruption of the shared index, in the same class as a wrong-typed index key, which is already an outage. Only a foreign `ZADD` of raw bytes into this namespace's keys produces it. The table row above that reads "not none" is therefore the accepted boundary of the rule, not an open defect.
 - **Round 5, 2026-09-29.** The table covers every outage the recovery task can reach. `Hold::AcknowledgementFailed` from `record_learning_applied` is reachable only from the engine tail (`Source::Live`), so it is not a row. The merged `unreadable` list is now sorted, as its doc says, with a test that failed first (`[a, c, b]`).
+
+**M10 status, 2026-09-29.** M10 is implemented test-first on `ai/learner-m10-calibrator`, from `fe92f63`. The calibrator is `crates/roundhouse-core/src/routing/learn/offline.rs` with `offline/{source,extract,estimate,report,write,drift,dump}.rs`. The binary is `crates/roundhouse-server/src/bin/learner-calibrate/main.rs`, and it only parses its two arguments. The adapter that opens the stores and writes the files is `crates/roundhouse-server/src/learner_calibrate.rs`. The tests are `crates/roundhouse-core/tests/learner_offline.rs` and `learner_offline_stores.rs` (with `tests/offline_support/`), and `crates/roundhouse-server/tests/learner_calibrate.rs` and `learner_calibrate_redis.rs` (Redis-gated). The README section "Calibration and the promotion report" documents the manifest, the four output files, and the report.
+
+What exists:
+
+- `calibrate(config, store, copy, source_commit)` enumerates the project's sessions through `learning_sessions`, reads each log to the cutoff, replays it, runs the drift check when a copy is given, writes the artifact, and builds the `Report`. It reads only. `the_calibrator_is_read_only_against_both_stores` counts every write, lease and pending call on a `Delegating` double, and every apply on the copy. The count is zero, and both marks are still pending after the run.
+- Two additive seams in core. `SessionState::replay_learning(events)` folds a whole log through the same `apply` and returns every accepted review and the whole entry chain. The live fold keeps only 16 reviews and a page of 64 entries. `session::screen` is credit's screen, extracted from `credit()` without a change in behavior. Credit and the calibrator call it, so an interval is eligible exactly when credit credits it. `the_screen_exclusions_equal_the_session_folds_causes` compares the two counts. `exploit_order` is `pub(super)` so that the offline module re-derives an exploit choice with the policy's own function.
+- The artifact is written for `Artifact::parse`, with `stage_revision`, the strategy list, the prior in `BTreeMap` order, the manifest digest and the source commit. It holds no clock time. The sidecar `artifact.json.meta.json` holds the time and the host.
+- `InputManifest` is the cutoff (draft 14.1). It holds the sorted session ids, the last sequence read, and the SHA-256 of the event JSON lines. Its digest names the artifact and the report. `calibration.cutoff` pins a rerun. A pinned log whose digest changed is refused. A marked session that the pin does not name is counted as marked after the cutoff.
+- `ClusterUnit::Session` has one variant today, labeled `sessions (sequence key)`. Every clustered number prints that label: the session counts, the bootstrap interval, the weighted clusters, and the line that compares the count with `quality.min_sessions`.
+
+The milestone did not settle these points, so the implementation made these decisions:
+
+- **The `learned` candidate is the logged learner, not a frozen state.** At each logged turn it is what `live` would have served without exploration: the recorded exploit strategy (`exploit_order` over the recorded plans), else `rules`. The report also shows each configured strategy as a fixed candidate. A re-gate of every turn over counters rebuilt from the manifest would evaluate a policy on the data that trained it, so M10 does not build one. The promotion summary is for `learned`.
+- **The `rules` rate is factual.** It is unweighted, over the eligible intervals where the `rules` plan's first target was the served one on every turn. In `shadow` those are all the eligible intervals.
+- **Cost and latency under the weights.** The candidate's cost is the self-normalized mean of per-interval measured cost. The `rules` cost is the factual mean. The candidate's p50 is the weighted lower median of first output from turn start over its weighted intervals' turns. A test whose inputs do not exist reports `not evaluable` with its reason, and it does not pass. This covers no support, an unpriced turn, and no latency sample.
+- **Bootstrap.** The stream is SplitMix64, written out and pinned by a golden test, because a library generator can change its stream between versions. Each replicate draws as many sessions as the manifest holds. The interval is `[floor(0.025 B), ceil(0.975 B) - 1]` of the sorted replicates. A replicate with no weight counts as 0.0 for the lower bound and 1.0 for the upper, and the report prints how many there were.
+- **Replay equivalence checks what the record pins.** The checks are: a propensity in `(0, 1]`, and exactly 1 when the turn could not explore; the served dispatch on the served plan's first target; an exploit choice equal to the first entry of the recomputed exploit order; and an explored member equal to the recorded draw modulo the recorded set, naming the chosen strategy. A turn that fails excludes its interval as `record does not replay`. The exploration rate is not recorded, so a rate draw alone cannot be re-checked. The rate was not added to `ExplorationEvidence`, because that changes the M2 wire shape of every learned `Routed`.
+- **The memory-store fixture is a dump.** Both session stores stamp `at_ms` with their own clock at append, so one fixture loaded into both would give two sets of latencies. `LogDump::capture` reads a store the way the calibrator does. `DumpStore` serves the dump through the `SessionStore` read methods and refuses every write. The Redis-gated test seeds Redis through real marked appends, captures it, and compares the two runs byte for byte. The enumeration and unreadable-member tests use the real `MemoryStore` index.
+- **The artifact prior is summed review credit.** `prior: credit` sums the quality deltas of the manifest's entry chains, across epochs, for the listed strategies. The report shows credit for unlisted strategies as dropped. `prior: zero` writes none. The field is required. Jev counts never enter the prior (`jev_answers_never_enter_the_artifact_prior`).
+- **The p50 is measured, not modeled.** It is `first output - TurnStarted` in the log, on the turns M5 samples: completed, with a first output after the served `Routed`, and a quote for the served target. On those turns it equals the M3 terms exactly: the overhead sample plus the quote plus the residual sample. So the brief's "residual-corrected TTFT plus the project overhead term" is the same number, measured per turn rather than modeled.
+- **Pricing.** A dispatch is priced at its recorded rate card whatever its `billing`. A local dispatch has no rate card, and the catalog's capacity price (ruling 6) is not in the log, so the manifest takes no local price. A local turn is `unpriced`, never $0. Judge side calls record no rate card, so the report prints judge tokens and prints judge dollars as unpriced. Classifier spend is the measured `usd`. A call with unknown usage is shown at its submitted estimate. A result counts once, and only against an open intent for the same turn: the metrics evaluation block's join, so a repeated delivery is not counted twice (`classifier_spend_counts_each_call_once_against_its_intent`).
+- **The drift check** reads the copy's watermark for each session, rebuilds the entries at or below it, and compares every counter that the manifest's recorded inputs read: quality pos, n and sessions for all three strategies, Jev counts, target operations, and the overhead. A copy watermark above the cutoff is listed. `SOURCE_COMMIT` is `ROUNDHOUSE_SOURCE_COMMIT` at build time, else the crate version, and never the clock.
+
+**Finding: a `shadow` report cannot pass the ruled cost test.** A `shadow` project never explores, so every turn's propensity is 1 for the `rules` target and 0 for any other. The `learned` candidate then has weight 1 on the intervals where it agreed with `rules` on every turn, and 0 elsewhere. Its estimated cost is the `rules` cost on that subset, so a 10% saving can come only from which intervals agreed, not from routing. Where it never agrees, every test is `not evaluable` (`a_shadow_candidate_that_differs_from_rules_is_not_evaluable`). This is the conditional estimand working as specified. It does mean that M11 precondition 2 cannot be met honestly from `shadow` logs alone. It needs an owner decision before M11: for example, a bounded `live` run with exploration to buy support, or a separately labeled estimate from the recorded plan quotes.
+
+Red lines. The tests were written against the implementation and then run against a skeleton, file by file. Nothing is committed, so the skeleton was the real files with these edits: the revision-2 weight (a product over matching turns only), the first turn's propensity as the trajectory probability, an effective sample size equal to N, per-interval resampling, one cause for every exclusion, no draw check, support only for the served target, propensity 1.0, the quote as cost and $0 for local, latency from `Routed`, the prior mode ignored, labels and unit names removed from the text, and every promotion test `not evaluable`. An earlier run with no `stage_revision` failed the round trip with `Artifact(Format("missing field `stage_revision`"))`. On the skeleton, 17 of the 24 pure tests written then failed on their own claim:
+
+- the weight: `left: 1.0, right: 0.0`;
+- the probability: `0.5` where `0.125` was expected;
+- the explored propensity: `1.0` where `0.05` was expected;
+- the reviewer fixture: `0.375` where `0.75` was expected;
+- the census: `(0, 3)` where `(1, 3)` was expected;
+- the exclusions: `Some(5)` where `Some(1)` was expected;
+- the fold agreement: `1` where `3` was expected;
+- the bootstrap: a replicate that split a session;
+- cost: `Priced(0.01)` where `Priced(0.00183)` was expected;
+- local: `Priced(0.0)` where `Unpriced` was expected;
+- p50: `400` where `700` was expected;
+- the effective sample size: `3.0` where `1.47` was expected;
+- the zero prior: `1000` where `0` was expected;
+- the promotion summary: `NotEvaluable("skeleton")` where `Pass` was expected;
+- the unit label, the changed draw (2 intervals where 1 was expected), and the shadow candidate (weight 1 where 0 was expected).
+
+With the enumeration and drift skeletons (`read_source` returning nothing, and `check` returning an empty result), 6 of 9 store tests failed on their own claim. Enumeration gave `[]` where the marked session was expected. The unreadable list was `[]`. Rollback gave two equal epochs. Drift compared 0 counters. The pinned refusal had no log to pin. The read-only test failed on its own guard that the copy was read.
+
+Controls, each held by a named mutation that fails it:
+
+- a clock in the artifact bytes: the byte-identity, SHA-256 and sidecar tests;
+- Jev counts summed into the prior: the Jev test;
+- a lease taken by `read_log`: the read-only test, with 2 writes where 0 were expected;
+- the `drift check not run` line removed: its test;
+- the rebuild ignoring the watermark: the watermark test;
+- the quality test without its support guard, and `learned` always equal to `rules`: the shadow-candidate test;
+- a changed SplitMix64 constant: the golden;
+- `DumpStore::read_events` ignoring `after_seq`: the dump test;
+- a fixed candidate acting on the served target: the action test;
+- the screen without its failover check: the exclusions test;
+- a clock in the report: the binary test;
+- `deny_unknown_fields` removed from `CalibrationConfig`: the manifest test;
+- a capture that drops each log's tail: both Redis-gated tests.
+- no intent join for classifier spend: `classifier_spend_counts_each_call_once_against_its_intent`, 3 calls where 1 was expected. That test was written after the join, the 25th pure test;
+- a Redis URL error message that drops the variable's name: `a_redis_source_names_its_url_variable_and_never_the_url`.
+
+Points left for M11:
+
+- The finding above: an owner decision on how a promotion shows a cost saving.
+- A local price. A recipe with local targets reports cost as unpriced until the log records the capacity price that each local dispatch was quoted at, or the owner rules that the manifest may name one.
+- The frozen-state candidate (a re-gate over counters rebuilt at the cutoff, held out from the intervals it is evaluated on) is not built.
+- `quality.min_sessions` counts the cluster unit. Renaming it `min_anchors` waits on the owner and on the anchor.
+- Judge dollars need a rate card on the side-call record.

@@ -140,3 +140,18 @@ pub struct LearningCauses {
     /// apply.
     pub other_credit_revision: u64,
 }
+
+impl LearningCauses {
+    /// Count one review the screen excluded, under its cause.
+    pub(crate) fn count(&mut self, exclusion: super::credit::Exclusion) {
+        use super::credit::Exclusion;
+        let counter = match exclusion {
+            Exclusion::UnknownLabel => &mut self.unknown_label,
+            Exclusion::FailoverInInterval => &mut self.failover_in_interval,
+            Exclusion::MissingRow => &mut self.missing_row,
+            Exclusion::MixedEpoch => &mut self.mixed_epoch,
+            Exclusion::OtherCreditRevision => &mut self.other_credit_revision,
+        };
+        *counter += 1;
+    }
+}

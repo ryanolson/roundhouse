@@ -50,7 +50,8 @@ use crate::routing::{DecisionRecord, SelectorBranch, Target};
 use crate::store::LearningMark;
 use crate::validate::REVIEW_RULE_REVISION;
 
-pub(crate) use credit::{CoveredRow, LearningRow, Reviewed};
+pub use credit::Exclusion;
+pub(crate) use credit::{CoveredRow, LearningRow, Reviewed, same_route, screen};
 pub use entry::{
     Deltas, JevDelta, LEARNING_PAGE, LearningCauses, LearningEntry, QualityDelta, TargetDelta,
 };
@@ -436,6 +437,12 @@ impl LearningFold {
 
     pub(crate) fn page(&self) -> &[LearningEntry] {
         &self.page
+    }
+
+    /// Move the page out. Only the whole-log replay calls it, after every
+    /// event, so its page never fills and nothing is counted beyond it.
+    pub(crate) fn take_page(&mut self) -> Vec<LearningEntry> {
+        std::mem::take(&mut self.page)
     }
 
     pub(crate) fn beyond(&self) -> u64 {

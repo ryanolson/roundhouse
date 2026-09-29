@@ -39,9 +39,10 @@ use learning::LearningFold;
 use review::ReviewTracker;
 
 pub use learning::{
-    Deltas, JevDelta, LEARNING_PAGE, LearningCauses, LearningEntry, QualityDelta, TargetDelta,
-    learning_mark,
+    Deltas, Exclusion, JevDelta, LEARNING_PAGE, LearningCauses, LearningEntry, QualityDelta,
+    TargetDelta, learning_mark,
 };
+pub(crate) use learning::{LearningRow, same_route, screen};
 pub(crate) use review::{IntervalFacts, TurnEnd, TurnState};
 pub use review::{MAX_REVIEW_DECISIONS, MAX_REVIEW_TURNS, REVIEW_OUTCOME_WINDOW, ReviewOutcome};
 
@@ -1387,6 +1388,37 @@ impl SessionState {
         .await
     }
 
+    /// Every accepted review and every learning entry of one whole log, in
+    /// order: the offline calibrator's replay (milestone M10).
+    ///
+    /// **Unbounded where the live fold is bounded, and only offline.** The
+    /// live fold keeps the last [`REVIEW_OUTCOME_WINDOW`] reviews and a page
+    /// of [`LEARNING_PAGE`] entries, which is right for a turn and useless for
+    /// a report over a whole manifest. This folds the same events through the
+    /// same [`Self::apply`], collects each review the tracker accepts as it is
+    /// accepted, and drains the page after every event, so neither bound is
+    /// ever reached. The causes are the fold's own, so a caller can check that
+    /// it screened the same reviews credit did.
+    pub fn replay_learning(events: &[SessionEvent]) -> LearningReplay {
+        let mut state = SessionState {
+            learning: LearningFold::with_floor(0),
+            ..Default::default()
+        };
+        let mut replay = LearningReplay::default();
+        for event in events {
+            let accepted = state.review.accepted();
+            state.apply(event);
+            if state.review.accepted() > accepted
+                && let Some(outcome) = state.review.outcomes().last()
+            {
+                replay.reviews.push(outcome.clone());
+            }
+            replay.entries.extend(state.learning.take_page());
+        }
+        replay.causes = state.learning.causes();
+        replay
+    }
+
     /// The one replay loop: fold every event of the log into `state`.
     async fn replay<S: SessionStore>(
         store: &S,
@@ -1412,6 +1444,19 @@ impl SessionState {
         }
         Ok(state)
     }
+}
+
+/// What [`SessionState::replay_learning`] folds out of a whole log.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LearningReplay {
+    /// Every review the tracker accepted, oldest first, with the label it
+    /// accepted it under ([`IntervalLabel::Unknown`](crate::validate::IntervalLabel::Unknown)
+    /// when it could not verify membership).
+    pub reviews: Vec<ReviewOutcome>,
+    /// The whole entry chain, from `prev_seq == 0`.
+    pub entries: Vec<LearningEntry>,
+    /// Why accepted reviews credited nothing, per cause.
+    pub causes: LearningCauses,
 }
 
 /// A running lease renewal, alive for exactly as long as this handle is.

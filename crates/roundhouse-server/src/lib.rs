@@ -80,6 +80,7 @@ pub mod dialect;
 pub mod engine;
 pub mod http;
 pub mod judge;
+pub mod learner_calibrate;
 pub mod learner_recovery;
 pub mod mcp_api;
 pub mod messages_api;

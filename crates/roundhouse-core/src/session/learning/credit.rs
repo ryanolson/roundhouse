@@ -84,7 +84,7 @@ impl LearningRow {
 /// **Structural, not by comparing `policy_identity` strings**: that would
 /// allocate twice per plan on every learned `Routed`, and would equate a
 /// hosted provider named `local` with a local worker.
-fn same_route(a: &Target, b: &Target) -> bool {
+pub(crate) fn same_route(a: &Target, b: &Target) -> bool {
     match (a, b) {
         (Target::Local { model: a, .. }, Target::Local { model: b, .. }) => a == b,
         (
@@ -131,48 +131,86 @@ pub(crate) struct Reviewed {
     pub(crate) rows: Vec<CoveredRow>,
 }
 
-/// The quality deltas of one accepted review, or `None` with the cause
-/// counted.
+/// Why an accepted review credits nothing: the draft's checks, in its order.
+///
+/// **The one spelling of the screen**, read by [`credit`] and by the offline
+/// calibrator (`routing::learn::offline`), which excludes exactly the
+/// intervals credit refuses and reports them by these causes. Two spellings
+/// would let the report count an interval the store never credited, or miss
+/// one it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Exclusion {
+    /// The label was `Unknown`, as written or because this build could not
+    /// verify the review's membership.
+    UnknownLabel,
+    /// A covered turn failed over.
+    FailoverInInterval,
+    /// A covered decision carries no learned evidence.
+    MissingRow,
+    /// The covered decisions belong to more than one epoch.
+    MixedEpoch,
+    /// A covered decision was taken under a credit rule this build does not
+    /// apply.
+    OtherCreditRevision,
+}
+
+/// Screen one accepted review: `Ok(positive)` when it may be credited, or the
+/// first check it fails.
 ///
 /// The checks run in the draft's order: the label, then a failover anywhere,
 /// then a decision with no row, then more than one epoch, then a foreign
 /// credit revision. Each makes the whole interval credit nothing.
-pub(crate) fn credit(reviewed: &Reviewed, causes: &mut LearningCauses) -> Option<Deltas> {
-    let positive = match reviewed.label {
+pub(crate) fn screen<I>(label: IntervalLabel, rows: I) -> Result<bool, Exclusion>
+where
+    I: IntoIterator<Item = Option<LearningRow>>,
+    I::IntoIter: Clone,
+{
+    let rows = rows.into_iter();
+    let positive = match label {
         IntervalLabel::Positive => true,
         IntervalLabel::Negative => false,
-        IntervalLabel::Unknown => {
-            causes.unknown_label += 1;
+        IntervalLabel::Unknown => return Err(Exclusion::UnknownLabel),
+    };
+    if rows.clone().flatten().any(|row| row.failed_before) {
+        return Err(Exclusion::FailoverInInterval);
+    }
+    if rows.clone().any(|row| row.is_none()) {
+        return Err(Exclusion::MissingRow);
+    }
+    let mut learned = rows.flatten();
+    if let Some(first) = learned.next() {
+        if learned.clone().any(|row| row.epoch != first.epoch) {
+            return Err(Exclusion::MixedEpoch);
+        }
+        if !first.is_current() || learned.any(|row| !row.is_current()) {
+            return Err(Exclusion::OtherCreditRevision);
+        }
+    }
+    Ok(positive)
+}
+
+/// The quality deltas of one accepted review, or `None` with the cause
+/// counted.
+///
+/// [`screen`] decides whether the interval is credited at all; a review is
+/// never accepted without decisions, so a screened interval has rows.
+pub(crate) fn credit(reviewed: &Reviewed, causes: &mut LearningCauses) -> Option<Deltas> {
+    let positive = match screen(
+        reviewed.label,
+        reviewed.rows.iter().map(|covered| covered.row),
+    ) {
+        Ok(positive) => positive,
+        Err(exclusion) => {
+            causes.count(exclusion);
             return None;
         }
     };
-    if reviewed
-        .rows
-        .iter()
-        .any(|covered| covered.row.is_some_and(|row| row.failed_before))
-    {
-        causes.failover_in_interval += 1;
-        return None;
-    }
-    let Some(rows) = reviewed
+    let rows = reviewed
         .rows
         .iter()
         .map(|covered| covered.row.map(|row| (covered.turn_index, row)))
-        .collect::<Option<Vec<_>>>()
-    else {
-        causes.missing_row += 1;
-        return None;
-    };
-    // A review is never accepted without decisions, so `rows` is not empty.
+        .collect::<Option<Vec<_>>>()?;
     let (_, first) = *rows.first()?;
-    if rows.iter().any(|(_, row)| row.epoch != first.epoch) {
-        causes.mixed_epoch += 1;
-        return None;
-    }
-    if rows.iter().any(|(_, row)| !row.is_current()) {
-        causes.other_credit_revision += 1;
-        return None;
-    }
 
     let consistent = rows
         .iter()

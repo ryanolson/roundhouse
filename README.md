@@ -576,6 +576,57 @@ The file's top-level `learner_recovery` block sets the cadence. It is required w
 
 Each node reads an artifact from its own path. The admin directory's fingerprint records the SHA-256 of each artifact's bytes, by project, so a node that read other bytes at the same path than the node that wrote a directory version reports a `learner_artifacts` divergence. A version written by a node with no learner enabled, or by a build older than this record, records no artifacts, and this check is skipped for it.
 
+#### Calibration and the promotion report
+
+The `learner-calibrate` binary writes a project's artifact and the report that a promotion from `shadow` to `live` is decided on (ruling 13). It only reads the stores: it never appends, clears, requeues, or takes a lease.
+
+```text
+learner-calibrate <manifest.json> <out-dir>
+```
+
+```json
+{
+  "source": { "redis": { "url_env": "ROUNDHOUSE_REDIS_URL", "namespace": "rh" } },
+  "drift_check": { "point_in_time_copy": { "url_env": "SNAPSHOT_REDIS_URL", "namespace": "rh" } },
+  "calibration": {
+    "project": "acme",
+    "strategies": ["rules", "efficient", "capable"],
+    "prior": "credit",
+    "quality": { "min_sessions": 20 },
+    "latency_limit_ms": 10000,
+    "bootstrap": { "seed": 20260929, "resamples": 1000 }
+  }
+}
+```
+
+- `source` is a Redis session store, or `{ "dump": { "path": "dump.json" } }`, a file of marked logs (`LogDump`) resolved against the manifest's directory. A Redis source names the environment variable that holds its URL, never the URL.
+- `drift_check` is optional. It names a point-in-time copy of the learner store, for example a snapshot loaded into a disposable Redis. The report then compares the counters in the copy with the entries that the copy's watermarks cover. Without it, the report says `drift check not run`, because a live store changes while the logs are read.
+- `prior` is required: `credit` carries the review credit of this manifest's intervals into the artifact, and `zero` writes no prior units. Jev answers never enter the prior.
+- `calibration.cutoff` is optional. Without it, every marked session of the project is read to its end.
+
+The binary lists the project's sessions from the source marks (`learning_sessions`), and it replays each log. It writes four files:
+
+| File | What it is |
+|---|---|
+| `artifact.json` | The artifact that `learner.artifact` names. It holds no clock time. Its bytes decide the epoch. |
+| `artifact.json.meta.json` | The sidecar: the creation time, the host, and the digests. Nothing hashes it. |
+| `report.md` | The report. |
+| `input-manifest.json` | The cutoff that the run read: each session id, its last sequence, and the SHA-256 of its events. Copy its `sessions` into `calibration.cutoff` to reproduce the run byte for byte. The report and the artifact name its digest. |
+
+The same manifest gives byte-identical artifact and report files. The bootstrap seed is in the report.
+
+What the report shows:
+
+- **The estimand.** Every weighted number is labeled `conditional interval value` (ruling 12). An evaluation unit is an accepted review with a `Positive` or `Negative` label, no failover, and learned evidence of one epoch on every covered decision. This is the same screen that credit uses. A candidate's weight on an interval is the product over its turns of `1[candidate == served] / propensity`, with the propensity that each turn recorded, so one mismatched turn gives weight zero. The estimate is self-normalized. Numbers about the served `rules` route are labeled `factual`.
+- **Candidates.** `learned` is what `live` would have served on each logged turn without exploration: the recorded exploit strategy, else `rules`. Each configured strategy is also shown as a fixed candidate. Each candidate has the support census, the effective sample size, and a bootstrap interval that resamples whole sessions.
+- **The cluster unit.** Sessions are clustered by `SessionId`, the ruled sequence key. A compaction starts a new generation, and a new generation is a new cluster. Every clustered number is labeled `sessions (sequence key)`.
+- **Exclusions.** Intervals excluded by cause (unknown label, failover, no learned row, mixed epoch, other credit revision, and a record that does not replay), and index members whose mark cannot be read.
+- **Cost and latency.** Cost is the terminal usage at the rate card that each dispatch recorded. A local dispatch records no rate card, so a candidate that weights one is `unpriced`, never $0. The p50 first output is measured in the log from `TurnStarted` to the first output after the served `Routed`.
+- **The promotion summary.** The three ruled tests for the `learned` candidate, each with its result: the bootstrap lower bound against the `rules` factual rate less 0.02, the cost at least 10% below the `rules` factual cost, and the p50 first output against `latency_limit_ms`. It states the session count against `quality.min_sessions`. A test whose inputs do not exist says `not evaluable` and why. A `shadow` project never explores, so a candidate that differs from `rules` has zero weight there. The owner approves each promotion.
+- Judge and classifier spend by strategy stratum (judge side calls record no rate card, so judge dollars are unpriced), the Jev agreement block, and the drift check.
+
+Rollback is a configuration change: name the previous artifact again, or set `mode` back. The previous artifact's bytes give the previous epoch, and the learner store still holds that epoch's counters.
+
 ## Hooking up Codex
 
 `POST /v1/responses` is an OpenAI Responses API surface over the same event
