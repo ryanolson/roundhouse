@@ -700,12 +700,12 @@ The owner placed the "session and sequence identity" workstream on this roadmap.
 | K0: trace corpus | The shadow supersession log (class, signal, predecessor and successor per generation change) and the per-deployment placement log. These are corpus inputs. K0 still owns the corpus schema and the baseline. | M2, M3 |
 | K1: activity ledger | Nothing new. The design's close and disconnect semantics (its questions 24 and 25) defer to K1's lifecycle state machine. | None |
 | K2: session-to-cache identity | The concrete identity piece. One Roundhouse `SessionId` is one sequence, `label#g{n}`. Its keyed digest is what Roundhouse sends as `x-dynamo-session-id`. A supersession (compaction, rewrite, close) is the first lifecycle hint, and its meaning is "not reused", close to `Cancel`. The plan maps the digest onto `SessionCacheKey` plus generation. `model_layout` and `reuse_scope` are K2 open items. | M1, M2, M4 |
-| K7: fleet-scale placement, embedded Dynamo first | Deployment targets. A continuation is sticky to its bound deployment. A new sequence goes to the deployment with the fewest in-flight tokens. No hash selects a deployment. The gain is measured with ground-truth hits from the in-process mocker harness. | M3, M5 |
+| K7: fleet-scale placement, embedded Dynamo first | Deployment targets. A continuation is sticky to its bound deployment. A new sequence goes to the deployment with the most in-flight headroom: nominal capacity minus in-flight tokens. No hash selects a deployment. The gain is measured with ground-truth hits from the in-process mocker harness. | M3, M5 |
 | K8: calibration and return-time models | The dispatch ledger (return curves, virtual LRU, learned effective capacity, adaptive rail) is deferred here. It is unlocked when K0's corpus exists. | Deferred |
 
 Two rules from this roadmap bind the workstream:
 
-- **No default timeouts before K0.** Every time constant in the plan is a named, provisional configuration value that is used only in shadow until K0 calibrates it.
+- **No default timeouts before K0.** Every policy constant in the plan (supersession holds, the live-lineage window, drain defaults, the rail wait) is a named, provisional configuration value. It acts only in shadow until K0 calibrates it. Storage bounds and plumbing intervals are ordinary configuration. Deployment placement can go live behind an opt-in switch, and invalidation stays in shadow.
 - **Dynamo is the cache authority.** Roundhouse states only that a sequence will not be reused. Release is Dynamo's. The in-band `x-dynamo-session-final` transport stays in shadow until a deployment acknowledges a handled release, or ships the release endpoint. The upstream draft proposes both. Dynamo main removed `kv_hints.evict_session` in #13134, and at main a session-final request still runs inference.
 
 Order: the open stack #18–#31 lands first. The plan's M1 (a pure crate) may proceed before it.
