@@ -1671,3 +1671,5 @@ The owner ruled on every point today. **`../PLAN-session-sequence-identity.md` i
     - Q14, Q17 and Q19 were delegated to the orchestrator, which accepted the recommendations. Q19's values are provisional under item 9.
     - Q28 and Q29 stand for the out-of-band endpoint.
     - No owner question is left open.
+
+[Note, 2026-09-29, after the upstream re-read in `dynamo-sequence-lifecycle-upstream.md`: item 4 is true at the pin `ac7b751`. But Dynamo main `6822bab` removed `kv_hints.evict_session` (#13134), and there a session-final request drops scheduler state and still runs inference. So the in-band transport stays in shadow until a deployment acknowledges a handled release or ships the release endpoint, not until it "consumes `evict_session`". Also, Dynamo main's mocker fills `cached_tokens` (#12711), so the measurement can move to the HTTP frontend after a Dynamo pin upgrade.]

@@ -706,6 +706,6 @@ The owner placed the "session and sequence identity" workstream on this roadmap.
 Two rules from this roadmap bind the workstream:
 
 - **No default timeouts before K0.** Every time constant in the plan is a named, provisional configuration value that is used only in shadow until K0 calibrates it.
-- **Dynamo is the cache authority.** Roundhouse states only that a sequence will not be reused. Release is Dynamo's. The in-band `x-dynamo-session-final` transport stays in shadow until Dynamo consumes `kv_hints.evict_session`.
+- **Dynamo is the cache authority.** Roundhouse states only that a sequence will not be reused. Release is Dynamo's. The in-band `x-dynamo-session-final` transport stays in shadow until a deployment acknowledges a handled release, or ships the release endpoint. The upstream draft proposes both. Dynamo main removed `kv_hints.evict_session` in #13134, and at main a session-final request still runs inference.
 
 Order: the open stack #18–#31 lands first. The plan's M1 (a pure crate) may proceed before it.

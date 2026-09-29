@@ -688,3 +688,12 @@ conclude the changelog entry is fabricated — the code exists, under a differen
 - **Precision:** the proposal's §21.9 says the ledger's compare runs "in one Redis script, as the correlation maps already do". That holds only for tool-call bindings (`BIND_CALL` in `crates/roundhouse-store-redis/src/correlation/scripts.rs`). The generation map is a plain write by design, and `roundhouse-core/src/control/correlation.rs:38-49` explains why it rejects a compare-and-set.
 
 The snapshot above is unchanged. The rebaselined table is §1 of `../PLAN-session-sequence-identity.md`. Its citations are derived again when the stack merges.]
+
+## Note, 2026-09-29: Dynamo main against the pin
+
+[A re-read of Dynamo main `6822bab` against the pin `ac7b751` is recorded in `../synergies/dynamo-sequence-lifecycle-upstream.md` §2, with citations. Corrections to this snapshot:
+
+- **§15.8.** A reader of `session_final` existed at the pin: the Python ThunderAgent router drops scheduler state on it. None of the readers releases KV. At main, `kv_hints.evict_session` is gone (#13134), and the native ThunderAgent plugin drops state and then runs the request.
+- **§14.1.** At both revisions the admin API is on by default and has no authentication. `/busy_threshold` is a precedent for how to mount a route, not for security.
+- **§15.7.** Dynamo main maps Codex `thread-id`, not `session-id`, as its session. This does not affect Roundhouse, because `x-dynamo-session-id` takes precedence.
+- **§13 claim 8.** It holds at the pin. At main the mocker fills `cached_tokens` for its vLLM scheduler model (#12711), but not for its SGLang model.]
