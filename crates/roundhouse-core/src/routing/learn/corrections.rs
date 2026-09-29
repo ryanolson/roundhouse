@@ -198,10 +198,10 @@ fn quoted_cached_tokens(candidate: &Candidate, isl_tokens: usize) -> f64 {
 /// **The last bound is the owner's rule**, and it is a bound here rather than a
 /// convention of the quote producer. `FrontierCatalog::quote` happens to set
 /// the matched prefix to the floor of the weighted cached count, which already
-/// keeps the result at or below the quote; but [`Candidate`]'s own doc
-/// describes that field as the raw prefix before weighting, and a producer that
-/// followed the doc would let a reuse surplus price a route below the ledger's
-/// quote. The ledger's prediction is itself bounded by the last block marker a
+/// keeps the result at or below the quote. But a local worker reports the raw
+/// prefix in that field (see [`Candidate::matched_prefix_tokens`]), and a
+/// frontier producer that did the same would let a reuse surplus price a route
+/// below the ledger's quote. The ledger's prediction is itself bounded by the last block marker a
 /// request actually sent, so a target that reused more than that has an
 /// upside the learner does not bank on.
 ///

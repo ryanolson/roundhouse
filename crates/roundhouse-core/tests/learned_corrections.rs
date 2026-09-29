@@ -368,20 +368,26 @@ fn a_prefill_above_the_input_quotes_no_cached_tokens() {
 fn the_cost_correction_uses_the_cache_sample_minimum() {
     let isl = 1_000;
     let candidate = frontier(sol(), isl, 800.0, 800.0);
+    // Ten samples each: enough for a latency minimum of 5, not for a cache
+    // minimum of 20. Each term must read its own minimum.
     let view = view(
         vec![ops(
             &sol(),
-            LatencySum::default(),
+            samples(1_000, 10),
             reuse(1_000 * 10, 500 * 10, 10),
         )],
-        LatencySum::default(),
+        samples(2_000, 10),
     );
     let ledger = ledger();
+    let corrections = Corrections::new(&view, &ledger, isl, 5, 20);
 
-    let cost = Corrections::new(&view, &ledger, isl, 5, 20).cost(&candidate);
-
+    let cost = corrections.cost(&candidate);
     assert_eq!(cost.correction, CostCorrection::TooFewSamples);
     assert_eq!(cost.adjusted_usd, cost.quoted_usd);
+
+    let latency = corrections.first_output(&candidate);
+    assert_eq!(latency.residual, LatencyTerm::Applied { mean_ms: 100 });
+    assert_eq!(latency.overhead, LatencyTerm::Applied { mean_ms: 200 });
 }
 
 /// Too few pairs is checked before zero predicted reuse: a zero from a thin

@@ -299,10 +299,12 @@ pub struct CostEvidence {
     pub correction: CostCorrection,
 }
 
-/// Whether the reuse correction moved the quote, and why not when it did not.
+/// Whether the reuse correction ran, and why not when it did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostCorrection {
+    /// The correction ran, and `adjusted_usd` is its result. That equals the
+    /// quote when nothing moved, or when moving would have lowered it.
     Applied,
     /// The target's measured pairs predicted no reuse, so there is no ratio.
     NoPredictedReuse,
