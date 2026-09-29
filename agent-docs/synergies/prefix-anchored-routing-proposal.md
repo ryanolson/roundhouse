@@ -349,3 +349,406 @@ Each milestone is one PR, cut from `main`. Tests come first. Every run is bounde
   - **A new session goes to the deployment with the lowest total KV load.** New sessions are spread evenly by that measure.
   - **The rail can override that choice.** If the net-new prefill per unit of time on that deployment is over its limit, the new session can go to a different deployment.
 - **Session detection is its own crate.** It can depend on some Roundhouse crates, and a later refactor can make it one unified crate. Deriving the session id is the key input to routing.
+
+## Addendum, 2026-09-29: design revision after the second ruling
+
+This addendum applies the first and second owner rulings to the design. It restates in full each section that the rulings change, by section number. Where this addendum and the text above disagree, this addendum wins. Sections 3, 5, 8.1, 8.5, 9, 10, 11, and 14 do not change, except that "pool" reads "deployment". New evidence is in evidence §14.
+
+### §0 (restated). Summary
+
+- **The unit is KV overlap.** Unchanged. A chain of digests over the canonical items gives tips at the end of each dispatched prompt and each settled response.
+- **Session detection is its own crate, `roundhouse-session-id`** (§17). It derives the label, detects the client, computes tip keys, and names the anchor. The unkeyed chain primitive stays in `roundhouse-core`, beside `Item::render`, so that the context assembler can extend it with no crate cycle.
+- **A deployment is a Dynamo deployment, and it is local** (ruling D6). Roundhouse sees several deployments. Each session is sticky to one.
+- **No hash selects a deployment.** A continuation goes to its stored bound deployment. An inherited session goes to the deployment of its deepest matched tip. A new session goes to the eligible deployment with the lowest estimated KV load (§7).
+- **The load signal** is the KV utilization of a deployment: in-flight KV blocks over KV capacity, summed over its decode-capable workers (§16). At the Dynamo pin, the only external source is the frontend's `/metrics` scrape of the KV router's own block count (evidence §14.3). Roundhouse corrects the reading for its own placements since the scrape.
+- **The rail limits net-new prefill per deployment per window.** Unchanged in its quantity. A continuation waits on the rail and does not move. A new session moves to the next deployment with room.
+- **Operators drain and bring up deployments.** A draining deployment takes no new sessions. Its bound sessions stay until idle or until a drain deadline, and then move at their next turn (§8.6).
+- **First measurable gain (M4):** the spread of new sessions across two mocker deployments under a burst, and the router-predicted hit rate per deployment. Neither needs the engine's `cached_tokens`, which the mocker does not fill.
+
+### §1 (restated). Terms
+
+- **Item**, **Render**, **Chain value** `c_i`, **Tip**, **Anchor**: unchanged.
+- **Label**: the conversation name that `roundhouse-session-id` derives, qualified by `ControlPlane::qualify(principal, name)`, without the `#g{n}` suffix.
+- **Deployment**: one Dynamo deployment, reached through its frontend. It replaces "pool" everywhere in this document. The embedded fleet is one deployment whose router runs in process.
+- **Deployment state**: `active`, `draining`, or `down` (§8.6).
+- **Load reading**: one scrape of a deployment's frontend `/metrics`, with its time.
+- **Estimated load** `Û_d`: the load reading plus the tokens that Roundhouse dispatched to deployment `d` since the reading (§16.3).
+- **Class** of a first turn: **continuation** (known label), **inherited** (unseen label, tip matched), or **new** (unseen label, no tip matched). Unchanged.
+- **Eligible deployment**: a deployment that serves the requested model, passes policy, budget, and egress filters, and is not `down`.
+
+### §2.2 (restated). Definition, and where each part is computed
+
+The formulas do not change:
+
+```text
+d_i  = SHA-256("rh-item-v1\0" || u64be(len(r_i)) || r_i)       r_i = items[i].render()
+c_0  = SHA-256("rh-chain-v1\0" || d_0)
+c_i  = SHA-256(c_{i-1} || d_i)                                   unkeyed, in memory only
+t    = SHA-256(canonical JSON of the declared tools)            zero bytes when none are declared
+k_P  = HMAC-SHA256(K, "rh-prefix-scope-v1\0" || namespace(P))   K = deployment secret, P = principal
+L_i  = HMAC-SHA256(k_P, "rh-prefix-tip-v1\0" || t || c_i)[..16] the stored tip key
+```
+
+The parts are split across two crates:
+
+| Part | Crate | Reason |
+|---|---|---|
+| `d_i`, `c_i` (the chain primitive) | `roundhouse-core`, module `item::chain`, beside `Item::render` | `ContextAssembler::push` extends the chain from the render that it already computes [rh crates/roundhouse-core/src/context.rs:216]. A primitive in the new crate makes core depend on a crate that depends on core. That is a cycle. |
+| `t`, `k_P`, `L_i`, the anchor | `roundhouse-session-id` | These are keyed identity. They need a secret and a principal namespace, which the chain does not. |
+
+- The invariant test `same_item_agreement_implies_equal_item_digests` stays in core, next to the primitive it pins.
+- **The crate loads no configuration.** The server reads the deployment secret and passes it to `TipKeyer::new` as a value. The crate never reads the environment, a file, or the catalog.
+- Tools are not in the chain. Configuration is in the chain. The anchor rule is unchanged: the anchor of the deepest matched tip, else `L_{m-1}` of the first dispatched prompt.
+
+### §4 (restated). Stored state
+
+The sequence is unchanged, except that the handler calls `roundhouse-session-id` for the label, the chain keys, and the anchor, and that the engine places by §7.
+
+| Family | Key | Value | Bound and eviction | Where |
+|---|---|---|---|---|
+| `label` | Qualified conversation key, no generation | anchor (16 B), bound `deployment_id`, `bound_at_ms`, `last_turn_at_ms` | TTL 7 days, refreshed per turn. Node memo capped at 4,096. | Memory or Redis |
+| `prefix_tip` | `L_i`, 16 B | anchor, `Target::ledger_key` (a deployment or a frontier model), `tokens` (u32), `at_ms` | TTL 1 hour, refreshed on write. Node memo capped at 65,536. | Same |
+| `deployment_state` (new) | `deployment_id` | `state`, `since_ms`, `drain_deadline_ms` (draining only), `set_by` | No TTL. An operator write replaces it. | Same. The catalog gives the value at startup. |
+| `deployment_dispatched` (new) | `deployment_id` | Monotone token counter: admitted input tokens of every turn that Roundhouse dispatched there | No TTL. `INCRBY` at dispatch only. Never decremented. | Same |
+| `deployment_inflight` (new) | `deployment_id` | Net token counter: admitted input tokens of turns in flight there | No TTL. `INCRBY` at dispatch, `DECRBY` at the terminal. Used only by the proxy of §16.4. | Same |
+| Rail window | `deployment_id` | Rolling net-new prefill window | As §8.5 | Same |
+
+- The `label` value names a **deployment id**, not a worker and not a hash bucket. A drain or a bring-up changes no stored binding.
+- The load reading is not stored. Each node scrapes on its own and keeps the last reading in memory (§16.2).
+- `deployment_dispatched` cannot drift, because it is never decremented. A node that dies loses nothing that the estimate needs.
+- `deployment_inflight` drifts upward when a node dies with turns in flight, because their decrements are lost. It over-counts load on one deployment, which sends new sessions elsewhere. Only the proxy of §16.4 reads it.
+
+### §6 (restated). Session labels
+
+- **The label values do not change.** `roundhouse-session-id` takes over the existing derivation, as a behavior-preserving move (§17). Responses: `thread-id`, then `session-id`, then `prompt_cache_key`, else a 422. Messages: `x-claude-code-session-id` or `metadata.user_id`, scoped by `x-claude-code-agent-id` and the dialect namespace [rh crates/roundhouse-server/src/messages_api/wire.rs:236-291].
+- **Claude Code is labeled by `x-claude-code-session-id`** (first ruling, question 9). The attribution block is a detection signal only. It is never a label, because it is 12 bits.
+- Unseen, history rewrite, client resets, and headerless clients: unchanged from §6 above.
+
+### §7 (restated). Placement
+
+#### 7.1 Preference order
+
+The order applies only inside the eligible set (§1). Stickiness is a preference inside the admitted set, never an override of policy, budget, or egress.
+
+1. **Continuation**: the bound deployment, if it is not `down`. A `draining` deployment keeps its bound sessions (§8.6).
+2. **Inherited**: the deployment of the deepest matched tip, if that deployment is `active`. The label is bound to it. If that deployment is `draining`, the session is placed as new, because a draining deployment takes no new labels. If the tip names a frontier target, the session is placed as new among the deployments, and the ledger keeps the seed for that frontier target, so its quote stays warm.
+3. **New**: the `active` deployment with the lowest estimated load `Û_d` (§16.3) among deployments that have a fresh load reading and room on their rail. The label is bound to it.
+
+**What "lowest" means.** Roundhouse takes the minimum `Û_d`. Among deployments whose `Û_d` is within `ε` of that minimum (default 0.02, that is two points of utilization), it picks one uniformly at random. This is not hash selection. No content, label, or deployment id enters the choice, and a change to the deployment set moves no bound session. The band exists so that two nodes that place in the same instant do not both pick one deployment on an exact tie.
+
+**The rail override.** If the lowest deployment's rail has no room, Roundhouse takes the next lowest that has room. This is the ruled override: net-new prefill over the limit sends a new session elsewhere.
+
+#### 7.2 Spread under a burst
+
+The reading lags. A burst of new sessions in one instant must not all land on the deployment that was lowest at the last scrape.
+
+- **Each placement adds its own load before the next one reads.** A node places new sessions one at a time, under one placement lock. Each placement increments `deployment_dispatched` for its deployment by its admitted input tokens before the lock is released (§16.3). The next placement sees that increment in `Û_d`.
+- **Across nodes**, the increment is an atomic `INCRBY` in the shared store. Two nodes that read the counter in the same store round trip can both pick one deployment. The bound on that race is one placement per concurrently placing node, per round trip. The `ε` band makes an exact tie between them unlikely.
+- **The lock covers only the choice and the increment,** not the dispatch. Its cost is one store round trip per new session. A continuation does not take the lock, because it does not choose.
+
+#### 7.3 When stickiness yields
+
+| Condition | Action |
+|---|---|
+| Policy, budget, or egress refuses the deployment | The filter wins. Place the turn as new among the remaining eligible deployments. |
+| The deployment is `down`, or it fails before the first byte (connect failure, 503, or 529) with no retry left | Mark it `down` for a cooldown if the failure is a connect failure or a 503. Place the turn as new. Rebind the label. The move costs one cold prefill, once. |
+| The deployment returns 529 before the first byte | The deployment is overloaded, not down. A **continuation** waits and retries under §8.4, and does not move. A **new** session goes to the next eligible deployment. |
+| The rail refuses a **new** session | Next lowest deployment with room. No KV is lost by the move. |
+| The rail refuses a **continuation** or an **inherited** session | Stay and wait (§8.4). A move re-prefills the whole prefix elsewhere, which is the load the rail limits. |
+| The deployment is `draining` and its drain deadline has passed | Place the next turn as new. Rebind the label (§8.6). |
+| A local-only session | Deployments only. Never a frontier target. |
+
+#### 7.4 What the learner and the rules picker see
+
+Unchanged from §7.3 above. The ledger is seeded for the matched deployment only. The price uses the expected hit. The rail uses only the certain hit.
+
+### §8.2 (restated). Deployment or instance
+
+| Limit | Where it applies | What Roundhouse observes |
+|---|---|---|
+| Rail on net-new prefill | Per deployment, in Roundhouse, before dispatch | Its own charges, then the measured `cached_tokens` and the serving worker ids after dispatch |
+| KV load for new-session placement | Per deployment, in Roundhouse | The load reading (§16) and its own in-flight counter |
+| Per-instance prefill load and placement | Per instance, inside the deployment, in the Dynamo router | Nothing before dispatch. No worker hint is sent (first ruling). |
+| Bring-up | Per deployment in Roundhouse. Per instance in Dynamo. | The deployment state and its first good load reading |
+
+### §8.3 (restated). Bring-up
+
+- An operator adds a deployment to the catalog, or sets its state to `active` through the admin plane (§8.6). It serves no new session until its first good load reading.
+- After that reading, its load is the lowest, so it draws new sessions. The lag correction (§7.2) raises its estimate with each placement. So it fills until its utilization reaches the others, and then new sessions spread evenly.
+- **Its rail spaces the prefill.** A new deployment has cold caches, so nearly every token that it admits is net-new. The rail caps that at its limit per window. New sessions over the limit go to the next lowest deployment.
+- **No ramp by default.** The rail and the reading gate are enough for a deployment whose workers are ready when they register. The optional `ramp_ms` of §8.3 above stays in the configuration, default 0, for engines that warm up slowly after they register. Continuing and inherited sessions never move to a new deployment.
+
+### §8.4 (restated). When the rail trips, and the sticky budget
+
+**The budget a continuation is held against is the rail of its bound deployment,** together with the fair-use and spend budgets of its principal, which already exist. There is no per-session share.
+
+| Option | Why not chosen, or why chosen |
+|---|---|
+| The deployment rail (chosen) | It limits the one load that a move of the continuation makes worse. It is already shared across nodes (§8.5). |
+| A per-session share of the rail | It divides a capacity limit by a count that changes each second. A long agent session with many turns is then refused while the deployment has room. It also needs a new configuration key per session. |
+| A KV-load admission budget | The KV load already decides new placement. A continuation's KV is mostly the prefix that it already holds, so refusing it on KV load refuses the cheapest work first. |
+
+When the budget is exhausted:
+
+1. A **new** session goes to the next lowest deployment with room.
+2. A **continuing** or **inherited** session waits for room, up to `min(max_rail_wait_ms, remaining turn deadline)`. It does not move.
+3. If no deployment can take a new session, the rail removes all deployment candidates. A frontier candidate that policy admits can still serve the turn, unless the session is local-only.
+4. When no candidate remains, the turn is refused with HTTP 429 and `Retry-After` (D5, first ruling).
+
+**`Retry-After` is Roundhouse's own number.** A Dynamo frontend refuses an overload with 529 by default and sends no `Retry-After` (evidence §14.8). Roundhouse maps a deployment's 529 or 503 before the first byte, with no candidate left, to 429. For a rail refusal, `Retry-After` is the time until the rail window has room for the turn's charge. For a deployment 529, it is `max_rail_wait_ms`, because Roundhouse cannot see when the deployment clears.
+
+### §8.6 (new). Deployment state, drain, and down
+
+| State | Takes new labels | Keeps bound labels | Set by |
+|---|---|---|---|
+| `active` | Yes, after the first good load reading | Yes | Catalog at startup, or the admin plane |
+| `draining` | No | Until idle, or until `drain_deadline_ms` | The admin plane |
+| `down` | No | No. Each bound label moves at its next turn. | The admin plane, or discovered: a connect failure or a 503 before the first byte, for `down_cooldown_ms` |
+
+- **The state is shared.** The catalog gives each deployment its state at startup. An operator changes it with `PUT /v1/admin/deployments/{id}/state`, which writes the `deployment_state` family (§4). Every node reads that family with a short memo (default 1 s). This follows the admin plane rule that a mutation affects the next admission and nothing in flight [rh crates/roundhouse-server/src/admin_api.rs:26-33].
+- **A discovered `down` is node-local.** One node's connect failure does not mark the deployment down for all nodes. An operator `down` is shared.
+- **Drain: recommended behavior.** Bound sessions stay until they go idle, and move at their next turn after the drain deadline. The default deadline is 30 minutes after the drain starts.
+  - Staying until idle costs no re-prefill for a session that ends on its own. The 30-minute default is a design choice, not a measurement. M4 data calibrates it.
+  - Moving at the next turn after the deadline bounds the drain time. A move at a turn boundary never interrupts a turn in flight.
+  - Moving all bound sessions at once was rejected. It re-prefills every live prefix on the other deployments in one burst, which the rail then refuses.
+- **The drain is complete** when no bound label has had a turn on the deployment for `drain_idle_ms` (default 10 minutes), or at the deadline. Roundhouse reports the count of bound labels that had a turn inside `drain_idle_ms`, per deployment, so the operator can see when to remove it.
+- A moved session is placed as new, so the rail spaces the moves too.
+
+### §12 (restated). Questions for the owner
+
+Ruled and closed: questions 1, 3, and 4 (first ruling), question 9 (first ruling), and question 2 (second ruling: a deployment is local).
+
+Still open from the first list, with the recommendation unchanged: question 5 (`x-dynamo-session-id` as a keyed digest of the label), 6 (drop the spawn-argument link), 7 (no opencode name), 8 (identical first requests share an anchor), 10 (`prefix_fingerprint` from the chain), 11 (`min_anchors`), 12 (`usage_limit_reached` for Codex on a rail 429), 13 (full charge for warm continuations on a remote deployment until reconciliation), and 14 (one deployment secret).
+
+New questions that the rulings leave open:
+
+15. **The load source when the frontend does not run the KV router.** The router gauge then does not exist (evidence §14.3). Recommend: such a deployment is placed on Roundhouse's own in-flight counter only (§16.4), and Roundhouse logs this once at startup. The alternative is to refuse the catalog entry.
+16. **Several frontends in one deployment.** With replica sync off, each frontend sees only its own traffic. Recommend: the catalog accepts one metrics URL per deployment, and a deployment with several frontends must run the KV router with `router_replica_sync` on. The alternative is that Roundhouse scrapes every frontend and sums their views.
+17. **The capacity source.** `model_total_kv_blocks` is one worker's value, last writer wins (evidence §14.6). Recommend: the catalog carries `kv_capacity_blocks` per deployment, and it wins. Without it, Roundhouse uses the scraped value times the count of decode worker series, and logs the homogeneity assumption.
+18. **The tie band `ε`.** Recommend 0.02. A value of 0 gives the strict minimum, which lets two nodes that place in one instant pick one deployment on an exact tie.
+19. **The drain defaults.** Recommend a 30-minute deadline and a 10-minute idle window, both per deployment in the catalog, and the admin call can override the deadline.
+20. **An upstream gauge for the engine-reported signal.** Recommend asking Dynamo to export `kv_used_blocks` and `kv_total_blocks` from `WorkerLoadState` as frontend gauges (§16.5). Recommend not switching placement to them until the vLLM question in evidence §14.11 is closed.
+
+### §13 (restated). Milestones
+
+Each milestone is one PR, cut from `main`. Tests come first. Every run is bounded by a timeout. Each PR keeps the tests it adds.
+
+**M1: the `roundhouse-session-id` crate and the chain primitive.**
+
+- Tests first, in `roundhouse-core`:
+  - `same_item_agreement_implies_equal_item_digests`, a property test.
+  - `a_response_stamp_does_not_move_the_chain`.
+  - `an_opaque_block_digests_the_same_in_any_key_order`.
+  - `the_assembler_chain_equals_a_chain_recomputed_from_scratch`.
+- Tests first, in `roundhouse-session-id`, against the fixtures in place (§17.5):
+  - `claude_fixture_labels_match_the_server_labels`: every Claude fixture body with its header capture gives the label that `messages_api::wire::session_key` gives at `2dd40dd`.
+  - `codex_header_precedence_is_thread_then_session_then_cache_key`, and `no_name_is_an_unnamed_error`.
+  - `the_attribution_block_is_detected_only_on_exact_match`: a changed prefix, a missing `;`, a block not at item 0, and a block with a non-hex fingerprint are not detected.
+  - `claude_code_is_detected_exactly_from_the_fixtures`, and `a_user_agent_alone_is_declared_not_exact`.
+  - `stripping_the_attribution_block_removes_item_zero_only`.
+  - `two_principals_never_share_a_tip_key`.
+  - `claude_fixture_divergence_is_pinned`: two sessions share 0 item links, turn 1 to turn 2 shares 2, turn 2 to turn 3 and the tool loop share all.
+- Change: the chain primitive in core. The new crate. The server's `session_key`, `scoped`, `session_component`, and the label part of `RequestContext::from_request` become calls into the crate. `the_live_client_body_canonicalizes_block_by_block` [rh wire.rs:814] stays green, because the strip is a dispatch-projection function and canonicalization does not call it.
+- Done means: the full server suite is green with every label derived through the crate. A benchmark reports chain time against tokenization time per 100 KB.
+
+**M2: binding and tips, in shadow.**
+
+- Tests first: as M2 above, with `deployment_id` in place of the pool. Add `a_label_binding_names_a_deployment_id_not_a_bucket`.
+- Change: the `label` and `prefix_tip` families, `SessionCreated.anchor`, the lookup in the handler, tip writes in the engine, and `prefix_fingerprint` from the chain. Routing does not change.
+- Done means: a replay of `use-cases/cache-aware-routing/turns.jsonl` reports class counts and a match-depth histogram, with numbers.
+
+**M3: deployments, their state, and the load signal, in shadow.**
+
+- Tests first:
+  - `a_deployment_needs_a_first_good_reading_before_it_takes_new_sessions`.
+  - `a_stale_reading_is_never_zero_load`: a failed scrape, an empty series set, and a reading older than the bound each make the deployment ineligible for new sessions.
+  - `the_reading_is_parsed_from_a_captured_frontend_exposition`: a Prometheus text body with decode and prefill series and the capacity and block-size gauges gives the expected `U_d`.
+  - `the_dispatched_counter_raises_the_estimate_before_the_next_placement`.
+  - `a_turn_that_ends_after_the_scrape_never_lowers_the_estimate`.
+  - `a_drain_is_shared_across_two_nodes`, `a_discovered_down_is_node_local`.
+  - `a_deployment_without_catalog_capacity_uses_the_scraped_capacity` (the recommendation on question 17).
+  - `a_deployment_without_a_metrics_url_is_placed_on_the_proxy` (the recommendation on question 15).
+- Change: `Target::Deployment { deployment_id, model }`, the deployment catalog (`metrics_url`, `kv_capacity_blocks`, initial state, drain defaults, rail limit), the admin state route, the scraper, `deployment_state`, `deployment_dispatched`, `deployment_inflight`, and the estimator. The engine logs the placement that §7 selects, and dispatches as it does today.
+- Done means: against two mocker deployments behind KV-router frontends, the shadow log shows the estimate beside each scraped reading, with the scrape lag in milliseconds. This run also closes the open evidence on whether the mocker fills the router gauge.
+
+**M4: placement and the rail (first measurable gain).**
+
+- Tests first:
+  - `a_continuation_goes_to_its_bound_deployment`, `an_inherited_label_goes_to_the_matched_deployment`, `an_inherited_label_on_a_draining_deployment_is_placed_as_new`.
+  - `a_new_session_goes_to_the_lowest_estimated_load`, `a_burst_of_new_sessions_spreads_before_the_next_reading`.
+  - `a_new_session_moves_when_the_rail_refuses`, `a_continuing_session_waits_and_does_not_move`.
+  - `a_policy_refusal_beats_stickiness`, `a_local_only_session_never_leaves_the_deployments`.
+  - `a_deployment_503_before_the_first_byte_marks_it_down_and_rebinds`, `a_deployment_529_holds_a_continuation`.
+  - `a_drain_deadline_moves_a_bound_session_at_its_next_turn`.
+  - `an_uncertain_hit_is_charged_as_net_new`, `a_measured_cached_count_reconciles_the_charge`.
+  - Against a stub deployment: no client header survives, the attribution block is stripped only on exact match, `nvext.extra_fields` asks for `worker_id`, and `cached_tokens` decodes as `CacheReadSource::Provider`.
+- Change: dispatch to `Target::Deployment` with §7 placement, the rail of §8, and drain. A rail refusal is still an in-stream failure until M5.
+- **First measurable gain.** Two mocker deployments, a burst of N new sessions (for example 64) in one second, then continuations:
+  - Spread: the largest over the smallest count of new sessions per deployment, and the largest over the smallest peak `U_d`. Compare with the lag correction off.
+  - Stickiness: the router's predicted hit rate per deployment, from the `router_kv_hit_rate` histogram (evidence §14.12), with stickiness on and with a load-only choice per turn. This is the router's prediction, not an engine measurement, and the report says so. If M3 finds that the frontend does not expose it, Roundhouse asks for `nvext.extra_fields: ["timing"]` and reads the same predicted ratio per request (evidence §14.12).
+  - Report the numbers. The gain is the difference.
+
+**M5: D5, headers held, and 429 with `Retry-After`.**
+
+- Tests first: `the_headers_are_held_until_the_routing_decision` with TTFT unchanged in the stub, `a_rail_refusal_is_a_429_with_retry_after`, `a_deployment_529_with_no_candidate_left_is_a_429`, and, if question 12 is ruled as recommended, `a_codex_client_gets_usage_limit_reached_with_resets_at`.
+- Done means: a mocker run under overload reports the count of 429 responses with `Retry-After` and zero in-stream rail failures.
+
+**M6: learner scope (D8).** As M5 above: `forks_share_an_arm`, `the_gate_counts_distinct_anchors`, `the_bootstrap_clusters_by_anchor`.
+
+### §15 (restated). Out of scope
+
+- Any change to prefix admission, to the conversation name, or to the refusal for a Responses request with no name.
+- A Roundhouse block index for a remote deployment.
+- Queue ordering inside a deployment.
+- **Any hash, modulo, or rendezvous choice over the deployment set.**
+- **Worker hints toward a remote deployment.**
+- A Roundhouse subscription to the Dynamo event plane. It needs `dynamo-runtime` (evidence §14.5).
+
+### §16 (new). The load signal
+
+#### 16.1 The quantity
+
+```text
+U_d = Σ_w used_blocks(w) / Σ_w capacity_blocks(w)      w over the decode-capable workers and ranks of deployment d
+```
+
+- **Decode-capable** means the aggregated workers, or the decode workers in disaggregated serving. Prefill workers are left out, because their KV is released when the prefill hands off.
+- **A fraction, not a count.** Deployments differ in size. With a raw block count, a small deployment fills until its count equals the count of a large one. That overloads the small one.
+- **Blocks, not tokens.** Two deployments with different block sizes still compare, because the ratio has no unit.
+
+#### 16.2 The source at the Dynamo pin, and how Roundhouse reads it
+
+Roundhouse pulls each deployment's frontend `/metrics` (evidence §14.3, §14.6):
+
+- `used = Σ dynamo_frontend_worker_active_decode_blocks{worker_type="decode"}` over all its series. Which `worker_type` label the router gives an aggregated worker was not traced. M3 reads it from a captured exposition.
+- `capacity = kv_capacity_blocks` from the catalog. Without it, `dynamo_frontend_model_total_kv_blocks{model} × (count of the decode series)`, which assumes identical workers.
+- `block_size = dynamo_frontend_model_kv_cache_block_size{model}`, used to convert Roundhouse's token counter into blocks.
+- **Scrape interval** 1 s by default. **Staleness bound** 3 intervals.
+
+Biases of this source, stated so that the M4 numbers are read correctly:
+
+- **It under-counts decode growth.** Output blocks are not tracked by default.
+- **It counts only traffic through the frontend that is scraped,** unless replica sync is on (question 16).
+- **It is the router's prediction.** An engine that evicts or preempts is not seen.
+- **It counts shared prefix blocks among in-flight requests once.** This is correct for KV occupancy.
+
+**A missing reading is never zero load.** A failed scrape, a body with no decode series, or a reading older than the staleness bound makes the deployment ineligible for new sessions. Its bound sessions are not affected. If no eligible deployment has a fresh reading, every deployment is placed on the in-flight counter alone (§16.4), and Roundhouse logs this once per outage.
+
+#### 16.3 The lag correction
+
+```text
+Û_d(now) = ( used_d(t_r) + (D_d(now) - D_d(t_r)) / block_size_d ) / capacity_d
+```
+
+- `t_r` is the time of the last good reading. `D_d` is the `deployment_dispatched` counter (§4). At each scrape, the node records the counter value next to the reading.
+- The router gauge moves at dispatch, so a turn that Roundhouse dispatched before `t_r` is already in `used_d(t_r)`. Only the tokens dispatched since `t_r` are added.
+- **The correction is never negative.** `D_d` only increases. A turn that ends after `t_r` does not lower the estimate. The next scrape shows its release.
+- A net in-flight counter was rejected here. A turn dispatched before `t_r` that ends after `t_r` removes its full input from a net counter, but the gauge counted only its deduplicated blocks. On a deployment with much shared prefix, the estimate then falls below the true load and draws new sessions. That is the unsafe direction.
+- The correction counts a turn's full input as new blocks, including a prefix that the deployment already holds. So it can only over-estimate, and only until the next scrape. That sends the next new session elsewhere, which is the safe direction for spread.
+
+#### 16.4 Roundhouse's own ledger as a proxy
+
+- **Use the in-flight counter, not the bound sessions.** A bound session between turns holds warm cache, not load. A proxy on bound sessions pushes new sessions away from deployments that hold many idle sessions. That is the opposite of an even spread of load.
+- **The in-flight proxy:** `Û_d = I_d / block_size_d / capacity_d`, where `I_d` is the `deployment_inflight` counter (§4).
+- **Its biases:**
+  - It misses all traffic that does not come through Roundhouse. It under-counts.
+  - It counts a prefix that two in-flight turns share twice. It over-counts.
+  - It does not see decode growth. It under-counts.
+- It is the fallback of §16.2 and the source for question 15. It is not the primary signal, because a deployment that other clients also use looks empty to it.
+
+#### 16.5 The smallest upstream change
+
+The frontend already holds the engine-reported `kv_used_blocks` and `kv_total_blocks` per worker and rank in `WorkerLoadState` (evidence §14.4). The smallest change exports them as two gauges, labeled like `worker_active_decode_blocks`. They are set where `update_from_active_load` and the runtime-configuration path write the state, and removed in `cleanup_worker_metrics`.
+
+- **What it adds:** all traffic and decode growth, as the engine reports them.
+- **What blocks a switch:** if vLLM counts evictable prefix-cached blocks as used, this signal saturates on every warm deployment (evidence §14.11). The switch waits for that answer. Until then, Roundhouse can log both signals side by side.
+
+### §17 (new). The `roundhouse-session-id` crate
+
+#### 17.1 Purpose
+
+The crate turns one request into four facts: the client, the session label, the prefix chain keys, and the anchor. It is pure: no store, no network, no clock, no async in its API. Routing reads its output. It does not route.
+
+#### 17.2 Public API
+
+```rust
+pub enum Surface { AnthropicMessages, OpenAiResponses }
+
+/// What the handler already has after canonicalization.
+pub struct RequestView<'a> {
+    pub surface: Surface,
+    pub headers: &'a http::HeaderMap,
+    pub items: &'a [roundhouse_core::item::Item],   // canonical items
+    pub tools: Option<&'a serde_json::Value>,       // declared tools, as sent
+    pub metadata_user_id: Option<&'a str>,           // Messages only
+    pub prompt_cache_key: Option<&'a str>,           // Responses only
+}
+
+pub enum Client { ClaudeCode { version: Option<String> }, Codex, Unknown }
+pub enum Confidence {
+    Exact,     // the exact attribution block at item 0
+    Declared,  // a client header only (user-agent, x-app, originator). Any client can send it.
+    NoSignal,
+}
+pub struct Detection { pub client: Client, pub confidence: Confidence }
+pub fn detect_client(view: &RequestView) -> Detection;
+
+pub enum Label { Named(String), Anonymous }       // unqualified; the server qualifies it
+pub enum LabelError { Unnamed, InvalidHeader(&'static str) }
+pub fn session_label(view: &RequestView) -> Result<Label, LabelError>;
+
+pub struct AttributionBlock<'a> { pub version: &'a str, pub fingerprint: &'a str, pub entrypoint: &'a str }
+pub fn attribution_block(items: &[Item]) -> Option<AttributionBlock<'_>>;
+pub fn without_attribution_block(items: &[Item]) -> &[Item];   // for the dispatch projection only
+
+pub struct TipKeyer { /* k_P */ }
+impl TipKeyer { pub fn new(deployment_secret: &[u8], principal_namespace: &str) -> Self; }
+pub struct TipKey(pub [u8; 16]);
+pub struct Anchor(pub [u8; 16]);
+pub fn tools_digest(tools: Option<&serde_json::Value>) -> [u8; 32];
+impl TipKeyer {
+    pub fn tip_keys(&self, chain: &roundhouse_core::item::chain::Chain, tools: &[u8; 32]) -> Vec<TipKey>;
+}
+pub fn new_anchor(first_prompt_keys: &[TipKey]) -> Anchor;   // L_{m-1}
+
+pub const CLAUDE_SESSION_HEADER: &str = "x-claude-code-session-id";
+pub const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
+```
+
+- **Detection is exact or declared.** `Exact` only for the attribution block at item 0 that matches `x-anthropic-billing-header: cc_version=<a.b.c>.<3 hex>; cc_entrypoint=<name>;` in full. `Declared` for `user-agent: claude-cli/…` or `originator` alone. Routing and the strip act only on `Exact`.
+- **The strip applies only on `Exact`, and only toward non-Anthropic targets.** The engine calls `without_attribution_block` in its dispatch projection. Canonical items, admission, and the chain do not change.
+- **The label keeps today's precedence and values** (§6). `Label::Anonymous` tells the server to mint `anonymous_key`, which stays in the server because it reads the process id and the clock.
+
+#### 17.3 Dependencies
+
+| Crate | Why |
+|---|---|
+| `roundhouse-core` | `Item`, `Role`, `ItemContent`, `Item::render`, the chain primitive, and the dialect namespace constant. One spelling of each. |
+| `http` (1.x) | `HeaderMap`, the type that axum re-exports. No async. |
+| `sha2` 0.10, `hmac` 0.12 | The digests of §2.2. `hmac` is new to the workspace. It is the RustCrypto crate of the `sha2` family. |
+| `serde_json` | `metadata.user_id` parsing and the canonical tools JSON. |
+| `thiserror` | `LabelError`. |
+
+- `roundhouse-core` brings `tokio` and `dynamo-kv-router` with it (evidence §14.10). The crate uses neither, and its API has no async. A later refactor can move `Item` into a smaller crate. The second ruling allows this.
+- **The dialect namespace moves to core.** Today it is spelled twice: `DIALECT_NAMESPACE` in the server [rh wire.rs:101] and `MESSAGES_SESSION_SEGMENT` in core [rh crates/roundhouse-core/src/validate/control_call.rs:197]. The crate needs it to scope a label, and core needs it to read a key. It becomes one constant in core, and both callers use it.
+
+#### 17.4 What stays out
+
+- Stores, `CorrelationMaps`, and the node memos.
+- Async and I/O of any kind, including the environment and the catalog.
+- Routing, placement, load, and deployment state.
+- `ControlPlane::qualify`, the principal, and the anonymous key.
+- `ApiError` and HTTP status codes. The server maps `LabelError` to its existing 422 messages.
+
+#### 17.5 What moves in, and what stays as an adapter
+
+| Today | After M1 |
+|---|---|
+| `SESSION_HEADER`, `AGENT_HEADER` [rh wire.rs:67, :78] | Moved to the crate. The server imports them from the crate. No re-export. |
+| `session_key`, `scoped`, `session_component` [rh wire.rs:236-323] | Moved into `session_label`. `session_key` is deleted, and `messages_api.rs` calls the crate with a `RequestView` built from `CreateMessageParams`. |
+| The label part of `RequestContext::from_request` and `conversation_key` [rh request_context.rs:23-54] | Moved into `session_label`. `RequestContext` stays in the server as the adapter that carries `prompt_cache_key`, `window_id`, and the forwarded fallback. |
+| `prefix_fingerprint` [rh request_context.rs:75-90] | Deleted in M2, when the fallback `prompt_cache_key` comes from the chain (question 10). |
+| `anonymous_key` [rh messages_api.rs:546] | Stays in the server. |
+| Attribution detection | New. No code reads the block today (evidence §14.10). |
+
+**Fixtures.** The crate's tests read the fixtures where they are, through `concat!(env!("CARGO_MANIFEST_DIR"), "/../roundhouse-server/tests/fixtures/<name>")`. No fixture moves, so no existing `include_str!` changes. The unused `claude-2.1.257-mcp-headers.json` pairs with the MCP body fixtures for the label test.

@@ -230,7 +230,7 @@ An independent read-only re-derivation checked nine claims against Roundhouse `2
 | 9e | `retry_429: false` in Codex's default provider info; retry policy retries 429 only when set | VERIFIED | `model-provider-info/src/lib.rs:267`: `retry_429: false,` inside the constructed `ApiRetryConfig`. `codex-client/src/retry.rs:17` declares `pub retry_429: bool` on `RetryOn`; `:29` gates `(self.retry_429 && status.as_u16() == 429)` inside `should_retry`. Both cited line numbers are exact. | None. |
 | 9f | Fair-use 429 body uses `error.type == "usage_limit_reached"` with `resets_at`; codex hardcodes `retry_429: false` everywhere | VERIFIED | `crates/roundhouse-server/src/http.rs` (cited range): a code comment states this exact rationale and cites `codex-api::api_bridge::map_api_error`, and the JSON body constructed a few lines later is `{"type": "usage_limit_reached", "scope": ..., "window": ..., "quantity": ..., ...}`. | The claim that the Anthropic SDK's `Retry-After` handling "was not read" is honestly flagged as open in the evidence doc itself — not re-checked here, out of scope for a 10-minute negative check. |
 
-## Summary of anything not a clean VERIFIED
+#### Summary of anything not a clean VERIFIED
 
 Every claim checked — 1 through 9 (1, 2, 3, 4, 5, 6, 7, 8, and the six spot-checked negatives in 9) — rules
 **VERIFIED**. None ruled PARTIALLY, REFUTED, or UNCHECKABLE. The one place evidence is *stronger* than the
@@ -240,3 +240,175 @@ that; direct inspection shows the mocker explicitly constructs `prompt_tokens_de
 places (`lib/mocker/servers/vllm/tests/sidecar.rs`, `lib/mocker/servers/sglang/tests/sidecar.rs`) where that
 field is populated at all, and `PromptTokensDetails::Some(...)` is never constructed anywhere under
 `lib/mocker`. This is a tightening of the same negative, not a different finding.
+
+## 14. Deployment load and session detection, 2026-09-29
+
+This section supports the addendum "design revision after the second ruling" in `../synergies/prefix-anchored-routing-proposal.md`. It was read against the same revisions as the rest of this document: Roundhouse `2dd40dd`, Dynamo `ac7b751`, and Codex `6344a65`. No code changed. No Cargo command ran. No deployment ran. The claim tags are the tags of section 1.
+
+### 14.0 Result
+
+- **No Dynamo surface gives a caller outside a deployment one number for the KV load of that deployment.** The frontend `/health` lists instances and no load. `/busy_threshold` returns thresholds only (sections 14.1 and 14.2).
+- **The frontend `/metrics` exposes the KV router's own view of in-flight KV blocks per worker**, as `dynamo_frontend_worker_active_decode_blocks`. The router sets it at each request lifecycle event. It exists only when the frontend runs the KV router (section 14.3).
+- **The workers publish their engine-reported used blocks (`kv_used_blocks`) on the event plane.** The frontend receives them and uses them for its overload gate, but exports them on no HTTP surface (section 14.4).
+- **The event plane needs a Dynamo `DistributedRuntime`.** Roundhouse deliberately carries no `dynamo-runtime` (section 14.5).
+- **The capacity gauge has only a `model` label.** It holds the block count of one worker, not a sum (section 14.6).
+- **A Dynamo frontend refuses an overload with HTTP 529 by default, and sends no `Retry-After`** (section 14.8).
+- **Roundhouse derives session labels in two server modules today.** No code reads `user-agent`, `originator`, or the attribution block as a client signal (section 14.10).
+
+### 14.1 Frontend routes that a caller outside the deployment can reach
+
+| Route | Source | What it returns | Load? |
+|---|---|---|---|
+| `/metrics` | [dynamo@ac7b751 lib/llm/src/http/service/metrics.rs:2175-2190], mounted with the system routes [dynamo@ac7b751 lib/llm/src/http/service/service_v2.rs:1167-1184] | Prometheus text of the frontend registry | Yes, per worker (sections 14.3, 14.6) |
+| `/health` | [dynamo@ac7b751 lib/llm/src/http/service/health.rs:63-98] | 503 until ready, then the instance list from discovery | No |
+| `/live` | [dynamo@ac7b751 lib/llm/src/http/service/health.rs:40-61] | 503 while shutting down, else 200 | No |
+| `/busy_threshold` (GET, POST) | [dynamo@ac7b751 lib/llm/src/http/service/busy_threshold.rs:1-45], mounted only when the admin API is on [service_v2.rs:1185-1194] | The configured thresholds per model | No. Thresholds, not the loads they compare. |
+| `/v1/models` | [service_v2.rs:1174-1181] | The model list | No |
+
+The frontend all these routes are on is the same HTTP service as the inference API, so a caller that can dispatch to the deployment can also scrape it.
+
+### 14.2 The standalone selection service
+
+- A deployment that runs the kv-router selection service as an HTTP server exposes `GET /loads` [dynamo@ac7b751 lib/kv-router/src/services/selection/server.rs:330]. It returns one `ModelLoadResponse` per model and routing group, with a `PotentialLoad` per worker and rank [dynamo@ac7b751 lib/kv-router/src/services/selection/core/mod.rs:1125-1152], [dynamo@ac7b751 lib/kv-router/src/services/selection/types.rs:546-552].
+- `PotentialLoad` carries `potential_prefill_tokens`, `potential_decode_blocks`, and `active_requests` [dynamo@ac7b751 lib/kv-router/src/protocols.rs:613-620]. With an empty prompt, "potential" is the current load.
+- It carries no capacity. Roundhouse's embedded fleet reads the same call in process and uses only `potential_prefill_tokens`. Its comment says that a capacity denominator (`total_kv_blocks`) is not in the catalog [rh crates/roundhouse-fleet/src/local.rs:410-425].
+- This surface is not the standard Dynamo frontend. A deployment has it only if it runs that service.
+
+### 14.3 The router-side gauge: `dynamo_frontend_worker_active_decode_blocks`
+
+- **Definition.** `WorkerLoadMetrics` holds two gauges, `dynamo_frontend_worker_active_decode_blocks` and `dynamo_frontend_worker_active_prefill_tokens`, with labels `worker_id`, `dp_rank`, `worker_type` [dynamo@ac7b751 lib/llm/src/kv_router/metrics.rs:472-526]. The frontend registers them on its HTTP registry [dynamo@ac7b751 lib/llm/src/http/service/service_v2.rs:1108-1116].
+- **Who sets it.** The KV router's active-sequence tracker. `observe_worker_load_snapshot` computes the worker's active blocks and calls `observe_load` [dynamo@ac7b751 lib/kv-router/src/sequences/multi_worker.rs:519-538], which sets the gauges [dynamo@ac7b751 lib/llm/src/kv_router/sequence.rs:155-169]. It runs after add, prefill completion, output blocks, and free [multi_worker.rs:905, :1078, :1204, :1264, :1289].
+- **Correction to a Dynamo comment.** The comment at [service_v2.rs:1112-1113] says that `KvWorkerMonitor` updates these gauges. It does not. The monitor only removes them when a worker leaves [dynamo@ac7b751 lib/llm/src/discovery/worker_monitor.rs:60-80]. The router's sequence tracker sets them.
+- **Freshness.** The gauge moves in the same call that books or frees the request. A scrape therefore lags only by its own interval.
+- **What it measures.** Blocks of in-flight requests as the router predicts them, not blocks the engine reports. Three defaults shape it [dynamo@ac7b751 lib/kv-router/src/scheduling/config.rs:810-813]:
+  - `router_track_active_blocks: true`. The gauge exists.
+  - `router_track_output_blocks: false`. Output blocks are not added. **The gauge under-counts decode growth.**
+  - `router_assume_kv_reuse: true`. Shared prefix blocks among in-flight requests are counted once.
+- **Several frontends.** `router_replica_sync` is `false` by default [config.rs:810]. Each frontend then sees only its own traffic. With replica sync on, a frontend applies peer events and calls the same `observe_worker_load_snapshot` [dynamo@ac7b751 lib/kv-router/src/sequences/replica_sync.rs:265-278]. So each frontend gauge then shows the peer traffic too. That the peer view is complete was not run.
+- **Only in KV router mode.** Nothing else sets the gauge. A frontend in round-robin or random mode exposes the metric name with no series.
+- **Unverified.** That a Dynamo mocker behind a KV-router frontend fills this gauge was not run. The router sets it without regard to the backend, so it is expected.
+
+### 14.4 The worker-reported signal: `kv_used_blocks`
+
+- **Definition.** `ActiveLoad` has `kv_used_blocks: Option<u64>`, "Total KV blocks currently in use on the worker … the authoritative signal for backend KV occupancy used by overload detection" [dynamo@ac7b751 lib/kv-router/src/protocols.rs:671-690].
+- **Transport.** A worker publishes it on the event plane subject `kv_metrics` [dynamo@ac7b751 lib/llm/src/kv_router.rs:215], [dynamo@ac7b751 lib/llm/src/kv_router/publisher/worker_metrics.rs:59-63]. The publisher sends only on change, after a 1 ms debounce [worker_metrics.rs:71-110].
+- **Producers.** vLLM sets it to `num_gpu_block * scheduler_stats.kv_cache_usage` in each stat-logger record [dynamo@ac7b751 components/src/dynamo/vllm/publisher.py:52-65]. TensorRT-LLM publishes its active block count [dynamo@ac7b751 components/src/dynamo/trtllm/publisher.py:687-701]. SGLang publishes its own value [dynamo@ac7b751 components/src/dynamo/sglang/publisher.py:229].
+- **Unverified: what vLLM counts as used.** Whether vLLM's `kv_cache_usage` counts evictable prefix-cached blocks as used was not read. The vLLM source is not in the pin. If it does, the value climbs toward 1.0 on every warm deployment and stops separating deployments.
+- **The frontend receives it.** `KvWorkerMonitor` subscribes to `kv_metrics` [worker_monitor.rs:739]. It stores `kv_used_blocks` and `kv_total_blocks` per rank in `WorkerLoadState` [worker_monitor.rs:256-263, :351-371]. It fills `kv_total_blocks` from the worker's runtime configuration [worker_monitor.rs:870-890].
+- **The frontend does not export it.** No gauge is set from `WorkerLoadState`. The monitor uses it only for the overload set [worker_monitor.rs:92-112, :386-420].
+- **The mocker.** `kv_used_blocks` has no producer under `lib/mocker/src` (a grep for the name found none).
+
+### 14.5 The event plane is not reachable without the Dynamo runtime
+
+- `EventSubscriber::for_endpoint` and `EventPublisher::for_endpoint` take an `Endpoint` and use its `DistributedRuntime` for the transport and the scope [dynamo@ac7b751 lib/runtime/src/transports/event_plane/mod.rs:287-307]. The transports are NATS and ZMQ [dynamo@ac7b751 lib/runtime/src/transports/event_plane/]. Discovery is part of the runtime.
+- Roundhouse deliberately depends on neither `dynamo-llm` nor `dynamo-runtime` [rh Cargo.toml:41-46].
+- Dynamo's own consumers of load read it from inside the deployment. The planner subscribes to forward-pass metrics (`forward-pass-metrics`) on the event plane [dynamo@ac7b751 components/src/dynamo/planner/environment/metrics_provider/runtime_provider.py:131-160], [dynamo@ac7b751 lib/llm/src/fpm_publisher.rs:30]. The experimental ThunderAgent router reads capacity from model cards through the same runtime [dynamo@ac7b751 components/src/dynamo/thunderagent_router/capacity.py:18-87].
+- Dynamo's global router, the one Dynamo layer above several pools, selects a pool from a configured grid over ISL, TTFT, and ITL targets, not from load [dynamo@ac7b751 components/src/dynamo/global_router/pool_selection.py:153, :224, :308], [dynamo@ac7b751 components/src/dynamo/global_router/README.md:5-14].
+
+### 14.6 Capacity and block size on the frontend
+
+- `dynamo_frontend_model_total_kv_blocks` has one label, `model`. It is "Total KV cache blocks available for a worker serving the model" [dynamo@ac7b751 lib/llm/src/http/service/metrics.rs:912-918]. Each runtime-configuration update overwrites it [metrics.rs:1200-1208]. **It is the capacity of one worker, last writer wins.** In disaggregated serving, a prefill worker can be the last writer. This was not traced to a run.
+- The runtime value is per data-parallel rank. vLLM divides its block count by the rank count [dynamo@ac7b751 components/src/dynamo/vllm/main.py:716].
+- `dynamo_frontend_model_kv_cache_block_size` gives the block size per model [metrics.rs:950].
+- Each worker also exposes `dynamo_component_total_blocks` and `dynamo_component_gpu_cache_usage_percent` per rank on its own system port [dynamo@ac7b751 components/src/dynamo/common/utils/prometheus.py:382-395], [dynamo@ac7b751 lib/runtime/src/metrics/prometheus_names.rs:821-827]. A caller must know every worker address to read them.
+
+### 14.7 Summary of load surfaces
+
+| Surface | Quantity | Scope | Freshness | How Roundhouse reads it |
+|---|---|---|---|---|
+| Frontend `/metrics`, `worker_active_decode_blocks` | Router-predicted in-flight blocks, prompt blocks only by default | Per worker and rank, one frontend's view | Each lifecycle event | Pull (HTTP scrape) |
+| Frontend `/metrics`, `model_total_kv_blocks` | Blocks of one worker | Per model | Each runtime configuration | Pull |
+| Frontend `/metrics`, `model_kv_cache_block_size` | Tokens per block | Per model | Each card | Pull |
+| Event plane `kv_metrics`, `kv_used_blocks` | Engine-reported used blocks | Per worker and rank | Each engine stat record, 1 ms debounce | Subscription, needs `dynamo-runtime` |
+| Event plane `forward-pass-metrics` | Scheduled and queued KV tokens per forward pass (vLLM, mocker) | Per worker | Each forward pass, 1 s idle heartbeat | Subscription, needs `dynamo-runtime` |
+| Worker system `/metrics` | `gpu_cache_usage_percent`, `total_blocks` | Per worker and rank | Each engine stat record | Pull, per worker address |
+| Selection service `GET /loads` | Potential prefill tokens and decode blocks | Per worker and rank | Each lifecycle event | Pull, only where that service runs |
+| `/health` | Instance list | Deployment | On request | Pull. No load. |
+
+### 14.8 Overload refusal at the frontend
+
+- The frontend refuses with the status in `DYN_HTTP_OVERLOAD_STATUS_CODE`, default 529 [dynamo@ac7b751 lib/llm/src/http/service/error.rs:10-28]. It does so when all workers of a model are over their busy thresholds [dynamo@ac7b751 lib/llm/src/http/service/busy_threshold.rs:5-9].
+- A grep of `lib/llm/src` for `retry-after` (any case) found nothing. **The frontend sends no `Retry-After`.**
+- The busy gate is off unless a threshold is set [worker_monitor.rs:598-605].
+
+### 14.9 Codex client signals at the pin
+
+- Codex sends `session-id` and `thread-id` from `build_session_headers` [codex@6344a65 codex-rs/codex-api/src/requests/headers.rs:5-14] and `x-openai-subagent` for a sub-agent [codex@6344a65 codex-rs/codex-api/src/endpoint/responses.rs:92-93].
+- The default originator is `codex_cli_rs` [codex@6344a65 codex-rs/login/src/auth/default_client.rs:40]. `default_headers` inserts `originator` and a Codex `user-agent` [default_client.rs:330-340].
+- **Unverified.** Whether the model client for a custom provider base URL sends `default_headers` was not traced. A loopback capture closes it.
+
+### 14.10 Roundhouse session derivation at `2dd40dd`
+
+| Fact | Source |
+|---|---|
+| The Messages label reads `x-claude-code-agent-id`, then `x-claude-code-session-id`, then `metadata.user_id`. It returns `None` when none is present. | `session_key` [rh crates/roundhouse-server/src/messages_api/wire.rs:236-255], constants [wire.rs:67, :78] |
+| The label is scoped as `anthropic_messages/{session}` or `anthropic_messages/{session}/agent/{agent}` | `scoped` [wire.rs:286-291], `DIALECT_NAMESPACE` [wire.rs:101] |
+| `session_component` parses both shipped `metadata.user_id` shapes | [wire.rs:299-323] |
+| The Responses label is `thread-id`, then `session-id`, then `prompt_cache_key`. None of the three gives a 422. | `RequestContext::from_request` [rh crates/roundhouse-server/src/request_context.rs:23-47], `conversation_key` [request_context.rs:49-54] |
+| `prefix_fingerprint` is the fallback `prompt_cache_key` | [request_context.rs:43, :75-90] |
+| An anonymous Messages request gets a fresh key per request | `anonymous_key` [rh crates/roundhouse-server/src/messages_api.rs:546-552] |
+| The principal prefix is added by `ControlPlane::qualify` | [rh crates/roundhouse-server/src/control_config/mod.rs:902-907] |
+| **A second spelling of the dialect namespace** is in core, so that core can tell a Messages session from its key | `MESSAGES_SESSION_SEGMENT` [rh crates/roundhouse-core/src/validate/control_call.rs:142-151, :197] |
+| `CreateMessageParams` is a server type | [wire.rs:120] |
+| The attribution block is `system[0]` in the fixtures, `x-anthropic-billing-header: cc_version=2.1.257.1f2; cc_entrypoint=sdk-cli;` | [fixture claude-2.1.257-turn-1.json] |
+| A test pins the attribution block as an ordinary canonical item, so that no strip happens at canonicalization | `the_live_client_body_canonicalizes_block_by_block` [wire.rs:814] |
+| Leading system blocks become `Developer` items | `mark_turn_configuration` [wire.rs:472] |
+| No code under `crates/*/src` reads `user-agent`, `originator`, `cc_version`, or `x-anthropic-billing-header` as a signal | `git grep` at `2dd40dd`. Hits are doc comments and tests only. |
+| `roundhouse-core` has no `http`, `axum`, or `redis` dependency, but has `tokio` and `dynamo-kv-router` | [rh crates/roundhouse-core/Cargo.toml:11-32] |
+| `item.rs` has no async code | `git grep` for `async fn`, `.await`, `tokio` in [rh crates/roundhouse-core/src/item.rs]: no hits |
+
+**The fixtures.** `crates/roundhouse-server/tests/fixtures/` holds 11 files. Eight are Claude Code request bodies. Three are header captures, each a JSON array of `{path, headers}`.
+
+- The header captures carry `user-agent: claude-cli/2.1.257 (external, sdk-cli)`, `x-app: cli`, and `x-claude-code-session-id` [fixture claude-2.1.257-headers.json].
+- `messages_api_surface.rs` includes the bodies and two header captures by relative path [rh crates/roundhouse-server/tests/messages_api_surface.rs:141-152, :209, :4501-4502].
+- `claude_launch/control_surface.rs` includes the MCP wire capture [rh crates/roundhouse-server/src/claude_launch/control_surface.rs:219].
+- `claude-2.1.257-mcp-headers.json` is included by no test.
+
+### 14.12 The router's predicted hit rate
+
+- At routing, the KV router records the overlap blocks and the input blocks of each request, and observes their ratio in the `kv_hit_rate` histogram of its request metrics [dynamo@ac7b751 lib/llm/src/kv_router/push_router.rs:327-339], [dynamo@ac7b751 lib/llm/src/protocols/common/timing.rs:342-350].
+- The histogram is named with `router_metric(KV_HIT_RATE)`, that is `router_kv_hit_rate`, "Predicted KV cache hit rate at routing time (0.0-1.0)", on the runtime metrics registry [dynamo@ac7b751 lib/llm/src/kv_router/metrics.rs:57-59, :921-928].
+- **Unverified.** The full exposed name, and whether the frontend `/metrics` includes it, were not run. The frontend includes the runtime registry only when `drt_metrics` is set [dynamo@ac7b751 lib/llm/src/http/service/metrics.rs:2170-2172].
+- The same ratio is also returned per request. `nvext.extra_fields: ["timing"]` selects the timing info [dynamo@ac7b751 lib/llm/src/protocols/common/extensions.rs:571-572], and that info carries `kv_hit_rate` [timing.rs:660-690].
+- It is the router's prediction, not a measurement by the engine.
+
+### 14.11 Open evidence added by this section
+
+| Question | What closes it |
+|---|---|
+| Does vLLM's `kv_cache_usage` count evictable prefix-cached blocks as used? | A read of the vLLM block pool at the version the Dynamo pin installs, or a run that holds a warm prefix with no request in flight. |
+| Does a mocker behind a KV-router frontend fill `worker_active_decode_blocks`? | The M3 stub run in the addendum. |
+| With `router_replica_sync` on, does each frontend's gauge include all peer traffic? | A two-frontend mocker run. |
+| In disaggregated serving, which worker last writes `model_total_kv_blocks`? | A disaggregated run, or catalog capacity (the addendum makes the catalog value win). |
+| Does Codex send `originator` to a custom provider? | A loopback capture at the pin line. |
+| Which `worker_type` label does the router give an aggregated worker? | A captured frontend exposition in M3. |
+| Is `router_kv_hit_rate` on the frontend `/metrics`, and under which full name? | The M3 mocker run. |
+
+### 14.13 Fact-check of section 14, 2026-09-29
+
+An independent read-only re-derivation verified all eight checked claims against the same pins. The Codex citations above first lacked the `codex-rs/` prefix. They are corrected. The crate-cycle argument is verified in its premises only, because the crate does not exist yet. The ledger follows.
+
+| # | Claim | Ruling | Evidence | Correction |
+|---|---|---|---|---|
+| 1 | No Dynamo frontend surface gives an outside caller one KV-load number; `/health` lists instances only; `/busy_threshold` returns thresholds only | VERIFIED | Exhaustive `grep -rn '\.route('` over `lib/llm/src/http/service/` finds only: metrics, busy_threshold (get/post), health, live, realtime ws, anthropic messages/models, generate, and the full OpenAI set (completions/chat/embeddings/classify/pooling/batches/models/responses/images/videos/audio). None of the inference or admin endpoints return an aggregate load number. `busy_threshold.rs:5-13` doc comment confirms thresholds-only; `health.rs` returns instance list / readiness only. | None. |
+| 2 | `dynamo_frontend_worker_active_decode_blocks`: per-worker, set by KV router on every request lifecycle event, only exists in KV-router mode, excludes output blocks by default, per-frontend view without replica sync | VERIFIED | `WorkerLoadMetrics` labels `worker_id, dp_rank, worker_type` at `lib/llm/src/kv_router/metrics.rs:472-526` (exact). `observe_load` at `sequence.rs:155-169` (exact), called from `observe_worker_load_snapshot` at `multi_worker.rs:519-536` (evidence said 519-538, off by 2 lines, immaterial), called at lines 905, 1078, 1204, 1264, 1289 (all confirmed by grep) and also via `replica_sync.rs:264-268` (evidence said 265-278, function `flush_replica_batch_effects` confirmed calling the same method). Defaults at `config.rs:810-813` confirmed byte-for-byte: `router_replica_sync: false`, `router_track_active_blocks: true`, `router_track_output_blocks: false`, `router_assume_kv_reuse: true`. The "correction to a Dynamo comment" claim is also verified: `service_v2.rs:1113` literally says "updated by KvWorkerMonitor when receiving ActiveLoad events", but `worker_monitor.rs`'s only touch of `WORKER_LOAD_METRICS` is `cleanup_worker_metrics` (remove on worker departure, lines ~60-78); the actual `.set()` happens in the router's sequence tracker, not the monitor. | None. |
+| 3 | Workers publish `kv_used_blocks` only on the event plane, no HTTP/metrics export | VERIFIED | `ActiveLoad.kv_used_blocks` doc comment at `protocols.rs:684-690` matches verbatim: "Total KV blocks currently in use on the worker ... the authoritative signal for backend KV occupancy used by overload detection." Publish subject `KV_METRICS_SUBJECT = "kv_metrics"` at `kv_router.rs:215` (exact). `grep -rn kv_used_blocks lib/llm/src/http/` returns zero hits — confirms no HTTP export. Frontend receiver `WorkerLoadState.kv_used_blocks`/`kv_total_blocks` fields confirmed at `worker_monitor.rs:256-263` (exact), filled from runtime config at `worker_monitor.rs:870-890` region (exact match of the `total_kv_blocks` population loop), subscription confirmed at `worker_monitor.rs:739` (exact — `EventSubscriber::for_endpoint(endpoint, KV_METRICS_SUBJECT)`). Mocker producer check: `grep -rn kv_used_blocks lib/mocker/src/` returns zero hits, confirming "no producer under `lib/mocker/src`." | None. |
+| 4 | Capacity gauge (`model_total_kv_blocks`) is one worker's value, last writer wins | VERIFIED | `metrics.rs:908-918` (evidence cites 912-918, close): single label `["model"]`, doc string verbatim "Total KV cache blocks available for a worker serving the model". `update_runtime_config_metrics` (called at `metrics.rs:1227` from `update_metrics_from_mdc`) does an unconditional `.with_label_values(&[model_name]).set(...)` on every call — confirmed last-writer-wins semantics, no aggregation, no worker-id label to distinguish sources. | None. |
+| 5 | Dynamo refuses overload with 529, no `Retry-After` | VERIFIED | `error.rs:19-21` (evidence cites 10-28, contains this): `StatusCode::from_u16(529)` is the hardcoded default, configurable only via `DYN_HTTP_OVERLOAD_STATUS_CODE` env var. `grep -rin 'retry-after\|retry_after' lib/llm/src/` returns zero hits anywhere in the frontend crate. `busy_threshold.rs:5-9` confirms the 529 fires "when all workers for a model exceed their thresholds." Gate-off condition confirmed at `worker_monitor.rs:598-605` (exact): `is_configured()` disables all per-field checks when no threshold is set. | None. |
+| 6a | Crate-cycle risk: moving the unkeyed chain primitive out of `roundhouse-core` into `roundhouse-session-id` would cycle, because `ContextAssembler::push` (in core) needs to extend the chain from a render it already computes | VERIFIED (design reasoning, premises confirmed) | `context.rs:216` is exactly `ContextAssembler::push`, which calls `self.tokenizer.encode(&item.render())` — confirmed the render-then-extend shape the argument depends on. `roundhouse-core/Cargo.toml` confirmed to depend on `dynamo-kv-router` (workspace, default-features=false) and `tokio`, but not `http`/`axum`/`redis` — matching the dependency-table row in §14.10 and the premise that core is deliberately thin. The proposed `roundhouse-session-id` crate does not yet exist in the tree (confirmed absent from workspace members and via filesystem search), so this is an unbuilt design claim, not an existing fact — but the architectural premises it rests on (core's actual deps, and where `push`/`render` live) are all verified. | The chain-primitive-in-core vs. keyed-identity-in-new-crate split is a proposed plan, not yet implemented; nothing to falsify against running code. |
+| 6b | Dialect namespace is spelled twice: `DIALECT_NAMESPACE` in the server and `MESSAGES_SESSION_SEGMENT` in core | VERIFIED | `messages_api/wire.rs:101`: `const DIALECT_NAMESPACE: &str = "anthropic_messages";` (exact line). `roundhouse-core/src/validate/control_call.rs:197`: `const MESSAGES_SESSION_SEGMENT: &str = "anthropic_messages";` (exact line), referenced at line 145 inside `of_session_key` at line 142 (exact). Same string, two independent named constants in two crates, with a comment at control_call.rs acknowledging the duplication ("Spelled here rather than imported because the server names it a crate above"). | None. |
+| 7 | File:line citations for code the crate would absorb | VERIFIED, all exact | `wire.rs`: `SESSION_HEADER` :67, `AGENT_HEADER` :78, `session_key` :236, `scoped` :286, `session_component` :299 — all exact line matches. `request_context.rs`: `from_request` :23, `conversation_key` :49, `prefix_fingerprint` :75 — all exact. `messages_api.rs`: `anonymous_key` :546 — exact. `control_config/mod.rs`: `qualify` :902 — exact. `item.rs`: `grep -n 'async fn\|\.await\|tokio'` returns zero hits — confirms no async code. Fixture citations: `claude-2.1.257-turn-1.json` `system[0]` is exactly `{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.257.1f2; cc_entrypoint=sdk-cli;"}` (byte-exact match). `wire.rs:472` is exactly `fn mark_turn_configuration`; `wire.rs:814` is exactly `fn the_live_client_body_canonicalizes_block_by_block`. Fixture directory has 11 files: 3 header captures (`claude-2.1.251-headers.json`, `claude-2.1.257-headers.json`, `claude-2.1.257-mcp-headers.json`) and 8 bodies — matches "Eight are Claude Code request bodies. Three are header captures." `messages_api_surface.rs` includes `2.1.251-headers.json` at line 143 and `2.1.257-headers.json` at line 152 (evidence cited 141-152, exact within range); `TURN_THREE_CURRENT` at line 209 confirmed. `claude_launch/control_surface.rs:219` confirmed as the sole includer of `claude-2.1.257-mcp-wire.json`. `claude-2.1.257-mcp-headers.json` confirmed included by no `.rs` file anywhere in the tree (grep across all `*.rs` for the filename finds zero `include_str!`/path references). `git grep` for `user-agent`, `originator`, `cc_version`, `x-anthropic-billing-header` under `crates/` finds hits only in `tests/fixtures/*.json`, `wire.rs`'s own `#[cfg(test)]` module (lines 820, 842, inside the test starting at 814), and `messages_api_surface.rs` test code — zero hits in non-test `src` paths outside the fixture/test surface. `originator` has zero hits anywhere in `crates/`. | Minor: the summary row phrasing "None of the three gives a 422" is confusing as written — the actual behavior (confirmed in code) is that a 422 fires only when *all three* of `thread-id`/`session-id`/`prompt_cache_key` are absent; presence of any one avoids it. Not a factual error, just an ambiguous sentence. |
+| 8a | `roundhouse-fleet/src/local.rs:410-425` comment: capacity denominator (`total_kv_blocks`) not in the catalog, uses `potential_prefill_tokens` | VERIFIED | Exact text match: "normalizing it would take a capacity denominator (`total_kv_blocks`) the catalog does not carry," and `load_for` returns `load.potential_prefill_tokens as f64`. | None. |
+| 8b | `GET /loads` on the standalone selection service; `PotentialLoad` has exactly `potential_prefill_tokens`, `potential_decode_blocks`, `active_requests` | VERIFIED | `server.rs:330`: `.route("/loads", get(loads))` exact. `protocols.rs:611-620`: `PotentialLoad` struct fields match exactly (worker_id, dp_rank, potential_prefill_tokens, potential_decode_blocks, active_requests). | None. |
+| 8c | Event plane needs `DistributedRuntime`; Roundhouse deliberately depends on neither `dynamo-llm` nor `dynamo-runtime` | VERIFIED | `rh Cargo.toml:41-46` region contains the exact comment "Deliberately NOT depending on `dynamo-llm`" and states `dynamo-kv-router` under `standalone-selection` "carries no `dynamo-runtime` dependency, enforced upstream by `lib/kv-router/src/services/CLAUDE.md`." The pinned rev in this dependency block (`ac7b7513790ef1d619b46f805aea03c9f21200ba`) matches the Dynamo pin under test. | None. |
+| 8d | `router_kv_hit_rate` histogram, "Predicted KV cache hit rate at routing time (0.0-1.0)", recorded via `push_router.rs` | VERIFIED | `metrics.rs:921-927`: doc string verbatim match, built via `router_metric(frontend_service::KV_HIT_RATE)` = `"router_" + KV_HIT_RATE` (confirms the stated full name `router_kv_hit_rate`). `push_router.rs:326-337`: `tracker.record_kv_hit(...)` and `guard.request_metrics().kv_hit_rate.observe(hit_rate)` confirmed inside the `if let Some(ref tracker)` block, gated exactly as evidence describes. | None. |
+| 8e | `admin_api.rs:26-33`: a mutation affects the next admission and nothing in flight | VERIFIED | Doc comment at `admin_api.rs:27-33` is a close paraphrase/match: "The next admission, and nothing in flight. A turn resolves its policy, its budget and its credentials once, at admission, and holds them for its whole life..." | None. |
+| 8f (new negative found) | Codex citations in evidence §14.9 (`codex@6344a65 codex-api/src/requests/headers.rs`, `codex-api/src/endpoint/responses.rs`, `login/src/auth/default_client.rs`) | PARTIALLY VERIFIED | The cited paths do **not** resolve at the pin as literally written — `~/.cargo/git/checkouts/codex-9eee5d47a939c68c/6344a65/codex-api/...` does not exist. The actual files live one directory deeper, under a `codex-rs/` workspace root: `codex-rs/codex-api/src/requests/headers.rs`, `codex-rs/codex-api/src/endpoint/responses.rs`, `codex-rs/login/src/auth/default_client.rs`. Once that prefix is supplied, every claimed line and quote checks out exactly: `build_session_headers` in `headers.rs` (session-id/thread-id headers), `x-openai-subagent` insert at `responses.rs:92-93` (exact), `DEFAULT_ORIGINATOR: &str = "codex_cli_rs"` at `default_client.rs:40` (exact), and `default_headers()` inserting `originator` and a user-agent starting at `default_client.rs:330` (exact). | The evidence document's Codex file citations are missing the `codex-rs/` path prefix throughout §14.9. Content and line numbers are otherwise accurate once that prefix is restored — this is a citation-formatting defect, not a substantive error. |
+
+#### Summary of anything not plain VERIFIED
+
+- **Claim 6a** (crate-cycle argument): the reasoning and its cited premises (core's actual dependencies, `ContextAssembler::push` calling `item.render()` at `context.rs:216`) are all confirmed, but the target crate (`roundhouse-session-id`) does not exist yet — this is unbuilt design, not a fact about running code, so it is verified only as "the stated premises are true," not as "the crate compiles this way."
+- **Claim 7** row on 422 behavior: phrasing "None of the three gives a 422" is ambiguous; actual mechanism (422 only when thread-id, session-id, and prompt_cache_key are all absent) is correct once clarified.
+- **Claim 8f** (new negative): every Codex file:line citation in evidence §14.9 is missing a `codex-rs/` directory prefix and will not resolve as written against the pinned checkout; the underlying content, once the correct path is used, is accurate down to the line number.
+
+No claim was refuted. No claim was uncheckable. `crates/roundhouse-core/src/control/credential/` was not read, per instructions, and nothing in this fact-check depends on it.
