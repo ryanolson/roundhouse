@@ -752,3 +752,883 @@ pub const CLAUDE_AGENT_HEADER: &str = "x-claude-code-agent-id";
 | Attribution detection | New. No code reads the block today (evidence §14.10). |
 
 **Fixtures.** The crate's tests read the fixtures where they are, through `concat!(env!("CARGO_MANIFEST_DIR"), "/../roundhouse-server/tests/fixtures/<name>")`. No fixture moves, so no existing `include_str!` changes. The unused `claude-2.1.257-mcp-headers.json` pairs with the MCP body fixtures for the label test.
+
+## Addendum, 2026-09-29: sequence identity, compaction invalidation, and the dispatch ledger
+
+This addendum applies the owner's direction of 2026-09-29 to the design. It restates in full each section that it changes, by number. Where this addendum and any text above disagree, this addendum wins. New evidence is in evidence §15. It was read against Roundhouse `2dd40dd`, Codex `6344a65`, Dynamo `ac7b751`, and the Claude Code 2.1.284 bundle.
+
+**Sections restated here:** §0, §1, §4, §6, §7, §8.2, §8.3, §8.4, §8.6, §9, §11, §12, §13, §15, §16, and §17. **New sections:** §18 (sequence identity), §19 (compaction detection), §20 (the invalidation contract), and §21 (the dispatch ledger). **Unchanged, except that "pool" reads "deployment":** §2, §3, §5, §8.1, §8.5, §10, and §14.
+
+### The owner's direction, 2026-09-29 (binding)
+
+1. **Terms.** The name of this workstream is now **session and sequence identity**.
+2. **The forgetting is important.** Roundhouse budgets future work at dispatch level, with no need for an exact KV load. Each request routed to a deployment is an agreement for some future work. A reservation is forgotten when its session does not come back. The ledger has these parts:
+   - a reservation per sequence on its deployment, sized as the current context plus the expected growth,
+   - a weight by the probability of return, from return curves learned from Roundhouse's own log, split by how the last turn ended,
+   - explicit release on close, on disconnect, and on a history rewrite,
+   - a virtual LRU per deployment at sequence level, which counts shared prefixes once through the tip chain,
+   - an effective capacity learned from the misses between predicted and observed cached tokens, with a multiplicative decrease and an additive increase,
+   - a prefill rail that adapts from TTFT inflation,
+   - placement: a continuation goes to its bound deployment first, and a new sequence goes to the deployment with the most headroom, subject to the prefill rail. Overbooking comes from the return curve. Bring-up follows from an empty ledger. Drain sets the capacity for new sequences to zero, and the reservations fade.
+   - The Dynamo load gauge (evidence §14) is optional calibration only.
+3. **Compaction detection and invalidation.** For Codex and Claude Code, Roundhouse detects a compaction and sends an invalidation message to the deployment. Roundhouse does not care how Dynamo invalidates. It only says that one id was compacted and will not be reused.
+4. **Codex uses several fields**, so more than one id can be necessary. Claude Code has its own set.
+
+### §0 (restated). Summary
+
+- **A session is the client's root identity. A sequence is one append-only KV lineage.** In Roundhouse, one sequence is one `SessionId`: a label plus its generation, `label#g{n}` (§18).
+- **The sequence key** is the principal namespace, the surface, the lineage name, and the generation. For Codex the lineage name is the thread. For Claude Code it is the session header scoped by the agent id (§18.2).
+- **Codex `session-id` alone is the wrong key.** Every sub-agent of one root sends the same value. An invalidation keyed by it frees a sibling's live KV (§18.3).
+- **Roundhouse sends one id downstream:** `x-dynamo-session-id`, set to a keyed digest of the sequence key. An invalidation names that digest (§18.6).
+- **A compaction is confirmed at the first admitted request of the new generation, never at the summarization request.** Admission reports where the new claim left the old history. A claim that leaves it only at the last exchange is a continuation, not a compaction (§19.2).
+- **Exact markers exist for both clients.** Codex advances the number in `x-codex-window-id`. Claude Code starts the first message after a compaction with a fixed sentence, and with hint headers on it sends `x-claude-code-context-compacted` (§19.1).
+- **The invalidation message** names the superseded sequence, its generation, the successor, and a reason. Delivery is at least once, with bounded retry, off the request path. A lost message costs memory on the deployment, never correctness (§20).
+- **The endpoint `POST /v1/sequences/invalidate` is a proposal for Dynamo.** No such endpoint exists at the Dynamo pin (evidence §15.8).
+- **The dispatch ledger** holds a weighted reservation per sequence per deployment. It places a new sequence where the headroom is largest, and it learns its own effective capacity from cache misses (§21).
+- **First measurable gain (M5):** the number of sequences that one deployment holds warm at an equal miss rate, with the return-curve ledger against a ledger that never forgets (§13).
+
+### §1 (restated). Terms
+
+**Identity.**
+
+- **Session**: the client's root identity. It is the Codex `session-id` header, or the Claude Code `x-claude-code-session-id` header. All sub-agents of one root share it. A session is never a KV key.
+- **Sequence**: one append-only KV lineage. In Roundhouse it is exactly one `SessionId`, which is one log. The identifier `SessionId` and the event `SessionCreated` keep their names in code.
+- **Label**: the qualified lineage name, `ControlPlane::qualify(principal, name)`, without the `#g{n}` suffix. Its derivation is unchanged (§18.2).
+- **Generation**: the `#g{n}` suffix that prefix admission mints when a claim disagrees with every stored generation of a label.
+- **Sequence key**: the tuple of §18.2.
+- **Sequence digest**: the keyed 16-byte digest of a sequence key (§18.6).
+- **Predecessor and successor**: the generation that a claim left (§19.2 says how it is chosen), and the new generation that the claim opened.
+- **Supersession**: a confirmed statement that a predecessor will not be reused (§19.2).
+- **Retained prefix**: the leading items on which the successor's claim agrees with the predecessor's stored history.
+
+**Placement and ledger.**
+
+- **Item**, **Render**, **Chain value**, **Tip**, **Anchor**, **Deployment**, **Deployment state**, **Eligible deployment**: unchanged from the revision after the second ruling.
+- **Class** of a first turn: **continuation**, **inherited**, or **new**. Unchanged.
+- **Reservation**: the ledger's entry for one sequence on one deployment (§21.2).
+- **Return curve**: the probability that a sequence returns after a given idle time, per client and per end kind (§21.4).
+- **End kind**: how the last turn of a sequence ended: `tool_call`, `end_turn`, `incomplete`, or `aborted`.
+- **Committed work** `W_d`: the weighted sum of the reservations on deployment `d` (§21.5).
+- **Effective capacity** `C_d`: the capacity, in Roundhouse tokens, that the ledger has learned for deployment `d` (§21.6).
+- **Headroom** `H_d`: `C_d` minus `W_d` minus a margin (§21.7).
+- **Load reading** and **estimated load** `Û_d`: now calibration only (§16).
+
+### §4 (restated). Stored state
+
+The handler calls `roundhouse-sequence-id` for the label, the client signals, the chain keys, the anchor, and the sequence digest. The engine places by §7 and keeps the ledger of §21.
+
+| Family | Key | Value | Bound and eviction | Milestone |
+|---|---|---|---|---|
+| `label` | Qualified label, no generation | anchor (16 B), bound `deployment_id`, `bound_at_ms`, `last_turn_at_ms` | TTL 7 days, refreshed per turn. Node memo capped at 4,096. | M3 |
+| `prefix_tip` | `L_i`, 16 B | anchor, `Target::ledger_key`, `tokens` (u32), `at_ms`, and the `SessionId` of the sequence that wrote it | TTL 1 hour, refreshed on write. Node memo capped at 65,536. | M4 |
+| `deployment_state` | `deployment_id` | `state`, `since_ms`, `drain_deadline_ms`, `set_by` | No TTL. An operator write replaces it. | M3 |
+| `reservation` (new) | `deployment_id`, then the `SessionId` | The record of §21.2, about 120 B | Deleted on release. Also deleted when its weight falls under 0.01, or 2 hours after its last terminal. | M4 |
+| `curve` (new) | client, end kind | Integer counts per time bin (§21.4) | No TTL. Counts only grow. | M4 |
+| `ledger_partial` (new) | `deployment_id`, then the node id | This node's share of `W_d`, its variance, its in-flight tokens, `at_ms` | Replaced each second. Removed only when another node adopts it (§21.9). | M4 |
+| `capacity` (new) | `deployment_id` | `C_d`, the rail limit, the TTFT model, `epoch` | No TTL. Last writer wins by `epoch`. | M4 |
+| Rail window | `deployment_id` | Rolling net-new prefill window, as §8.5 | As §8.5 | M5 |
+
+- **Removed from the placement path:** `deployment_dispatched` and `deployment_inflight`. The ledger carries in-flight work in its reservations. The dispatched counter returns only with the optional gauge calibration of §16.
+- **The invalidation outbox is node memory only** (§20.5). It is not stored.
+- **Every value is soft state.** A loss costs one cold placement or one missed invalidation. The curves can be rebuilt from a replay of the logs.
+
+### §6 (restated). Session labels
+
+- The label derivation does not change. Its full statement, with the session and sequence parts, is now §18.2.
+- Claude Code is labeled by `x-claude-code-session-id`, scoped by `x-claude-code-agent-id` when present. The attribution block is a detection signal only (first ruling, question 9).
+- **History rewrite.** A new generation keeps the label, so it keeps the bound deployment and the anchor. It is a new sequence, so it gets a new sequence digest. §19 decides whether it supersedes its predecessor.
+- **Client resets.** Claude Code `/clear` mints a new session id, so a new label and a new sequence. Nothing tells Roundhouse that the old one is closed. Its reservation fades by its return curve (§21.4).
+- **Headerless clients.** An anonymous Messages request gets a fresh key per request, so each request is its own sequence. The tips carry continuity (§6 of the first text). Roundhouse sends no invalidation for an anonymous key, because nothing confirms that it will not be reused.
+
+### §7 (restated). Placement
+
+#### 7.1 Preference order
+
+The order applies only inside the eligible set. Stickiness is a preference inside the admitted set, never an override of policy, budget, or egress.
+
+1. **Continuation**: the bound deployment, if it is not `down`. A `draining` deployment keeps its bound sequences until the drain deadline (§8.6).
+2. **Inherited**: the deployment of the deepest matched tip, if that deployment is `active`. Else the sequence is placed as new. This rule and the tip's frontier seed rule are unchanged.
+3. **New**: the `active` deployment with the largest headroom `H_d` (§21.7), among deployments with a fresh ledger (§21.9) and room on their rail. The label is bound to it.
+
+**What "largest" means.** Roundhouse takes the maximum `H_d`. Among deployments within `ε` of that maximum, it picks one uniformly at random. `ε` is 2% of the largest `C_d` by default. No content, label, or deployment id enters the choice. A change to the deployment set moves no bound sequence.
+
+**The rail override.** If the chosen deployment's rail has no room, Roundhouse takes the next largest headroom that has room. This is the ruled override.
+
+**Negative headroom.** When every deployment has negative headroom, the new sequence still goes to the largest one. Overbooking is the ledger's intent (§21.7). The rail, not the ledger, refuses work.
+
+#### 7.2 Spread under a burst
+
+- **Each placement reserves before the next one reads.** A node places new sequences one at a time under one placement lock. Each placement writes its in-flight reservation before the lock is released. The next placement sees it in `W_d`.
+- **Across nodes**, each node reads the other nodes' partials, which lag by at most one publish interval (§21.9). Two nodes that place in the same interval can both pick one deployment. The bound is one placement per concurrently placing node per interval. The `ε` band makes an exact tie unlikely.
+- **The lock covers only the choice and the reservation,** not the dispatch. A continuation does not take the lock.
+
+#### 7.3 When stickiness yields
+
+Unchanged from the revision after the second ruling, with two additions:
+
+| Condition | Action |
+|---|---|
+| The sequence was superseded, and its successor is the one that is placed | The successor keeps the label's bound deployment. It is a continuation for placement, because the retained prefix is there. |
+| The bound deployment is `down` | Place as new. Release every reservation on that deployment. Its sequences are reserved again where they land. |
+
+#### 7.4 What the learner and the rules picker see
+
+Quotes, not a new key. The expected hit in a quote is the lower of two numbers: the session `CacheLedger` estimate, and the virtual LRU prediction of §21.5. So the ledger can lower a quote's expected hit and never raise it (§21.10).
+
+### §8.2 (restated). Deployment or instance
+
+| Limit | Where it applies | What Roundhouse observes |
+|---|---|---|
+| Rail on net-new prefill | Per deployment, in Roundhouse, before dispatch. Its limit adapts from TTFT inflation (§21.6). | Its own charges, then the measured `cached_tokens` and the time to first token |
+| Headroom for new-sequence placement | Per deployment, in Roundhouse | The ledger (§21). The load gauge is calibration only (§16). |
+| Per-instance prefill load and placement | Per instance, inside the deployment, in the Dynamo router | Nothing before dispatch. No worker hint is sent (first ruling). |
+| Bring-up | Per deployment in Roundhouse. Per instance in Dynamo. | The deployment state and an empty ledger |
+| KV invalidation | Per deployment, by Dynamo | Only the acknowledgement of §20 |
+
+### §8.3 (restated). Bring-up
+
+- An operator adds a deployment to the catalog, or sets it `active` through the admin plane. Its ledger is empty, so its headroom is `C_d`, the largest of all. It draws new sequences.
+- Each placement reserves before the next one reads (§7.2). So the new deployment fills until its headroom meets the others, and then new sequences spread evenly.
+- **Its rail spaces the prefill.** A new deployment has cold caches, so nearly every admitted token is net-new. The rail caps that per window. New sequences over the limit go to the next largest headroom.
+- `C_d` starts at the nominal capacity from the catalog (question 17). The controller corrects it from the first misses (§21.6).
+- Continuing and inherited sequences never move to a new deployment. The optional `ramp_ms` stays, default 0.
+
+### §8.4 (restated). When the rail trips, and the sticky budget
+
+The budget that a continuation is held against is the rail of its bound deployment, together with the fair-use and spend budgets of its principal. The ledger is not an admission budget. It decides only where a new sequence goes.
+
+| Option | Why not chosen, or why chosen |
+|---|---|
+| The deployment rail (chosen) | It limits the one load that a move of the continuation makes worse. It is shared across nodes (§8.5). |
+| A per-sequence share of the rail | It divides a capacity limit by a count that changes each second. |
+| The ledger's headroom as an admission budget | A continuation's KV is mostly the prefix it already holds. Refusing it on headroom refuses the cheapest work first. |
+
+When the budget is exhausted:
+
+1. A **new** sequence goes to the next largest headroom with room.
+2. A **continuing** or **inherited** sequence waits for room, up to `min(max_rail_wait_ms, remaining turn deadline)`. It does not move.
+3. If no deployment can take a new sequence, the rail removes all deployment candidates. A frontier candidate that policy admits can still serve the turn, unless the session is local-only.
+4. When no candidate remains, the turn is refused with HTTP 429 and `Retry-After` (D5, first ruling).
+
+**The rail limit adapts.** The configured value is the ceiling. §21.6 lowers the working limit when TTFT inflates, and raises it back when TTFT recovers. `Retry-After` for a rail refusal is the time until the window has room under the working limit.
+
+### §8.6 (restated). Deployment state, drain, and down
+
+| State | Capacity for new sequences | Keeps bound sequences | Set by |
+|---|---|---|---|
+| `active` | `C_d` | Yes | Catalog at startup, or the admin plane |
+| `draining` | Zero | Until idle, or until `drain_deadline_ms` | The admin plane |
+| `down` | Zero | No. Each bound label moves at its next turn. Its reservations are released. | The admin plane, or discovered for `down_cooldown_ms` |
+
+- **The state is shared**, through the `deployment_state` family, with a 1 s memo. A discovered `down` is node-local. These rules are unchanged.
+- **Drain.** A draining deployment takes no new sequence, because its capacity for new sequences is zero. Its reservations are not released. They fade by their return curves, or they are released by the ordinary events of §21.3.
+- A bound sequence moves at its next turn after the drain deadline. The default deadline is 30 minutes. A moved sequence is placed as new, so the rail spaces the moves.
+- **The drain is complete** when the deployment's committed work `W_d` is under 1% of `C_d` and nothing is in flight, or at the deadline. Roundhouse reports `W_d` per deployment, so the operator can see the reservations fade.
+- A drain sends no invalidation. The sequences are not superseded, and the KV on a draining deployment is freed when the operator removes it.
+
+### §9 (restated). Scope and privacy
+
+- **Keyed per principal, not reversible, and no lookup crosses a principal.** Unchanged for tips and anchors.
+- **Something keyed now leaves Roundhouse.** Every dispatch to a deployment carries the sequence digest in `x-dynamo-session-id`, and every invalidation carries two digests (§18.6, §20.1).
+  - A digest is 16 bytes of HMAC output under the deployment secret. A reader without the secret cannot compute it from a label or test a guessed label against it.
+  - It is domain-separated from the tips and the anchor. A digest never matches a stored tip key.
+  - What the deployment learns is only which requests belong to one sequence. It already sees that in the content.
+- **Tips and anchors are still never exported.** They never go upstream, into metrics labels, into MCP answers, or into a frontier request. Logs carry at most the first 8 hex characters of an anchor or a digest.
+- **No secret, no digest.** Without the deployment secret, the tip families stay off, as before. Roundhouse also sends no `x-dynamo-session-id` and no invalidation. Placement and the ledger still work, because they key on the `SessionId` inside Roundhouse.
+- **Rotation.** A new secret changes every digest, including those of live sequences. The next dispatch of a live sequence carries a new id, so the deployment sees a new sequence. That costs Dynamo's per-sequence state, such as session affinity, and never correctness.
+  - The reservation stores the digest that was sent (§21.2). So an invalidation after a rotation names the id that the deployment actually saw.
+  - Labels survive a rotation, so bound sequences keep their deployments.
+
+### §11 (restated). Durability
+
+- `SessionCreated` gains three fields, each with a serde default. This is the forward-only door that `principal` and `arm` already use. A new event kind makes an older build fail to read the log, because `SessionEventKind` has no catch-all variant.
+  - `anchor: Option<Anchor>`, as before.
+  - `client: Option<ClientKind>`: `codex`, `claude_code`, or `unknown`, from the crate's detection. The return curves need it (evidence §15.9).
+  - `supersedes: Option<Supersession>`: the predecessor's `SessionId`, the retained prefix length in items, the reason, and the signal that detected it (§19.2).
+- A replay restores the anchor, the client, and the supersession chain from these events.
+- The label binding, the tips, the reservations, the curves, and the partials are soft state in the store that the deployment configures.
+- The seed on an inherited first turn is recorded on the `Routed` decision that uses it, so a replay prices it the same way.
+
+### §12 (restated). Questions for the owner
+
+**Closed earlier:** 1, 3, 4, and 9 (first ruling), and 2 (second ruling).
+
+**Disposition of each open question.**
+
+| # | Question | Status now |
+|---|---|---|
+| 5 | `x-dynamo-session-id` as a keyed digest of the label | **Superseded by question 21.** The digest now covers the sequence, not the label. |
+| 6 | Drop the spawn-argument link | Open. Recommendation unchanged: drop it. |
+| 7 | No opencode name | Open. Recommendation unchanged. |
+| 8 | Identical first requests share an anchor | Open. Recommendation unchanged: accept. The anchor is not the sequence digest, so an invalidation never reaches a sibling that shares an anchor. |
+| 10 | `prefix_fingerprint` from the chain | Open. Recommendation unchanged. It remains session-level for Codex, because Codex's own `prompt_cache_key` is the family root (evidence §15.3). |
+| 11 | `min_anchors` | Open. Recommendation unchanged. |
+| 12 | `usage_limit_reached` for a Codex rail 429 | Open. Recommendation unchanged. |
+| 13 | Full rail charge for warm continuations until reconciliation | Open. Recommendation unchanged. M5 measures it. |
+| 14 | One deployment secret | Open. Recommendation unchanged. The same secret now keys the sequence digest and the invalidation id. |
+| 15 | Load source without the KV router | **Closed by the direction.** Placement no longer needs the gauge. A deployment without it has no calibration, and nothing else changes. |
+| 16 | Several frontends in one deployment | **Replaced by question 29.** The gauge question is moot. The new question is where the invalidation goes. |
+| 17 | The capacity source | Open, and now more important. Recommend the catalog's `kv_capacity_blocks` times the block size as the nominal capacity, the start value and ceiling of `C_d`. |
+| 18 | The tie band `ε` | Open. Now applies to headroom. Recommend 2% of the largest `C_d`. |
+| 19 | Drain defaults | Open. Recommend a 30-minute deadline. The completion rule is now `W_d` under 1% of `C_d`. |
+| 20 | An upstream gauge for the engine-reported signal | Open, lowered to calibration only. Recommendation unchanged. |
+
+**New questions.**
+
+21. **The downstream id.** Recommend `x-dynamo-session-id` set to the sequence digest on every dispatch to a deployment, and no other identity header. No client header survives. With Dynamo's session affinity on, the digest keeps each sequence on its own worker. Codex `session-id` puts a whole family on one worker (evidence §15.7).
+22. **Invalidate on a rewrite as well as on a compaction.** An edit that rewinds several turns leaves a dead tail just as a compaction does. Recommend yes, with `reason: "rewrite"`, so that the deployment and the metrics can tell the two apart.
+23. **The grace for an inferred supersession.** Recommend holding an inferred invalidation for 120 s, and cancelling it if the predecessor lands again (§19.3). An exact one is sent at once.
+24. **What counts as a disconnect.** The direction says to release on disconnect. No client sends a disconnect signal, and the MCP surface is stateless (evidence §15.9). Recommend: a client that closes the response stream before the terminal event, and sends no request on that label within 10 s. The risk is Claude Code's Esc-then-retype, which closes the stream and returns within seconds. The 10 s grace covers most of those. The `aborted` curve learns the rest.
+25. **What counts as a close.** No close signal was found from either client. Recommend accepting `x-dynamo-session-final: true` from a client as a close of that label. Roundhouse then releases, invalidates, and does not forward the header.
+26. **The Claude Code launch.** Recommend that `claude_launch` sets `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. Without it, the compaction headers arrive only when an Anthropic remote flag is on for that user (evidence §15.5). The content marker still works without it.
+27. **The retained prefix.** Recommend that the deployment keeps shared blocks by its own reference counts, with the `successor` field as the join key. Recommend against sending a retained-prefix length. Roundhouse counts items and its own tokens, which do not map onto a deployment's chat template, tokenizer, or block size (§19.4).
+28. **Authentication of the invalidation.** Recommend a bearer token per deployment from the existing secret configuration, never from the catalog, and TLS for any address that is not loopback.
+29. **Several frontends in one deployment.** Recommend one invalidation URL per deployment in the catalog. Dynamo decides how one frontend reaches every worker. The alternative is that Roundhouse sends to every frontend.
+30. **Codex remote compaction.** Recommend keeping the generated provider name `Roundhouse`, so that Codex compacts locally through `/v1/responses`. Recommend serving no `/v1/responses/compact` and no `compaction_trigger` item (evidence §15.3). Serving them means a summarizer of Roundhouse's own.
+31. **The overbooking margin.** Recommend `z = 1` in §21.7. Zero trusts the curve fully. A larger value holds back capacity for the variance of returns.
+32. **The cold-start priors of the return curves** (§21.4). They are design choices, not measurements. Recommend accepting them for M4 and replacing them with M4's own numbers before M5 places on them.
+
+### §13 (restated). Milestones
+
+Each milestone is one PR, cut from `main`. Tests come first, and each PR keeps the tests it adds. Every run is bounded by a timeout.
+
+**Old to new.**
+
+| Before | Now |
+|---|---|
+| M1, the `roundhouse-session-id` crate | M1, renamed `roundhouse-sequence-id`, with the client signals added |
+| M2, binding and tips in shadow | Binding moves to M3. Tips move to M4, where the ledger uses them. |
+| M3, deployments and the load signal in shadow | Deployments move to M3. The gauge becomes optional M8. |
+| M4, placement and the rail | M5, with the ledger's headroom in place of the gauge |
+| M5, D5 | M6, unchanged |
+| M6, learner scope | M7, unchanged |
+
+**M1: the `roundhouse-sequence-id` crate and the chain primitive.**
+
+- Tests first, in `roundhouse-core`: the four chain tests of the earlier M1.
+- Tests first, in the crate, against the fixtures in place:
+  - The nine crate tests of the earlier M1, from `claude_fixture_labels_match_the_server_labels` to `claude_fixture_divergence_is_pinned`.
+  - `the_sequence_digest_separates_generations_labels_and_principals`.
+  - `a_codex_family_shares_a_session_but_never_a_sequence`: two thread ids under one `session-id` give one session and two sequence keys.
+  - `the_codex_window_header_parses_thread_and_number`, and a malformed value parses to nothing.
+  - `a_codex_compaction_request_is_read_from_turn_metadata`: `request_kind` and the `compaction` object.
+  - `the_claude_hint_headers_are_read_exactly`: `auto`, `manual`, and `reactive`, and any other value reads as none.
+  - `the_claude_continuation_sentence_is_detected_exactly`: with and without the Artifact sentence before it. A changed word is not detected.
+  - `the_codex_summary_prefix_is_detected_exactly`.
+- Change: the chain primitive in core. The new crate, with the API of §17. The label part of both surfaces becomes a call into the crate.
+- Done means: the full server suite is green with every label derived through the crate. A benchmark reports chain time against tokenization time per 100 KB.
+
+**M2: supersession detection, in shadow.**
+
+- Tests first:
+  - `a_probe_reports_where_the_claim_left_the_history`: `Probe::Disagrees` carries the agreed length and the start of the stored last admitted delta.
+  - `an_abandoned_summarization_is_a_continuation_not_a_supersession`.
+  - `a_codex_local_compaction_supersedes_on_the_window_advance`: claims built from the pin's compaction snapshots (evidence §15.2).
+  - `a_claude_compaction_supersedes_on_the_continuation_sentence`.
+  - `a_claude_sibling_without_an_agent_id_is_never_an_exact_supersession`.
+  - `an_edit_of_the_message_that_began_the_last_request_is_a_continuation`.
+  - `an_edit_before_a_tool_loop_is_an_inferred_rewrite`.
+  - `a_root_compaction_beside_a_sibling_without_an_agent_id_is_held_not_sent`: the root's continuation claim ties with the sibling's generation at `P = 0`.
+  - `a_rewind_is_an_inferred_rewrite`.
+  - `session_created_without_client_or_supersedes_still_reads`.
+  - `the_claude_launch_turns_on_gateway_hint_headers` (question 26).
+- Change: `Probe::Disagrees { agreed, last_delta_start }` and `Search::Fresh { candidates }`, both additive. The classifier of §19.2. `SessionCreated.client` and `SessionCreated.supersedes`. A log line per classification. The launch variable. Nothing is sent.
+- Done means: a replay of the Claude fixtures and of Codex claim pairs built from the pin's snapshots. It reports the class and the signal of every generation change, with counts.
+
+**M3: deployment targets, the sequence header, and the invalidation contract.**
+
+- Tests first, against a stub deployment that records what it receives:
+  - `every_dispatch_to_a_deployment_carries_the_sequence_digest_and_no_client_header`.
+  - `a_label_binding_names_a_deployment_id_not_a_bucket`.
+  - `an_exact_supersession_invalidates_after_the_successor_is_accepted`.
+  - `an_inferred_supersession_waits_and_is_cancelled_when_the_predecessor_lands_again`.
+  - `a_continuation_class_sends_nothing`.
+  - `an_invalidation_is_retried_then_dropped_and_counted`.
+  - `a_duplicate_invalidation_is_harmless`: the stub sees one id twice.
+  - `a_deployment_without_the_route_is_skipped_after_one_404`.
+  - `every_deployment_touched_within_the_tip_ttl_receives_it`.
+  - `the_invalidation_carries_the_deployment_token_and_never_the_label`.
+  - `session_final_from_a_client_closes_and_invalidates` (question 25).
+- Change: `Target::Deployment { deployment_id, model }`, the deployment catalog (URL, invalidation URL, token reference, nominal capacity, state, drain defaults, rail limit), the admin state route, the `label` and `deployment_state` families, dispatch with `x-dynamo-session-id`, and the outbox of §20.5. **Interim placement** for a new sequence: the deployment with the fewest in-flight tokens. M5 replaces it.
+- Done means: two mocker deployments behind stub invalidation receivers, with a replay that contains compactions. The run reports invalidations sent, accepted, retried, and dropped, and the delay from the successor's acceptance to the invalidation's acknowledgement, with numbers.
+
+**M4: the dispatch ledger, in shadow.**
+
+- Tests first:
+  - `a_reservation_is_made_at_dispatch_and_idles_at_the_terminal`.
+  - `a_supersession_releases_the_predecessor_and_reserves_the_successor_at_its_size`.
+  - `a_disconnect_releases_only_after_the_grace` (question 24).
+  - `the_return_curve_starts_at_its_prior_and_moves_with_observations`.
+  - `a_censored_gap_is_never_counted_as_a_return`.
+  - `a_shared_prefix_is_charged_once_at_the_larger_weight`.
+  - `the_virtual_lru_predicts_a_miss_beyond_effective_capacity`.
+  - `a_predicted_hit_observed_as_a_miss_shrinks_capacity_multiplicatively`.
+  - `a_predicted_miss_observed_as_a_hit_grows_capacity_additively`.
+  - `an_unmeasured_count_falls_back_to_ttft_and_abstains_when_uninformative`.
+  - `two_nodes_agree_on_a_reservation_by_last_writer`.
+  - `a_dead_nodes_partial_is_kept_and_decays_and_is_never_zero`.
+  - `the_ledger_never_raises_a_quote_expected_hit`.
+  - The `CorrelationMaps` contract suite for the new families, memory and Redis.
+- Change: the `prefix_tip`, `reservation`, `curve`, `ledger_partial`, and `capacity` families. The estimator, the virtual LRU, and the controller. The engine logs the ledger's choice beside the interim choice, and the predicted cached tokens beside the observed ones.
+- Done means: a replay of `use-cases/cache-aware-routing/turns.jsonl` reports each return curve with its counts. A two-mocker run reports the prediction error of the virtual LRU against the TTFT-derived hit, with numbers.
+
+**M5: ledger placement and the adaptive rail (first measurable gain).**
+
+- Tests first:
+  - `a_continuation_goes_to_its_bound_deployment`, `an_inherited_label_goes_to_the_matched_deployment`, and `an_inherited_label_on_a_draining_deployment_is_placed_as_new`.
+  - `a_new_sequence_goes_to_the_most_headroom`, and `a_burst_of_new_sequences_spreads_before_any_terminal`.
+  - `a_new_sequence_moves_when_the_rail_refuses`, and `a_continuing_sequence_waits_and_does_not_move`.
+  - `a_policy_refusal_beats_stickiness`, and `a_local_only_session_never_leaves_the_deployments`.
+  - `a_drain_sets_new_capacity_to_zero_and_the_reservations_fade`.
+  - `a_new_deployment_draws_new_sequences_until_its_headroom_matches`.
+  - `ttft_inflation_lowers_the_rail_and_recovery_raises_it`.
+  - `a_deployment_503_before_the_first_byte_marks_it_down_and_rebinds`, and `a_deployment_529_holds_a_continuation`.
+  - `an_uncertain_hit_is_charged_as_net_new`, and `a_measured_cached_count_reconciles_the_charge`.
+- Change: placement by §7, the adaptive rail, drain and bring-up by the ledger.
+- **First measurable gain.** Two mocker deployments. A replay of agent traffic with idle gaps, tool loops, and compactions.
+  - **Held warm.** The largest number of concurrent sequences that each deployment serves at a fixed TTFT-derived miss rate. Compare the return-curve ledger with a ledger that weights every reservation at 1. The difference is the gain from forgetting.
+  - **Spread.** The largest over the smallest count of new sequences per deployment under a burst.
+  - **Stickiness.** The router's predicted hit rate per deployment (evidence §14.12), with stickiness on and with a headroom-only choice per turn.
+  - Report the numbers. The report says that the hit is derived from TTFT, because the mocker reports no cached count.
+
+**M6: D5, headers held, and 429 with `Retry-After`.** Unchanged from the earlier M5.
+
+**M7: learner scope (D8).** Unchanged from the earlier M6.
+
+**M8 (optional): gauge calibration.** The scraper of the earlier M3, logged beside the ledger. It never places.
+
+### §15 (restated). Out of scope
+
+- Any change to the label derivation, or to the refusal of a Responses request with no name.
+- How Dynamo invalidates. Roundhouse sends the message of §20 and nothing else.
+- A Roundhouse block index for a remote deployment.
+- Queue ordering inside a deployment.
+- Any hash, modulo, or rendezvous choice over the deployment set.
+- Worker hints toward a remote deployment.
+- A Roundhouse subscription to the Dynamo event plane.
+- Serving `/v1/responses/compact` or a `compaction_trigger` item (question 30).
+
+### §16 (restated). The Dynamo load gauge: optional calibration
+
+- The quantity, the source, the biases, and the smallest upstream change of the earlier §16 stand as a description of the gauge.
+- **The gauge no longer places anything.** The direction makes it calibration only. The ledger of §21 places new sequences.
+- **What calibration means.** M8 logs `U_d` beside `W_d / C_d` for each deployment. A persistent gap shows traffic that Roundhouse does not see (§21.11). It does not change `C_d`.
+- **A missing reading changes nothing,** because nothing reads it for placement.
+
+### §17 (restated). The `roundhouse-sequence-id` crate
+
+#### 17.1 Purpose
+
+The crate turns one request into five facts: the client, the session, the label, the client's compaction signals, and the keyed digests. It is pure: no store, no network, no clock, and no async in its API. It does not route.
+
+#### 17.2 Public API
+
+The API of the earlier §17.2 stays, with three changes. `session_label` is renamed `label`, because a label names a lineage and not a session. `TipKeyer`, `Anchor`, detection, and the attribution functions do not change. The additions:
+
+```rust
+/// The client's root identity. Never a KV key.
+pub fn client_session(view: &RequestView) -> Option<&str>;   // Codex `session-id`, Claude session header
+
+pub struct SequenceKey<'a> {
+    pub namespace: &'a str,   // the principal namespace that `ControlPlane::qualify` uses
+    pub label: &'a str,       // unqualified label, as `label()` returns it
+    pub generation: u32,
+}
+pub struct SequenceDigest(pub [u8; 16]);
+pub struct SequenceDigester { /* K */ }
+impl SequenceDigester {
+    pub fn new(deployment_secret: &[u8]) -> Self;
+    pub fn digest(&self, key: &SequenceKey) -> SequenceDigest;
+    pub fn invalidation_id(&self, predecessor: &SequenceDigest, successor: Option<&SequenceDigest>) -> [u8; 16];
+}
+
+pub struct CodexWindow { pub thread: String, pub number: u64 }
+pub enum CompactionKind { Auto, Manual, Reactive }
+pub enum RequestPurpose { Turn, Compaction(Option<CompactionKind>), Other(String) }
+pub struct ClientSignals {
+    pub window: Option<CodexWindow>,                     // x-codex-window-id
+    pub purpose: RequestPurpose,                         // turn metadata request_kind, or x-claude-code-compaction
+    pub context_compacted: Option<CompactionKind>,       // x-claude-code-context-compacted
+    pub session_final: bool,                             // x-dynamo-session-final: true
+}
+pub fn client_signals(view: &RequestView) -> ClientSignals;
+
+pub enum ContentMarker { ClaudeContinuation, ClaudeSummaryRequest, CodexSummary }
+pub fn content_marker(item: &Item) -> Option<ContentMarker>;   // exact literal prefixes only
+```
+
+- **Every marker is exact.** `content_marker` matches the fixed sentences of evidence §15.2 and §15.5 as literal prefixes. `ClaudeContinuation` also accepts the one fixed Artifact sentence before its sentence. A near match is no match.
+- **`client_signals` never fails a request.** A malformed header reads as absent.
+- **The digests take the secret as a value.** The crate loads no configuration.
+
+#### 17.3 to 17.5
+
+Unchanged, except for the crate name. `SequenceDigester` uses the `hmac` and `sha2` crates already listed.
+
+### §18 (new). Sequence identity
+
+#### 18.1 Session against sequence
+
+| | Session | Sequence |
+|---|---|---|
+| What it names | One agent task on one client: a root and its sub-agents | One append-only KV lineage |
+| Codex | `session-id` (the root thread id) | One thread, one generation |
+| Claude Code | `x-claude-code-session-id` | One agent in that session, one generation |
+| In Roundhouse | Not stored today. The crate's `client_session`. | One `SessionId`, which is one log |
+| Used for | Grouping, reporting, and the learner's cluster if the owner rules so | Placement, reservations, the downstream id, and invalidation |
+| Changes on a compaction | No | Yes. The successor is a new sequence. |
+
+#### 18.2 The sequence key per client
+
+The key is `(principal namespace, surface, lineage, generation)`. Roundhouse already builds all four. The key is exactly the `SessionId` that `bound_session(qualify(principal, name), generation)` mints [rh crates/roundhouse-server/src/conversations.rs:780-785].
+
+| Client | Surface | Lineage (the label before qualification) | Generation |
+|---|---|---|---|
+| Codex | Responses | `thread-id`. Else `session-id`. Else `prompt_cache_key`. None of the three gives 422. | `#g{n}` from prefix admission |
+| Claude Code | Messages | `anthropic_messages/{session}` from `x-claude-code-session-id` or `metadata.user_id`, plus `/agent/{id}` when `x-claude-code-agent-id` is present | Same |
+| No headers, Messages | Messages | A fresh anonymous key per request | Always 0 |
+| No headers, Responses | Responses | `prompt_cache_key`, else 422 | `#g{n}` |
+
+**The Codex fields and what each one is for.**
+
+| Field | Role in this design |
+|---|---|
+| `session-id`, turn metadata `session_id` | The session. Never part of the sequence key when a thread id is present. |
+| `thread-id`, turn metadata `thread_id` | The lineage. The turn metadata value is the fallback carrier, as today. |
+| `x-codex-parent-thread-id`, `forked_from_thread_id` | An edge between sequences. Not used for identity. A context fork is found by the tips. |
+| `x-openai-subagent`, `subagent_kind` | A label for reports. Not used for identity. |
+| `prompt_cache_key` | The lineage only when no header is present. By default it equals `session_id`, so it is session-level (evidence §15.3). |
+| `x-codex-window-id` | The compaction epoch of one thread. An exact supersession signal (§19.1). Not part of the key. |
+| turn metadata `request_kind`, `compaction` | The purpose of one request (§19.1). Not part of the key. |
+
+**The Claude Code fields.** `x-claude-code-session-id` is the session. The agent id scopes the lineage. `x-claude-code-parent-agent-id` is an edge and is not used for identity. The two compaction hint headers are signals (§19.1).
+
+#### 18.3 Why Codex `session-id` alone is wrong
+
+1. **It is shared across sub-agents.** Every sub-agent of one root sends the root's `session-id` (`session-identity-evidence.md` §3.2, fact-checked). The siblings hold different histories, so they are different KV lineages.
+2. **An invalidation keyed by it frees a sibling's live KV.** When the root compacts, its predecessor dies, but its sub-agents' sequences do not. A message that names the family names them too.
+3. **Admission churns generations.** Two histories under one label disagree with each other on every turn. Each request opens or resumes a generation, and every change looks like a rewrite.
+4. **Dynamo reads it the same way.** Dynamo's own header map takes Codex `session-id` as its session (evidence §15.7). With session affinity on, a whole family then shares one worker.
+
+The default `prompt_cache_key` has the same flaw, because it equals `session_id`.
+
+#### 18.4 The same hazard for Claude Code
+
+- An in-process Claude Code sub-agent inherits the session header. Roundhouse keeps it apart only through `x-claude-code-agent-id`.
+- The 2.1.284 bundle sets that header whenever the client has an agent id (evidence §15.5). It was absent at 2.1.42, and no capture shows it.
+- A sub-agent without it lands on the root's label. Its first claim disagrees with the root, so admission opens a generation. The next root request lands back on the root's generation. The two generations alternate.
+- **So a Claude Code supersession is exact only with a marker** (§19.1). A bare generation change on a Claude label is at most an inferred rewrite. §19.3 holds it, and cancels it when the predecessor lands again.
+
+#### 18.5 Mapping onto the conversation name and the generation
+
+- The label is the conversation name that prefix admission resolves today. It does not change.
+- A generation is a sequence. `label` is generation 0, `label#g1` is generation 1, and so on.
+- A compaction successor is a new generation of the same label. It keeps the label's bound deployment and anchor (§6).
+- **Admission gains two facts, additively.** When a probe disagrees, it reports how many leading history items agreed, and where the stored last admitted delta began. The fresh-generation result lists the generations that the claim left (§19.2).
+
+#### 18.6 What Roundhouse sends downstream
+
+```text
+q   = namespace(P) || 0x00 || surface || 0x00 || label || 0x00 || u32be(generation)
+S   = HMAC-SHA256(K, "rh-sequence-v1\0" || q)[..16]          the sequence digest
+x-dynamo-session-id: hex(S)                                    32 characters
+```
+
+- **Keyed.** Only a holder of `K` can compute a digest from a label, so a deployment's logs do not reveal labels. `K` is the one deployment secret (question 14).
+- **Stable across nodes,** because every node has the same `K`. Two nodes that dispatch one sequence send one id.
+- **Domain-separated** from the tip keys and from the anchor by its own prefix string.
+- **Not the anchor.** A fork shares its parent's anchor. An invalidation by anchor frees the parent too.
+- **Not the label.** A label spans generations. An invalidation by label frees the successor's retained prefix too.
+- **No other identity header is sent.** No client header survives. No parent header is sent (question 21).
+
+#### 18.7 What an invalidation names
+
+An invalidation names one sequence digest: the predecessor's. It also carries the successor's digest when a successor exists, so that the deployment can keep what the two share (§19.4). It never names a session, a label, or an anchor.
+
+### §19 (new). Compaction detection
+
+#### 19.1 Signals per client
+
+| Client | Signal | Carried on | Exact or inferred | Source |
+|---|---|---|---|---|
+| Codex | `x-codex-window-id` number larger than the predecessor's last number, same thread | The first request after a successful compaction | **Exact** | Evidence §15.2 |
+| Codex | turn metadata `request_kind: "compaction"` | The summarization request | Exact that a compaction was **attempted**. Not a confirmation. | Evidence §15.2 |
+| Codex | A user item that starts with `SUMMARY_PREFIX` and a newline | Every request after a local compaction | **Exact** content marker | Evidence §15.2 |
+| Claude Code | `x-claude-code-context-compacted` | The first main-thread request after a successful compaction, when hint headers are on | **Exact** | Evidence §15.5 |
+| Claude Code | The continuation sentence at the start of the first history user item | Every request after a compaction | **Exact** content marker | Evidence §15.5 |
+| Claude Code | `x-claude-code-compaction`, or a last user item that starts with `CRITICAL: Respond with TEXT ONLY.` | The summarization request | Exact that a compaction was **attempted** | Evidence §15.5 |
+| Any client | A new generation whose claim leaves the predecessor before its last turn | The first request of the new generation | **Inferred** | §19.2 |
+
+- **Codex's content marker persists.** The summary stays in the history after a compaction, so a later rewrite also sees it. §19.2 uses it only on the first request of a new generation.
+- **Claude Code's continuation sentence also persists.** The same rule applies.
+- **The window test needs the predecessor's last window, per generation.** The reservation record stores it (§21.2). When the reservation is gone, the test cannot run, and the supersession is inferred.
+
+#### 19.2 The trigger and the classifier
+
+**The trigger is the first admitted request of the new generation.** The summarization request is never the trigger, because a compaction can fail after it (evidence §15.2, §15.6).
+
+When `bind_prefix` opens a fresh generation, it reports every generation that it probed and found disagreeing. For each such candidate it has two numbers:
+
+- `P`: the count of leading history items on which the claim agrees with the candidate's stored history.
+- `T`: the start of the candidate's **last admitted delta**, that is, the index of the first item that the candidate's last request appended. In a tool loop, that is the last tool result, not the last user message.
+
+**The predecessor** is the candidate with the largest `P`. A tie goes to the higher generation. That choice is only a best guess when a label holds more than one live lineage (§18.4). So the classifier also asks whether the predecessor is **unambiguous**:
+
+- **Codex:** the label is a `thread-id`, and the predecessor's stored last window has the same thread and a smaller number than the claim's window. With a thread label, one label holds one lineage.
+- **Claude Code:** the predecessor's last admitted delta is a summarization request (the `ClaudeSummaryRequest` marker, §17.2). Or the label has exactly one candidate that had a turn in the last 2 hours.
+- **Any other case** is ambiguous.
+
+```text
+if P >= T:
+    class = continuation            the claim resends everything up to the predecessor's last request
+else if an exact marker is present (§19.1) and the predecessor is unambiguous:
+    class = supersession, reason = compaction, detected_by = the marker          (exact)
+else if an exact marker is present:
+    class = supersession, reason = compaction, detected_by = the marker          (inferred: held)
+else:
+    class = supersession, reason = rewrite, detected_by = retained_prefix       (inferred: held)
+```
+
+- **Continuation.** Only the predecessor's last request is dead. That covers an abandoned summarization, a failed compaction, and an edit of the user message that began the last request. The KV through `T` is the successor's prefix. So nothing is invalidated. The reservation moves to the successor (§21.3).
+- **Supersession.** The claim dropped history before the predecessor's last request. The predecessor's tail will not be reused.
+- **A marker alone does not make an invalidation exact.** Take a Claude label that holds a root (g0) and a sibling with no agent id (g1). The root compacts. Its next claim carries the continuation sentence and agrees with neither, so `P = 0` for both and the tie picks g1. The unambiguity test fails, because g1's last request was not a summarization. So the invalidation is held (§19.3), and it is cancelled when the sibling lands on g1 again.
+
+`P` and `T` are computed on the configuration-free history. For Claude Code the configuration run is compared apart and replaced in place [rh crates/roundhouse-server/src/prefix_admission.rs:746-794], so a changed system prompt never counts as a rewrite.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as bind_prefix
+    participant K as Classifier (§19.2)
+    participant L as Ledger (§21)
+    participant D as Deployment
+    participant O as Outbox (§20)
+    C->>A: summarization request (old history + prompt)
+    A-->>C: lands on g0, an ordinary turn
+    C->>A: first request after compaction
+    A->>K: Fresh g1, predecessor g0, P, T, signals
+    K-->>A: supersession, compaction, exact
+    A->>L: release g0, reserve g1 at its size
+    A->>D: dispatch g1, x-dynamo-session-id = S(g1)
+    D-->>A: response headers
+    A->>O: enqueue invalidate S(g0), successor S(g1)
+    O->>D: POST /v1/sequences/invalidate
+    D-->>O: 202
+```
+
+#### 19.3 Timing: exact at once, inferred after a grace
+
+| Class | Ledger | Invalidation |
+|---|---|---|
+| Continuation | Move the reservation to the successor | None |
+| Supersession, exact | Release the predecessor at once. Reserve the successor. | Enqueue after the successor's dispatch is accepted |
+| Supersession, inferred | Release the predecessor at once. Reserve the successor. | Hold for 120 s (question 23). Cancel it if a request lands on the predecessor in that time. |
+
+- **Why hold an inferred one.** A Claude sibling without an agent id, or a client that resumes an older branch, looks like a rewrite. Its "predecessor" is alive. The hold turns that mistake into a cancelled message.
+- **A release is cheap to undo.** If a request lands on a released predecessor, the ledger reserves it again as a continuation.
+- **An invalidation is never undone, and never needs to be.** If a request lands later on an invalidated sequence, the deployment serves it as ordinary work and prefills what it freed. Correctness does not depend on the message.
+
+#### 19.4 The prefix that the predecessor and the successor share
+
+After a compaction, the two sequences still share a leading run. For Codex, that is the instructions and the tools. For a mid-turn compaction it can also include the initial context and a user message (evidence §15.2). For Claude Code it is the tools and the system prompt.
+
+**Recommendation: the deployment keeps shared blocks by its own reference counts. Roundhouse sends the successor's digest and no length** (question 27).
+
+| Option | Why not chosen, or why chosen |
+|---|---|
+| Reference counts in the deployment, joined by `successor` (chosen) | The successor's first request reaches the deployment before the invalidation (§20.4), so its blocks are already held under the successor's id. The deployment frees only blocks that no live sequence holds. Blocks shared with other sequences, such as a common system prompt, stay too. |
+| Roundhouse sends a retained-prefix length | Roundhouse counts items and its own tokens. The deployment counts blocks of its chat template and tokenizer. A length that is too long keeps dead blocks. A length that is too short frees live ones. |
+
+#### 19.5 The ledger at a supersession
+
+- **Release the predecessor's reservation at once**, on every deployment that holds one.
+- **Reserve the successor at its compacted size:** its admitted input tokens, in flight, on the bound deployment.
+- A compaction shrinks the context. So the deployment's committed work falls by the difference, and its headroom grows at once. It does not wait for a curve to fade.
+
+#### 19.6 Compaction, edit, and retry
+
+| Event | Generation change | Class | Why |
+|---|---|---|---|
+| A verbatim retry | None. The claim is shorter than or equal to the stored history. | Not seen | `suffix_after` treats it as a retry [rh prefix_admission.rs:796-810] |
+| A retry after a failed stream | None. Provisional items are skipped. | Not seen | [rh prefix_admission.rs:577-591] |
+| An abandoned summarization | Yes | Continuation | `P >= T` |
+| An edit of the user message that began the last request | Yes | Continuation | `P >= T` |
+| An edit of a user message before a tool loop in the last turn | Yes | Supersession, rewrite, inferred | `P < T`, because `T` is the last tool result. Held, so it costs nothing if wrong. |
+| A rewind of several turns | Yes | Supersession, rewrite, inferred | `P < T`, no marker |
+| A compaction with a marker and an unambiguous predecessor | Yes | Supersession, compaction, exact | `P < T`, marker |
+| A compaction with a marker beside a Claude sibling with no agent id | Yes | Supersession, compaction, inferred | The predecessor is ambiguous |
+| A Claude sibling with no agent id | Yes, and it alternates | Supersession, rewrite, inferred, then cancelled | The predecessor lands again within the hold |
+
+#### 19.7 Codex remote compaction behind Roundhouse
+
+- With the generated configuration, Codex compacts locally, through `/v1/responses` (evidence §15.3). §19.1 covers that path.
+- A hand-written configuration named `OpenAI` makes Codex try remote compaction. Roundhouse answers 422 for the v2 trigger item, and no route for v1. The compaction fails, and the Codex turn ends with an error.
+- Recommendation: keep it that way, and document it (question 30). Remote compaction needs a server-side summarizer that returns an opaque item, which Roundhouse does not have.
+
+### §20 (new). The invalidation contract
+
+#### 20.1 The message
+
+```json
+{
+  "version": 1,
+  "id": "0f3c9a4e6b21d7c85a90e1f2b3c4d5e6",
+  "sequence": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+  "generation": 2,
+  "successor": "11223344556677889900aabbccddeeff",
+  "reason": "compaction",
+  "detected_by": "codex_window",
+  "issued_at_ms": 1790000000000
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `version` | The contract version. 1. |
+| `id` | `invalidation_id(sequence, successor)`, 16 bytes in hex. Deterministic, so a retry carries the same id. |
+| `sequence` | The digest of the sequence that will not be reused. The same value that its requests carried in `x-dynamo-session-id`. |
+| `generation` | Its generation number. For reports and ordering checks only. |
+| `successor` | The digest of the successor, or `null` for a close. |
+| `reason` | `compaction`, `rewrite`, or `closed`. |
+| `detected_by` | `codex_window`, `codex_summary`, `claude_header`, `claude_continuation`, `retained_prefix`, or `session_final`. |
+| `issued_at_ms` | Roundhouse's clock at enqueue. |
+
+- **No label, anchor, session, principal, or content ever enters the message.**
+- A batch form carries up to 256 messages as `{"invalidations": [...]}`.
+
+#### 20.2 The endpoint: a proposal for Dynamo
+
+- `POST /v1/sequences/invalidate` on the deployment's frontend. **This endpoint does not exist at the Dynamo pin.** Nothing like it exists there (evidence §15.8):
+  - `x-dynamo-session-final` is in-band, on an inference request, and nothing at the pin reads the hint that it produces.
+  - `clear_kv_blocks` is per worker, flushes the whole prefix cache, and is not on the frontend.
+- **The answer.** `202` with `{"accepted": n}`. An unknown sequence is accepted, because the message is idempotent. `401` for a bad token. `429` or `503` for a retry. `404` means that the deployment does not have the route.
+- **What Dynamo does is Dynamo's.** The contract says only that the sequence will not be reused. It does not ask Dynamo to refuse a later request that carries the same id (§19.3).
+- A precedent exists for an admin-gated frontend route: `/busy_threshold` is mounted only when the admin API is on (evidence §14.1). The proposal suggests the same gate.
+
+#### 20.3 Idempotency and delivery
+
+- **At least once.** A retry resends the same `id`. The deployment treats a second message with one `id` as a no-op.
+- **Bounded retry.** Four attempts: at once, then after 1 s, 4 s, and 16 s. A `404` stops the attempts, and the deployment is marked "no invalidation route" for 10 minutes, with one log line.
+- **Then dropped and counted.** A dropped message costs memory on the deployment until its own idle expiry, never correctness.
+- **Off the request path.** No turn waits for an invalidation. A full outbox drops its oldest message first.
+
+#### 20.4 Ordering
+
+1. **After the successor is accepted.** The message is enqueued only after the successor's first request received its response headers from that deployment. The successor then holds its prefix under its own id first.
+2. **Never while the predecessor is in flight.** The per-session gate serializes one `SessionId`, not a predecessor against its successor. So at send time the outbox asks whether the predecessor's log is leased. If it is, the message waits for the lease to end.
+3. **A later request under an invalidated id is ordinary.** It can happen when a client resumes an old branch. The deployment serves it, and Roundhouse reserves it again.
+4. **Two messages for one sequence are the same message,** because the pair of predecessor and successor is fixed and the `id` is deterministic.
+
+#### 20.5 The outbox
+
+- One in-memory queue per node, capped at 10,000 messages. It is not stored. A node that dies loses its queue, which costs memory on the deployments only.
+- The inferred hold of §19.3 lives in the same queue, with its release time.
+- Counters: enqueued, sent, accepted, retried, dropped, cancelled, and the delay from enqueue to acknowledgement.
+
+#### 20.6 Authentication
+
+- `Authorization: Bearer <token>`, one token per deployment, from the existing secret configuration and never from the catalog (question 28). The catalog names the secret. It does not hold it.
+- TLS for any address that is not loopback. Roundhouse refuses to load an `http://` invalidation URL that is not loopback.
+
+#### 20.7 Recipients
+
+- Every deployment that the predecessor was dispatched to within the tip TTL (1 hour). The reservation record keeps that list (§21.2).
+- Normally that is the bound deployment only. A sequence that moved (a `down` deployment, a drain deadline) also left KV on the deployment it moved away from.
+- **A frontier target gets nothing.** No provider API takes such a message.
+- **The embedded fleet gets nothing** until it has an endpoint of its own.
+
+### §21 (new). The dispatch ledger
+
+#### 21.1 Purpose
+
+The ledger answers one question: how much future KV work has Roundhouse promised to each deployment? It does not measure KV. It books each dispatch as an agreement for future work. It weights that agreement by the chance that the sequence comes back. It forgets the agreement when the sequence does not come back.
+
+#### 21.2 The data
+
+**Per reservation** (one sequence on one deployment):
+
+| Field | Meaning |
+|---|---|
+| `sequence` | The `SessionId`, which keys the entry, as the correlation maps already key generations by the qualified label |
+| `sent_digest` | The sequence digest that was sent on its last dispatch, or none without a secret (§9) |
+| `deployment_id` | Where it is reserved |
+| `state` | `in_flight` or `idle` |
+| `context_tokens` | Admitted input tokens plus output tokens of the last turn: what the deployment holds at the end of the turn |
+| `growth_tokens` | The expected growth before the next dispatch, from the growth table of §21.4 |
+| `client` | `codex`, `claude_code`, or `unknown` |
+| `end_kind` | `tool_call`, `end_turn`, `incomplete`, or `aborted` |
+| `ended_at_ms` | The time of the last terminal event, or the dispatch time while in flight |
+| `parent` | Optional: the `SessionId` of a sequence it shares a prefix with on this deployment, and `shared_tokens` (§21.5) |
+| `touched` | The deployments it was dispatched to within the tip TTL, each with its last time (§20.7) |
+| `codex_window` | The last `x-codex-window-id` number of this sequence, Codex only (§19.2) |
+| `last_delta_marker` | Whether this sequence's last admitted delta was a summarization request (§19.2) |
+| `version` | `(updated_at_ms, node_id)`, for last-writer-wins (§21.9) |
+
+The size of a reservation is `s = context_tokens + growth_tokens`.
+
+**Per deployment:**
+
+| Field | Meaning |
+|---|---|
+| `nominal` | The catalog capacity: `kv_capacity_blocks` times the block size (question 17) |
+| `C_d` | The effective capacity, learned (§21.6) |
+| `W_d`, `V_d` | The committed work and its variance, summed from node partials (§21.9) |
+| `in_flight_tokens` | The in-flight part of `W_d` |
+| `rail_limit` | The working rail limit, at most the configured one (§21.6) |
+| `ttft_model` | `t0` and `k`, the fixed delay and the prefill time per uncached token (§21.6) |
+| `state` | From `deployment_state` |
+
+#### 21.3 The life of a reservation
+
+| Event | Effect |
+|---|---|
+| Dispatch | Create or update the reservation as `in_flight`, weight 1, sized by admitted input plus the expected output |
+| Terminal event | Set `idle`, set `context_tokens`, `end_kind`, and `ended_at_ms`, and look up `growth_tokens` |
+| Next dispatch of the same sequence | Back to `in_flight` |
+| Continuation class at a new generation (§19.2) | Move the reservation to the successor |
+| Supersession (§19.2) | **Release** the predecessor. Reserve the successor. |
+| Close: `x-dynamo-session-final: true` (question 25) | **Release** every reservation of the label. Invalidate with `reason: closed`. |
+| Disconnect: the stream closed before its terminal, and no request on the label within 10 s (question 24) | **Release**. No invalidation, because the sequence can still come back. |
+| The weight falls under 0.01, or 2 hours pass after `ended_at_ms` | Delete. This is the forgetting. |
+| The deployment goes `down` | Release every reservation on it |
+
+**The end kind** is read from the log, not from the provider's stop reason alone:
+
+- `tool_call` when the last assistant item of the turn is a tool call,
+- `incomplete` when the turn ended with `ResponseIncomplete`,
+- `aborted` when the client closed the stream before the terminal event,
+- `end_turn` otherwise.
+
+`ResponseCompleted.stop_reason` is an open string and is often absent (evidence §15.9). So the item is the primary signal.
+
+#### 21.4 The return curve
+
+**What the log gives.** For each terminal event on a label, the gap until the next `TurnStarted` on the same label, in any generation. A compaction successor counts as a return of the lineage. The client kind comes from `SessionCreated.client` (§11). The end kind comes from §21.3. A gap with no next turn yet is **censored**: the sequence has not returned so far, and it can still return.
+
+**The estimator.** A discrete-time survival estimate with a defective distribution, because some sequences never return.
+
+- Time bins: 24 bins, log-spaced from 1 s to 2 hours. Past 2 hours a sequence counts as not returned.
+- Per curve `(client, end_kind)` and per bin `b`: `n_b`, the sequences still waiting at the start of the bin, and `r_b`, the returns in the bin.
+- The hazard is `h_b = r_b / n_b`. The survival to bin `b` is `S_b = Π_{j<b} (1 - h_j)`. The chance of any return by 2 hours is `F_∞ = 1 - S_24`.
+- **The weight** of an idle reservation at age `t`, in bin `b(t)`, is the chance that it still returns: `w(t) = (S_{b(t)} - S_24) / S_{b(t)}`. It falls with age and reaches zero at the horizon.
+- An in-flight reservation has weight 1.
+
+**The cold-start prior.** Each curve starts with 50 pseudo-observations drawn from a prior curve. They are design choices, not measurements (question 32). M4 replaces them with the log's own numbers.
+
+| End kind | Prior chance of return within 2 hours | Prior median gap |
+|---|---|---|
+| `tool_call` | 0.97 | 8 s |
+| `incomplete` | 0.90 | 5 s |
+| `aborted` | 0.80 | 20 s |
+| `end_turn` | 0.70 | 90 s |
+
+**The update.** A node records each terminal event in memory as pending. When the sequence returns, the node adds 1 to `n` for each bin it waited through and adds 1 to `r` in the return bin. When the horizon passes, it adds 1 to `n` for every bin. It then writes the increments to the shared `curve` counts with `HINCRBY`. Counts from several nodes add up with no conflict. A node that dies loses its pending samples, which costs samples and nothing else.
+
+**The growth table.** Per curve, the 75th percentile of `next admitted input - (context_tokens)` over the observed returns. Its prior is 2,000 tokens after `tool_call` and 1,000 after the other kinds. These are design choices too.
+
+**A later input.** Claude Code's `x-claude-code-prev-tool-durations` hint header reports tool run times. It can sharpen the `tool_call` curve. It is out of scope for M4.
+
+#### 21.5 The virtual LRU and shared prefixes
+
+**Committed work.**
+
+```text
+W_d = Σ_in_flight s_i  +  Σ_idle w_i · s'_i  +  Σ_shared max(w over its holders) · shared_tokens
+V_d = Σ_idle w_i · (1 - w_i) · s'_i²
+```
+
+`s'_i` is the reservation's size minus the part it shares with its parent on the same deployment.
+
+**Shared prefixes are counted once, through the tip chain.**
+
+- A sequence that inherited a tip on the same deployment records a `parent` and `shared_tokens`. The parent is the sequence that wrote the tip. The shared tokens are the tip's token count.
+- The shared part is charged once, at the largest weight among the reservations that hold it. A fork and its parent then cost their common prefix once.
+- **What the tips do not see.** A tip exists only at the end of a dispatched prompt or response. So two sessions that share only a system prompt share no tip, and both are charged in full. That overstates `W_d`, which is the safe direction for placement.
+
+**The virtual LRU.** The ledger orders a deployment's reservations. In-flight reservations come first, then idle ones by `ended_at_ms`, newest first. It walks that order and adds each reservation's unweighted size, with shared parts counted once.
+
+- A reservation inside `C_d` is **resident**. On its return, the predicted cached tokens are its last dispatched prompt.
+- A reservation past `C_d` is **evicted**. On its return, the predicted cached tokens are 0.
+- The model is at sequence level. An engine evicts blocks, not sequences, so the model is coarser than the engine. §21.6 corrects its capacity, not its shape.
+
+#### 21.6 The capacity controller
+
+**From measured cached tokens.** On each return of an idle reservation to the same deployment, when the count is `CacheReadSource::Provider`:
+
+- The observation is a **hit** when `cached_tokens` is at least half of the predicted resident prefix. Else it is a **miss**.
+- **Resident and miss:** `C_d ← max(0.25 · nominal, 0.9 · C_d)`. The multiplicative decrease.
+- **Evicted and hit:** `C_d ← min(nominal, C_d + 0.01 · nominal)`. The additive increase.
+- **Resident and hit, evicted and miss:** no change.
+
+The factors 0.9 and 0.01 and the floor of 0.25 are design choices. M4 reports how often each case happens.
+
+**Units.** `C_d` is in Roundhouse tokens, from Roundhouse's own tokenizer. `nominal` is in the deployment's tokens, through its chat template. So the ceiling and the floor are approximate. The controller absorbs the ratio between the two counts, because it learns `C_d` from observations in Roundhouse's units.
+
+**The TTFT fallback, when the count is not measured.** The mocker reports no cached count (evidence §13, claim 8). Its prefill time still depends on the cached prefix (evidence §15.10).
+
+- Per deployment, fit `TTFT ≈ t0 + k · uncached_tokens` from the first turns of new sequences, which have no cached prefix. The fit is an exponentially weighted least squares.
+- For a return with predicted resident prefix `p`: the expected TTFT for a hit is `t0 + k · (isl - p)`, and for a miss it is `t0 + k · isl`. The observation is the nearer of the two.
+- **Abstain** when `k · p` is less than three times the residual spread of the fit. The two cases then cannot be told apart.
+- The classification feeds the same four cases as above.
+
+**The prefill rail from TTFT inflation.**
+
+- The inflation of a turn is the observed TTFT over the expected TTFT for its predicted cached tokens.
+- Per deployment and per rail window, take the 90th percentile of the inflation.
+- If it is above 1.5, the working rail limit falls by 20%. If it is under 1.1, the limit rises by 5% of the configured value. The limit stays between 10% and 100% of the configured value.
+- These numbers are design choices.
+
+**One controller per deployment.** Every node computes updates from its own observations. It writes `C_d` and the rail limit to the `capacity` family with an `epoch` counter, and the higher epoch wins. Updates are small and frequent, so a lost write costs one step.
+
+#### 21.7 Headroom and overbooking
+
+```text
+H_d = C_d - W_d - z · sqrt(V_d)          z = 1 by default (question 31)
+```
+
+- **Overbooking comes from the return curve.** A reservation that probably will not return has a weight under 1. So the sum of the raw sizes on a deployment can exceed `C_d` while `W_d` does not. No separate overbooking factor exists.
+- The variance term holds back capacity for the chance that more sequences return than expected.
+- When the curve is too optimistic, sequences that the virtual LRU marked resident miss. The controller then lowers `C_d`. So an overbooking error corrects itself through the misses.
+
+#### 21.8 Placement, bring-up, and drain
+
+- **Placement** is §7. A continuation goes to its bound deployment. A new sequence goes to the largest `H_d`, subject to the rail.
+- **Bring-up** is an empty ledger: `W_d = 0`, so `H_d = C_d`, the largest (§8.3).
+- **Drain** sets the capacity for new sequences to zero. The reservations fade by their curves (§8.6).
+
+#### 21.9 Several Roundhouse nodes
+
+- **One reservation, last writer wins.** The `reservation` entry carries `version = (updated_at_ms, node_id)`. A write with a lower version is ignored. The compare runs in one Redis script, as the correlation maps already do [rh crates/roundhouse-core/src/control/correlation.rs:238].
+- **The node that wrote a reservation last owns it.** A continuation that reaches another node reads the entry and takes it over with its write.
+- **Deployment totals are sums of node partials.** Each node sums `W_d`, `V_d`, and in-flight tokens over the reservations it owns. It publishes them to `ledger_partial` each second. Any node reads `W_d` as the sum of the partials.
+- **The lag is bounded** by one publish interval plus one read.
+- **A partial older than 3 s is stale.** It is kept, never read as zero. Its committed work decays by the pooled return curve from its last publish time.
+- **Adoption.** After 10 s, another node scans that node's reservations in the `reservation` family and takes them over. The stale partial is then removed.
+- **Store outage.** Each node places on its own reservations plus the last partials it read, decayed as above. It divides `C_d` by the configured node count for new placements, as the rail does (§8.5). It logs once per outage.
+
+#### 21.10 What the ledger can never do
+
+- **Make a route look cheaper than it is.** The ledger never raises a quote's expected hit. The expected hit on a deployment is the lower of the session `CacheLedger` estimate and the virtual LRU prediction. An evicted prediction sets it to zero. A resident prediction leaves the `CacheLedger` value as it is. This is the owner's cost rule.
+- **Treat a stale reading as free capacity.** A stale partial is decayed, never dropped. A deployment whose partials cannot be read is placed on the last values it had.
+  - After a node restart, the node's old partial is stale. It decays and is then adopted (§21.9). Nothing restarts at zero.
+  - Take a deployment with no partial at all. If the `label` family binds a label to it with a turn in the last 2 hours, the deployment is **unknown**. An unknown deployment takes no new sequence, unless every deployment is unknown. Then Roundhouse places on in-flight tokens alone and logs once.
+- **Refuse a turn.** The rail refuses. The ledger only chooses among deployments.
+- **Free KV.** Only the deployment frees KV, on an invalidation or by its own eviction.
+
+#### 21.11 When other clients share the deployment
+
+| Case | What happens | Direction |
+|---|---|---|
+| Traffic that does not come through Roundhouse fills the KV | Sequences that the virtual LRU marked resident miss. `C_d` falls until it matches Roundhouse's share. | Safe: fewer new sequences go there |
+| That traffic is bursty | `C_d` falls on the burst and rises slowly after it, by the additive step | Safe, but it under-uses the deployment after a burst |
+| That traffic delays prefill without evicting | TTFT inflates. The fallback classifies hits as misses, and `C_d` falls. The rail limit falls too. | Safe, and a false signal. M8's gauge shows the foreign load for calibration. |
+| A second Roundhouse deployment with its own store shares the Dynamo deployment | Each sees the other as foreign traffic | Safe, as above |
+| A client that never returns | Its reservation fades by the curve, over at most 2 hours | Overstates `W_d` until then |
+| A client that returns after 2 hours | Its reservation is gone. It is placed as a continuation and reserved again. | The deployment can have evicted it anyway |
+
+#### 21.12 Cost per turn
+
+- **Dispatch and terminal:** one reservation write each, pipelined with the tip writes. No read on a warm node, because the node owns the entry.
+- **A new-sequence placement:** one read of each eligible deployment's partials, which a node memo answers for up to one publish interval.
+- **Each second, per node:** one partial write per deployment. The curve increments are batched in the same pipeline.
+- **Memory:** about 120 B per reservation. At 10,000 live sequences per deployment that is about 1.2 MB per deployment (estimate, not measured).

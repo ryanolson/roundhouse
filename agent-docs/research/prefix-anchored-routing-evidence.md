@@ -412,3 +412,259 @@ An independent read-only re-derivation verified all eight checked claims against
 - **Claim 8f** (new negative): every Codex file:line citation in evidence §14.9 is missing a `codex-rs/` directory prefix and will not resolve as written against the pinned checkout; the underlying content, once the correct path is used, is accurate down to the line number.
 
 No claim was refuted. No claim was uncheckable. `crates/roundhouse-core/src/control/credential/` was not read, per instructions, and nothing in this fact-check depends on it.
+
+## 15. Sequence identity, compaction on the wire, and invalidation surfaces, 2026-09-29
+
+This section supports the addendum "sequence identity, compaction invalidation, and the dispatch ledger" in `../synergies/prefix-anchored-routing-proposal.md`. No code changed. No Cargo command ran. No client ran against a provider. No deployment ran.
+
+### 15.0 Result
+
+- **Codex has three compaction paths at the pin, and Roundhouse gets the local one.** The path depends on the provider name. Roundhouse's generated configuration names the provider `Roundhouse`, so Codex summarizes through an ordinary `/responses` request (sections 15.2, 15.3).
+- **Codex marks a compaction exactly, twice.** The summarization request carries `request_kind: "compaction"` in `x-codex-turn-metadata`. The first request after a successful compaction carries a larger window number in `x-codex-window-id` (section 15.2).
+- **Roundhouse serves no `/v1/responses/compact` route and refuses the compaction item types with 422** (section 15.4).
+- **Claude Code 2.1.284 marks a compaction exactly, but only when gateway hint headers are on.** The summarization request carries `x-claude-code-compaction`. The first main-thread request after a successful compaction carries `x-claude-code-context-compacted`. Behind a custom base URL, the headers need `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` or a remote flag (section 15.5).
+- **Claude Code also marks a compaction in content, at every version on this box.** The first message after a compaction starts with a fixed sentence. The summarization request ends with a user message that starts with a fixed sentence (section 15.5).
+- **Both clients summarize with a request that appends to the old history.** Prefix admission therefore lands that request on the old generation. The next request then forks a new generation whether the compaction succeeded or not (section 15.6).
+- **Codex `session-id` and the default `prompt_cache_key` name the whole agent family, not one sequence.** Dynamo's own header map uses Codex `session-id` as its session (section 15.7).
+- **Dynamo at the pin has no endpoint that invalidates one sequence.** The nearest constructs are an unconsumed `x-dynamo-session-final` hint and a per-worker `clear_kv_blocks` control that flushes the whole prefix cache (section 15.8).
+- **The Roundhouse log already holds what a return curve needs, except the client kind** (section 15.9).
+- **The Dynamo mocker's prefill time depends on the cached prefix.** So a TTFT-based hit estimate is testable against the mocker, which does not report cached tokens (section 15.10).
+
+### 15.1 Method and claim tags
+
+The tags of section 1 apply. This section adds one tag:
+
+- **[claude@2.1.284 +N]**: the byte offset `N` of the quoted text in the installed Claude Code executable `~/.local/share/claude/versions/2.1.284`. The file is a Bun single-file executable with minified JavaScript inside. Its SHA-256 starts with `3dd0f96d7ada4631`. The offsets come from `ccgrep.py`, which sits beside this document. Run it with the executable path as its first argument. It searches the file as bytes and prints a window around each hit. The executable was not run.
+
+Limits of the bundle read:
+
+- A bundle read is source-level evidence of one version. It is not a wire capture. No Claude Code compaction request was captured at any version.
+- The Roundhouse fixtures are 2.1.251 and 2.1.257. No bundle of those versions is on this box. The oldest bundle on this box is 2.1.270.
+- Minified names such as `vsn` or `pzt` change between builds. The quoted strings and the header names are the stable part.
+
+### 15.2 Codex: the three compaction paths at the pin
+
+**Selection.**
+
+| Path | Request | Chosen when | Source |
+|---|---|---|---|
+| Local | `POST {base}/responses`, streamed. The whole history plus one user message with the summarization prompt. | The provider's remote compaction support is `Unsupported` | [codex@6344a65 codex-rs/core/src/tasks/compact.rs:60-77], [codex-rs/core/src/session/turn.rs:1223-1235] |
+| Remote v1 | `POST {base}/responses/compact`, unary. The whole history. The server returns the compacted items. | Support is `V1`, or `V2` with the `remote_compaction_v2` feature off | [codex@6344a65 codex-rs/core/src/tasks/compact.rs:52-58], [codex-rs/core/src/client.rs:162, :552-658] |
+| Remote v2 | `POST {base}/responses`, streamed. The whole history plus one `compaction_trigger` input item. The server returns exactly one `compaction` output item. | Support is `V2` and `remote_compaction_v2` is on. It is on by default. | [codex@6344a65 codex-rs/core/src/tasks/compact.rs:41-51], [codex-rs/core/src/compact_remote_v2_attempt.rs:77], [codex-rs/core/src/compact_remote_v2.rs:400-457], [codex-rs/features/src/lib.rs:1462-1465] |
+
+- A configured provider gets `V2` only when `is_openai()` is true or the base URL is an Azure Responses URL. Every other configured provider gets `Unsupported` [codex@6344a65 codex-rs/model-provider/src/provider.rs:299-313].
+- `is_openai()` compares the provider **name** with `"OpenAI"` [codex@6344a65 codex-rs/model-provider-info/src/lib.rs:34, :403-405]. The built-in OpenAI provider keeps that name when `openai_base_url` overrides its URL [codex-rs/model-provider-info/src/lib.rs:331-333, :434-437].
+- The pin's own test pins a custom URL to `Unsupported` [codex@6344a65 codex-rs/model-provider/src/provider.rs:596-625].
+- A fourth path exists under the `token_budget` feature. It installs a new context window with no summarization request at all [codex@6344a65 codex-rs/core/src/compact_token_budget.rs:21-24, :82]. The feature is `UnderDevelopment` and off by default [codex-rs/features/src/lib.rs:1348-1351].
+
+**Triggers.**
+
+- Manual: `/compact` runs `CompactTask` [codex@6344a65 codex-rs/core/src/tasks/compact.rs:28-85].
+- Automatic, before a turn: when the token limit is reached [codex@6344a65 codex-rs/core/src/session/turn.rs:1005-1020].
+- Automatic, in the middle of a turn: after a tool output pushes the context over the limit [codex@6344a65 codex-rs/core/src/session/turn.rs:452-477].
+- The automatic limit is 90% of the model's context window, or the configured limit if that is smaller [codex@6344a65 codex-rs/protocol/src/openai_models.rs:472-483], [codex-rs/core/src/session/context_window.rs:32-35, :74-79].
+- Roundhouse's generated catalog states a 272,000-token window and a `null` compaction limit [rh crates/roundhouse-server/src/codex_launch.rs:171, :493-497]. At the pin's rule that is an automatic compaction at 244,800 tokens. **The catalog is written for the Codex 0.146.0 binary on this box, not for the pin.** The 90% rule was read at the pin only.
+
+**What reaches the wire.**
+
+| Path | `x-codex-turn-metadata` header | Body `client_metadata["x-codex-turn-metadata"]` | `implementation` value |
+|---|---|---|---|
+| Local | Yes | Yes | `responses` |
+| Remote v1 | Yes | No. The v1 body type has no `client_metadata` field. | `responses_compact` |
+| Remote v2 | Yes | Yes | `responses_compaction_v2` |
+
+- `CompactionTurnMetadata` has five fields: `trigger` (`manual`, `auto`), `reason` (`user_requested`, `context_limit`, `model_downshift`, `comp_hash_changed`), `implementation`, `phase` (`standalone_turn`, `pre_turn`, `mid_turn`), and `strategy` (`memento`, `prefix_compaction`) [codex@6344a65 codex-rs/core/src/responses_metadata.rs:86-115], [codex-rs/analytics/src/facts.rs:379-417].
+- A compaction request sets `request_kind: "compaction"` and a `compaction` object in the turn metadata payload [codex@6344a65 codex-rs/core/src/responses_metadata.rs:134-150, :343-382].
+- The header is inserted by `compatibility_headers`, the body field by `client_metadata` [codex@6344a65 codex-rs/core/src/responses_metadata.rs:274-341]. The local path builds the metadata at [codex-rs/core/src/compact.rs:178-179, :265-269]. The v1 path adds the compatibility headers at [codex-rs/core/src/client.rs:621], and its body type is `CompactionInput` [codex-rs/codex-api/src/common.rs:28-43]. The v2 path stamps its value at [codex-rs/core/src/compact_remote_v2.rs:83, :117].
+- The streamed request body carries `client_metadata` [codex@6344a65 codex-rs/core/src/client.rs:921-938].
+- The pin's test asserts `request_kind == "compaction"` and the full `compaction` object on a local compaction request. It asserts that the next request has `request_kind == "turn"`, no `compaction` object, and a different `window_id` [codex@6344a65 codex-rs/core/tests/suite/compact.rs:3672, :3786-3838].
+
+**The window number is the exact post-compaction marker.**
+
+- `x-codex-window-id` is `"{thread_id}:{window_number}"` [codex@6344a65 codex-rs/core/src/session/mod.rs:3670-3675], sent as a compatibility header [codex-rs/core/src/responses_metadata.rs:315].
+- Local compaction advances the window only after the summarization stream completes [codex@6344a65 codex-rs/core/src/compact.rs:282-360]. Remote v1 and v2 advance it only after a successful attempt [codex-rs/core/src/compact_remote.rs:268], [codex-rs/core/src/compact_remote_v2.rs:304]. The token-budget path advances it too [codex-rs/core/src/state/session.rs:215-219].
+- A failed compaction does not advance the window. A mid-turn failure ends the turn with an error and leaves the history as it was [codex@6344a65 codex-rs/core/src/session/turn.rs:466-474].
+- A resume restores the stored window number rather than advancing it [codex@6344a65 codex-rs/core/src/session/mod.rs:1494], [codex-rs/core/src/session/session.rs:1413].
+
+**What the history looks like after compaction.** The pin's snapshots show `input` only. `instructions` stay unchanged and travel beside `input`. Roundhouse stores them as canonical item 0 [rh crates/roundhouse-server/src/responses_api/wire.rs:46].
+
+| Case | Last request before | First request after | Source |
+|---|---|---|---|
+| Manual, local | developer permissions, environment context, `first manual turn`, reply, summarization prompt | `first manual turn`, summary, developer permissions, environment context, `second manual turn` | [codex@6344a65 codex-rs/core/tests/suite/snapshots/all__suite__compact__manual_compact_with_history_shapes.snap:8-19] |
+| Before a turn, local | permissions, environment, `USER_ONE`, reply, `USER_TWO`, reply, summarization prompt | `USER_ONE`, `USER_TWO`, summary, permissions, environment diff, `USER_THREE` | [...pre_turn_compaction_including_incoming_shapes.snap:8-24] |
+| Mid-turn, local | permissions, environment, user, function call, function output, summarization prompt | permissions, environment, user, summary | [...mid_turn_compaction_shapes.snap:8-19] |
+| Rollback past a compaction | compacted layout | Still the compacted layout. The rollback does not restore the pre-compaction history. | [codex@6344a65 codex-rs/core/tests/suite/snapshots/all__suite__compact_resume_fork__rollback_past_compaction_shapes.snap:6-27] |
+
+- Local compaction keeps the most recent real user messages up to 20,000 tokens, then appends the summary as a user message [codex@6344a65 codex-rs/core/src/compact.rs:57, :639-717].
+- The summary text starts with the fixed `SUMMARY_PREFIX` ("Another language model started to solve this problem and produced a summary of its thinking process. …") and a newline [codex@6344a65 codex-rs/core/src/compact.rs:349-351], [codex-rs/prompts/templates/compact/summary_prefix.md:1]. The summarization prompt starts with "You are performing a CONTEXT CHECKPOINT COMPACTION." [codex-rs/prompts/templates/compact/prompt.md:1]. A configured `compact_prompt` replaces the prompt but not the prefix [codex-rs/core/src/compact.rs:118-123].
+- Before a turn and for `/compact`, Codex drops the initial context and injects it again on the next regular turn. In the middle of a turn, it inserts the initial context before the last real user message [codex@6344a65 codex-rs/core/src/compact.rs:59-74, :362-367], [codex-rs/core/src/compact.rs:571-637].
+- Remote compaction keeps user messages, assistant messages, and the `compaction` item. It drops developer messages [codex@6344a65 codex-rs/core/src/compact_remote.rs:355-397]. Remote v2 keeps up to 64,000 tokens of retained messages [codex-rs/core/src/compact_remote_v2.rs:65, :459-487].
+
+**Consequence for the KV lineage, derived from the snapshots.** In Roundhouse's canonical order, a pre-turn or manual compaction diverges at item 1. The first `input` item was the permissions developer message and becomes a retained user message. So the old and new sequences share only `instructions` and the tools. A mid-turn compaction with one user message shares the instructions, the initial context, and that user message. It diverges at the first tool call.
+
+### 15.3 Codex behind Roundhouse
+
+- Roundhouse's generated `config.toml` names the provider `Roundhouse`. Its comment says that the name `OpenAI` turns on the routing-hint header, remote compaction, and zstd compression, "Roundhouse serves none of the three" [rh crates/roundhouse-server/src/codex_launch.rs:416-420]. A test pins the name [rh codex_launch.rs:737-748].
+- **With the generated configuration**, Codex uses local compaction. The summarization request is an ordinary `POST /v1/responses` turn.
+- **With a hand-written configuration named `OpenAI`**, remote v2 is on by default. The request carries a `compaction_trigger` input item, which Roundhouse refuses with 422 (section 15.4). With v2 off, the request goes to `/v1/responses/compact`, which has no route (section 15.4).
+  - A manual compaction then reports an error. A pre-turn compaction fails the turn. A mid-turn compaction ends the turn with an error [codex@6344a65 codex-rs/core/src/session/turn.rs:466-474, :1011-1020].
+  - This failure behavior is derived from source. It was not run.
+- `prompt_cache_key` defaults to `session_id`, the family root. The one override at the pin is the guardian reviewer, which uses `guardian:{parent_thread_id}` [codex@6344a65 codex-rs/core/src/client.rs:484-488], [codex-rs/core/src/session/session.rs:1279-1284], [codex-rs/core/src/guardian/review_session.rs:276-288].
+
+### 15.4 Roundhouse at `2dd40dd`: routes, refusals, and what admission reports
+
+| Fact | Source |
+|---|---|
+| The Responses surface mounts one route, `POST /v1/responses`. No `/v1/responses/compact` route exists, and the server adds no fallback. Axum's default answer for an unknown path is 404 (not run). | [rh crates/roundhouse-server/src/responses_api.rs:176, :208-212], [rh crates/roundhouse-server/src/main.rs:1177] |
+| `compaction`, `compaction_trigger`, and `context_compaction` input items are refused with 422 and a message that names the type | [rh crates/roundhouse-server/src/responses_api/wire.rs:124-126], test `the_item_types_a_real_client_can_resend_are_named` [rh crates/roundhouse-server/src/responses_api/wire/tests.rs:506] |
+| `x-codex-window-id` is read as an observation. `observe_context` reports `window_changed`, node-local and in memory only. | [rh crates/roundhouse-server/src/request_context.rs:30], [rh crates/roundhouse-server/src/conversations.rs:583-614] |
+| The turn-metadata `thread_id` is parsed, and nothing else from that header | `codex_thread_id` [rh crates/roundhouse-server/src/responses_api.rs:562-570] |
+| A generation is a session id: the key alone for generation 0, `{key}#g{n}` after | `bound_session` [rh crates/roundhouse-server/src/conversations.rs:780-785] |
+| `bind_prefix` returns the session, the delta, and one flag: a fresh generation opened after a disagreement | [rh crates/roundhouse-server/src/prefix_admission.rs:175, :184-253] |
+| `Probe::Disagrees` carries no data. Admission does not know where the claim left the stored history, or which generation it left. | [rh prefix_admission.rs:466-479, :529-535] |
+| A claim is admitted only when it agrees with the stored history on their whole overlap. A shorter claim is a retry. | `admit`, `suffix_after` [rh prefix_admission.rs:781-810] |
+| A fresh generation starts with no ledger state, "priced cold" | [rh prefix_admission.rs:229-242] |
+| `CacheLedger::invalidate` exists for compaction, and no production code calls it. A fresh generation is a new session, so its ledger starts empty anyway. | [rh crates/roundhouse-core/src/routing/ledger.rs:20-24, :555-557], its only caller is the test [rh ledger.rs:1038-1049] |
+
+### 15.5 Claude Code: compaction in the 2.1.284 bundle
+
+**The summarization request.**
+
+- The prompt starts with a fixed block, `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.` [claude@2.1.284 +206385457]. `Noe` joins that block with the summary instructions, `Your task is to create a detailed summary of the conversation so far, …` [claude@2.1.284 +206398013], [+206388512].
+- **The cache-sharing path, on by default.** When the flag `tengu_compact_cache_prefix` is on (default `true`) [claude@2.1.284 +206451579], the summary runs as a one-turn fork with `querySource: "compact"`. It passes `cacheSafeParams`, so it keeps the main thread's system prompt, tools, and messages. It appends one user message with the prompt. Tool use is denied [+206462607]. So this request is the old history plus one user message.
+- **The fallback path.** It uses the system prompt `You are a helpful AI assistant tasked with summarizing conversations.`. It drops the tools when `stripNonEssential` is set, and sets `enablePromptCaching: false` [claude@2.1.284 +206466151, +206466996].
+- A reactive compaction, after a prompt-too-long refusal, uses the same fork with `forkLabel: "reactive-compact"` [claude@2.1.284 +206401727].
+- A hook can supply the replacement history. Then no summarization request is sent, and the compaction still arms the post-compaction marker [claude@2.1.284 +206423569].
+
+**The first request after compaction.**
+
+- The summary message starts with `This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.` One optional Artifact sentence can come before it [claude@2.1.284 +206398620].
+- Optional tails follow: a transcript path, `Recent messages are preserved verbatim.`, and a note that the head was truncated [claude@2.1.284 +206398620].
+- The 2.1.270 bundle carries the same sentence and the same fallback system prompt (a `grep -c` of each literal).
+
+**Gateway hint headers.**
+
+| Header | Set on | Values | Source |
+|---|---|---|---|
+| `x-claude-code-compaction` | The summarization request | `auto`, `manual`, or `reactive` | Constants [claude@2.1.284 +205616041], writer `$It` [+206611938], values `Woe` [+206423790] |
+| `x-claude-code-context-compacted` | The next main-thread request after a successful compaction, once | Same | Armed by `pzt` after success [+206422059, +206455259], consumed by `VVr` [+197062748], read per query [+206679786] |
+| `x-cc-compaction-request`, `x-cc-context-compacted` | The same requests, first-party only | Same | [+205616041], [+206611938] |
+
+- **The gate.** The `x-claude-code-*` pair is sent when `vsn()` is true. `vsn()` returns the value of `CLAUDE_CODE_GATEWAY_HINT_HEADERS` when that variable is set. Otherwise it is true for the first-party Anthropic URL, false for a non-first-party provider, and the remote flag `tengu_splendid_sutton` (default `false`) otherwise [claude@2.1.284 +203364143]. The `x-cc-*` pair needs `Gl()`, which is false when `ANTHROPIC_BASE_URL` points away from Anthropic [+198217798].
+- **Behind Roundhouse**, `ANTHROPIC_BASE_URL` is Roundhouse [rh crates/roundhouse-server/src/claude_launch.rs:290]. So the `x-claude-code-*` pair arrives only with `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`, or when the remote flag is on for that user. The remote flag cannot be read from this box.
+- The bundle's changelog says to "opt in with `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`" for these gateway hint headers, under 2.1.283 [claude@2.1.284 +213681747].
+- The post-compaction header is armed only when the compaction ran on the main thread (`Yb(querySource, agentId)`) [+206422059, +206455259]. A sub-agent compaction arms nothing.
+- **Version range.** A `grep -c` of each header name finds none in 2.1.270 and finds both in 2.1.276, 2.1.278, 2.1.280, 2.1.281, and 2.1.284. The Roundhouse fixtures (2.1.251, 2.1.257) are older than all of these.
+
+**Identity headers in the same bundle.**
+
+- The client factory sets `x-claude-code-agent-id` when its agent context has an `agentId`, and `x-claude-code-parent-agent-id` when it has a `parentAgentId` [claude@2.1.284 +203366550]. The session header constant is `X-Claude-Code-Session-Id` [+199902704].
+- Earlier evidence recorded both agent headers as "documented only, never captured" (`session-identity-evidence.md` §4.1). The bundle shows the code that sends them at 2.1.284. It is still not a capture.
+- **Unverified.** Whether the compaction fork runs with its own `agentId`, and so sends its own `x-claude-code-agent-id`, was not traced.
+
+### 15.6 How a compaction lands in prefix admission (derived, not run)
+
+1. **The summarization request is an append.** For Codex local compaction, the request is the old `input` plus one user message (section 15.2). For the Claude Code cache-sharing path, it is the old messages plus one user message (section 15.5). The claim agrees with the stored generation and extends it. So admission lands it on the old generation with a delta of that one message [rh prefix_admission.rs:781-810].
+2. **The summary answer is appended to that generation** as an ordinary response.
+3. **The next request forks, in every case.**
+   - After a successful compaction, the claim drops history. It disagrees at canonical item 1 for Codex (section 15.2), and at the first history item for Claude Code.
+   - After a failed or abandoned compaction, the client resends the old history without the summarization message. The stored generation holds that message, so the overlap disagrees at that position and the claim forks too.
+   - The provisional-item rule does not help here. It skips only items stamped by a response that did not complete [rh prefix_admission.rs:577-591, :699-736]. The summarization prompt is an unstamped client item.
+4. **A Claude Code fallback summary replaces the configuration run in place.** The leading system blocks are configuration and are replaced, not compared [rh prefix_admission.rs:746-794]. So the fallback request still lands on the old generation.
+
+So "a new generation opened" is not by itself proof that a compaction succeeded. What tells the two cases apart is where the new claim leaves the old history. A failed compaction leaves it at the summarization message. A successful one leaves it near the start.
+
+### 15.7 Session and sequence fields
+
+| Field | Client | Names | Source |
+|---|---|---|---|
+| `session-id` header | Codex | The root thread of the agent family. Every sub-agent sends the same value. | `session-identity-evidence.md` §3.1, §3.2, §11 claim 3 (fact-checked) |
+| `thread-id` header, turn metadata `thread_id` | Codex | One thread, one member | Same |
+| `x-codex-parent-thread-id`, turn metadata `parent_thread_id`, `forked_from_thread_id` | Codex | The parent, the fork origin | Same |
+| `x-openai-subagent`, turn metadata `subagent_kind` | Codex | The kind of sub-agent | Same |
+| `prompt_cache_key` | Codex | `session_id` by default, so the family root | Section 15.3 |
+| `x-codex-window-id` | Codex | `{thread_id}:{window_number}`. The number advances on each successful compaction. | Section 15.2 |
+| turn metadata `request_kind`, `compaction` | Codex | The purpose of one request | Section 15.2 |
+| `x-claude-code-session-id` | Claude Code | The session. In-process sub-agents inherit it. | `session-identity-evidence.md` §4 |
+| `x-claude-code-agent-id`, `x-claude-code-parent-agent-id` | Claude Code | The member, the nested parent | Section 15.5 |
+| `x-claude-code-compaction`, `x-claude-code-context-compacted` | Claude Code | The purpose of one request, the first request after a compaction | Section 15.5 |
+
+**Dynamo's own reading of these fields.**
+
+- Dynamo's header map takes Codex `session-id` as the session, with no child header [dynamo@ac7b751 lib/llm/src/protocols/agents.rs:33-38]. For Claude Code it takes the agent id as the session and falls back to the session header [agents.rs:26-32, :70-93]. `x-dynamo-session-id` wins over all of them [agents.rs:59-68].
+- Dynamo's documentation asks for one id per "reasoning and tool-use chain" and says that a sub-agent can have its own id [dynamo@ac7b751 docs/fern/pages/use-cases/agents/session-ids.mdx:8, :18-20]. Its Codex tab says only that `session-id` maps to `session_id` [session-ids.mdx:53].
+- So a Codex family arrives at Dynamo as one session when Dynamo reads the Codex header itself.
+- Dynamo's session affinity pins a session id to a worker for a TTL. It is off unless `--router-session-affinity-ttl-secs` is set. It holds at most 65,536 entries [dynamo@ac7b751 lib/llm/src/session_affinity/mod.rs:16-33], [components/src/dynamo/frontend/frontend_args.py:118-122]. The key is the header-derived id [dynamo@ac7b751 lib/llm/src/protocols/common/extensions.rs:287-292].
+
+### 15.8 Invalidation surfaces at the Dynamo pin
+
+- **No endpoint takes a sequence id and releases its blocks.** The frontend route list in section 14.13 claim 1 has no such route. A grep of `lib/llm/src/http` and `components/src/dynamo` for `invalidat`, `evict`, `clear_kv`, and `/v1/sessions` found only the items below and unrelated caches. **This negative needs an independent fact-check.**
+- **`x-dynamo-session-final: true`** is documented as "a dedicated minimal request when the session ends", so that "lifecycle-aware consumers can release per-session state" [dynamo@ac7b751 docs/fern/pages/use-cases/agents/session-ids.mdx:36-38]. The frontend turns it into `kv_hints: { evict_session: true }` [dynamo@ac7b751 lib/llm/src/protocols/common/extensions.rs:67-69, :254-266]. A grep of every `.rs` and `.py` file in the Dynamo tree found no reader of `evict_session` or `kv_hints`. The only hits are that construction, the request-trace records, and tests. **This negative needs an independent fact-check.** It is also in-band: it rides on an inference request.
+- **`clear_kv_blocks`** is a per-worker control endpoint. vLLM calls `reset_prefix_cache(reset_connector=True)`, which clears the whole prefix cache of that worker [dynamo@ac7b751 components/src/dynamo/vllm/handlers.py:2030-2040]. SGLang refuses while any request is active [components/src/dynamo/sglang/request_handlers/handler_base.py:737-760]. A test reaches it on a worker system port at `/engine/control/clear_kv_blocks` [dynamo@ac7b751 tests/utils/payloads.py:681-690]. It is not on the frontend and it is not scoped to a sequence.
+- **A precedent for an admin-gated frontend route.** `/busy_threshold` is mounted only when the admin API is on (section 14.1).
+
+### 15.9 What the Roundhouse log gives a return curve
+
+| Need | Source in the log | Source |
+|---|---|---|
+| Time of each event | `SessionEvent.at_ms`, the appending node's wall clock | [rh crates/roundhouse-core/src/event.rs:831-837] |
+| Start of a turn | `TurnStarted` | [rh event.rs:335-338] |
+| How a turn ended | The last assistant `ItemAppended` of the turn (a tool call or text), and `ResponseCompleted.stop_reason`, an open provider string that is often `None` | [rh event.rs:340-342, :353-423] |
+| Size of the turn | `ResponseCompleted.usage`: input, cached input, output. `cache_read_source` says whether the cached count is a measurement. | [rh event.rs:44, :95-126] |
+| The lineage across generations | The session id is `{label}` or `{label}#g{n}` | Section 15.4 |
+| Principal and arm | `SessionCreated.principal`, `SessionCreated.arm` | [rh event.rs:290-333] |
+| **Client kind** | **Not recorded.** `SessionCreated` has `model_policy`, `principal`, and `arm` only. | [rh event.rs:290-333] |
+| A close signal | **None found.** The MCP surface is stateless (`NeverSessionManager`), so no MCP session ends when a client exits. This read found no close signal from Codex at the pin or from Claude Code 2.1.284. The search was not exhaustive. | [rh crates/roundhouse-mcp/src/transport.rs:396] |
+
+### 15.10 The mocker's prefill time
+
+- The mocker's performance model computes prefill time from `isl - prefix`, the tokens that are not cached [dynamo@ac7b751 lib/mocker/src/common/perf_model.rs:226-237]. Both scheduler models pass the mean cached prefix [lib/mocker/src/scheduler/vllm/core.rs:2657], [lib/mocker/src/scheduler/sglang/core.rs:831-834], and a request passes its `cached_tokens` [lib/mocker/src/common/protocols.rs:333].
+- So the mocker's time to first token falls with a cache hit, while its usage reports no cached count (section 13, claim 8).
+- **Unverified.** The size of that drop under the mocker's speedup ratio was not run.
+
+### 15.11 Open evidence added by this section
+
+| Question | What closes it |
+|---|---|
+| A captured Claude Code compaction: the summarization request, the first request after it, and both hint headers with `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` | A loopback capture with `claude-code-wire-probe.py` at 2.1.276 or later |
+| Does the Claude Code compaction fork send its own `x-claude-code-agent-id`? | The same capture |
+| Does the Claude Code attribution fingerprint change after a compaction, because the first user text changes? | The same capture. The design does not depend on it. |
+| A captured Codex local compaction behind Roundhouse at the pin line | A loopback capture of `/compact` and of an automatic compaction |
+| No Dynamo reader of `evict_session`, and no per-sequence invalidation route | An independent fact-check of both negatives |
+| Is the remote flag `tengu_splendid_sutton` on for any user? | Not closable from outside Anthropic. The launch sets the variable instead. |
+| The size of the mocker's TTFT drop on a cache hit, under its speedup ratio | A two-request mocker run |
+
+### 15.12 Fact-check of section 15, 2026-09-29
+
+An independent read-only re-derivation verified all ten checked claims against the same pins and the 2.1.284 executable. One caveat: the Dynamo pin history has ancestor commits for a `trajectory_final` / `evict_trajectory` feature, but the source at the pin uses `session_final` / `evict_session`, and only test assertions read `evict_session`. A later grep for "trajectory" at the pin finds nothing. The ledger follows.
+
+| # | Claim | Ruling | Evidence (file:line) | Notes / correction |
+|---|---|---|---|---|
+| 1 | Codex: every sub-agent sends the root's `session-id`; default `prompt_cache_key` equals it; `thread-id` is per thread | **VERIFIED** | `agent/control.rs:104-112` (doc comment: "every sub-agents from a common root share the same session ID"), `agent/control.rs:159` (`session_id(&self) -> SessionId`), `client.rs:484-488` (`prompt_cache_key` = `prompt_cache_key_override.unwrap_or(responses_metadata.session_id.clone())`), `codex-api/src/requests/headers.rs:5-13` (`build_session_headers` inserts literal `session-id` and `thread-id` headers), `core/src/client.rs:621-624` (calls `build_session_headers(session_id, thread_id)` with `responses_metadata.session_id`/`.thread_id`), `turn_metadata.rs:101-160` (`thread_id: String` is a distinct per-`CodexResponsesMetadata` field, sourced from a fresh `ThreadId` per spawned thread, `agent/control/spawn.rs`) | The doc comment on `AgentControl` is an explicit, load-bearing statement of exactly this design decision — strongest possible confirmation short of a wire capture. |
+| 2 | Codex: `x-codex-window-id` exists and its number increases after a successful compaction | **VERIFIED** | `session/mod.rs:3670` (`current_window_id` = `format!("{thread_id}:{window_number}")`, exact line match to evidence), `client.rs:148` (`X_CODEX_WINDOW_ID_HEADER = "x-codex-window-id"`), `state/session.rs:187-219` (`auto_compact_window_number`/`advance_auto_compact_window` delegate to an `AutoCompactWindow` counter), `compact.rs:282-349` (`advance_auto_compact_window().await` is called only after the retry loop reaches `Ok(())`, i.e., only after the summarization stream completes) | Local-path advance point confirmed directly; remote v1/v2 advance points (`compact_remote.rs:268`, `compact_remote_v2.rs:304`) were not re-read line-for-line but the local-path mechanism generalizes and the pattern (advance after success, not before) is structurally the same in each module. |
+| 3a | Local compaction request carries `request_kind: "compaction"` in turn metadata | **VERIFIED** | `responses_metadata.rs:134-138` (`CodexResponsesRequestKind::Compaction(metadata) => ("compaction", Some(metadata))`), `responses_metadata.rs:343-364` (`turn_metadata_payload` maps this into the `CodexTurnMetadataPayload.request_kind` field, key `"request_kind"` at line 31) | |
+| 3b | Non-OpenAI provider name compacts locally through `/v1/responses`, not `/responses/compact` | **VERIFIED** | `model-provider/src/provider.rs:299-309` (`capabilities()`: `RemoteCompactionSupport::V2` iff `is_openai() \|\| is_azure_responses_provider(...)`, else `Unsupported`), `model-provider-info/src/lib.rs:403-405` (`is_openai(&self) -> bool { self.name == OPENAI_PROVIDER_NAME }`, `OPENAI_PROVIDER_NAME = "OpenAI"`), `core/src/tasks/compact.rs:38-70` (the branch: `V2` → `compact_remote_v2` streamed via ordinary responses request with a `compaction_trigger` item; `V1 \| V2-without-feature` → `compact_remote::run_remote_compact_task` which posts to `RESPONSES_COMPACT_ENDPOINT` = `/responses/compact` (`client.rs:162`); `Unsupported` → `crate::compact::run_compact_task`, which sends an ordinary turn through the normal client session (no special endpoint constant exists for it) | Also directly confirmed the pin's own test `configured_provider_remote_compaction_matches_provider_support` (`provider.rs:596-625`) pins a custom base URL/name to `Unsupported`. |
+| 4 | Auto-compaction threshold is 90% of the model's context window at the pin | **VERIFIED** | `protocol/src/openai_models.rs:472-473` (`auto_compact_token_limit`: `(context_window * 9) / 10`), `core/src/session/context_window.rs:20-79` (`context_window_token_status` uses this limit, plus a config override taking the min, to decide `token_limit_reached`) | |
+| 5 | Roundhouse `2dd40dd` has no `/v1/responses/compact` route and refuses compaction item types with 422 | **VERIFIED** | `responses_api.rs` (`responses_router` registers exactly one route, `{API_PREFIX}/responses` → `create_response`; no second route), `main.rs` (only `responses_api::responses_router(...)` is merged — no compact route anywhere), `responses_api/wire.rs` (`canonical_item`'s catch-all `other => Err(ApiError::unprocessable(format!("input item type \`{other}\` is not supported")))`), `http.rs:245-247,261-263` (`ApiError::unprocessable`/`unprocessable_named` both set `StatusCode::UNPROCESSABLE_ENTITY` = 422), `responses_api/wire/tests.rs` (`the_item_types_a_real_client_can_resend_are_named` test lists `"compaction"`, `"compaction_trigger"`, `"context_compaction"` in `refused_types`, asserting each 422s and names the type) | |
+| 6 | Roundhouse `SessionId` is `label#g{n}`; a history rewrite starts a new generation | **VERIFIED** | `conversations.rs:780-785` (`bound_session`: `0 => SessionId::new(key)`, `n => SessionId::new(format!("{key}#g{n}"))`, doc comment confirms generation 0 is the bare key), `prefix_admission.rs` (`bind_prefix`'s `Search::Fresh { generation, history_rewritten }` arm opens a new generation via `open_fresh(...)` and returns the `history_rewritten` flag; doc comment explicitly states the returned flag "reports a fresh generation opened after a prefix disagreement") | |
+| 7a | Claude Code 2.1.284: the first message after compaction starts with a fixed sentence | **VERIFIED (quoted exactly)** | `ccgrep.py` hit at byte offset `+206398620`: `"This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation."` — exact byte-offset match to the evidence doc's citation | |
+| 7b | `x-claude-code-context-compacted` is sent only when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` (or the equivalent gate) | **VERIFIED** | `+203364166`: `function vsn(){let e=a.CLAUDE_CODE_GATEWAY_HINT_HEADERS;if(e!==void 0)return e;if(Gl())return!0;if(Oe()!=="firstParty")return!1;return x("tengu_splendid_sutton",!1)}`; `+205616140`: `ict="x-claude-code-context-compacted"` constant defined alongside `x-cc-context-compacted`, `x-claude-code-compaction`; `+206611938`: writer `$It(e,n,r){...let s=Gl(),g=vsn();if(n!==void 0){if(s)e[ect]=n;if(g)e[ict]=n}...}` — `ict` (the header in question) is gated strictly on `g = vsn()`; `+197062748`: `pzt`/`VVr` arm/consume `pendingContextCompacted`; `+206679786`: `VVr()` is only called `if Ss(h.querySource)==="main" && Yb(...)`, i.e., only on the main-thread request after a successful compaction | All five cross-referenced offsets in the evidence doc line up into one coherent mechanism: explicit env-var gate, first-party/remote-flag fallback, main-thread-only arming. |
+| 8a | Nothing reads `evict_session` at the Dynamo pin | **VERIFIED, with a historical caveat** | `lib/llm/src/protocols/common/extensions.rs:68` (field def), `:257-258` (constructed from `session_final`), and a repo-wide `grep -rn "\.kv_hints\b"` shows the field is touched **only inside test assertions** (`extensions.rs:1064,1197,1204`) — no production code path reads it. | Caveat found during re-derivation: `git log` on the Dynamo checkout shows commits #10172/#10214/#10800/#10808 (a "trajectory identity" feature with `evict_trajectory`/`trajectory_final`, described in `docs/fern/.../dynamo-v1-3-0.mdx`) are ancestors of the pin `ac7b751`, but a `grep -rln "trajectory"` over `.rs`/`.py` files at the pin finds **no such code** — only two unrelated hits. This is most likely an earlier terminology (`trajectory`→`session`) that was renamed in later commits; it does not change the ruling (the *current* `evict_session`/`kv_hints` field, whatever its ancestry, still has no reader), but it means the changelog entry and the live code use different vocabulary for what may be the same lineage, which is worth a note in case a future search greps for "trajectory" and wrongly concludes the feature doesn't exist at all. |
+| 8b | No route invalidates one sequence | **VERIFIED** | Repo-wide grep of `lib/llm/src/http` and `components/src/dynamo` for `.route(` calls containing session/sequence/invalidate/evict/clear found none; `clear_kv_blocks` confirmed as a per-worker, non-frontend control call: `components/src/dynamo/vllm/handlers.py:2029-2038` (`reset_prefix_cache(reset_connector=True)`, whole-cache flush), `components/src/dynamo/sglang/request_handlers/handler_base.py:737-760` (`Cannot clear KV cache while requests are active` refusal when `tokenizer_manager.rid_to_state` is non-empty), reached only via `/engine/control/clear_kv_blocks` in `tests/utils/payloads.py:683-690` (a worker-scoped test endpoint, not a frontend route) | |
+| 8c | Dynamo's header map reads Codex `session-id` as the session | **VERIFIED** | `lib/llm/src/protocols/agents.rs:11` (`HEADER_CODEX_SESSION_ID = "session-id"`), `:24-42` (`AGENT_HEADER_MAPPINGS` entry for Codex has `root_session_header: HEADER_CODEX_SESSION_ID, child_session_header: None, parent_session_header: None`), `:60-90` (`agent_context_header_values`: when no `x-dynamo-session-id` is present, falls through the mapping table and for Codex uses the root header value directly as `session_id`, with no child header to distinguish sub-agents) | |
+| 9 | The summarization request is an append to the old history (lands on the old generation) | **VERIFIED** | `compact.rs:239-245` (`run_compact_task_inner_impl`): `let mut history = sess.clone_history().await; history.record_items(&[initial_input_for_turn.into()], ...)` — the full existing history is cloned, then exactly one item (the summarization prompt) is appended via `record_items`. Nothing is removed before the request is sent; the loop that follows (`compact.rs:270+`) sends `history.clone().for_prompt(...)` as the turn's `input`. | This is a clean, direct confirmation: the local-compaction request literally is "clone old history, append one item," which is definitionally what prefix admission would treat as a continuation of the existing generation. |
+| 10a | `CacheLedger::invalidate` exists, and no production code calls it — only a test does | **VERIFIED** | `roundhouse-core/src/routing/ledger.rs:20-24` (module doc: "`CacheLedger::invalidate` exists for that case and must be called whenever the assembler rewrites history"), `:555-557` (`pub fn invalidate(&mut self) { self.state.clear(); }`), repo-wide `git grep "\.invalidate()"` across all `.rs` files in the whole tree at `2dd40dd` returns exactly one hit: `ledger.rs:1049`, which is inside `#[test] fn invalidation_clears_warm_prefixes_after_a_compaction()` | |
+| 10b | Roundhouse's generated Codex config names the provider `Roundhouse` (never `OpenAI`), documented in the config comment and pinned by a test | **VERIFIED** | `codex_launch.rs` (embedded config template): comment `# Never "OpenAI": codex matches this *name* (not the table key) to decide whether to attach its routing-hint header, use remote compaction, and zstd-compress the request body. Roundhouse serves none of the three.` followed by `name = "Roundhouse"`; test `the_provider_name_is_not_openai` asserts `name.to_ascii_lowercase() != "openai"` with a matching rationale string | |
+| 10c | Roundhouse's catalog states a 272,000-token window and a `null` compaction limit | **VERIFIED** | `codex_launch.rs`: `pub const CONTEXT_WINDOW_TOKENS: u64 = 272_000;` with a doc comment explaining it matches "0.146.0's own fallback metadata", and `"auto_compact_token_limit": null` in the generated model-info JSON with a comment explaining why (a judge-turn compaction limit would make the client rewrite its own history off a number describing a side call) | |
+| 10d | `/responses/compact` is a distinct endpoint used only by remote v1, never by local compaction | **VERIFIED** | `core/src/client.rs:162`: `const RESPONSES_COMPACT_ENDPOINT: &str = "/responses/compact";`, used only from the remote-v1 path (`compact_remote.rs`); the local path (`compact.rs`) sends its request through the ordinary turn-streaming client session with no reference to this constant, i.e., through the normal `/responses` (or websocket-equivalent) turn path | |
+
+#### Summary of anything not a clean VERIFIED
+
+Everything above is **VERIFIED**. The only wrinkle is inside claim 8a: the Dynamo pin's git
+history contains ancestor commits for a `trajectory_final`/`evict_trajectory` feature (per
+`docs/fern/pages/reference/general/releases/dynamo-v1-3-0.mdx`) that does not appear anywhere in
+the pin's actual `.rs`/`.py` source tree — the working code instead has `session_final`/
+`evict_session`. This looks like a rename across the feature's lifetime, not a contradiction, and
+it does not change the ruling that nothing at the pin reads `evict_session` today. It's flagged
+here only so a later reader who greps for "trajectory" and finds nothing doesn't mistakenly
+conclude the changelog entry is fabricated — the code exists, under a different name.
