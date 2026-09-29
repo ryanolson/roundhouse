@@ -30,7 +30,8 @@
 //! [`LEARNING_PAGE`] entries above the last `LearningApplied`, and counts the
 //! rest. The learner store's watermark is the authority; a backfill replay
 //! ([`SessionState::project_learning`](super::SessionState::project_learning))
-//! refills the page from it.
+//! refills the page from it, and holds every entry above that watermark even
+//! when the log's hint is higher (see [`Hold`]).
 //!
 //! **Marks.** [`learning_mark`] tells `Session::commit` which event of a batch
 //! the source store must record as the session's learning mark, so every
@@ -146,6 +147,26 @@ struct AwaitingAnswer {
     row: LearningRow,
 }
 
+/// Which entries the page holds: the two replays that build a fold.
+///
+/// Two variants rather than `hint.max(floor)`, because the two thresholds
+/// disagree exactly when it matters. The learner store can hold less than the
+/// log acknowledged: it lost recent writes (draft 11.6), or the audit found
+/// its watermark below the mark (11.7). A backfill from that watermark that
+/// also honored the hint would skip the entries between the two, the store
+/// would answer `ChainGap` with the same watermark, and delivery for the
+/// session would stall for good.
+#[derive(Debug, Default, Clone, Copy)]
+enum Hold {
+    /// The live fold and a plain replay: entries above the highest
+    /// `LearningApplied`, which also prunes the page.
+    #[default]
+    Hint,
+    /// A backfill: every entry above the learner store's watermark.
+    /// `LearningApplied` still moves the hint but neither holds nor prunes.
+    Floor(u64),
+}
+
 /// Learning state for one session.
 #[derive(Debug, Default)]
 pub(crate) struct LearningFold {
@@ -157,13 +178,14 @@ pub(crate) struct LearningFold {
     last_entry: u64,
     /// The highest `through_seq` of a `LearningApplied`.
     hint: u64,
-    /// Entries at or below this are not held: the backfill's watermark.
-    floor: u64,
+    /// Which entries the page holds.
+    hold: Hold,
     page: Vec<LearningEntry>,
-    /// Entries above the hint that the page does not hold. Exact until a
-    /// `LearningApplied` reaches past the page without reaching the newest
-    /// entry; from then an upper bound, which only costs a backfill that
-    /// finds the true set. It is never an undercount, which would lose one.
+    /// Entries above the [`Hold`] threshold that the page does not hold.
+    /// Exact until a `LearningApplied` reaches past the page without reaching
+    /// the newest entry; from then an upper bound, which only costs a backfill
+    /// that finds the true set. It is never an undercount, which would lose
+    /// one.
     beyond: u64,
     causes: LearningCauses,
     open: Option<OpenTurn>,
@@ -175,14 +197,23 @@ pub(crate) struct LearningFold {
 }
 
 impl LearningFold {
-    /// A fold whose page holds only entries above `floor`.
+    /// A backfill fold: its page holds every entry above `floor`, whatever
+    /// `LearningApplied` the log records.
     pub(crate) fn with_floor(floor: u64) -> Self {
         Self {
-            floor,
+            hold: Hold::Floor(floor),
             ..Self::default()
         }
     }
 
+    /// Opens the turn on every `TurnStarted`, learned or not: one
+    /// `ResponseId` clone per turn, on the learner-off path too.
+    ///
+    /// Not deferred to the first learned `Routed`: that turn's `TurnStarted`
+    /// comes before its learned evidence, so gating on `started` would lose
+    /// the first learned turn's rows, and binding the id at the `Routed` would
+    /// accept a dispatch of a response that is not the open turn, which the
+    /// id match rejects.
     pub(crate) fn turn_started(&mut self, response_id: &ResponseId, at_ms: u64) {
         self.open = Some(OpenTurn {
             response_id: response_id.clone(),
@@ -206,10 +237,10 @@ impl LearningFold {
             self.started = true;
             self.last_learned = Some((response_id.clone(), row));
         }
-        // Only a turn that can add operational rows is tracked, so a session
-        // whose learner is off clones no target here. Every `Routed` of one
-        // turn carries the same selection, so a turn is learned on all of its
-        // dispatches or on none.
+        // Only a turn that can add operational rows is tracked, so an
+        // unlearned `Routed` clones nothing here (its turn's id was taken at
+        // `turn_started`). Every `Routed` of one turn carries the same
+        // selection, so a turn is learned on all of its dispatches or on none.
         let Some(current) = row.filter(LearningRow::is_current) else {
             return row;
         };
@@ -363,10 +394,13 @@ impl LearningFold {
         Some(deltas)
     }
 
-    /// A `LearningApplied` folded in: the store has every entry through
-    /// `through_seq`.
+    /// A `LearningApplied` folded in: the store had every entry through
+    /// `through_seq`. A backfill records the hint and keeps its page.
     pub(crate) fn applied(&mut self, through_seq: u64) {
         self.hint = self.hint.max(through_seq);
+        if let Hold::Floor(_) = self.hold {
+            return;
+        }
         self.page.retain(|entry| entry.seq > through_seq);
         if through_seq >= self.last_entry {
             self.beyond = 0;
@@ -386,7 +420,11 @@ impl LearningFold {
             deltas,
         };
         self.last_entry = seq;
-        if seq <= self.hint.max(self.floor) {
+        let held_after = match self.hold {
+            Hold::Hint => self.hint,
+            Hold::Floor(floor) => floor,
+        };
+        if seq <= held_after {
             return;
         }
         if self.beyond == 0 && self.page.len() < LEARNING_PAGE {

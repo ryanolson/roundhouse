@@ -639,11 +639,20 @@ impl Script {
 
     /// Every entry the fold produced, from a backfill below the first.
     ///
-    /// Only for logs shorter than a page.
+    /// Only for logs shorter than a page. Asserts the chain is whole, from
+    /// `prev_seq == 0` through every link, so a `LearningApplied` in the log
+    /// cannot silently drop the entries it acknowledged from what a test
+    /// inspects.
     pub async fn entries(&self) -> Vec<LearningEntry> {
         let state = self.backfill(0).await;
         assert_eq!(state.learning_beyond(), 0, "a fixture log within one page");
-        state.learning_page().to_vec()
+        let entries = state.learning_page().to_vec();
+        let mut prev = 0;
+        for entry in &entries {
+            assert_eq!(entry.prev_seq, prev, "a whole chain: {entries:?}");
+            prev = entry.seq;
+        }
+        entries
     }
 
     /// The entry whose source event is `seq`.

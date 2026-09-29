@@ -5,12 +5,13 @@
 //!
 //! The online routing learner (`agent-docs/DRAFT-online-routing-learner.md`
 //! §11.7, and `agent-docs/PLAN-online-routing-learner.md`) folds some session
-//! events into shared counters in a separate store. Every call to that store can fail, so the record of
-//! *which sessions still owe it entries* cannot live there: a session whose
-//! every learner-store call failed would never be registered, and nothing
-//! would find it once the session went idle. The index lives here instead,
-//! written by the same atomic, lease-fenced step that appends the source
-//! event, so an entry-producing event that is durable is also discoverable.
+//! events into shared counters in a separate store. Every call to that store
+//! can fail, so the record of *which sessions still owe it entries* cannot
+//! live there: a session whose every learner-store call failed would never be
+//! registered, and nothing would find it once the session went idle. The
+//! index lives here instead, written by the same atomic, lease-fenced step
+//! that appends the source event, so an entry-producing event that is durable
+//! is also discoverable.
 //!
 //! Two structures per backend:
 //!

@@ -97,6 +97,31 @@ async fn backfill_from_a_seq_refills_the_page_in_order() {
     assert_eq!(state.learning_beyond(), 0);
 }
 
+/// **The learner store's watermark outranks the log's hint.** When the store
+/// lost writes the log already acknowledged (draft 11.6), or an audit finds a
+/// watermark below the mark (11.7), the backfill from that watermark must hold
+/// the entries between it and the hint, or the store answers `ChainGap` with
+/// the same watermark forever. The live fold on the same log is the control:
+/// it still drops what `LearningApplied` confirmed.
+#[tokio::test]
+async fn a_backfill_below_a_stale_hint_refills_from_the_floor() {
+    let mut script = many(8);
+    let all = produced(&script);
+    script.applied(all[5]);
+
+    let live = script.state().await;
+    let held: Vec<u64> = live.learning_page().iter().map(|entry| entry.seq).collect();
+    assert_eq!(held, all[6..], "the live fold prunes at the hint");
+
+    let state = script.backfill(all[1]).await;
+    let page = state.learning_page();
+    let held: Vec<u64> = page.iter().map(|entry| entry.seq).collect();
+    assert_eq!(held, all[2..], "every entry above the store's watermark");
+    assert_eq!(page[0].prev_seq, all[1], "the chain runs through the floor");
+    assert_eq!(state.learning_beyond(), 0);
+    assert_eq!(state.learning_hint(), all[5], "the hint is still recorded");
+}
+
 #[tokio::test]
 async fn learning_applied_moves_the_hint() {
     let mut script = many(4);

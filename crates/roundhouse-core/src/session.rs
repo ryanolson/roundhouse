@@ -1308,12 +1308,14 @@ impl SessionState {
     }
 
     /// The learning entries above the hint that this fold holds, in order, at
-    /// most [`LEARNING_PAGE`] of them. See [`learning`].
+    /// most [`LEARNING_PAGE`] of them: above the floor instead, for a
+    /// [`Self::project_learning`] backfill. See [`learning`].
     pub fn learning_page(&self) -> &[LearningEntry] {
         self.learning.page()
     }
 
-    /// Entries above the hint that [`Self::learning_page`] does not hold. A
+    /// Entries above the hint (or a backfill's floor) that
+    /// [`Self::learning_page`] does not hold. A
     /// backfill ([`Self::project_learning`]) fetches them; while this is above
     /// zero the page takes no later entry, so its order never skips one.
     pub fn learning_beyond(&self) -> u64 {
@@ -1363,8 +1365,11 @@ impl SessionState {
     /// The same replay [`Self::project`] runs, with the page floor at
     /// `hold_after`, so the page holds the first [`LEARNING_PAGE`] entries
     /// above it in order. `hold_after` is a learner-store watermark, or the
-    /// fold's hint when the page ran dry. The ledger is left empty: no entry
-    /// reads it.
+    /// fold's hint when the page ran dry. **The floor outranks the log's
+    /// hint**: `LearningApplied` events still set
+    /// [`Self::learning_hint`] but neither hold nor prune, so a watermark
+    /// below the hint (a store that lost acknowledged writes) refills the
+    /// entries between the two. The ledger is left empty: no entry reads it.
     pub async fn project_learning<S: SessionStore>(
         store: &S,
         session_id: &SessionId,

@@ -13,7 +13,7 @@ use roundhouse_core::routing::learn::{
     Band, CREDIT_SCALE, CacheReuse, JevCounts, LatencySum, LearnedInput, LevelKey, Strategy, Units,
 };
 use roundhouse_core::routing::{Target, Tier};
-use roundhouse_core::session::{Deltas, LearningEntry, TargetDelta};
+use roundhouse_core::session::{Deltas, LearningCauses, LearningEntry, TargetDelta};
 
 use learning_support::*;
 
@@ -80,6 +80,9 @@ async fn every_entry_producing_event_yields_one_entry_even_with_empty_deltas() {
     // Not entry-producing, whatever follows learned evidence.
     script.intent(&refused);
     script.applied(0);
+    // Nor is an acknowledgement, and the backfill from zero still holds every
+    // entry it covered.
+    script.applied(expected[2]);
 
     let entries = script.entries().await;
     let seqs: Vec<u64> = entries.iter().map(|entry| entry.seq).collect();
@@ -274,6 +277,43 @@ async fn another_epoch_or_credit_revision_credits_nothing() {
         ),
         (1, 1, 1),
         "{causes:?}"
+    );
+}
+
+/// Each cause alone, so the counters cannot trade places: the combined test
+/// above sets one of each and would pass with any two swapped.
+#[tokio::test]
+async fn a_mixed_epoch_review_counts_only_the_epoch_cause() {
+    let mut script = Script::new();
+    let a = script.turn(Spec::new().decision());
+    let b = script.turn(Spec::new().epoch(other_epoch()).decision());
+    script.review(&[&a, &b], on_track());
+
+    let state = script.state().await;
+    assert_eq!(state.accepted_reviews(), 1);
+    assert_eq!(
+        state.learning_causes(),
+        LearningCauses {
+            mixed_epoch: 1,
+            ..LearningCauses::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_foreign_credit_revision_review_counts_only_the_revision_cause() {
+    let mut script = Script::new();
+    let turn = script.turn(Spec::new().credit_revision(99).decision());
+    script.review(&[&turn], on_track());
+
+    let state = script.state().await;
+    assert_eq!(state.accepted_reviews(), 1);
+    assert_eq!(
+        state.learning_causes(),
+        LearningCauses {
+            other_credit_revision: 1,
+            ..LearningCauses::default()
+        }
     );
 }
 
@@ -518,6 +558,18 @@ async fn cache_rows_require_provider_measurement() {
         Spec::new().chosen(qwen()).plans(local_plans).decision(),
     );
     let local_done = script.complete(&local_turn, measured(450));
+    // 4506 of 10000 is 450.6 per mille: 451 to nearest, 450 truncated. Nearest
+    // is unbiased, so a sum of many samples keeps the ratio of the sums.
+    let mut fractional_turn = script.begin();
+    script.route(&mut fractional_turn, Spec::new().decision());
+    let fractional_done = script.complete(
+        &fractional_turn,
+        roundhouse_core::event::Usage {
+            input_tokens: 10_000,
+            cached_input_tokens: 4_506,
+            ..measured(0)
+        },
+    );
 
     let entry = script.entry(measured_done).await;
     assert_eq!(
@@ -527,6 +579,12 @@ async fn cache_rows_require_provider_measurement() {
             observed_permille: 450,
             n: 1
         })
+    );
+    let entry = script.entry(fractional_done).await;
+    assert_eq!(
+        target(deltas(&entry), &opus()).map(|row| row.cache.observed_permille),
+        Some(451),
+        "per mille rounds to nearest"
     );
     for seq in [unmeasured_done, local_done] {
         let entry = script.entry(seq).await;

@@ -559,8 +559,11 @@ pub enum SessionEventKind {
     /// streams it and no dispatch pairs with it.
     ///
     /// Part of the one-way door of draft section 13: a build older than this
-    /// variant cannot decode a log that holds one. Only a project whose learner
-    /// is not `off` produces entries, so only such a project writes it.
+    /// variant cannot decode a log that holds one. Written per session, not
+    /// per project mode: only a session with a `Routed` that carries learned
+    /// evidence produces entries, and it keeps producing them, and so keeps
+    /// receiving this event, after its project returns to `off` (draft section
+    /// 23). A session whose project never enabled the learner never holds one.
     LearningApplied {
         through_seq: u64,
     },
