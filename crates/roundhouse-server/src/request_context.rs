@@ -126,3 +126,6 @@ mod tests {
         assert_ne!(context.prompt_cache_key, context.prefix_fingerprint);
     }
 }
+
+#[cfg(test)]
+mod label_golden;
