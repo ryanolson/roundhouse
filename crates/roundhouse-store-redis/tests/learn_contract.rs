@@ -205,3 +205,224 @@ async fn a_wrong_type_key_is_refused_before_any_write() {
     }
     assert!(missed.is_empty(), "{missed:#?}");
 }
+
+/// A batch whose write phase is larger than Lua's stack still applies whole.
+///
+/// Lua's `unpack` fails past about 8000 results, and the operations hash of
+/// 700 targets is 4202 fields, 8404 `HSET` arguments. The credit entry before
+/// it stages a quality hash, which the script writes first. A write phase that
+/// unpacked each hash in one call would store that quality hash and then
+/// raise on the operations hash, leaving counters behind with no watermark to
+/// say they were applied.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_batch_past_the_lua_unpack_limit_applies_whole() {
+    let store = connect_learner_in(fresh_namespace()).await;
+    let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
+    let turn = input(Tier::Capable, false);
+    let targets: Vec<_> = (0..700).map(|i| frontier(&format!("m{i}"))).collect();
+    let mut wide = residual(e, &targets[0], 0);
+    wide.targets = targets
+        .iter()
+        .enumerate()
+        .map(|(i, target)| {
+            let mut row = residual(e, target, i as i64 - 350).targets.remove(0);
+            row.failover = i as u64;
+            row
+        })
+        .collect();
+    let entries = [
+        entry(10, 0, Some(credit(e, l0(&turn), Strategy::Rules, 3, 5))),
+        entry(20, 10, Some(wide)),
+    ];
+
+    let applied = store.apply(&batch(&project, &session, &entries)).await;
+    assert_eq!(
+        applied,
+        Ok(roundhouse_core::learn_store::Applied {
+            applied: 2,
+            watermark: 20
+        })
+    );
+    let request = ReadRequest::new(project.clone(), e, &turn, &all_strategies(), &targets);
+    let view = store.read(&request).await.unwrap();
+    let rules = view.levels[2]
+        .strategies
+        .iter()
+        .find(|counts| counts.strategy == Strategy::Rules)
+        .unwrap();
+    assert_eq!((rules.pos_units, rules.n_units, rules.sessions), (3, 5, 1));
+    assert_eq!(view.targets.len(), 700);
+    for (i, row) in view.targets.iter().enumerate() {
+        assert_eq!(row.target, targets[i].policy_identity());
+        assert_eq!(
+            (row.latency.sum_ms, row.latency.n, row.failover),
+            (i as i64 - 350, 1, i as u64),
+            "{}",
+            row.target
+        );
+    }
+}
+
+/// A stored value this store never writes is refused by `read` as
+/// `Unavailable` naming its key and field: a negative count in an unsigned
+/// field, and any text that is not a plain decimal integer.
+///
+/// `read` may fail only with `Unavailable` or `WrongType`, so it cannot use
+/// `CounterRange`; but the message must still say where the foreign value is,
+/// or the operator has nothing to clean up. A read that took the value as 0,
+/// or as whatever Lua's `tonumber` makes of hex and exponents, would route on
+/// a count nobody wrote.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_foreign_stored_value_is_refused_by_read_naming_its_key_and_field() {
+    let namespace = fresh_namespace();
+    let store = connect_learner_in(namespace.clone()).await;
+    let mut raw = raw_from_env().await;
+    let e = epoch(1);
+    let turn = input(Tier::Capable, false);
+    let target = frontier("large");
+    let identity = target.policy_identity();
+    let mut missed = Vec::new();
+    // (quality key or not, field, stored value)
+    let cases = [
+        (true, "rules:pos".to_owned(), "-1"),
+        (true, "capable:n".to_owned(), "1e3"),
+        (true, "jev_capable".to_owned(), "0x10"),
+        (false, format!("{identity}:lat_n"), "-1"),
+        (false, format!("{identity}:lat_sum"), " 5"),
+        (false, format!("{identity}:cache_n"), "abc"),
+        (false, "turn:pre_sum".to_owned(), "2.5"),
+    ];
+    for (quality, field, value) in cases {
+        let project = fresh_project();
+        let key = if quality {
+            learn_quality_key(&namespace, &project, e, l0(&turn))
+        } else {
+            learn_ops_key(&namespace, &project, e)
+        };
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg(&field)
+            .arg(value)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        let request = ReadRequest::new(project, e, &turn, &all_strategies(), [&target]);
+        match store.read(&request).await {
+            Err(LearnerError::Unavailable(message))
+                if message.contains(&key) && message.contains(&field) => {}
+            other => missed.push(format!("{field} = {value:?}: read answered {other:?}")),
+        }
+    }
+    assert!(missed.is_empty(), "{missed:#?}");
+}
+
+/// A watermark is a plain decimal integer within `2^53 - 1`, and `apply` and
+/// `watermark` agree on that. Lua's `tonumber` reads `0x5` as 5 and Rust's
+/// `u64` parse reads `+5` as 5; a store that let either through would chain
+/// entries onto a watermark one reader sees and the other refuses.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_foreign_watermark_is_refused_by_apply_and_by_watermark() {
+    let namespace = fresh_namespace();
+    let store = connect_learner_in(namespace.clone()).await;
+    let mut raw = raw_from_env().await;
+    let session = SessionId::generate();
+    let e = epoch(1);
+    let turn = input(Tier::Capable, false);
+    let mut missed = Vec::new();
+    for value in ["0x5", "+5", "5.0", "-0", " 5", "1e1"] {
+        let project = fresh_project();
+        let key = learn_watermark_key(&namespace, &project);
+        let _: () = redis::cmd("HSET")
+            .arg(&key)
+            .arg(session.as_str())
+            .arg(value)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        let before = store.snapshot(&project).await;
+        let entries = [entry(
+            10,
+            0,
+            Some(credit(e, l0(&turn), Strategy::Rules, 1, 1)),
+        )];
+        match store.apply(&batch(&project, &session, &entries)).await {
+            Err(LearnerError::CounterRange { counter })
+                if counter.contains(&key) && counter.contains(session.as_str()) => {}
+            other => missed.push(format!("{value:?}: apply answered {other:?}")),
+        }
+        if store.snapshot(&project).await != before {
+            missed.push(format!("{value:?}: apply wrote"));
+        }
+        match store.watermark(&project, &session).await {
+            Err(LearnerError::Unavailable(message)) if message.contains(&key) => {}
+            other => missed.push(format!("{value:?}: watermark answered {other:?}")),
+        }
+    }
+    assert!(missed.is_empty(), "{missed:#?}");
+}
+
+/// A snapshot and restore of one project touch no key of another project
+/// whose id extends it. The `SCAN` pattern ends at the `}:` after the hash
+/// tag; without it, `proj_ab*` matches `proj_ab12`'s keys too, and a restore
+/// of `proj_ab` would roll `proj_ab12` back with it.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_restore_leaves_a_project_whose_id_extends_it_alone() {
+    let namespace = fresh_namespace();
+    let store = connect_learner_in(namespace.clone()).await;
+    let (short, long) = (
+        roundhouse_core::control::ProjectId::new("proj_ab"),
+        roundhouse_core::control::ProjectId::new("proj_ab12"),
+    );
+    let session = SessionId::generate();
+    let e = epoch(1);
+    let turn = input(Tier::Capable, false);
+    let first = [entry(
+        10,
+        0,
+        Some(credit(e, l0(&turn), Strategy::Rules, 1, 1)),
+    )];
+    let second = [entry(
+        20,
+        10,
+        Some(credit(e, l0(&turn), Strategy::Rules, 1, 2)),
+    )];
+    for project in [&short, &long] {
+        store
+            .apply(&batch(project, &session, &first))
+            .await
+            .unwrap();
+    }
+
+    let snapshot = store.snapshot(&short).await;
+    let long_wm = learn_watermark_key(&namespace, &long);
+    let long_prefix = &long_wm[..long_wm.len() - "wm".len()];
+    let foreign: Vec<_> = snapshot
+        .keys()
+        .filter(|key| key.starts_with(long_prefix))
+        .collect();
+    assert!(
+        foreign.is_empty(),
+        "the snapshot of proj_ab holds {foreign:?}"
+    );
+
+    for project in [&short, &long] {
+        store
+            .apply(&batch(project, &session, &second))
+            .await
+            .unwrap();
+    }
+    let long_before = store.snapshot(&long).await;
+    store.restore(&short, snapshot).await;
+
+    assert_eq!(store.watermark(&short, &session).await, Ok(10));
+    assert_eq!(store.watermark(&long, &session).await, Ok(20));
+    assert_eq!(
+        store.snapshot(&long).await,
+        long_before,
+        "proj_ab12 changed"
+    );
+}

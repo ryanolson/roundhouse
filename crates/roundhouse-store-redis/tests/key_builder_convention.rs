@@ -267,10 +267,16 @@ fn key_is_a_keys_entry(args: &str) -> bool {
 /// and each one names `KeyFamily::Learn`, so none borrows another family's
 /// version. And every `redis.call` in `src/learn/scripts.rs` reaches its key
 /// through `KEYS[...]`: a script that concatenated a key from `ARGV` would
-/// write a key the builder never named, whatever the Rust side built. The
-/// live half, that a real apply writes exactly the keys these functions
+/// write a key the builder never named, whatever the Rust side built. Its
+/// command is one of [`LEARN_SCRIPT_COMMANDS`], so a `RENAME` or `COPY`
+/// whose first key is `KEYS[i]` cannot write a second key taken from
+/// anywhere else. The live half, that a real apply writes exactly the keys these functions
 /// name, is `the_store_writes_only_the_keys_its_key_functions_name` in
 /// `learn_contract.rs`.
+/// The commands the learn scripts may call: the type check, the reads, and
+/// the two writes the module doc allows. Each takes exactly one key.
+const LEARN_SCRIPT_COMMANDS: [&str; 6] = ["TYPE", "HGET", "HMGET", "HSET", "SISMEMBER", "SADD"];
+
 #[test]
 fn every_learn_key_is_built_by_the_shared_builder() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -305,6 +311,15 @@ fn every_learn_key_is_built_by_the_shared_builder() {
         while let Some(at) = rest.find("redis.call(") {
             calls += 1;
             let args = &rest[at + "redis.call(".len()..];
+            let command = args
+                .split_once(',')
+                .map(|(command, _)| command.trim().trim_matches('\''));
+            assert!(
+                command.is_some_and(|command| LEARN_SCRIPT_COMMANDS.contains(&command)),
+                "src/learn/scripts.rs:{}: a redis.call whose command is not one of \
+                 {LEARN_SCRIPT_COMMANDS:?}: {line}",
+                index + 1
+            );
             assert!(
                 key_is_a_keys_entry(args),
                 "src/learn/scripts.rs:{}: a redis.call whose key is not exactly KEYS[...]: {line}",

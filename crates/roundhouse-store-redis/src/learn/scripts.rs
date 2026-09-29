@@ -18,8 +18,11 @@
 //! script made before an error. So the script checks the type of every key
 //! the batch names, then the chain and every counter's range entry by entry,
 //! and only then writes, with `HSET` and `SADD` alone, on keys whose type it
-//! has checked. An out-of-memory refusal or a server failure during the write
-//! phase is outside this guarantee, and no test here can inject one.
+//! has checked. The writes go out in chunks of at most `CHUNK` values,
+//! because Lua's `unpack` raises past about 8000 results: one `HSET` of a
+//! wide operations hash would fail after the hashes before it were stored.
+//! An out-of-memory refusal or a server failure during the write phase is
+//! outside this guarantee, and no test here can inject one.
 //!
 //! **Types are checked for every key the batch names**, including keys only a
 //! skipped entry would touch. A key of the wrong type is foreign data in this
@@ -48,7 +51,10 @@ const RANGE: i64 = 4;
 /// a key any other way.
 ///
 /// `counter` reads a stored field: absent is 0, and anything that is not an
-/// integer within the counter's range is `nil`, which the caller reports. A
+/// integer within the counter's range is `nil`, which the caller reports.
+/// An integer is decimal digits alone, with a leading `-` only for a signed
+/// sum: `tonumber` by itself also reads `0x10`, `1e3` and ` 5`, which this
+/// store never writes, and the Rust `watermark` applies the same rule. A
 /// stored value past `2^53 - 1` could not be added to exactly, so it is
 /// refused rather than rounded.
 const PRELUDE: &str = r"
@@ -56,13 +62,11 @@ local MAX = 9007199254740991
 local OK, WRONG_TYPE, CHAIN_GAP, CHAIN_DIVERGED, RANGE = 0, 1, 2, 3, 4
 local function counter(stored, signed)
   if not stored then return 0 end
+  local pattern = '^%d+$'
+  if signed then pattern = '^-?%d+$' end
+  if not string.match(stored, pattern) then return nil end
   local n = tonumber(stored)
-  if n == nil or n ~= math.floor(n) or n > MAX then return nil end
-  if signed then
-    if n < -MAX then return nil end
-  elseif n < 0 then
-    return nil
-  end
+  if n > MAX or n < -MAX then return nil end
   return n
 end
 local function type_is(index, want)
@@ -74,29 +78,32 @@ end
 /// One turn's counters, with no write.
 ///
 /// KEYS: the three quality keys, most specific first, then the operations
-/// key. ARGV: the count `F` of quality fields, the `F` quality fields, then
-/// the operations fields. Reply: `OK` then every quality field of each
-/// quality key and every operations field, absent as 0; or `WRONG_TYPE key`;
-/// or `RANGE key field` for a stored value that is not an exact integer.
+/// key. ARGV: the count `F` of quality fields, the signs (one letter per
+/// field, `s` signed or `u` a count, as [`ReadPlan`] builds them), the `F`
+/// quality fields, then the operations fields. Reply: `OK` then every
+/// quality field of each quality key and every operations field, absent as
+/// 0; or `WRONG_TYPE key`; or `RANGE key field` for a stored value that is
+/// not an integer within its field's range.
 const READ: &str = r"
 for i = 1, #KEYS do
   if not type_is(i, 'hash') then return {WRONG_TYPE, i} end
 end
+local fields, signs = tonumber(ARGV[1]), ARGV[2]
 local reply = {OK}
 local function read(key, first, last)
   local values = redis.call('HMGET', KEYS[key], unpack(ARGV, first, last))
   for j = 1, last - first + 1 do
-    local n = counter(values[j], true)
-    if n == nil then return {RANGE, key, first + j - 1} end
+    local at = first + j - 1
+    local n = counter(values[j], string.sub(signs, at - 2, at - 2) == 's')
+    if n == nil then return {RANGE, key, at} end
     reply[#reply + 1] = n
   end
 end
-local fields = tonumber(ARGV[1])
 for key = 1, 3 do
-  local refused = read(key, 2, fields + 1)
+  local refused = read(key, 3, fields + 2)
   if refused then return refused end
 end
-local refused = read(4, fields + 2, #ARGV)
+local refused = read(4, fields + 3, #ARGV)
 if refused then return refused end
 return reply
 ";
@@ -114,10 +121,10 @@ return reply
 /// it, as the memory backend's `stage` does, and a refusal reports the
 /// watermark the store holds.
 const APPLY: &str = r"
-local hashes = tonumber(ARGV[2])
+local types = ARGV[2]
 for i = 1, #KEYS do
   local want = 'hash'
-  if i > hashes then want = 'set' end
+  if string.sub(types, i, i) == 's' then want = 'set' end
   if not type_is(i, want) then return {WRONG_TYPE, i} end
 end
 local session = ARGV[1]
@@ -175,17 +182,22 @@ for _ = 1, tonumber(ARGV[3]) do
   end
 end
 if applied == 0 then return {OK, 0, watermark} end
+-- Even, so no chunk splits a field from its value.
+local CHUNK = 1000
 for _, key in ipairs(touched) do
   local args = {}
   for _, field in ipairs(fields[key]) do
     args[#args + 1] = field
     args[#args + 1] = staged[key][field]
   end
-  redis.call('HSET', KEYS[key], unpack(args))
+  for first = 1, #args, CHUNK do
+    redis.call('HSET', KEYS[key], unpack(args, first, math.min(first + CHUNK - 1, #args)))
+  end
 end
-for set = hashes + 1, #KEYS do
-  if members[set] and #members[set].list > 0 then
-    redis.call('SADD', KEYS[set], unpack(members[set].list))
+for set = 1, #KEYS do
+  local list = members[set] and members[set].list or {}
+  for first = 1, #list, CHUNK do
+    redis.call('SADD', KEYS[set], unpack(list, first, math.min(first + CHUNK - 1, #list)))
   end
 end
 redis.call('HSET', KEYS[1], session, watermark)
@@ -216,6 +228,7 @@ impl Scripts {
             invocation.key(key.as_str());
         }
         invocation.arg(plan.quality_fields.len());
+        invocation.arg(plan.signs.as_str());
         for field in plan.quality_fields.iter().chain(&plan.ops_fields) {
             invocation.arg(field.as_str());
         }
@@ -278,9 +291,15 @@ pub(super) fn decode_read(
             return Err(LearnerError::WrongType { key });
         }
         Some(&RANGE) => {
-            let key = key_at(position(&numbers, 1, reply)?).unwrap_or_default();
+            let key = key_at(position(&numbers, 1, reply)?).ok_or_else(|| unexpected(reply))?;
+            let field = plan
+                .field(position(&numbers, 2, reply)?)
+                .ok_or_else(|| unexpected(reply))?;
+            // `read` may fail only with `Unavailable` or `WrongType`, so the
+            // refusal is `Unavailable`, naming where the foreign value is.
             return Err(LearnerError::Unavailable(format!(
-                "`{key}` holds a counter that is not an integer within 2^53 - 1"
+                "`{key}` field `{field}` holds a value this store never writes: \
+                 not a decimal integer within 2^53 - 1, or negative for a count"
             )));
         }
         _ => return Err(unexpected(reply)),
@@ -290,8 +309,8 @@ pub(super) fn decode_read(
         return Err(unexpected(reply));
     }
     let mut values = numbers[1..].iter().copied();
-    // Every field but the two signed sums is a nonnegative count; a negative
-    // one is a value this store never writes.
+    // The script refused a negative count, so one here is another build's
+    // reply.
     let mut unsigned = || {
         values
             .next()
@@ -379,7 +398,9 @@ pub(super) fn decode_apply(reply: &[Value], plan: &ApplyPlan) -> Result<Applied,
             store_watermark: unsigned(1)?,
         }),
         Some(&RANGE) => Err(LearnerError::CounterRange {
-            counter: plan.counter(position(&numbers, 1, reply)?, position(&numbers, 2, reply)?),
+            counter: plan
+                .counter(position(&numbers, 1, reply)?, position(&numbers, 2, reply)?)
+                .ok_or_else(|| unexpected(reply))?,
         }),
         _ => Err(unexpected(reply)),
     }

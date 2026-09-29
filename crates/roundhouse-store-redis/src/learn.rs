@@ -147,14 +147,16 @@ const JEV_EFFICIENT: &str = "jev_efficient";
 const PRE_SUM: &str = "turn:pre_sum";
 const PRE_N: &str = "turn:pre_n";
 
-/// The six counters of a target row, in the order a read returns them.
-const TARGET_COUNTERS: [&str; 6] = [
-    "lat_sum",
-    "lat_n",
-    "failover",
-    "cache_pred",
-    "cache_obs",
-    "cache_n",
+/// The six counters of a target row, in the order a read returns them, each
+/// with whether it is signed. `lat_sum` is the one signed counter of a row;
+/// the read's range check and the apply's op code both come from this table.
+const TARGET_COUNTERS: [(&str, bool); 6] = [
+    ("lat_sum", true),
+    ("lat_n", false),
+    ("failover", false),
+    ("cache_pred", false),
+    ("cache_obs", false),
+    ("cache_n", false),
 ];
 
 /// A `seen` member: `<level>:<key>:<strategy>`.
@@ -221,6 +223,10 @@ struct ReadPlan {
     /// Asked of the operations key: every target's six counters, then the
     /// overhead sum and count.
     ops_fields: Vec<String>,
+    /// One letter per field, the quality fields then the operations fields:
+    /// `s` for a signed sum, `u` for a count. The script refuses a negative
+    /// count itself, so the refusal names the key and field it came from.
+    signs: String,
 }
 
 impl ReadPlan {
@@ -234,13 +240,16 @@ impl ReadPlan {
             }
         }
         quality_fields.extend([JEV_CAPABLE.to_owned(), JEV_EFFICIENT.to_owned()]);
+        let mut signs = "u".repeat(quality_fields.len());
         let mut ops_fields = Vec::with_capacity(request.targets().len() * 6 + 2);
         for target in request.targets() {
-            for counter in TARGET_COUNTERS {
+            for (counter, signed) in TARGET_COUNTERS {
                 ops_fields.push(target_field(target, counter));
+                signs.push(sign(signed));
             }
         }
         ops_fields.extend([PRE_SUM.to_owned(), PRE_N.to_owned()]);
+        signs.extend([sign(true), sign(false)]);
         Self {
             keys: [
                 quality(l2),
@@ -250,8 +259,23 @@ impl ReadPlan {
             ],
             quality_fields,
             ops_fields,
+            signs,
         }
     }
+
+    /// The field at 1-based `ARGV` position `arg`, as `scripts::READ` lays
+    /// out `ARGV`: the quality field count and the signs come first.
+    fn field(&self, arg: usize) -> Option<&str> {
+        self.quality_fields
+            .iter()
+            .chain(&self.ops_fields)
+            .nth(arg.checked_sub(3)?)
+            .map(String::as_str)
+    }
+}
+
+fn sign(signed: bool) -> char {
+    if signed { 's' } else { 'u' }
 }
 
 /// One argument of the apply script: a field or member name, or an integer.
@@ -259,7 +283,7 @@ impl ReadPlan {
 /// Integers cross as their decimal text, which `tonumber` reads exactly up to
 /// [`MAX_EXACT`]; [`LearningBatch::check`] has already refused anything past
 /// it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum Arg {
     Text(String),
     Int(i64),
@@ -282,12 +306,12 @@ const OP_SESSION: i64 = 3;
 /// What one apply sends the script: every key the batch can touch, and each
 /// entry's ops.
 ///
-/// `KEYS` is the watermark hash, then every counter hash, then every `seen`
-/// set, so the script can check each key against the type its position gives
-/// it before it reads any. `ARGV` is the session id, the count of hash keys
-/// (the watermark included), the entry count, then per entry `seq`,
-/// `prev_seq`, the width of its ops and the ops themselves. An op names its
-/// keys by their 1-based position in `KEYS`:
+/// `KEYS` is every key in the order the batch first names it, the watermark
+/// hash first. `ARGV` is the session id, a type string with one letter per
+/// key (`h` for a hash, `s` for a set) so the script can check every key
+/// before it reads any, the entry count, then per entry `seq`, `prev_seq`,
+/// the width of its ops and the ops themselves. An op names its keys by
+/// their 1-based position in `KEYS`:
 ///
 /// - `OP_ADD key field delta` and `OP_ADD_SIGNED key field delta` add to one
 ///   counter, which must stay within `0..=2^53 - 1` or `±(2^53 - 1)`;
@@ -298,119 +322,79 @@ struct ApplyPlan {
     args: Vec<Arg>,
 }
 
-/// A key an op names before the plan knows where the sets start.
-#[derive(Clone, Copy)]
-enum Slot {
-    Hash(usize),
-    Set(usize),
-}
-
 impl ApplyPlan {
     fn new(namespace: &KeyNamespace, batch: &LearningBatch<'_>) -> Self {
-        let mut hashes: Vec<String> = vec![watermark_key(namespace, batch.project)];
-        let mut sets: Vec<String> = Vec::new();
-        let mut entries: Vec<(u64, u64, Vec<Op>)> = Vec::with_capacity(batch.entries.len());
+        let mut layout = Layout::default();
+        layout.position(watermark_key(namespace, batch.project), HASH);
+        let mut body = Vec::new();
         for entry in batch.entries {
             let mut ops = Vec::new();
             if let Some(deltas) = &entry.deltas {
-                let mut builder = OpBuilder {
+                OpBuilder {
                     namespace,
                     batch,
-                    hashes: &mut hashes,
-                    sets: &mut sets,
+                    layout: &mut layout,
                     ops: &mut ops,
-                };
-                builder.add(deltas);
+                }
+                .add(deltas);
             }
-            entries.push((entry.seq, entry.prev_seq, ops));
+            body.extend([
+                Arg::Int(entry.seq as i64),
+                Arg::Int(entry.prev_seq as i64),
+                Arg::Int(ops.len() as i64),
+            ]);
+            body.extend(ops);
         }
-        let hash_count = hashes.len();
-        let position = |slot: Slot| -> i64 {
-            let index = match slot {
-                Slot::Hash(index) => index,
-                Slot::Set(index) => hash_count + index,
-            };
-            // 1-based, as Lua indexes `KEYS`.
-            index as i64 + 1
-        };
         let mut args = vec![
             Arg::Text(batch.session.as_str().to_owned()),
-            Arg::Int(hash_count as i64),
-            Arg::Int(entries.len() as i64),
+            Arg::Text(layout.types),
+            Arg::Int(batch.entries.len() as i64),
         ];
-        for (seq, prev_seq, ops) in entries {
-            let mut encoded = Vec::new();
-            for op in ops {
-                op.encode(&position, &mut encoded);
-            }
-            args.push(Arg::Int(seq as i64));
-            args.push(Arg::Int(prev_seq as i64));
-            args.push(Arg::Int(encoded.len() as i64));
-            args.extend(encoded);
+        args.extend(body);
+        Self {
+            keys: layout.keys,
+            args,
         }
-        let mut keys = hashes;
-        keys.extend(sets);
-        Self { keys, args }
     }
 
     /// The counter a `CounterRange` reply names: the key and the field,
-    /// spelled the way `HGET` takes them.
-    fn counter(&self, key: usize, field_arg: usize) -> String {
-        let key = self
-            .keys
-            .get(key.wrapping_sub(1))
-            .map_or("<unknown key>", String::as_str);
-        let field = match self.args.get(field_arg.wrapping_sub(1)) {
-            Some(Arg::Text(text)) => text.clone(),
-            Some(Arg::Int(number)) => number.to_string(),
-            None => "<unknown field>".to_owned(),
+    /// spelled the way `HGET` takes them. `None` for a position outside
+    /// `KEYS` or `ARGV`, which only another build's script could report.
+    fn counter(&self, key: usize, field_arg: usize) -> Option<String> {
+        let key = self.keys.get(key.checked_sub(1)?)?;
+        let field = match self.args.get(field_arg.checked_sub(1)?)? {
+            Arg::Text(text) => text.clone(),
+            Arg::Int(number) => number.to_string(),
         };
-        format!("{key} {field}")
+        Some(format!("{key} {field}"))
     }
 }
 
-enum Op {
-    Add {
-        key: Slot,
-        field: String,
-        delta: i64,
-        signed: bool,
-    },
-    Session {
-        set: Slot,
-        member: String,
-        key: Slot,
-        field: String,
-    },
+/// The type letters of `ApplyPlan`'s type string.
+const HASH: char = 'h';
+const SET: char = 's';
+
+/// The apply's `KEYS` as the ops name them, and the type of each.
+#[derive(Default)]
+struct Layout {
+    keys: Vec<String>,
+    /// One of [`HASH`] or [`SET`] per key of `keys`.
+    types: String,
 }
 
-impl Op {
-    fn encode(self, position: &impl Fn(Slot) -> i64, out: &mut Vec<Arg>) {
-        match self {
-            Op::Add {
-                key,
-                field,
-                delta,
-                signed,
-            } => out.extend([
-                Arg::Int(if signed { OP_ADD_SIGNED } else { OP_ADD }),
-                Arg::Int(position(key)),
-                Arg::Text(field),
-                Arg::Int(delta),
-            ]),
-            Op::Session {
-                set,
-                member,
-                key,
-                field,
-            } => out.extend([
-                Arg::Int(OP_SESSION),
-                Arg::Int(position(set)),
-                Arg::Text(member),
-                Arg::Int(position(key)),
-                Arg::Text(field),
-            ]),
-        }
+impl Layout {
+    /// The 1-based position of `key` in `KEYS`, as Lua indexes it, appended
+    /// with its type the first time it is named.
+    fn position(&mut self, key: String, kind: char) -> i64 {
+        let index = match self.keys.iter().position(|existing| *existing == key) {
+            Some(index) => index,
+            None => {
+                self.keys.push(key);
+                self.types.push(kind);
+                self.keys.len() - 1
+            }
+        };
+        index as i64 + 1
     }
 }
 
@@ -420,52 +404,49 @@ impl Op {
 struct OpBuilder<'p, 'b> {
     namespace: &'p KeyNamespace,
     batch: &'p LearningBatch<'b>,
-    hashes: &'p mut Vec<String>,
-    sets: &'p mut Vec<String>,
-    ops: &'p mut Vec<Op>,
+    layout: &'p mut Layout,
+    ops: &'p mut Vec<Arg>,
 }
 
 impl OpBuilder<'_, '_> {
-    fn hash(&mut self, key: String) -> Slot {
-        Slot::Hash(slot_of(self.hashes, key))
-    }
-
-    fn set(&mut self, key: String) -> Slot {
-        Slot::Set(slot_of(self.sets, key))
+    fn counter(&mut self, key: i64, field: String, delta: i64, signed: bool) {
+        self.ops.extend([
+            Arg::Int(if signed { OP_ADD_SIGNED } else { OP_ADD }),
+            Arg::Int(key),
+            Arg::Text(field),
+            Arg::Int(delta),
+        ]);
     }
 
     fn add(&mut self, deltas: &Deltas) {
         let (namespace, project, epoch) = (self.namespace, self.batch.project, deltas.epoch);
         for quality in &deltas.quality {
-            let key = self.hash(quality_key(namespace, project, epoch, quality.key));
-            let set = self.set(seen_key(namespace, project, epoch, self.batch.session));
-            let unsigned = |counter: &str, delta: u64| Op::Add {
-                key,
-                field: strategy_field(quality.strategy, counter),
-                delta: delta as i64,
-                signed: false,
-            };
-            self.ops.push(unsigned("pos", quality.units.pos));
-            self.ops.push(unsigned("n", quality.units.n));
-            self.ops.push(Op::Session {
-                set,
-                member: seen_member(quality.key, quality.strategy),
-                key,
-                field: strategy_field(quality.strategy, "sessions"),
-            });
+            let key = self
+                .layout
+                .position(quality_key(namespace, project, epoch, quality.key), HASH);
+            let set = self
+                .layout
+                .position(seen_key(namespace, project, epoch, self.batch.session), SET);
+            let field = |counter| strategy_field(quality.strategy, counter);
+            self.counter(key, field("pos"), quality.units.pos as i64, false);
+            self.counter(key, field("n"), quality.units.n as i64, false);
+            self.ops.extend([
+                Arg::Int(OP_SESSION),
+                Arg::Int(set),
+                Arg::Text(seen_member(quality.key, quality.strategy)),
+                Arg::Int(key),
+                Arg::Text(field("sessions")),
+            ]);
         }
         for jev in &deltas.jev {
-            let key = self.hash(quality_key(namespace, project, epoch, jev.key));
+            let key = self
+                .layout
+                .position(quality_key(namespace, project, epoch, jev.key), HASH);
             for (field, delta) in [
                 (JEV_CAPABLE, jev.counts.capable),
                 (JEV_EFFICIENT, jev.counts.efficient),
             ] {
-                self.ops.push(Op::Add {
-                    key,
-                    field: field.to_owned(),
-                    delta: delta as i64,
-                    signed: false,
-                });
+                self.counter(key, field.to_owned(), delta as i64, false);
             }
         }
         // The memory backend leaves the operations key alone when an entry
@@ -473,7 +454,9 @@ impl OpBuilder<'_, '_> {
         if deltas.targets.is_empty() && deltas.overhead.n == 0 && deltas.overhead.sum_ms == 0 {
             return;
         }
-        let key = self.hash(ops_key(namespace, project, epoch));
+        let key = self
+            .layout
+            .position(ops_key(namespace, project, epoch), HASH);
         for target in &deltas.targets {
             let values = [
                 target.latency.sum_ms,
@@ -483,39 +466,12 @@ impl OpBuilder<'_, '_> {
                 target.cache.observed_permille as i64,
                 target.cache.n as i64,
             ];
-            for (index, (counter, delta)) in TARGET_COUNTERS.into_iter().zip(values).enumerate() {
-                self.ops.push(Op::Add {
-                    key,
-                    field: target_field(&target.target, counter),
-                    delta,
-                    // `lat_sum` is the one signed counter of a target row.
-                    signed: index == 0,
-                });
+            for ((counter, signed), delta) in TARGET_COUNTERS.into_iter().zip(values) {
+                self.counter(key, target_field(&target.target, counter), delta, signed);
             }
         }
-        self.ops.push(Op::Add {
-            key,
-            field: PRE_SUM.to_owned(),
-            delta: deltas.overhead.sum_ms,
-            signed: true,
-        });
-        self.ops.push(Op::Add {
-            key,
-            field: PRE_N.to_owned(),
-            delta: deltas.overhead.n as i64,
-            signed: false,
-        });
-    }
-}
-
-/// The index of `key` in `keys`, appended the first time it is named.
-fn slot_of(keys: &mut Vec<String>, key: String) -> usize {
-    match keys.iter().position(|existing| *existing == key) {
-        Some(index) => index,
-        None => {
-            keys.push(key);
-            keys.len() - 1
-        }
+        self.counter(key, PRE_SUM.to_owned(), deltas.overhead.sum_ms, true);
+        self.counter(key, PRE_N.to_owned(), deltas.overhead.n as i64, false);
     }
 }
 
@@ -549,11 +505,15 @@ impl LearnerStore for RedisLearnerStore {
                 Some("WRONGTYPE") => LearnerError::WrongType { key: key.clone() },
                 _ => unavailable(error),
             })?;
+        // The same rule as the apply script's `counter` for an unsigned
+        // field: decimal digits alone, within 2^53 - 1. A bare `parse`
+        // would also take `+5`, which the script refuses, and the two would
+        // disagree on whether the session has a watermark.
         match stored {
             None => Ok(0),
-            Some(text) => text
-                .parse::<u64>()
-                .ok()
+            Some(text) => Some(&text)
+                .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|text| text.parse::<u64>().ok())
                 .filter(|watermark| *watermark <= MAX_EXACT)
                 .ok_or_else(|| {
                     LearnerError::Unavailable(format!(

@@ -280,6 +280,15 @@ fn glob_literal(text: &str) -> String {
     pattern
 }
 
+/// The `SCAN MATCH` pattern for every key of `project`, and no other
+/// project's: its prefix, through the `}:` after the tag, then `*`.
+fn learn_project_pattern(store: &crate::RedisLearnerStore, project: &ProjectId) -> String {
+    format!(
+        "{}*",
+        glob_literal(&crate::learn::project_prefix(store.namespace(), project))
+    )
+}
+
 /// The learner store's snapshot lever: `SCAN` over the project's key prefix,
 /// then `DUMP` each key; a restore deletes every key under the prefix and
 /// `RESTORE`s the snapshot's. The snapshot holds the watermark hash and the
@@ -292,19 +301,23 @@ fn glob_literal(text: &str) -> String {
 /// restored key may dump differently from the original, so compare only
 /// snapshots taken without a restore between them.
 ///
-/// The prefix ends at the `}:` after the project's hash tag, so a project id
-/// that itself contains `}:` could match another project's keys. Every test
-/// mints `proj_<hex>` ids.
+/// **Restore deletes only under the project's prefix.** The prefix ends at
+/// the `}:` after the project's hash tag, so `proj_ab` does not match
+/// `proj_ab12`, and no other family's key or other project's key is touched.
+/// A project id that itself contains `}:` could still match another
+/// project's keys; every test mints `proj_<hex>` ids.
+///
+/// **`SCAN MATCH` walks the whole keyspace**: the pattern filters each reply,
+/// it does not narrow the walk, so a snapshot costs one pass over every key
+/// the Redis holds. That is fine for a test Redis and is why this lives in
+/// test support rather than in the store.
 #[async_trait::async_trait]
 impl roundhouse_core::learn_store::contract::LearnerStoreControl for crate::RedisLearnerStore {
     type Snapshot = std::collections::BTreeMap<String, Vec<u8>>;
 
     async fn snapshot(&self, project: &ProjectId) -> Self::Snapshot {
         let mut conn = self.connection();
-        let pattern = format!(
-            "{}*",
-            glob_literal(&crate::learn::project_prefix(self.namespace(), project))
-        );
+        let pattern = learn_project_pattern(self, project);
         let mut snapshot = std::collections::BTreeMap::new();
         for key in scan(&mut conn, &pattern).await {
             let dump: Option<Vec<u8>> = redis::cmd("DUMP")
@@ -321,10 +334,7 @@ impl roundhouse_core::learn_store::contract::LearnerStoreControl for crate::Redi
 
     async fn restore(&self, project: &ProjectId, snapshot: Self::Snapshot) {
         let mut conn = self.connection();
-        let pattern = format!(
-            "{}*",
-            glob_literal(&crate::learn::project_prefix(self.namespace(), project))
-        );
+        let pattern = learn_project_pattern(self, project);
         let live = scan(&mut conn, &pattern).await;
         if !live.is_empty() {
             let _: i64 = redis::cmd("DEL")

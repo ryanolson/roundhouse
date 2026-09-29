@@ -440,6 +440,8 @@ The recovery design assumes that all keys of one project are in one replication 
 
 The watermark hash and the `seen` sets keep one entry for each session forever. That is the same cost that `spend.rs` states for its watermarks and once-only identities. No compaction protocol exists.
 
+**Addendum, 2026-09-29.** Superseded in part by the plan's M7 status note (`PLAN-online-routing-learner.md` section 9): the crate does have a hash-tag convention, and the keys carry a `{project}` tag; the quality hash gains `jev_capable` and `jev_efficient`, and the operations hash gains `turn:pre_sum` and `turn:pre_n`.
+
 ### 11.5 Engine delivery
 
 The fold keeps a learning cursor, not a loss policy:

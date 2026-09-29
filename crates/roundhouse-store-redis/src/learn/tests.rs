@@ -17,8 +17,8 @@ use roundhouse_core::routing::learn::{EpochId, Strategy, StrategySet};
 use roundhouse_core::session::LearningEntry;
 
 use super::{
-    ApplyPlan, ReadPlan, RedisLearnerStore, ops_key, project_prefix, quality_key, seen_key,
-    watermark_key,
+    ApplyPlan, Arg, OP_SESSION, ReadPlan, RedisLearnerStore, ops_key, project_prefix, quality_key,
+    seen_key, watermark_key,
 };
 use crate::keys::KeyNamespace;
 
@@ -166,4 +166,78 @@ async fn the_scripts_return_only_integers() {
         );
         assert_eq!(reply.first(), Some(&Value::Int(*code)), "{name}: {reply:?}");
     }
+}
+
+/// The `SADD` of the write phase is chunked like the `HSET`s.
+///
+/// Lua's `unpack` raises past about 8000 results, and the script writes the
+/// counter hashes before the `seen` sets, so an unchunked `SADD` of 9000 new
+/// members would fail after the quality hash was stored. No batch built from
+/// real deltas names that many members, so the plan is built by hand: one
+/// entry of 9000 session ops, each with its own member.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_seen_set_past_the_lua_unpack_limit_applies_whole() {
+    let url = std::env::var("ROUNDHOUSE_TEST_REDIS_URL")
+        .expect("--include-ignored asks for the real backend; set ROUNDHOUSE_TEST_REDIS_URL");
+    let namespace = KeyNamespace::new(format!("rhtest-{}", uuid::Uuid::new_v4().simple())).unwrap();
+    let store = RedisLearnerStore::connect_namespaced(&url, namespace.clone())
+        .await
+        .unwrap();
+    let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
+    let turn = input(Tier::Capable, false);
+    let quality = quality_key(&namespace, &project, e, l0(&turn));
+    let seen = seen_key(&namespace, &project, e, &session);
+    const MEMBERS: i64 = 9000;
+    let mut ops = Vec::new();
+    for member in 0..MEMBERS {
+        ops.extend([
+            Arg::Int(OP_SESSION),
+            Arg::Int(3),
+            Arg::Text(format!("m{member}")),
+            Arg::Int(2),
+            Arg::Text("rules:sessions".to_owned()),
+        ]);
+    }
+    let mut args = vec![
+        Arg::Text(session.as_str().to_owned()),
+        Arg::Text("hhs".to_owned()),
+        Arg::Int(1),
+        Arg::Int(10),
+        Arg::Int(0),
+        Arg::Int(ops.len() as i64),
+    ];
+    args.extend(ops);
+    let plan = ApplyPlan {
+        keys: vec![
+            watermark_key(&namespace, &project),
+            quality.clone(),
+            seen.clone(),
+        ],
+        args,
+    };
+
+    let reply = store
+        .scripts
+        .apply(&mut store.connection(), &plan)
+        .await
+        .unwrap();
+    assert_eq!(
+        reply,
+        vec![Value::Int(0), Value::Int(1), Value::Int(10)],
+        "one entry applied"
+    );
+    let mut conn = store.connection();
+    let members: i64 = redis::cmd("SCARD")
+        .arg(&seen)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let sessions: Option<i64> = redis::cmd("HGET")
+        .arg(&quality)
+        .arg("rules:sessions")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!((members, sessions), (MEMBERS, Some(MEMBERS)));
 }
