@@ -1085,6 +1085,13 @@ async fn serve<S: SessionStore>(
     let (engine, recovery) = routing_composition::attach_learner(engine, learner);
     let _recovery = recovery.map(|recovery| recovery.spawn());
     let engine = Arc::new(engine);
+    // Read off the engine, not the composition: this is the name every
+    // turn's record will carry, so wiring any other policy than the composed
+    // one shows here, and `tests/learner_binary_boot.rs` reads it.
+    tracing::info!(
+        policy = %engine.policy().name(),
+        "the engine routes every turn under this policy"
+    );
 
     // Seven surfaces, one process and one log: the native transport, which
     // exposes sessions and the log itself; the Responses API, which lets an

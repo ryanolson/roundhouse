@@ -25,6 +25,8 @@
 //! [`Source::Live`]: a replay above a floor holds every entry above it up to
 //! the page size, so its page is empty only when nothing is owed.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -33,8 +35,8 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::learn_store::{LearnerError, LearningBatch};
 use roundhouse_core::metrics::{DeliveryOutcome, LearningDelivery};
 use roundhouse_core::routing::learn::EpochId;
-use roundhouse_core::session::{LearningEntry, Session, SessionState};
-use roundhouse_core::store::{ClearOutcome, SessionStore};
+use roundhouse_core::session::{LearningEntry, Session, SessionError, SessionState};
+use roundhouse_core::store::{ClearOutcome, SessionStore, StoreError};
 
 use super::RoutingLearner;
 
@@ -74,32 +76,48 @@ pub(crate) enum Delivered {
 pub(crate) enum Hold {
     /// A refusal no retry fixes: the session's delivery stopped.
     Stopped,
-    /// The learner store did not answer, or ran past the apply timeout.
+    /// The learner store answered an apply with `Unavailable`.
     LearnerUnavailable,
+    /// This session's apply ran past the apply timeout. Its result is
+    /// unknown, and the resend skips what landed.
+    ApplyTimedOut,
     /// A key this session's batch names holds foreign data (`WrongType`):
     /// the store answers, and this one session cannot be delivered until an
     /// operator removes the key.
     ForeignKey,
-    /// The session store could not replay this session's log.
+    /// A backfill could not replay this session's log: it is gone or
+    /// corrupt (`CorruptLog`), or the replay ran past the source timeout.
     SourceUnavailable,
+    /// A backfill met a session-store backend failure.
+    SourceDown,
     /// A second gap in one delivery: the backfill did not close it.
     GapPersisted,
     /// The store applied, and the acknowledgement or the mark clear failed.
     AcknowledgementFailed,
+    /// The store applied, and the mark clear ran past the source timeout.
+    ClearTimedOut,
 }
 
 impl Hold {
     /// Whether a store is out, so a sweep should end rather than visit the
     /// next session only to meet the same outage.
     ///
-    /// **Only what says the store itself is down.** A hold that belongs to
-    /// one session -- a foreign key, a replay of its log that failed, a stop
-    /// -- must not end the sweep: the sweep would end with its cursor on that
-    /// session, the next would start there, and one session nobody can
-    /// finish would starve every session behind it in every project, which
-    /// is the failure the index's byte-order cursor exists to prevent.
+    /// **Only what says the store itself is down**: an apply the learner
+    /// store answered `Unavailable`, a backfill or an acknowledgement the
+    /// session store failed. A hold that belongs to one session -- a foreign
+    /// key, a stop, a gap the backfill did not close, a log that is gone, or
+    /// a call of this session's that ran past its timeout -- must not end the
+    /// sweep: the sweep would end with its cursor on that session, the next
+    /// would start there, and one session nobody can finish would starve
+    /// every session behind it in every project, which is the failure the
+    /// index's byte-order cursor exists to prevent. A timeout is one
+    /// session's because the next session's first call is what probes the
+    /// store: when the store is down, that call fails and ends the sweep.
     pub(crate) fn is_outage(self) -> bool {
-        matches!(self, Hold::LearnerUnavailable | Hold::AcknowledgementFailed)
+        matches!(
+            self,
+            Hold::LearnerUnavailable | Hold::SourceDown | Hold::AcknowledgementFailed
+        )
     }
 }
 
@@ -111,6 +129,38 @@ pub(crate) struct Delivery<'a, S: SessionStore> {
     pub(crate) project: &'a ProjectId,
     pub(crate) session: &'a SessionId,
     pub(crate) apply_timeout: Duration,
+    /// The bound on a backfill (the whole replay) and on the mark clear:
+    /// the recovery task's `source_timeout`. `None` for the engine's tail,
+    /// whose calls the turn's own deadline and lease already bound.
+    pub(crate) source_timeout: Option<Duration>,
+    /// The recovery task's held set, so a backfill that fails on every sweep
+    /// warns once. `None` for the engine's tail, which warns every time: a
+    /// turn is not a periodic sweep.
+    pub(crate) held: Option<&'a HeldSessions>,
+}
+
+/// Sessions already warned about as held. A session leaves the set when it
+/// is delivered, so a later hold is a new episode and warns again.
+///
+/// A mutex only so a sweep can share it across its awaits; it is never
+/// contended.
+#[derive(Default)]
+pub(crate) struct HeldSessions(Mutex<HashSet<SessionId>>);
+
+impl HeldSessions {
+    /// Whether `session` is newly held, so its warning should fire.
+    pub(crate) fn first_hold(&self, session: &SessionId) -> bool {
+        let mut held = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        !held.contains(session) && held.insert(session.clone())
+    }
+
+    /// `session` was delivered: its next hold is a new one.
+    pub(crate) fn delivered(&self, session: &SessionId) {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(session);
+    }
 }
 
 impl<S: SessionStore> Delivery<'_, S> {
@@ -159,8 +209,8 @@ impl<S: SessionStore> Delivery<'_, S> {
         {
             let hint = live.state().learning_hint();
             match self.backfill(hint).await {
-                Some(backfilled) => replay = Some(backfilled),
-                None => return Delivered::Held(Hold::SourceUnavailable),
+                Ok(backfilled) => replay = Some(backfilled),
+                Err(hold) => return Delivered::Held(hold),
             }
             counters.record(project, DeliveryOutcome::Backfill);
         }
@@ -213,8 +263,8 @@ impl<S: SessionStore> Delivery<'_, S> {
                     }
                     gap_backfilled = true;
                     match self.backfill(store_watermark).await {
-                        Some(refilled) => replay = Some(refilled),
-                        None => return Delivered::Held(Hold::SourceUnavailable),
+                        Ok(refilled) => replay = Some(refilled),
+                        Err(hold) => return Delivered::Held(hold),
                     }
                     counters.record(project, DeliveryOutcome::Backfill);
                 }
@@ -274,7 +324,7 @@ impl<S: SessionStore> Delivery<'_, S> {
                     // The result is unknown: the apply may have landed. The
                     // resend skips what did, by the entry identity rule.
                     counters.record(project, DeliveryOutcome::TimedOut);
-                    return Delivered::Held(Hold::LearnerUnavailable);
+                    return Delivered::Held(Hold::ApplyTimedOut);
                 }
             }
         };
@@ -300,15 +350,24 @@ impl<S: SessionStore> Delivery<'_, S> {
             self.acknowledgement_failed(watermark, &error.to_string());
             return Delivered::Held(Hold::AcknowledgementFailed);
         }
-        match self.sessions.clear_learning_mark(session, watermark).await {
-            Ok(cleared) => Delivered::Confirmed {
+        match bounded(
+            self.source_timeout,
+            self.sessions.clear_learning_mark(session, watermark),
+        )
+        .await
+        {
+            Some(Ok(cleared)) => Delivered::Confirmed {
                 watermark,
                 cleared,
                 more,
             },
-            Err(error) => {
+            Some(Err(error)) => {
                 self.acknowledgement_failed(watermark, &error.to_string());
                 Delivered::Held(Hold::AcknowledgementFailed)
+            }
+            None => {
+                self.acknowledgement_failed(watermark, "the mark clear timed out");
+                Delivered::Held(Hold::ClearTimedOut)
             }
         }
     }
@@ -323,18 +382,40 @@ impl<S: SessionStore> Delivery<'_, S> {
             .record(self.project, DeliveryOutcome::AcknowledgementFailed);
     }
 
-    /// A read-only replay whose page holds the entries above `floor`.
-    async fn backfill(&self, floor: u64) -> Option<SessionState> {
-        match SessionState::project_learning(self.sessions, self.session, floor).await {
-            Ok(state) => Some(state),
-            Err(error) => {
-                tracing::warn!(
-                    project = %self.project, session = %self.session, floor, %error,
-                    "the learning backfill could not replay the log; the entries stay pending"
-                );
-                None
+    /// A read-only replay whose page holds the entries above `floor`, the
+    /// whole replay under the source timeout. A backend failure is the
+    /// session store's ([`Hold::SourceDown`]); a log that is gone or corrupt,
+    /// or a replay that ran out of time, is this session's
+    /// ([`Hold::SourceUnavailable`]).
+    async fn backfill(&self, floor: u64) -> Result<SessionState, Hold> {
+        let replayed = bounded(
+            self.source_timeout,
+            SessionState::project_learning(self.sessions, self.session, floor),
+        )
+        .await;
+        let (error, hold) = match replayed {
+            Some(Ok(state)) => return Ok(state),
+            Some(Err(error @ SessionError::Store(StoreError::Backend(_)))) => {
+                (error.to_string(), Hold::SourceDown)
             }
+            Some(Err(error)) => (error.to_string(), Hold::SourceUnavailable),
+            None => ("the replay timed out".to_owned(), Hold::SourceUnavailable),
+        };
+        if self.held.is_none_or(|held| held.first_hold(self.session)) {
+            tracing::warn!(
+                project = %self.project, session = %self.session, floor, %error,
+                "the learning backfill could not replay the log; the entries stay pending"
+            );
         }
+        Err(hold)
+    }
+}
+
+/// `call` under `timeout` when there is one: `None` when it ran out.
+async fn bounded<T>(timeout: Option<Duration>, call: impl Future<Output = T>) -> Option<T> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, call).await.ok(),
+        None => Some(call.await),
     }
 }
 

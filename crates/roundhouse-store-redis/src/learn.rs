@@ -527,13 +527,14 @@ impl LearnerStore for RedisLearnerStore {
                 Some("WRONGTYPE") => LearnerError::WrongType { key: key.clone() },
                 _ => unavailable(error),
             })?;
+        // A field this store never writes is foreign data for this one
+        // session, as a hash of the wrong type is: `WrongType`, which holds
+        // the session. `Unavailable` would say the store is down, and the
+        // recovery task ends its sweep on that at this same session, every
+        // sweep, for every project behind it.
         match stored {
             None => Ok(0),
-            Some(text) => stored_count(&text).ok_or_else(|| {
-                LearnerError::Unavailable(format!(
-                    "`{key}` holds `{text}` for session `{session}`, not a watermark"
-                ))
-            }),
+            Some(text) => stored_count(&text).ok_or(LearnerError::WrongType { key }),
         }
     }
 }

@@ -27,13 +27,13 @@ use crate::rig::{
     residuals, terms,
 };
 
-fn shadow() -> LearnerTerms {
+pub(crate) fn shadow() -> LearnerTerms {
     terms(LearnerMode::Shadow)
 }
 
 /// The section 4 cadence, with a 1 ms idle window so a test waits only a few
 /// milliseconds for its marks to count as idle.
-fn cadence() -> RecoveryCadence {
+pub(crate) fn cadence() -> RecoveryCadence {
     RecoveryCadence {
         sweep_interval: Duration::from_millis(30_000),
         idle_after_ms: 1,
@@ -46,19 +46,19 @@ fn cadence() -> RecoveryCadence {
     }
 }
 
-fn recovery(rig: &Rig) -> LearnerRecovery<CountingStore> {
+pub(crate) fn recovery(rig: &Rig) -> LearnerRecovery<CountingStore> {
     rig.engine
         .learner_recovery(cadence())
         .expect("the rig attaches a learner")
 }
 
 /// Wait past the idle window by the wall clock the memory store stamps with.
-async fn idle() {
+pub(crate) async fn idle() {
     std::thread::sleep(Duration::from_millis(5));
 }
 
 /// The next `n` tail applies do not land: the store is down for them.
-fn refuse_applies(rig: &Rig, n: usize) {
+pub(crate) fn refuse_applies(rig: &Rig, n: usize) {
     for _ in 0..n {
         rig.learner
             .script(ApplyScript::Refuse(LearnerError::Unavailable(
@@ -68,7 +68,7 @@ fn refuse_applies(rig: &Rig, n: usize) {
 }
 
 /// Every pending session, idle or not.
-async fn pending(rig: &Rig) -> Vec<SessionId> {
+pub(crate) async fn pending(rig: &Rig) -> Vec<SessionId> {
     SessionStore::pending_learning(
         rig.sessions.as_ref(),
         None,

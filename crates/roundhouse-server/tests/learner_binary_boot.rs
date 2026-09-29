@@ -37,6 +37,23 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// A control-plane file with one project over the binary's own echo catalog
+/// that writes a tier recipe and no learner: the composition is `stage`.
+fn tiers_control_plane() -> PathBuf {
+    let dir = scratch();
+    let plane = serde_json::json!({
+        "projects": [{
+            "id": "acme",
+            "tiers": { "capable": ["echo/echo"], "efficient": [] }
+        }],
+        "users": [{ "id": "ada" }],
+        "keys": [{ "project": "acme", "user": "ada", "key_sha256": TURN_HASH }]
+    });
+    let path = dir.join("control-plane.json");
+    std::fs::write(&path, plane.to_string()).expect("the control plane writes");
+    path
+}
+
 /// A control-plane file with one `shadow` project over the binary's own echo
 /// catalog, its artifact beside it, and the recovery block.
 fn shadow_control_plane() -> PathBuf {
@@ -125,29 +142,28 @@ fn strip_ansi(line: &str) -> String {
     out
 }
 
-/// Wait, bounded, for the listening line, and return everything printed by
-/// then. A binary that exits or never listens fails with what it printed.
-fn wait_until_listening(guard: &mut ChildGuard, lines: &Arc<Mutex<Vec<String>>>) -> String {
+/// Wait, bounded, for the line that says which policy the engine routes
+/// under, and return everything printed by then. `serve` logs it after
+/// "roundhouse listening", once the engine is built. A binary that exits or
+/// never gets there fails with what it printed.
+fn wait_until_serving(guard: &mut ChildGuard, lines: &Arc<Mutex<Vec<String>>>) -> String {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         {
             let seen = lines.lock().unwrap();
-            if seen
-                .iter()
-                .any(|line| line.contains("roundhouse listening"))
-            {
+            if seen.iter().any(|line| line.contains(SERVING)) {
                 return seen.join("\n");
             }
         }
         if let Some(status) = guard.0.try_wait().expect("the child's status reads") {
             panic!(
-                "the binary exited with {status} before listening:\n{}",
+                "the binary exited with {status} before serving:\n{}",
                 lines.lock().unwrap().join("\n")
             );
         }
         if Instant::now() >= deadline {
             panic!(
-                "the binary did not listen within 30 s:\n{}",
+                "the binary did not serve within 30 s:\n{}",
                 lines.lock().unwrap().join("\n")
             );
         }
@@ -155,11 +171,29 @@ fn wait_until_listening(guard: &mut ChildGuard, lines: &Arc<Mutex<Vec<String>>>)
     }
 }
 
+/// The message of the line `serve` logs with the engine's own policy name.
+const SERVING: &str = "the engine routes every turn under this policy";
+
+/// The policy the engine was built with, from its `serve` line: what a
+/// turn's record names, read off the engine rather than the composition, so
+/// `main.rs` wiring any other policy than the composed one shows here.
+fn serving_policy(printed: &str) -> &str {
+    let line = printed
+        .lines()
+        .find(|line| line.contains(SERVING))
+        .expect("the serving line");
+    let after = line
+        .split("policy=")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no policy field: {line}"));
+    after.split_whitespace().next().unwrap_or_default()
+}
+
 #[test]
 fn the_binary_boots_a_shadow_project_on_the_memory_backend() {
     let plane = shadow_control_plane();
     let (mut guard, lines) = spawn(&[("ROUNDHOUSE_CONTROL_PLANE", plane.to_str().unwrap())]);
-    let printed = wait_until_listening(&mut guard, &lines);
+    let printed = wait_until_serving(&mut guard, &lines);
     assert!(
         printed.contains("the learned router is composed over the stage router"),
         "{printed}"
@@ -170,6 +204,22 @@ fn the_binary_boots_a_shadow_project_on_the_memory_backend() {
     );
     assert!(
         printed.contains("the learner recovery task is running"),
+        "{printed}"
+    );
+    assert_eq!(serving_policy(&printed), "learned", "{printed}");
+}
+
+/// **No learner: the policy name is unchanged.** A file with a tier recipe
+/// and no learner boots the stage router, as before M9, and runs no recovery
+/// task.
+#[test]
+fn the_binary_boots_a_no_learner_file_under_the_stage_policy() {
+    let plane = tiers_control_plane();
+    let (mut guard, lines) = spawn(&[("ROUNDHOUSE_CONTROL_PLANE", plane.to_str().unwrap())]);
+    let printed = wait_until_serving(&mut guard, &lines);
+    assert_eq!(serving_policy(&printed), "stage", "{printed}");
+    assert!(
+        !printed.contains("the learner recovery task is running"),
         "{printed}"
     );
 }
@@ -186,7 +236,7 @@ fn the_binary_boots_a_shadow_project_on_the_redis_backend() {
         ("ROUNDHOUSE_REDIS_URL", &url),
         ("ROUNDHOUSE_REDIS_NAMESPACE", &namespace),
     ]);
-    let printed = wait_until_listening(&mut guard, &lines);
+    let printed = wait_until_serving(&mut guard, &lines);
     assert!(
         printed.contains("the learned router is composed over the stage router"),
         "{printed}"
@@ -199,4 +249,5 @@ fn the_binary_boots_a_shadow_project_on_the_redis_backend() {
         printed.contains("the learner recovery task is running"),
         "{printed}"
     );
+    assert_eq!(serving_policy(&printed), "learned", "{printed}");
 }

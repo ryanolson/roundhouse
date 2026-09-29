@@ -240,7 +240,7 @@ pub async fn boot_directory(
                 judge: checks.judge_identity(),
                 // Per version, not per handle: the directory stamps the axis
                 // of the plane each commit compiled (routing learner M9).
-                artifacts: Vec::new(),
+                artifacts: None,
             };
             ControlDirectory::new(
                 file.config,
@@ -692,6 +692,9 @@ pub struct PlaneLearner {
     /// `learner_recovery` block. Read by the composition root, like the
     /// salt, and by nothing else.
     recovery: Option<crate::learner_recovery::RecoveryCadence>,
+    /// Whether a project's learner is `shadow` or `live`: `validate`'s
+    /// answer, which both the recovery refusal and the composition read.
+    enabled: bool,
     /// `{project}={sha256}` for every resolved learner artifact, sorted: the
     /// artifact axis of the directory fingerprint.
     artifacts: Vec<String>,
@@ -756,6 +759,7 @@ impl ControlPlane {
             learner_recovery: _,
             turn_keys,
             recovery_cadence,
+            learner_enabled,
             learner_artifacts,
         } = config;
         ControlPlane::Configured {
@@ -765,6 +769,7 @@ impl ControlPlane {
             arm_salt: arm_salt.unwrap_or_default(),
             learner: Box::new(PlaneLearner {
                 recovery: recovery_cadence,
+                enabled: learner_enabled,
                 artifacts: learner_artifacts,
             }),
         }
@@ -955,6 +960,16 @@ impl ControlPlane {
         match self {
             ControlPlane::Open => None,
             ControlPlane::Configured { learner, .. } => learner.recovery,
+        }
+    }
+
+    /// Whether a project on this plane runs the learner in `shadow` or
+    /// `live`, keyed or not: the answer `validate` gave when it decided the
+    /// `learner_recovery` block is required.
+    pub fn enables_the_learner(&self) -> bool {
+        match self {
+            ControlPlane::Open => false,
+            ControlPlane::Configured { learner, .. } => learner.enabled,
         }
     }
 

@@ -100,6 +100,10 @@ roundhouse-server = { path = ".", features = ["test-support"] }
 # time instead of the box's load. Resolver v3 keeps a dev-dependency feature
 # out of `cargo build`, so this widens no shipped binary's graph.
 tokio = { workspace = true, features = ["test-util"] }
+# Learner artifact fixtures: the files the control-plane tests compile from
+# are removed when the test drops them. Already in the lock through another
+# dependency, so this adds a consumer, not a version.
+tempfile = "3"
 # The end-to-end cache-hit proof drives a real mock engine that publishes KV
 # events into the embedded selection service. See tests/mocker_cache_hits.rs.
 dynamo-mocker = { workspace = true }

@@ -86,6 +86,22 @@ pub enum StoreError {
         marked: ProjectId,
         requested: ProjectId,
     },
+    /// One session's log holds content this store never writes: an entry it
+    /// cannot decode, an id out of sequence, a length that disagrees with
+    /// the newest id. The store answered, and read the log; the fault is in
+    /// that one log (a foreign writer, a partial restore), not in the store.
+    ///
+    /// **Separate from [`Self::Backend`] so no caller can read it as an
+    /// outage.** A caller that pauses on a store that is down (the learner
+    /// recovery task ends its sweep and keeps its cursor) would stop at this
+    /// session on every attempt, and one bad log would starve every session
+    /// behind it. A caller that has no such distinction treats it as it
+    /// treats `Backend`: an internal failure of this one request.
+    #[error("the log of session `{session_id}` is corrupt: {detail}")]
+    CorruptLog {
+        session_id: SessionId,
+        detail: String,
+    },
     #[error("backend failure: {0}")]
     Backend(#[from] anyhow::Error),
 }

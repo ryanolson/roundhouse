@@ -53,7 +53,9 @@
 //! the append script never parses or splices JSON.
 //!
 //! An entry that violates the format — a missing field, an id some foreign
-//! writer auto-generated — fails the read loudly as [`StoreError::Backend`].
+//! writer auto-generated — fails the read loudly as
+//! [`StoreError::CorruptLog`]: the store answered, and the fault is in that
+//! one log, so no caller may read it as the store being down.
 //! Skipping it would silently drop events from a replay, and a replay that
 //! quietly disagrees with what was appended is the one failure mode an
 //! event-sourced store must never have.
@@ -325,17 +327,29 @@ fn backend(error: redis::RedisError) -> StoreError {
 /// a read batch must be contiguous from its cursor and the newest id must
 /// equal the stream's length — because seqs run 1..=len with no gaps. The
 /// suffix check here only rejects what is unambiguously malformed.
-fn seq_of(entry_id: &str, log_key: &str) -> Result<u64, StoreError> {
+fn seq_of(entry_id: &str, session_id: &SessionId, log_key: &str) -> Result<u64, StoreError> {
     let parsed = entry_id
         .split_once('-')
         .filter(|(_, tail)| *tail == "0")
         .and_then(|(seq, _)| seq.parse::<u64>().ok());
     parsed.ok_or_else(|| {
-        StoreError::Backend(anyhow::anyhow!(
-            "stream entry `{entry_id}` in `{log_key}` is not `<seq>-0` shaped; \
-             the log has a writer other than this store"
-        ))
+        corrupt_log(
+            session_id,
+            format!(
+                "stream entry `{entry_id}` in `{log_key}` is not `<seq>-0` shaped; \
+                 the log has a writer other than this store"
+            ),
+        )
     })
+}
+
+/// A log this store read and whose content it never writes. See
+/// [`StoreError::CorruptLog`] for why this is not `Backend`.
+fn corrupt_log(session_id: &SessionId, detail: String) -> StoreError {
+    StoreError::CorruptLog {
+        session_id: session_id.clone(),
+        detail,
+    }
 }
 
 /// Rebuild a [`SessionEvent`] from one stream entry.
@@ -344,13 +358,16 @@ fn event_of(
     session_id: &SessionId,
     log_key: &str,
 ) -> Result<SessionEvent, StoreError> {
-    let seq = seq_of(&entry.id, log_key)?;
+    let seq = seq_of(&entry.id, session_id, log_key)?;
     let corrupt = |what: &str| {
-        StoreError::Backend(anyhow::anyhow!(
-            "stream entry `{}` in `{log_key}` {what}; refusing to replay a log \
-             that would come back different from what was appended",
-            entry.id
-        ))
+        corrupt_log(
+            session_id,
+            format!(
+                "stream entry `{}` in `{log_key}` {what}; refusing to replay a log \
+                 that would come back different from what was appended",
+                entry.id
+            ),
+        )
     };
 
     let at_ms: u64 = entry
@@ -608,11 +625,14 @@ impl SessionStore for RedisSessionStore {
         for (offset, event) in events.iter().enumerate() {
             let expected = after_seq + 1 + offset as u64;
             if event.seq != expected {
-                return Err(StoreError::Backend(anyhow::anyhow!(
-                    "log `{log_key}` is not contiguous: expected seq {expected}, \
-                     found {}; the log has a writer other than this store",
-                    event.seq
-                )));
+                return Err(corrupt_log(
+                    session_id,
+                    format!(
+                        "log `{log_key}` is not contiguous: expected seq {expected}, \
+                         found {}; the log has a writer other than this store",
+                        event.seq
+                    ),
+                ));
             }
         }
         Ok(events)
@@ -632,17 +652,20 @@ impl SessionStore for RedisSessionStore {
         let last = newest
             .ids
             .first()
-            .map_or(Ok(0), |entry| seq_of(&entry.id, &log_key))?;
+            .map_or(Ok(0), |entry| seq_of(&entry.id, session_id, &log_key))?;
         // Contiguity from 1 means the newest seq *is* the entry count. An
         // entry a foreign writer added with an auto id passes the shape check
         // but not this one. Revisit if trimming ever lands: a trimmed log
         // breaks len == last deliberately, and this check must learn the
         // trim boundary then.
         if last != len {
-            return Err(StoreError::Backend(anyhow::anyhow!(
-                "log `{log_key}` has {len} entries but its newest id is {last}; \
-                 the log has a writer other than this store"
-            )));
+            return Err(corrupt_log(
+                session_id,
+                format!(
+                    "log `{log_key}` has {len} entries but its newest id is {last}; \
+                     the log has a writer other than this store"
+                ),
+            ));
         }
         Ok(last)
     }

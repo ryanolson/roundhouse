@@ -530,13 +530,13 @@ The engine reads the learner store once per learned turn, bounded by `read_timeo
 
 #### Startup
 
-When a project in the file's `learner` blocks is `shadow` or `live`, the binary composes the learner at boot (`routing_composition::compose`):
+When a project in the file's `learner` blocks is `shadow` or `live`, the binary composes the learner at boot (`routing_composition::compose`). This holds for a project that no turn key names yet, because the same check decides that the `learner_recovery` block is required:
 
 - The routing policy is `learned`, which wraps the stage router. Every decision in the process records `policy: "learned"`, as a process with a recipe records `stage`. Turns of projects with no learner, or with an `off` one, route exactly as the stage router routes them.
 - The learner store is opened with the other shared state: `RedisLearnerStore` when `ROUNDHOUSE_REDIS_URL` is set, under the same `ROUNDHOUSE_REDIS_NAMESPACE`, or memory otherwise. The memory store logs a warning that learner state ends with the process.
 - The recovery task starts (see below).
 
-When no project is `shadow` or `live`, nothing changes: the policy is `affinity` or `stage` as before, no learner store is opened, no recovery task runs, and no learner line is logged.
+When no project is `shadow` or `live`, nothing changes: the policy is `affinity` or `stage` as before, no learner store is opened, no recovery task runs, and no learner line is logged. Either way, `serve` logs the engine's policy before it serves (`policy=learned`, `policy=stage` or `policy=affinity`).
 
 An invalid artifact stops the boot, because the loader reads every artifact when it validates the file. A `learner` block that the admin plane adds to a process that booted with no learner routes as before and logs one warning for each such project until a restart composes the learner.
 
@@ -548,7 +548,7 @@ The recovery task delivers sessions that went idle with entries owed: a session 
 2. for each one, reads the learner store's watermark, replays the log above it without a lease, and delivers up to `pages_per_session_per_sweep` pages through the same delivery the engine runs, then clears the mark with the watermark the store confirmed. The mark goes only when the store holds every entry through it;
 3. audits a page of every session ever marked. A session whose learner watermark is below its mark lost state after a clear, and the audit makes it pending again. The audit never clears.
 
-The task never appends to a log, never takes a lease, and does not check leases. Its applies and outcomes count in the same `learning.delivery` counters as the engine's. When a store does not answer, the sweep stops with the marks in place, the next sweep waits twice as long (at most 8 intervals), and one warning covers the whole outage. A problem with one session is not an outage: a learner key holding foreign data (`WrongType`) or a log replay that fails or times out holds that session, logs it with its project, and the sweep goes on to the next.
+The task never appends to a log, never takes a lease, and does not check leases. Its applies and outcomes count in the same `learning.delivery` counters as the engine's. When a store is down, the sweep stops with the marks in place and its place in the index kept, the next sweep waits twice as long (at most 8 intervals), and one warning covers the whole outage. A store is down when the learner store answers a watermark read or an apply with `Unavailable`, when a watermark read times out, or when a session-store call fails with a backend error. A problem with one session is not an outage. The task holds that session, logs it once with its project until it is delivered, and goes on to the next session. These problems are: a learner key or watermark field holding foreign data (`WrongType`), a stopped session, a gap the backfill cannot close, a log that is gone or holds entries this store never writes, and an apply, replay, gap backfill or clear of that session that runs past its timeout. A timeout counts as the session's own problem because the next session's watermark read tests whether the store is down.
 
 The file's top-level `learner_recovery` block sets the cadence. It is required when any project is `shadow` or `live`, in the file or through an admin write, and no field may be 0. A block with no learner enabled is accepted, so the admin plane can add a learner later. The values below are the plan's starting values:
 
@@ -565,9 +565,9 @@ The file's top-level `learner_recovery` block sets the cadence. It is required w
 }
 ```
 
-`read_timeout_ms` bounds one learner-store watermark read, `apply_timeout_ms` one apply, and `source_timeout_ms` one session-store call (an index page, a replay, a clear, or a requeue).
+`read_timeout_ms` bounds one learner-store watermark read, `apply_timeout_ms` one apply, and `source_timeout_ms` one session-store call (an index page, a replay, a gap backfill, a clear, or a requeue).
 
-Each node reads an artifact from its own path. The admin directory's fingerprint records the SHA-256 of each artifact's bytes, by project, so a node that read other bytes at the same path than the node that wrote a directory version reports a `learner_artifacts` divergence.
+Each node reads an artifact from its own path. The admin directory's fingerprint records the SHA-256 of each artifact's bytes, by project, so a node that read other bytes at the same path than the node that wrote a directory version reports a `learner_artifacts` divergence. A version written by a node with no learner enabled, or by a build older than this record, records no artifacts, and this check is skipped for it.
 
 ## Hooking up Codex
 

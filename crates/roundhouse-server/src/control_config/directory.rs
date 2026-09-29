@@ -832,9 +832,11 @@ impl Managed {
     /// exists to have been compiled under anything.
     ///
     /// `own_artifacts` is the learner artifact axis of *this node's* compile of
-    /// the same records, or `None` when this node could not compile them; the
-    /// axis is then not compared, because this node has no artifact bytes to
-    /// compare, and the refused version already says why.
+    /// the same records, recorded even when empty, or `None` when this node
+    /// could not compile them; the axis is then not compared, because this
+    /// node has no artifact bytes to compare, and the refused version already
+    /// says why. A stored axis of `None` is not compared either (see
+    /// `CompiledUnder::artifacts`).
     fn note_divergence(
         &self,
         version: u64,
@@ -845,7 +847,7 @@ impl Managed {
             return;
         }
         let own = CompiledUnder {
-            artifacts: own_artifacts.map_or_else(|| stored.artifacts.clone(), <[String]>::to_vec),
+            artifacts: own_artifacts.map(<[String]>::to_vec),
             ..self.compiled_under.clone()
         };
         let differs = own.differs_from(stored);
@@ -1356,7 +1358,7 @@ impl Managed {
         // a lineage -- the first write of a deployment's life, or the first
         // after the key was lost -- is the only place this node can learn which
         // lineage it has just published into (R-D2″).
-        let artifacts = plane.learner_artifacts().to_vec();
+        let artifacts = CompiledUnder::stamped_artifacts(plane.learner_artifacts());
         let committed = self
             .store
             .commit(loaded.version, next.clone(), artifacts.clone())
@@ -1481,7 +1483,10 @@ impl Managed {
                 artifacts: artifacts.clone(),
                 ..self.compiled_under.clone()
             };
-            self.note_divergence(committed.version, &stamped, Some(&artifacts));
+            // The stamp is `None` exactly when this node's compile resolved
+            // no artifact, so its own axis is the stamp's list, or empty.
+            let own = artifacts.as_deref().unwrap_or_default();
+            self.note_divergence(committed.version, &stamped, Some(own));
         }
         if let Some(regression) = &regression {
             warn_regression(

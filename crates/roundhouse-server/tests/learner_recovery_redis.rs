@@ -20,6 +20,7 @@ use async_trait::async_trait;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{Principal, ProjectId};
+use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::learn_store::contract::LearnerStoreControl;
@@ -35,9 +36,12 @@ use roundhouse_core::routing::{AffinityPolicy, PickerMode, StagePolicy, Target, 
 use roundhouse_core::store::SessionStore;
 use roundhouse_fleet::{EchoFrontierClient, FrontierClients, WireProtocol};
 use roundhouse_server::learner_recovery::RecoveryCadence;
+use roundhouse_server::test_support::captured_warnings;
 use roundhouse_server::test_support::{frontier_spec, single_model_catalog};
 use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig};
-use roundhouse_store_redis::test_support::{fresh_namespace, url_from_env};
+use roundhouse_store_redis::test_support::{
+    fresh_namespace, learn_watermark_key, log_key_in, url_from_env,
+};
 use roundhouse_store_redis::{KeyNamespace, RedisLearnerStore, RedisSessionStore};
 
 /// The Redis learner store, whose next `refusals` applies do not land.
@@ -325,4 +329,128 @@ async fn two_tasks_and_the_audit_keep_redis_counts_exact() {
     let restored = one.sweep().await;
     assert_eq!(restored.cleared, 1);
     assert_eq!(first.residuals(&project).await, 2, "restored from the log");
+}
+
+/// **M1: one garbage watermark field holds its session, not the sweep.** The
+/// field belongs to one session, so a value this store never writes answers
+/// `WrongType` for that session, and the sweep delivers the session behind
+/// it. Before, it answered `Unavailable`: an outage that ended every sweep
+/// at the same session with the cursor unmoved, for every project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_garbage_watermark_field_holds_its_session_and_the_sweep_goes_on_on_redis() {
+    let namespace = fresh_namespace();
+    let (bad_project, good_project) = (fresh_project(), fresh_project());
+    let node = node(&namespace, "node-a", 2).await;
+    // `a/...` sorts before `b/...`, so the bad session is the page's first.
+    let bad = SessionId::new(format!("a/{bad_project}/s"));
+    let good = SessionId::new(format!("b/{good_project}/s"));
+    node.turn(&bad, "t1", &admission(&bad_project)).await;
+    node.turn(&good, "t1", &admission(&good_project)).await;
+    assert_eq!(node.pending().await, 2);
+
+    let mut raw = redis::Client::open(url_from_env().as_str())
+        .expect("a Redis URL")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("a raw connection");
+    let _: () = redis::cmd("HSET")
+        .arg(learn_watermark_key(&namespace, &bad_project))
+        .arg(bad.as_str())
+        .arg("x")
+        .query_async(&mut raw)
+        .await
+        .expect("the foreign value writes");
+
+    idle();
+    let mut task = node.engine.learner_recovery(cadence()).expect("a learner");
+    let report = task.sweep().await;
+    assert!(
+        !report.outage,
+        "one session's garbage field is not an outage"
+    );
+    assert_eq!(
+        node.residuals(&good_project).await,
+        1,
+        "the session behind it is delivered"
+    );
+    assert_eq!(node.pending().await, 1, "the bad session stays pending");
+    assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
+}
+
+/// **A corrupt log holds its session, not the sweep** (M9 review, the L1
+/// ruling). A foreign writer `XADD`s an entry with an auto-generated id into
+/// the first session's log, so its replay reads a log that is not
+/// contiguous. The store answered: that is `CorruptLog`, one session's fault,
+/// and the task holds that session, warns once, and delivers the session
+/// behind it. As `Backend` it was an outage that ended every sweep there.
+///
+/// Synchronous with a current-thread runtime, because `captured_warnings`
+/// captures only the calling thread's events.
+#[test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+fn a_corrupt_log_holds_its_session_and_the_sweep_goes_on_on_redis() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let namespace = fresh_namespace();
+    let (bad_project, good_project) = (fresh_project(), fresh_project());
+    // `a/...` sorts before `b/...`, so the corrupt session is the page's first.
+    let bad = SessionId::new(format!("a/{bad_project}/s"));
+    let good = SessionId::new(format!("b/{good_project}/s"));
+    let (node, mut task) = rt.block_on(async {
+        let node = node(&namespace, "node-a", 2).await;
+        node.turn(&bad, "t1", &admission(&bad_project)).await;
+        node.turn(&good, "t1", &admission(&good_project)).await;
+        assert_eq!(node.pending().await, 2);
+
+        let mut raw = redis::Client::open(url_from_env().as_str())
+            .expect("a Redis URL")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("a raw connection");
+        let _: String = redis::cmd("XADD")
+            .arg(log_key_in(&namespace, &bad))
+            .arg("*")
+            .arg("at_ms")
+            .arg(1u64)
+            .arg("kind")
+            .arg(
+                serde_json::to_string(&SessionEventKind::Error {
+                    message: "a foreign writer".into(),
+                })
+                .expect("JSON"),
+            )
+            .query_async(&mut raw)
+            .await
+            .expect("the foreign entry writes");
+        let task = node.engine.learner_recovery(cadence()).expect("a learner");
+        (node, task)
+    });
+
+    let warned = captured_warnings(|| {
+        rt.block_on(async {
+            for sweep in 0..2 {
+                idle();
+                let report = task.sweep().await;
+                assert!(
+                    !report.outage,
+                    "sweep {sweep}: a corrupt log is not an outage"
+                );
+            }
+            assert_eq!(
+                node.residuals(&good_project).await,
+                1,
+                "the session behind it is delivered"
+            );
+            assert_eq!(node.pending().await, 1, "the corrupt session stays pending");
+        });
+    });
+    assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
+    assert_eq!(
+        warned.matches("the log of this session is corrupt").count(),
+        1,
+        "two sweeps, one line: {warned}"
+    );
 }

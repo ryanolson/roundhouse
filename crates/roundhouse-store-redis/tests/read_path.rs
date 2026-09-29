@@ -71,10 +71,12 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
         .query_async(&mut rig.raw)
         .await
         .unwrap();
+    // `CorruptLog`, not `Backend`: the store answered, and the fault is in
+    // this one log's content (M9 review, L1 ruling).
     assert!(
         matches!(
             rig.store.read_events(&sid, 0, 16).await,
-            Err(StoreError::Backend(_))
+            Err(StoreError::CorruptLog { ref session_id, .. }) if *session_id == sid
         ),
         "an unreadable entry is corruption to report, not an event to skip"
     );
@@ -100,11 +102,29 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
         .unwrap();
     assert!(matches!(
         rig.store.read_events(&sid, 0, 16).await,
-        Err(StoreError::Backend(_))
+        Err(StoreError::CorruptLog { ref session_id, .. }) if *session_id == sid
     ));
     assert!(matches!(
         rig.store.last_seq(&sid).await,
-        Err(StoreError::Backend(_))
+        Err(StoreError::CorruptLog { ref session_id, .. }) if *session_id == sid
+    ));
+
+    // An entry with the right id and a `kind` no build writes.
+    let sid = SessionId::generate();
+    assert!(rig.store.create_session(&sid, "affinity").await.unwrap());
+    let _: String = redis::cmd("XADD")
+        .arg(log_key(&sid))
+        .arg("1-0")
+        .arg("at_ms")
+        .arg(1u64)
+        .arg("kind")
+        .arg("{\"not\":\"an event\"}")
+        .query_async(&mut rig.raw)
+        .await
+        .unwrap();
+    assert!(matches!(
+        rig.store.read_events(&sid, 0, 16).await,
+        Err(StoreError::CorruptLog { ref session_id, .. }) if *session_id == sid
     ));
 }
 

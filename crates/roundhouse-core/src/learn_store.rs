@@ -97,6 +97,11 @@ pub trait LearnerStore: Send + Sync + 'static {
 
     /// The `(project, session)` watermark, 0 for a session with no entry
     /// applied. Makes no write.
+    ///
+    /// Fails only with [`LearnerError::Unavailable`], the store did not
+    /// answer, or [`LearnerError::WrongType`], this session's watermark holds
+    /// foreign data. The first says the store is down; the second is one
+    /// session's.
     async fn watermark(
         &self,
         project: &ProjectId,
@@ -312,8 +317,10 @@ pub enum LearnerError {
     #[error("malformed learning batch: {reason}")]
     Malformed { reason: String },
     /// A key the call names holds another type than the layout gives it,
-    /// written by something other than this store. Only the Redis backend can
-    /// meet it. Nothing was written: the Redis script checks every key's type
+    /// written by something other than this store; or, from `watermark`, the
+    /// session's watermark field holds a value this store never writes, which
+    /// is foreign data for that one session in the same way. Only the Redis
+    /// backend can meet it. Nothing was written: the Redis script checks every key's type
     /// before its first write, because it cannot undo one.
     #[error("learner store key `{key}` holds the wrong type")]
     WrongType { key: String },

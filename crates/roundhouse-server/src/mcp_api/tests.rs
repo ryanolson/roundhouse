@@ -207,9 +207,10 @@ fn two_keys_that_restate_one_policy_are_a_rotation_and_not_an_ambiguity() {
 /// which is why no existing test could tell a store outage apart from a
 /// tenancy verdict: the one arm that renders as "not yours" was also the
 /// only arm reachable. `RedisSessionStore::last_seq` returns
-/// [`StoreError::Backend`] for a transport failure *and* for its
-/// foreign-writer contiguity check, so this is the shape a real deployment
-/// hits on a connection reset, not an invented one.
+/// [`StoreError::Backend`] for a transport failure (and
+/// [`StoreError::CorruptLog`] for its foreign-writer contiguity check, which
+/// this surface answers the same way), so this is the shape a real
+/// deployment hits on a connection reset, not an invented one.
 struct OutageStore;
 
 #[async_trait]

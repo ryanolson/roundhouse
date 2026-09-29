@@ -38,16 +38,19 @@ fn catalog() -> StaticFrontierCatalog {
     single_model_catalog(frontier_spec("echo", "echo", WireProtocol::OpenAiResponses))
 }
 
-fn artifact_file(bytes: &str) -> String {
-    let path = std::env::temp_dir().join(format!(
-        "roundhouse-learner-startup-{}.json",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&path, bytes).expect("the temp dir is writable");
-    path.to_string_lossy().into_owned()
+/// A file holding `bytes`, removed when the test drops it. A plane reads its
+/// artifact when it compiles, so the file must outlive only the load.
+fn artifact_file(bytes: &str) -> tempfile::TempPath {
+    let file = tempfile::NamedTempFile::new().expect("the temp dir is writable");
+    std::fs::write(file.path(), bytes).expect("the temp file is writable");
+    file.into_temp_path()
 }
 
-fn valid_artifact() -> String {
+fn path_of(file: &tempfile::TempPath) -> String {
+    file.to_string_lossy().into_owned()
+}
+
+fn valid_artifact() -> tempfile::TempPath {
     artifact_file(
         r#"{"schema_revision":1,"input_revision":1,"selector_revision":1,"stage_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":["rules","capable"],"prior":[],"manifest_digest":"00","source_commit":"test"}"#,
     )
@@ -121,8 +124,9 @@ fn plane(document: &str) -> ControlPlane {
 }
 
 fn shadow_plane() -> ControlPlane {
+    let artifact = valid_artifact();
     plane(&document(
-        Acme::Learner(learner("shadow", valid_artifact())),
+        Acme::Learner(learner("shadow", path_of(&artifact))),
         true,
     ))
 }
@@ -431,14 +435,72 @@ fn an_admin_added_learner_warns_until_restart() {
     assert!(lines[1].contains("beta"), "{}", lines[1]);
 }
 
+/// **L6: one predicate decides both the refusal and the composition.** A
+/// `shadow` project the file declares with no turn key yet (its keys are
+/// minted later through the admin plane) makes `validate` require the
+/// `learner_recovery` block, so the learner is composed too: its first turn
+/// routes learned, and no "added through the admin plane" warning names the
+/// wrong cause. Before, the composition asked the key table, found no key,
+/// and composed none.
+#[test]
+fn a_file_declared_shadow_project_with_no_turn_key_composes_the_learner() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let artifact = valid_artifact();
+    let mut keyless: serde_json::Value = serde_json::from_str(&document(
+        Acme::Learner(learner("shadow", path_of(&artifact))),
+        true,
+    ))
+    .expect("JSON");
+    keyless["keys"] = serde_json::json!([]);
+    let booted = plane(&keyless.to_string());
+    assert_eq!(booted.configured_admissions().count(), 0, "no turn key");
+    // The admission a key minted later resolves to.
+    let minted = admission_of(&shadow_plane());
+
+    let warned = captured_warnings(|| {
+        rt.block_on(async {
+            let backends = per_process().await;
+            let composition = routing_composition::compose(&booted, &backends)
+                .await
+                .expect("the composition opens");
+            assert_eq!(composition.policy.name(), "learned");
+            let store = memory_store(&backends);
+            let (engine, recovery) = engine(Arc::clone(&store), composition);
+            assert!(recovery.is_some(), "the recovery task is composed");
+            let decision = turn(
+                &engine,
+                &store,
+                &SessionId::new("acme/ada/minted"),
+                "t1",
+                &minted,
+            )
+            .await;
+            assert!(
+                is_learned(&decision),
+                "the minted key's turn routes learned"
+            );
+        });
+    });
+    assert!(
+        !warned.contains("enables the learner, but this process composed none"),
+        "{warned}"
+    );
+}
+
 /// **An invalid artifact stops the boot.** The loader reads each artifact
 /// when it validates the file, so the refusal is the file load's, before
 /// anything is composed.
 #[test]
 fn an_invalid_artifact_stops_the_boot() {
     let broken = artifact_file(r#"{"schema_revision":1}"#);
-    let file = artifact_file(&document(Acme::Learner(learner("shadow", broken)), true));
-    match ControlPlaneConfig::load_fingerprinted(&file) {
+    let file = artifact_file(&document(
+        Acme::Learner(learner("shadow", path_of(&broken))),
+        true,
+    ));
+    match ControlPlaneConfig::load_fingerprinted(path_of(&file)) {
         Err(ControlPlaneError::LearnerRejected {
             source: LearnerConfigError::Artifact { .. },
             ..
@@ -446,11 +508,12 @@ fn an_invalid_artifact_stops_the_boot() {
         other => panic!("expected an artifact refusal, got {:?}", other.map(|_| ())),
     }
     // Control: the same file over a valid artifact loads.
+    let artifact = valid_artifact();
     let valid = artifact_file(&document(
-        Acme::Learner(learner("shadow", valid_artifact())),
+        Acme::Learner(learner("shadow", path_of(&artifact))),
         true,
     ));
-    ControlPlaneConfig::load_fingerprinted(&valid).expect("a valid artifact loads");
+    ControlPlaneConfig::load_fingerprinted(path_of(&valid)).expect("a valid artifact loads");
 }
 
 /// The Redis arm: naming a Redis composes the Redis learner store, under the

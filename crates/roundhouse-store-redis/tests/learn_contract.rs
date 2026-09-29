@@ -358,8 +358,10 @@ async fn a_foreign_watermark_is_refused_by_apply_and_by_watermark() {
         if store.snapshot(&project).await != before {
             missed.push(format!("{value:?}: apply wrote"));
         }
+        // `WrongType`, not `Unavailable`: the field is one session's, and
+        // the store answered (M9 review, M1).
         match store.watermark(&project, &session).await {
-            Err(LearnerError::Unavailable(message)) if message.contains(&key) => {}
+            Err(LearnerError::WrongType { key: named }) if named == key => {}
             other => missed.push(format!("{value:?}: watermark answered {other:?}")),
         }
     }

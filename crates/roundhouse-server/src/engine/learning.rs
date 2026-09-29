@@ -374,6 +374,8 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             project: &project,
             session: &session_id,
             apply_timeout,
+            source_timeout: None,
+            held: None,
         }
         .deliver(delivery::Source::Live(session))
         .await;

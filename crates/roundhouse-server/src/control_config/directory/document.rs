@@ -34,9 +34,10 @@
 //!   have gained since is `#[serde(default)]` (see [`records`]).
 //! - **`records`** is the tenancy itself.
 //! - **`compiled_under`** is the writer's fingerprint of the inputs it
-//!   compiled against — the file, the catalog, the fleet's routing candidates
-//!   and the TTL. Written here, on every commit, so that a reader whose own
-//!   inputs differ can say so (R-D9). This module *stamps* and *carries* it;
+//!   compiled against — the file, the catalog, the fleet's routing
+//!   candidates, the TTL, the judge, and, when its plane enables the routing
+//!   learner, the learner artifacts it read. Written here, on every commit,
+//!   so that a reader whose own inputs differ can say so (R-D9). This module *stamps* and *carries* it;
 //!   what a reader does about a difference is decided one level up, where the
 //!   plane being served is.
 //!
@@ -120,11 +121,15 @@ pub const DIRECTORY_DOCUMENT_CEILING_BYTES: usize = 8 * 1024 * 1024;
 /// — which is why nothing here refuses anything; it is a fact a reader can
 /// name.
 ///
-/// Every field is `#[serde(default)]` and every field is written even when
-/// empty. The first is what lets a document written by a build that had no
-/// fingerprint (or a smaller one) still load; the second keeps the envelope's
-/// shape stable, so the byte-for-byte fixture pins a document rather than a
-/// coincidence of which fields happened to be populated.
+/// Every field is `#[serde(default)]`, and every field but
+/// [`Self::artifacts`] is written even when empty. The first is what lets a
+/// document written by a build that had no fingerprint (or a smaller one)
+/// still load; the second keeps the envelope's shape stable, so the
+/// byte-for-byte fixture pins a document rather than a coincidence of which
+/// fields happened to be populated. `artifacts` is the exception, and is
+/// written only by a writer whose plane enables the learner, so a document
+/// with no learner stays byte-identical to one written before the axis
+/// existed.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompiledUnder {
     /// SHA-256 of the control-plane file's bytes, hex.
@@ -175,13 +180,27 @@ pub struct CompiledUnder {
     /// the same records. Two nodes that read different bytes at one path run
     /// two epochs, and this is where they say so.
     ///
-    /// Skipped when empty, so a document with no learner is byte-identical to
-    /// one written before the axis existed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<String>,
+    /// **`None` is "not recorded", and is never compared.** A document
+    /// written before the axis existed, or by a writer whose plane enables no
+    /// learner, has none; reading that as "no artifacts" would make every
+    /// node that compiles a learner from such a document report a
+    /// divergence after an upgrade that changed nothing. `Some` of a list,
+    /// an empty one included, is compared. `None` is not written, so a
+    /// document with no learner is byte-identical to one written before the
+    /// axis existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<Vec<String>>,
 }
 
 impl CompiledUnder {
+    /// The artifact axis a writer stamps for a plane that resolved
+    /// `artifacts`: `None` when it resolved none. A plane resolves an
+    /// artifact exactly for each `shadow` or `live` project, so `None` means
+    /// the writer's plane enables no learner.
+    pub fn stamped_artifacts(artifacts: &[String]) -> Option<Vec<String>> {
+        (!artifacts.is_empty()).then(|| artifacts.to_vec())
+    }
+
     /// Which of the inputs this fingerprint and `other` disagree about
     /// (R-D9), in a fixed order, empty when they agree.
     ///
@@ -215,7 +234,9 @@ impl CompiledUnder {
         if self.judge != other.judge {
             differs.push(DivergentInput::Judge);
         }
-        if self.artifacts != other.artifacts {
+        if let (Some(own), Some(theirs)) = (&self.artifacts, &other.artifacts)
+            && own != theirs
+        {
             differs.push(DivergentInput::Artifacts);
         }
         differs
@@ -409,7 +430,7 @@ impl DirectoryStore for DocumentDirectoryStore {
         &self,
         expected_version: u64,
         records: DirectoryRecords,
-        artifacts: Vec<String>,
+        artifacts: Option<Vec<String>>,
     ) -> Result<StoredVersion, StoreFailure> {
         let document = DirectoryDocument {
             schema: DIRECTORY_DOCUMENT_SCHEMA,

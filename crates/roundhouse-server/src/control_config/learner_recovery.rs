@@ -50,7 +50,8 @@ pub struct LearnerRecoveryConfig {
     pub read_timeout_ms: u64,
     /// One learner-store apply.
     pub apply_timeout_ms: u64,
-    /// One session-store call: an index page, a replay, a clear or a requeue.
+    /// One session-store call: an index page, a replay, a gap backfill, a
+    /// clear or a requeue.
     pub source_timeout_ms: u64,
 }
 

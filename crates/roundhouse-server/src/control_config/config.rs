@@ -531,6 +531,13 @@ pub struct ControlPlaneConfig {
     /// resolved.
     #[serde(skip)]
     pub(super) recovery_cadence: Option<RecoveryCadence>,
+    /// Whether a project's learner resolved to `shadow` or `live`, decided by
+    /// [`Self::validate`] from the projects. The one answer both the
+    /// `learner_recovery` refusal and the composition root's choice read, so
+    /// a project the file declares before any key names it cannot be
+    /// required to carry the cadence and still compose no learner.
+    #[serde(skip)]
+    pub(super) learner_enabled: bool,
     /// `{project}={sha256}` for every project whose learner resolved an
     /// artifact, sorted: the artifact axis of this node's directory
     /// fingerprint (`CompiledUnder::artifacts`). Built by [`Self::validate`]
@@ -1343,6 +1350,7 @@ impl ControlPlaneConfig {
 
         self.turn_keys = turn_keys;
         self.recovery_cadence = recovery_cadence;
+        self.learner_enabled = enabling.is_some();
         self.learner_artifacts = learner_artifacts;
         Ok(())
     }

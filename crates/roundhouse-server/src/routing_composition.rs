@@ -57,15 +57,13 @@ pub fn composes_the_stage_router(plane: &ControlPlane) -> bool {
 
 /// Does any project on this plane run the learner in `shadow` or `live`?
 ///
-/// An `off` block resolves to no terms at all, so this asks only whether some
-/// admission carries terms whose mode is active.
+/// **The projects, not the key table**, and `validate`'s own answer rather
+/// than a second one: the same predicate decides that the `learner_recovery`
+/// block is required. A project the file declares before any key names it
+/// (its keys minted later through the admin plane) is then composed for,
+/// rather than required to carry the cadence and composed none.
 pub fn composes_the_learner(plane: &ControlPlane) -> bool {
-    plane.configured_admissions().any(|admission| {
-        admission
-            .learner
-            .as_deref()
-            .is_some_and(|terms| terms.mode.active().is_some())
-    })
+    plane.enables_the_learner()
 }
 
 /// What `serve` builds the engine from: the router, and the learner when one

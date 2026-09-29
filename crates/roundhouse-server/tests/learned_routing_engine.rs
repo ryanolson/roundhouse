@@ -26,6 +26,8 @@ mod classified;
 mod delivery;
 #[path = "learned_routing_engine/recovery.rs"]
 mod recovery;
+#[path = "learned_routing_engine/recovery_holds.rs"]
+mod recovery_holds;
 #[path = "learned_routing_engine/stops.rs"]
 mod stops;
 

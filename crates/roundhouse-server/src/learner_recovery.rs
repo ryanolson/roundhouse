@@ -37,18 +37,23 @@
 //! session here. The body for one session is a function of its project and
 //! id, so a superseded generation is delivered and cleared like any other.
 //!
-//! **An outage ends the sweep, backs off, and logs once.** A store that does
-//! not answer is met by the first session of a sweep and would be met by
-//! every other, so the sweep stops there with the marks in place, the next
-//! sweep waits twice as long (up to [`MAX_BACKOFF_FACTOR`] intervals), and one
-//! warning covers the outage however many sweeps and sessions it spans. The
-//! first clean sweep resets both.
+//! **An outage ends the sweep, backs off, and logs once.** A store that says
+//! it is down -- a learner-store call that answers `Unavailable`, a
+//! watermark read that times out, a session-store call that fails with a
+//! backend error -- is met by the first session of a sweep and would be met
+//! by every other, so the sweep stops there with the marks in place, the
+//! next sweep waits twice as long (up to [`MAX_BACKOFF_FACTOR`] intervals),
+//! and one warning covers the outage however many sweeps and sessions it
+//! spans. The first clean sweep resets both.
 //!
-//! **One session's trouble is not an outage.** A key holding foreign data
-//! (`WrongType`), a replay that fails or times out, or a stopped session holds
-//! that session only, and the sweep goes on: ending it would leave the cursor
-//! on the same session, and one session nobody can finish would starve every
-//! project behind it.
+//! **One session's trouble is not an outage.** A key or field holding
+//! foreign data (`WrongType`), a stop, a gap the backfill cannot close, a log
+//! that is gone, and an apply, replay, backfill or clear of this session that
+//! runs past its timeout each hold that session only, and the sweep goes on:
+//! ending it would leave the cursor on the same session, and one session
+//! nobody can finish would starve every project behind it. A timeout is one
+//! session's because the next session's watermark read is what probes the
+//! store. A held session warns once, until it is delivered.
 //!
 //! **The pass cursors are this task's memory.** Each index is walked in
 //! session id order and resumes after the last session a sweep finished; a
@@ -64,14 +69,14 @@ use roundhouse_core::control::ProjectId;
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::learn_store::LearnerError;
 use roundhouse_core::metrics::{DeliveryOutcome, MetricsRecorder};
-use roundhouse_core::session::SessionState;
+use roundhouse_core::session::{SessionError, SessionState};
 use roundhouse_core::store::{
     ClearOutcome, LearningCursor, LearningPage, MarkedSession, RequeueOutcome, SessionStore,
     StoreError,
 };
 
 use crate::engine::learning::RoutingLearner;
-use crate::engine::learning::delivery::{Delivered, Delivery, Source};
+use crate::engine::learning::delivery::{Delivered, Delivery, HeldSessions, Source};
 
 /// The most intervals one backoff waits: 8, reached after three outages in a
 /// row. Long enough that an outage costs a store a handful of probes per
@@ -98,7 +103,8 @@ pub struct RecoveryCadence {
     pub read_timeout: Duration,
     /// One learner-store apply.
     pub apply_timeout: Duration,
-    /// One session-store call: an index page, a replay, a clear or a requeue.
+    /// One session-store call: an index page, a replay, a gap backfill, a
+    /// clear or a requeue.
     pub source_timeout: Duration,
 }
 
@@ -129,6 +135,10 @@ pub struct LearnerRecovery<S: SessionStore> {
     /// Sweeps in a row that met an outage: the backoff exponent, and the
     /// once-per-outage flag (the warning fires on the first).
     outages: u32,
+    /// Sessions already warned about as held, so one held on every sweep
+    /// warns once, here and in the delivery's gap backfill. A session leaves
+    /// it when it is delivered, so a later hold warns again.
+    held: HeldSessions,
 }
 
 /// Why a sweep stopped early: a store did not answer.
@@ -158,6 +168,7 @@ impl<S: SessionStore> LearnerRecovery<S> {
             pending_after: None,
             audit_after: None,
             outages: 0,
+            held: HeldSessions::default(),
         }
     }
 
@@ -234,6 +245,8 @@ impl<S: SessionStore> LearnerRecovery<S> {
             project,
             session,
             apply_timeout: self.cadence.apply_timeout,
+            source_timeout: Some(self.cadence.source_timeout),
+            held: Some(&self.held),
         };
         for _ in 0..self.cadence.pages_per_session_per_sweep.get() {
             let Some(state) = self.replay(project, session, confirmed).await? else {
@@ -252,13 +265,14 @@ impl<S: SessionStore> LearnerRecovery<S> {
                     cleared,
                     more,
                 } => {
+                    self.held.delivered(session);
                     confirmed = watermark;
                     if !more {
                         return Ok(cleared == ClearOutcome::Covered);
                     }
                 }
                 Delivered::Held(hold) if hold.is_outage() => return Err(Outage),
-                // Stopped, or a gap the backfill did not close: the entries
+                // One session's hold (see `Hold::is_outage`): the entries
                 // stay pending and the next sweep tries again.
                 Delivered::Nothing | Delivered::Held(_) => return Ok(false),
             }
@@ -326,11 +340,13 @@ impl<S: SessionStore> LearnerRecovery<S> {
         {
             Ok(Ok(watermark)) => Ok(Watermark::At(watermark)),
             Ok(Err(error @ LearnerError::WrongType { .. })) => {
-                tracing::warn!(
-                    %project, %session, %error,
-                    "the learner store holds foreign data for this session; the recovery task \
-                     holds it and goes on with the rest"
-                );
+                if self.held.first_hold(session) {
+                    tracing::warn!(
+                        %project, %session, %error,
+                        "the learner store holds foreign data for this session; the recovery \
+                         task holds it and goes on with the rest"
+                    );
+                }
                 self.metrics
                     .learning_delivery()
                     .record(project, DeliveryOutcome::Unavailable);
@@ -349,7 +365,8 @@ impl<S: SessionStore> LearnerRecovery<S> {
 
     /// The log above `floor`, lease-free. `None` for a session whose log is
     /// gone or could not be replayed in time, which holds that session and is
-    /// not an outage: skipping it lets the sweep go on.
+    /// not an outage: skipping it lets the sweep go on. A backend failure is
+    /// the session store's, and an outage.
     async fn replay(
         &self,
         project: &ProjectId,
@@ -363,25 +380,47 @@ impl<S: SessionStore> LearnerRecovery<S> {
         .await;
         match replayed {
             Ok(Ok(state)) => Ok(Some(state)),
-            Ok(Err(roundhouse_core::session::SessionError::Store(
-                StoreError::SessionNotFound(_),
-            ))) => {
-                tracing::warn!(
-                    %project, %session,
-                    "a session marked for learning is not in the log; the recovery task skips it"
-                );
+            // The session store failed after its index page answered: it is
+            // down, and every session behind this one would meet the same.
+            Ok(Err(SessionError::Store(error @ StoreError::Backend(_)))) => {
+                tracing::debug!(%project, %session, %error, "the log replay met a backend failure");
+                Err(Outage)
+            }
+            // The store read the log, and its content is foreign: this one
+            // session's fault, which an outage would stop the sweep on at
+            // every attempt.
+            Ok(Err(SessionError::Store(error @ StoreError::CorruptLog { .. }))) => {
+                if self.held.first_hold(session) {
+                    tracing::warn!(
+                        %project, %session, %error,
+                        "the log of this session is corrupt; the recovery task holds it and goes \
+                         on with the rest"
+                    );
+                }
+                Ok(None)
+            }
+            Ok(Err(SessionError::Store(StoreError::SessionNotFound(_)))) => {
+                if self.held.first_hold(session) {
+                    tracing::warn!(
+                        %project, %session,
+                        "a session marked for learning is not in the log; the recovery task skips it"
+                    );
+                }
+                Ok(None)
+            }
+            Ok(Err(error)) => {
+                if self.held.first_hold(session) {
+                    tracing::warn!(%project, %session, %error, "the log replay failed; the session is held");
+                }
                 Ok(None)
             }
             // One session's replay, after the index already answered: held,
             // not an outage, so a log too long for `source_timeout` cannot
-            // stall the sessions behind it. A store that is really down
-            // fails the next index call, and that ends the sweep.
-            Ok(Err(error)) => {
-                tracing::warn!(%project, %session, %error, "the log replay failed; the session is held");
-                Ok(None)
-            }
+            // stall the sessions behind it.
             Err(_) => {
-                tracing::warn!(%project, %session, "the log replay timed out; the session is held");
+                if self.held.first_hold(session) {
+                    tracing::warn!(%project, %session, "the log replay timed out; the session is held");
+                }
                 Ok(None)
             }
         }

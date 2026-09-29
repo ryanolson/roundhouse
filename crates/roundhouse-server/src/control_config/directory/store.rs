@@ -228,15 +228,16 @@ pub trait DirectoryStore: Send + Sync + 'static {
     /// it just published into, and would have to guess or re-read.
     ///
     /// `artifacts` is the learner artifact axis of the plane the writer
-    /// compiled from `records` (`ControlPlane::learner_artifacts`), stamped
-    /// beside the handle's own [`compiled_under`](Self::compiled_under): the
-    /// one axis of the fingerprint that belongs to a version rather than to
-    /// the process (routing learner M9; see `CompiledUnder::artifacts`).
+    /// compiled from `records` (`CompiledUnder::stamped_artifacts` of
+    /// `ControlPlane::learner_artifacts`), stamped beside the handle's own
+    /// [`compiled_under`](Self::compiled_under): the one axis of the
+    /// fingerprint that belongs to a version rather than to the process
+    /// (routing learner M9; see `CompiledUnder::artifacts`).
     async fn commit(
         &self,
         expected_version: u64,
         records: DirectoryRecords,
-        artifacts: Vec<String>,
+        artifacts: Option<Vec<String>>,
     ) -> Result<StoredVersion, StoreFailure>;
 
     /// The current identity, without paying to read the records.

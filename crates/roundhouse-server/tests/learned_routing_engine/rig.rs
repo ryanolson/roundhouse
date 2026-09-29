@@ -7,6 +7,7 @@
 //! counts mark clears and acknowledgements and can refuse the latter.
 
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,7 +35,8 @@ use roundhouse_core::routing::{
 use roundhouse_core::session::{Deltas, LearningEntry, QualityDelta, TargetDelta};
 use roundhouse_core::store::doubles::Delegating;
 use roundhouse_core::store::{
-    ClearOutcome, LearningMark, Lease, MemoryStore, SessionStore, StoreError,
+    ClearOutcome, LearningCursor, LearningMark, LearningPage, Lease, MemoryStore, RequeueOutcome,
+    SessionStore, StoreError,
 };
 use roundhouse_fleet::{
     EchoFrontierClient, FrontierClient, FrontierClients, FrontierModelSpec, StaticFrontierCatalog,
@@ -205,6 +207,7 @@ pub struct ProbeStore {
     wrong_typed_applies: Mutex<Vec<ProjectId>>,
     script: Mutex<VecDeque<ApplyScript>>,
     refused: Mutex<HashMap<SessionId, LearnerError>>,
+    stalled: Mutex<HashMap<SessionId, Duration>>,
 }
 
 impl ProbeStore {
@@ -267,6 +270,12 @@ impl ProbeStore {
     pub fn refuse_session(&self, session: &SessionId, error: LearnerError) {
         self.refused.lock().unwrap().insert(session.clone(), error);
     }
+
+    /// Stall every apply for `session` for `stall`, then refuse it: an apply
+    /// that never lands inside any apply timeout shorter than `stall`.
+    pub fn stall_session(&self, session: &SessionId, stall: Duration) {
+        self.stalled.lock().unwrap().insert(session.clone(), stall);
+    }
 }
 
 #[async_trait]
@@ -299,6 +308,11 @@ impl LearnerStore for ProbeStore {
         let refused = self.refused.lock().unwrap().get(batch.session).cloned();
         if let Some(error) = refused {
             return Err(error);
+        }
+        let stall = self.stalled.lock().unwrap().get(batch.session).copied();
+        if let Some(stall) = stall {
+            tokio::time::sleep(stall).await;
+            return Err(LearnerError::Unavailable("the apply stalled".into()));
         }
         let step = self.script.lock().unwrap().pop_front();
         match step {
@@ -333,14 +347,36 @@ impl LearnerStore for ProbeStore {
 
 // ------------------------------------------------------------ session store
 
+/// What a replay of one session's log meets, from its `after`-th replay
+/// since the fault was set on (0 is the next one).
+#[derive(Clone, Copy)]
+pub enum ReplayFault {
+    /// The log is gone: `SessionNotFound`.
+    Missing { after: usize },
+    /// The read never answers.
+    Hangs { after: usize },
+    /// The session store fails with a backend error.
+    Fails { after: usize },
+}
+
 /// The memory session store, counting mark clears and `LearningApplied`
-/// appends, and able to refuse the latter.
+/// appends, and able to refuse the latter; and, for the recovery task's hold
+/// classes, able to lose or hang one session's log, hang its mark clear, or
+/// go down after an index page answered.
 #[derive(Default)]
 pub struct CountingStore {
     pub inner: MemoryStore,
     clears: AtomicUsize,
     acks: AtomicUsize,
     refuse_acks: AtomicBool,
+    /// Full replays (reads from sequence 0) per session.
+    replays: Mutex<HashMap<SessionId, usize>>,
+    /// The fault, and the replays the session had when it was set.
+    replay_faults: Mutex<HashMap<SessionId, (ReplayFault, usize)>>,
+    hung_clears: Mutex<Vec<SessionId>>,
+    /// Armed: the next index page answers, and every call after it fails.
+    down_after_index: AtomicBool,
+    down: AtomicBool,
 }
 
 impl CountingStore {
@@ -354,6 +390,56 @@ impl CountingStore {
 
     pub fn refuse_acks(&self, refuse: bool) {
         self.refuse_acks.store(refuse, Ordering::SeqCst);
+    }
+
+    /// Full replays of `session`'s log so far.
+    pub fn replays(&self, session: &SessionId) -> usize {
+        self.replays
+            .lock()
+            .unwrap()
+            .get(session)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn fault_replays(&self, session: &SessionId, fault: ReplayFault) {
+        let base = self.replays(session);
+        self.replay_faults
+            .lock()
+            .unwrap()
+            .insert(session.clone(), (fault, base));
+    }
+
+    pub fn heal_replays(&self, session: &SessionId) {
+        self.replay_faults.lock().unwrap().remove(session);
+    }
+
+    /// Every mark clear of `session` hangs.
+    pub fn hang_clears(&self, session: &SessionId) {
+        self.hung_clears.lock().unwrap().push(session.clone());
+    }
+
+    /// `true`: the next index page answers, and every session-store call
+    /// after it fails with a backend error until `false`.
+    pub fn go_down_after_the_next_index_page(&self, armed: bool) {
+        self.down_after_index.store(armed, Ordering::SeqCst);
+        if !armed {
+            self.down.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn fail_if_down(&self) -> Result<(), StoreError> {
+        match self.down.load(Ordering::SeqCst) {
+            true => Err(StoreError::Backend(anyhow::anyhow!("the store is down"))),
+            false => Ok(()),
+        }
+    }
+
+    /// After an index page answered: go down if armed.
+    fn after_index(&self) {
+        if self.down_after_index.load(Ordering::SeqCst) {
+            self.down.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -392,7 +478,74 @@ impl Delegating for CountingStore {
         confirmed_through: u64,
     ) -> Result<ClearOutcome, StoreError> {
         self.clears.fetch_add(1, Ordering::SeqCst);
+        self.fail_if_down()?;
+        if self.hung_clears.lock().unwrap().contains(session_id) {
+            std::future::pending::<()>().await;
+        }
         SessionStore::clear_learning_mark(&self.inner, session_id, confirmed_through).await
+    }
+
+    async fn read_events(
+        &self,
+        session_id: &SessionId,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>, StoreError> {
+        self.fail_if_down()?;
+        if after_seq == 0 {
+            let replay = {
+                let mut replays = self.replays.lock().unwrap();
+                let count = replays.entry(session_id.clone()).or_default();
+                *count += 1;
+                *count - 1
+            };
+            let fault = self.replay_faults.lock().unwrap().get(session_id).copied();
+            match fault {
+                Some((ReplayFault::Missing { after }, base)) if replay >= base + after => {
+                    return Err(StoreError::SessionNotFound(session_id.clone()));
+                }
+                Some((ReplayFault::Hangs { after }, base)) if replay >= base + after => {
+                    std::future::pending::<()>().await;
+                }
+                Some((ReplayFault::Fails { after }, base)) if replay >= base + after => {
+                    return Err(StoreError::Backend(anyhow::anyhow!("the store is down")));
+                }
+                _ => {}
+            }
+        }
+        SessionStore::read_events(&self.inner, session_id, after_seq, limit).await
+    }
+
+    async fn requeue_learning(
+        &self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<RequeueOutcome, StoreError> {
+        self.fail_if_down()?;
+        SessionStore::requeue_learning(&self.inner, session_id, mark_seq).await
+    }
+
+    async fn pending_learning(
+        &self,
+        after: Option<&LearningCursor>,
+        idle_for_ms: u64,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError> {
+        self.fail_if_down()?;
+        let page = SessionStore::pending_learning(&self.inner, after, idle_for_ms, limit).await;
+        self.after_index();
+        page
+    }
+
+    async fn learning_sessions(
+        &self,
+        after: Option<&LearningCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError> {
+        self.fail_if_down()?;
+        let page = SessionStore::learning_sessions(&self.inner, after, limit).await;
+        self.after_index();
+        page
     }
 }
 

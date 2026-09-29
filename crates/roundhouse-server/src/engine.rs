@@ -1065,6 +1065,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         Arc::clone(&self.metrics)
     }
 
+    /// The policy every turn routes under: the name its record carries.
+    pub fn policy(&self) -> &dyn RoutingPolicy {
+        self.policy.as_ref()
+    }
+
     /// The serialization gate for one session's turns.
     fn turn_gate(&self, session_id: &SessionId) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(

@@ -27,6 +27,17 @@ fn artifact_bytes(manifest: &str) -> String {
     )
 }
 
+/// An artifact file under `manifest`, removed when the test drops it.
+fn artifact_file(manifest: &str) -> tempfile::NamedTempFile {
+    let file = tempfile::NamedTempFile::new().expect("the temp dir is writable");
+    std::fs::write(file.path(), artifact_bytes(manifest)).expect("the temp file is writable");
+    file
+}
+
+fn path_of(file: &tempfile::NamedTempFile) -> String {
+    file.path().to_string_lossy().into_owned()
+}
+
 fn reachable() -> Candidate {
     Candidate {
         target: Target::Frontier {
@@ -97,18 +108,79 @@ fn learning_project(artifact: &str) -> ProjectEntry {
     .expect("a project entry")
 }
 
+fn axis(artifacts: Option<&[&str]>) -> CompiledUnder {
+    CompiledUnder {
+        artifacts: artifacts.map(|list| list.iter().map(|entry| entry.to_string()).collect()),
+        ..CompiledUnder::default()
+    }
+}
+
 #[test]
 fn an_artifact_axis_that_differs_is_named_on_its_own() {
-    let stored = CompiledUnder {
-        artifacts: vec!["learns=aa".into()],
-        ..CompiledUnder::default()
-    };
-    let own = CompiledUnder {
-        artifacts: vec!["learns=bb".into()],
-        ..CompiledUnder::default()
-    };
+    let stored = axis(Some(&["learns=aa"]));
+    let own = axis(Some(&["learns=bb"]));
     assert_eq!(own.differs_from(&stored), vec![DivergentInput::Artifacts]);
     assert_eq!(stored.differs_from(&stored.clone()), Vec::new());
+    assert_eq!(
+        axis(Some(&[])).differs_from(&stored),
+        vec![DivergentInput::Artifacts],
+        "a recorded empty list is compared: the writer resolved no artifact"
+    );
+}
+
+/// **L3: `None` is "not recorded", and is never compared**, on either side.
+#[test]
+fn an_unrecorded_artifact_axis_is_never_compared() {
+    let own = axis(Some(&["learns=aa"]));
+    assert_eq!(own.differs_from(&axis(None)), Vec::new());
+    assert_eq!(axis(None).differs_from(&own), Vec::new());
+}
+
+/// **L3: a document written before the artifact axis existed** records none,
+/// and a node that compiles a learner from its records reports no
+/// divergence. Before, the missing field read as "no artifacts", and every
+/// M9 node that compiled a learner named a divergence at boot after an
+/// upgrade.
+#[tokio::test]
+async fn a_pre_m9_document_compiled_by_a_node_with_a_learner_reports_no_divergence() {
+    let artifact = artifact_file("first");
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
+    let writer = node(Arc::clone(&documents), 0).await;
+    writer
+        .apply(
+            DirectoryMutation::CreateProject {
+                entry: learning_project(&path_of(&artifact)),
+            },
+            1,
+        )
+        .await
+        .expect("a file with a recovery block admits an admin-added learner");
+
+    // What a pre-M9 build wrote for these records: no artifact axis.
+    let stored = documents.load().await.expect("the store answers");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&stored.document.expect("a document")).expect("JSON");
+    assert!(
+        document["compiled_under"]
+            .as_object_mut()
+            .expect("an object")
+            .remove("artifacts")
+            .is_some(),
+        "control: the M9 writer stamped the axis"
+    );
+    documents
+        .commit(stored.version, serde_json::to_vec(&document).expect("JSON"))
+        .await
+        .expect("the rewrite commits");
+
+    let reader = node(Arc::clone(&documents), 3).await;
+    assert_eq!(
+        reader.plane(4).await.learner_artifacts().len(),
+        1,
+        "the reader compiled the learner"
+    );
+    assert_eq!(reader.status().divergence, None);
+    assert_eq!(reader.status().divergences_named, 0);
 }
 
 /// **The digest changes `CompiledUnder` when the bytes at one path change.**
@@ -118,12 +190,8 @@ fn an_artifact_axis_that_differs_is_named_on_its_own() {
 /// names the artifact axis, and only that axis.
 #[tokio::test]
 async fn the_artifact_digest_changes_compiled_under_when_the_bytes_at_one_path_change() {
-    let path = std::env::temp_dir().join(format!(
-        "roundhouse-artifact-axis-{}.json",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::write(&path, artifact_bytes("first")).expect("the temp dir is writable");
-    let artifact = path.to_string_lossy().into_owned();
+    let file = artifact_file("first");
+    let artifact = path_of(&file);
 
     let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
     let writer = node(Arc::clone(&documents), 0).await;
@@ -149,7 +217,7 @@ async fn the_artifact_digest_changes_compiled_under_when_the_bytes_at_one_path_c
     assert_eq!(agreeing.status().divergences_named, 0);
 
     // One byte of intent more: another manifest, so another epoch.
-    std::fs::write(&path, artifact_bytes("second")).expect("the temp file is writable");
+    std::fs::write(file.path(), artifact_bytes("second")).expect("the temp file is writable");
     let diverging = node(Arc::clone(&documents), 5).await;
     diverging.plane(6).await;
     assert_eq!(
