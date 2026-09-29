@@ -430,7 +430,11 @@ pub async fn a_batch_that_skips_an_entry_returns_chain_gap_and_changes_nothing<
 /// It is refused as `ChainDiverged`, which the engine reports and never
 /// backfills. The rule compares with the watermark as the batch's earlier
 /// entries moved it, so a batch that diverges from its own staged entry is
-/// refused the same way, and still reports the watermark the store holds.
+/// refused the same way, and still reports the watermark the store holds. A
+/// batch that begins with an entry the store already holds, which skips by
+/// identity, is still refused when the next entry skips over the watermark: a
+/// backend that checked only the first entry against the watermark, and each
+/// later entry against the entry before it, would accept that diverged chain.
 pub async fn a_diverged_chain_is_refused_and_is_not_a_gap<S: LearnerStoreControl>(store: &S) {
     let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
     let turn = input(Tier::Capable, false);
@@ -456,6 +460,13 @@ pub async fn a_diverged_chain_is_refused_and_is_not_a_gap<S: LearnerStoreControl
             store_watermark: 20
         }),
         "entry 40 skips over the batch's own entry 30"
+    );
+    assert_eq!(
+        refused(vec![next(10, 0), next(30, 10)]).await,
+        Err(LearnerError::ChainDiverged {
+            store_watermark: 20
+        }),
+        "entry 10 skips by identity, and entry 30 still skips over the store's entry 20"
     );
     assert_eq!(
         refused(vec![next(30, 25)]).await,
@@ -652,6 +663,8 @@ pub async fn every_input_rule_refuses_its_batch_as_malformed<S: LearnerStoreCont
             vec![rules(10, 0), rules(20, 10), rules(15, 10)],
         ),
         ("a prev_seq equal to its seq", vec![rules(10, 10)]),
+        // A second case of the rule above: `seq` is already bounded, so a
+        // `prev_seq` past the bound is also at or above its `seq`.
         ("a prev_seq above 2^53 - 1", vec![rules(10, MAX_EXACT + 1)]),
         (
             "a signed delta beyond -(2^53 - 1)",
