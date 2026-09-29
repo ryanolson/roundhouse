@@ -35,7 +35,9 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use roundhouse_core::context::ByteTokenizer;
-use roundhouse_core::control::{FrontierCadence, Principal, TargetFilter, TurnPolicy};
+use roundhouse_core::control::{
+    FrontierCadence, Principal, TargetFilter, TurnCredentials, TurnPolicy,
+};
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -426,8 +428,11 @@ async fn a_fleet_that_hangs_past_its_bound_is_skipped_and_the_turn_serves_a_fron
     let elapsed = started.elapsed();
     result.expect("a silent selector must not fail a turn with a hosted target");
 
+    // Under a second against a 100 ms bound: tight enough that a bound read
+    // at ten times its value, or a second full wait, goes red, and loose
+    // enough for the frontier echo and a loaded CI box.
     assert!(
-        elapsed < std::time::Duration::from_millis(2_500),
+        elapsed < std::time::Duration::from_millis(1_000),
         "the residency call must be bounded by its own deadline, not the \
          five-second turn deadline: took {elapsed:?}"
     );
@@ -452,6 +457,37 @@ async fn a_local_only_session_with_an_erroring_fleet_still_fails_the_turn() {
         other => panic!("expected the fleet's own error, got {other:?}"),
     }
     assert_eq!(rig.fleet.calls(), 1);
+    let routed = rig
+        .store
+        .read_events(&session_id, 0, 1_000)
+        .await
+        .expect("an in-memory log reads")
+        .into_iter()
+        .filter(|event| matches!(event.kind, SessionEventKind::Routed { .. }))
+        .count();
+    assert_eq!(routed, 0, "nothing was dispatched anywhere");
+}
+
+/// **A policy that admits a hosted target is not enough to fail open: some
+/// credential has to reach it.** Here the policy is unrestricted, but the
+/// turn forwards no credential, so no hosted provider can authenticate it.
+/// Failing open would swap the fleet's error for a credential one on a turn
+/// that could only ever have been served locally — the fleet's failure is the
+/// turn's, with the fleet's error class.
+#[tokio::test]
+async fn a_policy_admitted_hosted_target_with_no_credential_does_not_fail_open() {
+    let rig = rig(Behaviour::Errors).await;
+    let uncredentialed = Admission {
+        principal: Principal::new("proj", "user"),
+        credentials: TurnCredentials::forwarding(None),
+        ..Admission::open()
+    };
+    let (session_id, result) = attempt(&rig, turn_input(None), &uncredentialed).await;
+    match result {
+        Err(EngineError::Fleet(_)) => {}
+        other => panic!("expected the fleet's own error, got {other:?}"),
+    }
+    assert_eq!(rig.fleet.calls(), 1, "the residency call was made");
     let routed = rig
         .store
         .read_events(&session_id, 0, 1_000)

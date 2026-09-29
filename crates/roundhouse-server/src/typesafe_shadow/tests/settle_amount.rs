@@ -84,20 +84,19 @@ async fn hanging_upstream() -> SocketAddr {
 
 /// **Row 1: a connection that was never established settles at zero.**
 ///
-/// The listener is bound and dropped, so the port is known to refuse. No byte
-/// of the request existed on a wire, so nothing was billed and booking the
-/// estimate would over-count a call that never happened.
+/// Port 1 on loopback, as `roundhouse-fleet`'s transport tests use: nothing
+/// listens there, so the refusal is deterministic. A port bound and dropped
+/// can be reused by another test before the connect, which would turn this
+/// into a sent request. No byte of the request existed on a wire, so nothing
+/// was billed and booking the estimate would over-count a call that never
+/// happened.
 #[tokio::test]
 async fn a_refused_connection_settles_at_zero() {
-    let addr = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
-    };
     let ledger = RecordingLedger::granting(GRANT);
     let credential = credential();
 
     let record = classify_by(
-        &shadow_at(format!("http://{addr}"), ledger.clone()),
+        &shadow_at("http://127.0.0.1:1".to_string(), ledger.clone()),
         &credential,
         never(),
     )

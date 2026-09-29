@@ -268,12 +268,20 @@ pub enum SystemOneError {
     /// The HTTP exchange failed below the status line.
     ///
     /// `sent` says whether the request may have reached the service, and it is
-    /// what the caller's accounting turns on: `false` only when no connection
-    /// was ever established (or no client existed), which is the one transport
-    /// failure that provably bought nothing. Anything later — a reset after
-    /// the write, a body cut off mid-stream — may have been billed, and
-    /// reading it as free is the bias that makes an evaluation look cheaper
-    /// than it is.
+    /// what the caller's accounting turns on. It is `false` in two cases only:
+    /// no request existed yet (the client could not be built, or the key could
+    /// not be put in a header), or reqwest proves no connection was
+    /// established (`is_connect()`: a refusal, a failed lookup, or reqwest's
+    /// own `connect_timeout`, which it reports as a connect error). Every other
+    /// transport failure is `true` — a reset after the write, a body cut off
+    /// mid-stream — because it may have been billed, and reading it as free is
+    /// the bias that makes an evaluation look cheaper than it is.
+    ///
+    /// A connect that is still pending when the call's own deadline fires is
+    /// not this variant at all: it is [`Self::DeadlineExceeded`], which the
+    /// caller books at the estimate on purpose, since nothing here can prove
+    /// the request never left. That deadline starts before the connect timer
+    /// and runs for the same length, so it is normally the one that fires.
     #[error("the service could not be reached (timed out: {timed_out}, sent: {sent})")]
     Transport {
         message: String,

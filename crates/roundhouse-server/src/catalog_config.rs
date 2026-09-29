@@ -106,7 +106,7 @@ pub struct CatalogConfig {
     pub local_ttft_ms_per_prefill_token: f64,
     /// How long a turn waits for the fleet's residency answer, in ms, before
     /// it routes among its hosted targets without a local quote. Uses the
-    /// engine's default when omitted.
+    /// engine's default when omitted. Zero is refused at load.
     #[serde(default = "default_fleet_quote_deadline_ms")]
     pub fleet_quote_deadline_ms: u64,
     /// The citation for imported `quality_prior`s, if a provenance file was
@@ -704,6 +704,20 @@ impl CatalogConfig {
                     expected: "rates and latencies cannot be negative",
                 });
             }
+        }
+
+        // Zero is not "no bound": it abandons the residency call before any
+        // fleet can answer, so a healthy fleet loses every local candidate to
+        // `fleet_timeout` and a local deployment silently serves hosted.
+        if self.fleet_quote_deadline_ms == 0 {
+            return Err(CatalogError::InvalidValue {
+                path: path.to_string(),
+                model: "<catalog>".to_string(),
+                field: "fleet_quote_deadline_ms",
+                value: 0.0,
+                expected: "zero would drop every local candidate as fleet_timeout while the \
+                           fleet is healthy; set a positive bound in milliseconds",
+            });
         }
 
         // The gate's own inputs, on the same 0.0..=1.0 scale it compares.

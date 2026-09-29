@@ -614,10 +614,53 @@ enum Resolved<'a> {
         served: Tier,
         outcome: StageOutcome,
         ordered: Vec<&'a Candidate>,
+        /// How a guarded turn's fallbacks split, and `None` on every other
+        /// arm. Counted here because this is the only place the partition is
+        /// made; the rationale reads it rather than re-deriving the split from
+        /// quotes it would have to compare a second time.
+        guarded: Option<GuardedFallbacks>,
     },
     /// Nothing either tier names was admitted; the caller degrades past the
     /// recipe instead.
     Degrade,
+}
+
+/// The three groups a guarded turn's fallbacks come in, in failover order.
+///
+/// Not carried on [`StageOutcome::CostGuard`], which is recorded evidence:
+/// the counts describe this turn's candidate pool, not the decision, and a
+/// replay reads the decision.
+#[derive(Debug, Clone, Copy)]
+struct GuardedFallbacks {
+    /// Capable members that also quote below the efficient head, after the
+    /// winner that leads them.
+    cheaper_capable: usize,
+    /// The efficient tier the pick named.
+    efficient: usize,
+    /// Capable members that quote at or above the efficient head.
+    dearer_capable: usize,
+}
+
+impl GuardedFallbacks {
+    /// The fallback clause from the groups that hold something, in order.
+    ///
+    /// **Only the non-empty ones**, because the sentence is republished into
+    /// the calling model's context by `explain_last_route`: naming "cheaper
+    /// strong targets" when the winner was the only one tells that model about
+    /// a failover option that does not exist.
+    fn describe(self, served: Tier, picked: Tier) -> String {
+        let mut groups = Vec::with_capacity(3);
+        if self.cheaper_capable > 0 {
+            groups.push(format!("cheaper {} targets", served.label()));
+        }
+        if self.efficient > 0 {
+            groups.push(format!("the {} tier", picked.label()));
+        }
+        if self.dearer_capable > 0 {
+            groups.push(format!("the rest of the {} tier", served.label()));
+        }
+        groups.join(", then ")
+    }
 }
 
 impl StagePolicy {
@@ -687,6 +730,7 @@ impl StagePolicy {
                     served,
                     outcome: StageOutcome::PickedTierEmpty { served },
                     ordered,
+                    guarded: None,
                 },
             };
         }
@@ -748,6 +792,13 @@ impl StagePolicy {
                 let (cheaper_capable, dearer_capable): (Vec<_>, Vec<_>) = capable
                     .into_iter()
                     .partition(|candidate| candidate.expected_cost_usd < head.expected_cost_usd);
+                let guarded = GuardedFallbacks {
+                    // The winner leads the cheaper group and is not its own
+                    // fallback; `position` above proved the group non-empty.
+                    cheaper_capable: cheaper_capable.len() - 1,
+                    efficient: picked.len(),
+                    dearer_capable: dearer_capable.len(),
+                };
                 let ordered: Vec<&Candidate> = cheaper_capable
                     .into_iter()
                     .chain(picked)
@@ -757,6 +808,7 @@ impl StagePolicy {
                     served: Tier::Capable,
                     outcome: StageOutcome::CostGuard { displaced },
                     ordered,
+                    guarded: Some(guarded),
                 };
             }
         }
@@ -765,6 +817,7 @@ impl StagePolicy {
             served: pick.tier,
             outcome: StageOutcome::Served { tier: pick.tier },
             ordered: picked,
+            guarded: None,
         }
     }
 
@@ -884,13 +937,14 @@ impl RoutingPolicy for StagePolicy {
         let signals = ctx.signals.cloned().unwrap_or_default();
         let pick = pick_tier(&signals, recipe.picker(), recipe.confidence_threshold());
 
-        let (served, outcome, ordered) = match Self::resolve(recipe, pick, pool) {
+        let (served, outcome, ordered, guarded) = match Self::resolve(recipe, pick, pool) {
             Resolved::Degrade => return Self::degrade_past_the_recipe(recipe, pick, &admitted),
             Resolved::Tier {
                 served,
                 outcome,
                 ordered,
-            } => (served, outcome, ordered),
+                guarded,
+            } => (served, outcome, ordered, guarded),
         };
         // The evidence is built once and read from, rather than a `source`
         // recomputed here beside it: `StageEvidence::source` is the rule's one
@@ -979,15 +1033,13 @@ impl RoutingPolicy for StagePolicy {
         // sentence says so rather than calling them one tier's. Names of the
         // tiers only, no prices, for the reason the clauses above give.
         if !fallbacks.is_empty() {
-            match &evidence.outcome {
-                StageOutcome::CostGuard { .. } => rationale.push_str(&format!(
-                    "; {} fallback(s): cheaper {} targets, then the {} tier, then the rest of the {} tier",
+            match guarded {
+                Some(groups) => rationale.push_str(&format!(
+                    "; {} fallback(s): {}",
                     fallbacks.len(),
-                    served.label(),
-                    pick.tier.label(),
-                    served.label(),
+                    groups.describe(served, pick.tier),
                 )),
-                _ => rationale.push_str(&format!(
+                None => rationale.push_str(&format!(
                     "; {} fallback(s) in the same tier",
                     fallbacks.len()
                 )),
@@ -2205,6 +2257,75 @@ mod tests {
         assert!(
             !decision.rationale.contains('$'),
             "and the sentence still carries no price: {}",
+            decision.rationale
+        );
+    }
+
+    /// **The fallback clause names only groups that hold something.** The
+    /// rationale is republished into the calling model's context by
+    /// `explain_last_route`, so a sentence describing "cheaper strong targets"
+    /// or "the rest of the strong tier" when there are none tells that model
+    /// about failover options that do not exist.
+    ///
+    /// One capable member and one efficient member: the winner is the only
+    /// cheaper capable target, and there is no dearer one, so the single
+    /// fallback is the efficient tier and the clause must say only that. The
+    /// second fixture is the review-round-6 shape, where the cheaper group is
+    /// empty after the winner but a dearer capable member exists.
+    #[tokio::test]
+    async fn the_guarded_fallback_clause_names_only_non_empty_groups() {
+        let recipe = TierRecipe::new(
+            vec!["openai/nova".into()],
+            vec!["openai/luna".into()],
+            PickerMode::EfficientFirst,
+            DEFAULT_CONFIDENCE_THRESHOLD,
+        )
+        .unwrap();
+        let candidates = vec![hosted("nova", 0.90, 0.04), hosted("luna", 0.70, 0.12)];
+        let fixture = Fixture::open()
+            .with_recipe(recipe)
+            .with_signals(deescalating());
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+        assert_eq!(
+            (decision.source, decision.fallbacks.clone()),
+            (
+                Some(DecisionSource::CostGuard),
+                vec![candidates[1].target.clone()]
+            ),
+            "{}",
+            decision.rationale
+        );
+        assert!(
+            decision
+                .rationale
+                .ends_with("; 1 fallback(s): the weak tier"),
+            "the one fallback group that exists is the efficient tier: {}",
+            decision.rationale
+        );
+        for absent in ["cheaper strong targets", "the rest of"] {
+            assert!(
+                !decision.rationale.contains(absent),
+                "`{absent}` names a group that holds nothing: {}",
+                decision.rationale
+            );
+        }
+
+        // sol quotes above the head, nova below: nothing cheaper is left after
+        // the winner, but a dearer capable member is.
+        let candidates = vec![
+            hosted("sol", 0.95, 0.90),
+            hosted("nova", 0.90, 0.04),
+            hosted("luna", 0.70, 0.12),
+        ];
+        let fixture = Fixture::open()
+            .with_recipe(guard_recipe())
+            .with_signals(deescalating());
+        let decision = stage().choose(&fixture.ctx(&candidates)).await.unwrap();
+        assert!(
+            decision
+                .rationale
+                .ends_with("; 2 fallback(s): the weak tier, then the rest of the strong tier"),
+            "no cheaper capable target follows the winner, so none is named: {}",
             decision.rationale
         );
     }

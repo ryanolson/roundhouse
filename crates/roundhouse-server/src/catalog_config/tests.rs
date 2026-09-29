@@ -480,6 +480,44 @@ fn an_unset_fleet_quote_deadline_is_the_engine_default_of_500_ms() {
     );
 }
 
+/// **A zero bound is refused at load.** Zero does not mean "no bound": it
+/// abandons the residency call before the fleet can answer, so every turn that
+/// could fail open drops its local candidate as `fleet_timeout` while the fleet
+/// is healthy, and a local deployment quietly sends its traffic to hosted
+/// models. The error has to say that, or the operator reads it as pedantry.
+#[test]
+fn a_zero_fleet_quote_deadline_is_refused_at_load() {
+    let error = CatalogConfig::from_json(
+        &with_local_section(
+            r#",
+          "fleet_quote_deadline_ms": 0"#,
+        ),
+        "test",
+    )
+    .expect_err("a zero bound drops every local candidate");
+    assert!(
+        matches!(&error, CatalogError::InvalidValue { field, .. }
+            if *field == "fleet_quote_deadline_ms"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("fleet_timeout"),
+        "the refusal must say what zero would do: {error}"
+    );
+
+    // CONTROL: the smallest positive bound loads, so the refusal is about
+    // zero and not about the field being set.
+    let config = CatalogConfig::from_json(
+        &with_local_section(
+            r#",
+          "fleet_quote_deadline_ms": 1"#,
+        ),
+        "test",
+    )
+    .expect("a one-millisecond bound is short, and sayable");
+    assert_eq!(config.fleet_quote_deadline_ms, 1);
+}
+
 /// A misspelled bound is refused rather than loaded at the default, for the
 /// reason the local-latency keys are.
 #[test]

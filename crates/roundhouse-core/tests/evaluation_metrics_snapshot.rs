@@ -395,6 +395,31 @@ fn unknown_usage(call: &str, turn_index: u64, source: &str) -> ClassificationRec
     }
 }
 
+/// An unknown-usage result whose settle booked `submitted_usd` — the grant's
+/// estimate for a request that may have been billed.
+fn unknown_booked(
+    call: &str,
+    turn_index: u64,
+    source: &str,
+    submitted_usd: f64,
+    settled: SettlementAck,
+) -> ClassificationRecord {
+    ClassificationRecord {
+        call_id: ResponseId::new(call),
+        source_turn_index: turn_index,
+        source_response_id: ResponseId::new(source),
+        completed_at_ms: 5_000,
+        outcome: ClassificationOutcome::Failed {
+            reason: "transport".into(),
+            spend: EvaluationSpend::Unknown {
+                granted_usd: 2.0,
+                settled,
+                submitted_usd,
+            },
+        },
+    }
+}
+
 /// Nothing was sent, so nothing was billed: a refusal established before HTTP.
 fn refused(call: &str, turn_index: u64, source: &str) -> ClassificationRecord {
     ClassificationRecord {
@@ -1598,6 +1623,142 @@ fn a_repair_without_an_accepted_result_books_nothing() {
         "c-3 is still pending"
     );
     assert_eq!(count(&ada, &["evaluation", "results"]), 7);
+}
+
+// ---------------------------------------------------------------------------
+// Booked estimates: approximate, and never left out of the total
+// ---------------------------------------------------------------------------
+
+/// One principal's document over a log of classifier calls alone, so every
+/// dollar in `observed_cost` is an evaluation dollar.
+fn evaluation_only(log: &Log) -> Value {
+    let recorder = MetricsRecorder::new();
+    recorder.record(log.events());
+    json(&recorder.snapshot_for(&PrincipalKey::from(&ada()), &config(), 9_999))
+}
+
+/// **A booked estimate is evaluation cost, published as the estimated part.**
+///
+/// An unknown-usage call that may have reached the service settles at the
+/// grant's estimate. Leaving that booking out of the observed total made a
+/// deployment whose classifier calls failed after the write read as cheaper
+/// than one whose calls succeeded, which is the one direction a cost estimate
+/// may never err in. The split mirrors hosted spend's
+/// `frontier_spend_measured_usd` / `frontier_spend_estimated_usd`, so the
+/// reader can still tell the measured dollar from the booked one.
+#[test]
+fn a_booked_estimate_enters_the_evaluation_total_as_its_estimated_part() {
+    let mut log = Log::new("acme/ada/estimate", Some(ada()));
+    log.intent("c-u", 1, "r1", "haiku");
+    log.result(unknown_booked(
+        "c-u",
+        1,
+        "r1",
+        0.25,
+        SettlementAck::Committed,
+    ));
+    let document = evaluation_only(&log);
+
+    close(
+        dollars(&document, &["observed_cost", "evaluation_usd"]),
+        0.25,
+        "the evaluation half includes the booked estimate",
+    );
+    close(
+        dollars(&document, &["observed_cost", "total_usd"]),
+        0.25,
+        "and so does the combined total",
+    );
+    close(
+        dollars(&document, &["observed_cost", "evaluation_measured_usd"]),
+        0.0,
+        "nothing was measured",
+    );
+    close(
+        dollars(&document, &["observed_cost", "evaluation_estimated_usd"]),
+        0.25,
+        "the whole evaluation half is the estimate, and says so",
+    );
+    close(
+        dollars(&document, &["evaluation", "measured_usd"]),
+        0.0,
+        "an estimate never becomes a measured dollar",
+    );
+    close(
+        dollars(&document, &["evaluation", "estimated_usd"]),
+        0.25,
+        "the evaluation object carries the same estimated part",
+    );
+    assert_eq!(
+        at(&document, &["evaluation", "cost_incomplete"]),
+        &Value::Bool(true),
+        "an estimate is approximate: the call's real cost is still unknown, the \
+         same way an estimated serving call leaves the serving half incomplete"
+    );
+    assert_eq!(
+        at(&document, &["observed_cost", "incomplete"]),
+        &Value::Bool(true)
+    );
+}
+
+/// **A booked estimate counts while its settle is open, and once after a
+/// repair closes it.** The repair moves the settlement, never the cost.
+#[test]
+fn a_repaired_estimate_is_counted_once() {
+    let mut log = Log::new("acme/ada/estimate", Some(ada()));
+    log.intent("c-u", 1, "r1", "haiku");
+    log.result(unknown_booked(
+        "c-u",
+        1,
+        "r1",
+        0.25,
+        SettlementAck::Unconfirmed,
+    ));
+    let open = evaluation_only(&log);
+    log.repair("c-u", true);
+    let repaired = evaluation_only(&log);
+
+    for (document, state) in [(&open, "open"), (&repaired, "repaired")] {
+        close(
+            dollars(document, &["observed_cost", "evaluation_usd"]),
+            0.25,
+            &format!("{state}: the estimate is in the evaluation half exactly once"),
+        );
+        close(
+            dollars(document, &["observed_cost", "evaluation_estimated_usd"]),
+            0.25,
+            &format!("{state}: as the estimated part"),
+        );
+        close(
+            dollars(document, &["observed_cost", "total_usd"]),
+            0.25,
+            &format!("{state}: and in the combined total exactly once"),
+        );
+        let settlement = at(document, &["evaluation", "settlement"]);
+        close(
+            dollars(settlement, &["committed_usd"]) + dollars(settlement, &["unconfirmed_usd"]),
+            dollars(document, &["evaluation", "measured_usd"])
+                + dollars(document, &["evaluation", "estimated_usd"]),
+            &format!("{state}: every booked dollar is acknowledged or open, never both"),
+        );
+    }
+
+    // CONTROL: the repair really matched, so the single count above is not a
+    // repair that silently resolved nothing.
+    assert_eq!(
+        count(&open, &["evaluation", "settlement", "unconfirmed_calls"]),
+        1
+    );
+    assert_eq!(
+        count(&repaired, &["evaluation", "settlement", "repaired_calls"]),
+        1
+    );
+    close(
+        dollars(&repaired, &["evaluation", "settlement", "committed_usd"])
+            - dollars(&open, &["evaluation", "settlement", "committed_usd"]),
+        0.25,
+        "the repair moved the booked estimate into committed, once",
+    );
 }
 
 // ---------------------------------------------------------------------------

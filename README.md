@@ -1067,11 +1067,11 @@ It is reported beside the total, never added into it.
 
 The metrics JSON and dashboard report classifier costs separately from serving costs. The `evaluation` object distinguishes measured usage, unknown usage, pending intents, and calls refused before HTTP. Its `measured_usd` uses each call's recorded rates. It is not a provider invoice, and current catalog changes do not reprice it. Classifier tokens do not enter serving counters.
 
-Cost and settlement are separate observations. An unconfirmed settlement does not erase recorded usage or cost. A later repair updates the acknowledgement without adding another call or another charge. The settlement `committed_usd` includes the estimates booked for calls with unknown usage; `measured_usd` does not. Missing usage and unanswered intents keep evaluation cost incomplete. Replayed events and duplicate results count once per session and call identity.
+Cost and settlement are separate observations. An unconfirmed settlement does not erase recorded usage or cost. A later repair updates the acknowledgement without adding another call or another charge. A call with unknown usage settles at the grant's estimate if the request may have reached the service. `evaluation.estimated_usd` reports those booked estimates, counted once per call whether the settle was acknowledged, repaired or is still open. `measured_usd` never includes them. The settlement `committed_usd` includes both. Missing usage and unanswered intents keep evaluation cost incomplete, even when an estimate stands in for the missing usage, because an estimate is not what the service billed. Replayed events and duplicate results count once per session and call identity.
 
 The `evaluation.models` rows distinguish the requested model from the service-reported model. Missing reported identity stays unknown. The existing access rules apply: admin credentials see deployment totals, while turn credentials see their principal's totals.
 
-The `observed_cost` object adds catalog-priced serving spend and recorded classifier cost, with both price bases stated. Judge side calls remain in serving spend and count once. This sum is not an invoice or a measure of local hardware costs. Forwarded subscription seats remain outside the dollar amounts. `savings.total_usd` retains its existing meaning: cache savings plus routing savings.
+The `observed_cost` object adds catalog-priced serving spend and recorded classifier cost, with both price bases stated. Its `evaluation_usd` is `evaluation_measured_usd` plus `evaluation_estimated_usd`, the same measured/estimated split that hosted spend uses. The booked estimates are in the total so that a classifier call that may have been billed never reads as free. Judge side calls remain in serving spend and count once. This sum is not an invoice or a measure of local hardware costs. Forwarded subscription seats remain outside the dollar amounts. `savings.total_usd` retains its existing meaning: cache savings plus routing savings.
 
 The `covers` field identifies the included costs as `hosted_serving_and_classifier_calls`. The `serving_gaps` object reports estimated usage, hosted model rows without a reported price, and locally served calls. Local calls contribute to `serving_gaps.local_calls` because this projection does not price GPU time. These counts can overlap and must not be added together.
 
@@ -1162,7 +1162,7 @@ plane's deployment/project/member tiers.
 
 For a measured prefill rate, set the slope to `1000 / tokens_per_second`. The quote is the base plus that slope times Dynamo's effective prefill tokens. Leave the slope at zero until a measurement exists. The server loads these values into its engine configuration, but the current binary does not attach a local fleet.
 
-**Fleet residency bound.** The catalog also accepts `fleet_quote_deadline_ms`, which defaults to `500`. It bounds the Dynamo residency call on a turn that has an admitted hosted target. If the fleet returns an error or does not answer in time, the turn drops the local candidate, routes among its hosted targets, and records `local_quote_skipped` as `fleet_error` or `fleet_timeout`. A turn whose policy admits only local targets does not use this bound: it waits up to the turn deadline, and a fleet failure still fails the turn, so a local-only session never goes to a hosted model.
+**Fleet residency bound.** The catalog also accepts `fleet_quote_deadline_ms`, which defaults to `500`. Zero stops catalog loading, because it would drop every local candidate as `fleet_timeout` while the fleet is healthy. The bound applies to the Dynamo residency call on a turn that can fail open. If the fleet returns an error or does not answer in time, the turn drops the local candidate, routes among its hosted targets, and records `local_quote_skipped` as `fleet_error` or `fleet_timeout`. A turn that cannot fail open does not use this bound. That is a turn whose policy admits only local targets, a turn where no credential reaches any hosted provider, or a turn whose frontier cadence is spent. Such a turn waits up to the turn deadline, and a fleet failure still fails the turn, so a local-only session never goes to a hosted model.
 
 **Cache lifetime.** For an `anthropic_messages` target, `cache_model: {"kind": "deterministic", "ttl_ms": 3600000}` selects one-hour conversation cache markers. The catalog requires `cache_write_per_mtok_usd` to equal twice the input rate for that entry. The error names the required rate. This check also applies to Messages gateways, regardless of their configured provider name.
 
@@ -1463,7 +1463,9 @@ The live test has no `#[ignore]`. Enabling the feature includes it in an unfilte
   exchanges, so none of them is a test about the picker.
 - **A dead provider costs one attempt, not the turn** — a transport failure
   advances to the next candidate of the same tier inside one turn, one deadline
-  and **one grant settled once**; the failover crosses transports as well as
+  and **one grant settled once** (a cost-guarded turn is the exception: it
+  tries the capable members cheaper than the efficient head, then the efficient
+  tier, then the rest of the capable tier); the failover crosses transports as well as
   targets (the second attempt goes out through the second provider's own
   client); a refusal, a 401 and a 404 fail where they stand; an exhausted tier
   fails with every attempt on the record — the terminal failure included — and

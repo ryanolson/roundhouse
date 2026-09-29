@@ -84,6 +84,17 @@ pub(super) struct EvaluationCallTally {
     pub(super) measured_calls: u64,
     pub(super) measured_usd: f64,
     pub(super) unknown_usage_calls: u64,
+    /// What the settles of `unknown_usage_calls` submitted: the grant's
+    /// estimate for a request that may have been billed, zero for one that
+    /// provably never left.
+    ///
+    /// Booked here, at the one accepted result per call, and never at a
+    /// repair: a repair moves a settlement from open to acknowledged and adds
+    /// no cost, so booking at the record is what counts a repaired call once
+    /// by construction rather than by a subtraction that has to agree with it.
+    /// Kept apart from `measured_usd` because it is a ledger booking, not a
+    /// price anybody measured.
+    pub(super) estimated_usd: f64,
     pub(super) refused_calls: u64,
     pub(super) input_tokens: u64,
     pub(super) output_tokens: u64,
@@ -102,8 +113,9 @@ impl EvaluationCallTally {
                 self.input_tokens += usage.input_tokens;
                 self.output_tokens += usage.output_tokens;
             }
-            Some(EvaluationSpend::Unknown { .. }) => {
+            Some(EvaluationSpend::Unknown { submitted_usd, .. }) => {
                 self.unknown_usage_calls += 1;
+                self.estimated_usd += submitted_usd;
             }
             // Nothing was sent, so nothing was billed -- the one class that
             // is free rather than unknown, and the one with no settlement.
@@ -118,6 +130,7 @@ impl EvaluationCallTally {
         self.measured_calls += other.measured_calls;
         self.measured_usd += other.measured_usd;
         self.unknown_usage_calls += other.unknown_usage_calls;
+        self.estimated_usd += other.estimated_usd;
         self.refused_calls += other.refused_calls;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
@@ -216,6 +229,11 @@ impl EvaluationCounters {
     ///
     /// A pending intent and an unreported usage are both "somebody billed an
     /// amount nobody here can name". A refusal is not: nothing was sent.
+    ///
+    /// An unreported usage stays here even though its booked estimate is now
+    /// in the evaluation total: the estimate is a stand-in for the amount, not
+    /// the amount, the same way an estimated serving call is priced and still
+    /// counted in `ServingCostGaps::estimated_calls`.
     pub(super) fn cost_incomplete(&self) -> bool {
         self.pending() > 0 || self.all.unknown_usage_calls > 0
     }

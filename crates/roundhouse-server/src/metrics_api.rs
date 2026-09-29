@@ -572,6 +572,22 @@ mod tests {
              table, not `renderEvaluation` -- if this extraction ever widens to \
              include the wrong function, this must be the first thing to fail"
         );
+        // The scan above proves only that what the page reads exists; it
+        // cannot prove the page reads a new field. The evaluation half's
+        // booked estimate is in `evaluation_usd` and the combined total, so
+        // the page has to say how much of that figure is an estimate, the
+        // way the hosted spend note does.
+        for split in [
+            "data.evaluation.estimated_usd",
+            "data.observed_cost.evaluation_measured_usd",
+            "data.observed_cost.evaluation_estimated_usd",
+        ] {
+            assert!(
+                evaluation_table.contains(split),
+                "the evaluation panel must render `{split}`, or a booked estimate \
+                 reads as a measured dollar"
+            );
+        }
         for field in [
             "requested_model",
             "reported_model",
