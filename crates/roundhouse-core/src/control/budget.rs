@@ -116,10 +116,11 @@ pub enum BudgetWindow {
 pub enum Exhaustion {
     /// Keep serving, from our own fleet.
     ///
-    /// The default, and nearly free: local candidates are already priced at
-    /// zero dollars, so a zero grant excludes every frontier candidate and
-    /// admits every local one through the ordinary admissibility predicate.
-    /// No branch, no fallback, no special case.
+    /// The default, and nearly free: [`TurnBudget::admits`] admits every
+    /// local candidate whatever its capacity quote, so a zero grant excludes
+    /// every frontier candidate and admits every local one through the
+    /// ordinary admissibility predicate. No branch, no fallback, no special
+    /// case.
     DegradeToLocal {
         /// Whether a turn may go back to frontier when the local pool cannot
         /// serve it — see [`TurnBudget::overflow_armed`].
@@ -327,9 +328,15 @@ impl TurnBudget {
     /// **The budget axis of admissibility**: can this turn afford `candidate`?
     ///
     /// The whole of the degrade-to-local behavior, and the reason it needs no
-    /// branch anywhere else. Local candidates are priced at `0.0`
-    /// (`roundhouse-fleet/src/local.rs`), so a zero ceiling admits every local
-    /// candidate and excludes every frontier one through this one comparison.
+    /// branch anywhere else: a local candidate is always admitted, so a zero
+    /// ceiling admits every local candidate and excludes every frontier one.
+    ///
+    /// **Local is admitted by target, not by its quote.** A local quote is zero
+    /// dollars only while the catalog sets no `local_capacity_price`; with one,
+    /// it carries the capacity cost of the turn (`roundhouse-fleet/src/local.rs`).
+    /// That cost is GPU time this deployment already owns, not money the ledger
+    /// granted, so comparing it with the grant would refuse a local-only turn
+    /// under an exhausted budget — the one turn degrade-to-local exists to serve.
     ///
     /// Compared through [`amount_covers`](super::spend::amount_covers) rather
     /// than a bare `<=`: the ceiling is a grant priced by the same ledger this
@@ -343,6 +350,9 @@ impl TurnBudget {
     /// axis and not a `permits` one, and why a budget-excluded frontier model
     /// stays in `considered` and its counterfactual saving stays true.
     pub fn admits(&self, candidate: &crate::routing::Candidate) -> bool {
+        if candidate.target.is_local() {
+            return true;
+        }
         match self {
             TurnBudget::Unlimited => true,
             TurnBudget::Granted { ceiling_usd, .. } => {
@@ -465,7 +475,7 @@ mod tests {
         };
         assert!(
             spent.admits(&candidate(0.0)),
-            "local is priced at zero, so an exhausted budget still affords it"
+            "local is admitted by target, so an exhausted budget still affords it"
         );
         assert!(!spent.admits(&candidate(0.01)));
 
@@ -484,6 +494,39 @@ mod tests {
         // ceiling: a quote smaller than the tolerance itself must still be
         // excluded, or degrade-to-local stops being an exact floor.
         assert!(!spent.admits(&candidate(1e-9)));
+    }
+
+    /// **A local candidate priced at its configured capacity cost is still
+    /// admitted by an exhausted budget.** The capacity price is GPU time the
+    /// deployment owns, not ledger money, so it must not close degrade-to-local.
+    /// The funded control proves the candidate would otherwise be refused on
+    /// its price: the same quote above a small ceiling is still admitted.
+    #[test]
+    fn a_priced_local_candidate_survives_an_exhausted_budget() {
+        let priced_local = Candidate {
+            expected_cost_usd: 0.02,
+            ..candidate(0.0)
+        };
+        assert!(
+            priced_local.target.is_local(),
+            "the fixture is a local target"
+        );
+
+        let spent = TurnBudget::exhausted(Exhaustion::degrade_with_overflow());
+        assert!(
+            spent.admits(&priced_local),
+            "a priced local quote is capacity, not budget spend"
+        );
+        let tight = TurnBudget::Granted {
+            ceiling_usd: 0.01,
+            state: BudgetState::Unconstrained,
+            on_exhaustion: Exhaustion::degrade_with_overflow(),
+        };
+        assert!(tight.admits(&priced_local));
+        assert!(
+            !tight.admits(&candidate(0.02)),
+            "control: a hosted quote of the same amount is refused by the same ceiling"
+        );
     }
 
     #[test]

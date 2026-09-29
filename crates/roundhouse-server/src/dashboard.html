@@ -284,7 +284,7 @@ that the API does not have, so a hard refresh loses nothing.
       <div class="split-item">
         <div class="split-label">Router's own quote <span class="chip">cross-check</span></div>
         <div class="split-value dim" id="savings-quoted">$0.00</div>
-        <div class="split-note">What the router priced the hosted alternative at, at decision time. Not added in.</div>
+        <div class="split-note">The router's hosted quote less its local quote, at decision time. Not added in.</div>
       </div>
     </div>
     <!-- Present only when this deployment's quality priors were imported from a
@@ -722,15 +722,22 @@ that the API does not have, so a hard refresh loses nothing.
     if (data.observed_cost.evaluation_incomplete) short.push("evaluation");
     if (data.observed_cost.serving_gaps.unpriced_models > 0) short.push("unpriced serving rows");
     if (data.observed_cost.serving_gaps.estimated_calls > 0) short.push("unreported serving calls");
-    if (data.observed_cost.serving_gaps.local_calls > 0) short.push("local GPU time, never priced");
+    if (data.observed_cost.serving_gaps.local_calls > 0) short.push("local GPU time, unpriced");
     // A booked estimate is in the evaluation figure, so say how much of it is
     // one — the hosted spend note's measured/estimated split, applied here.
     const evaluationSplit = data.observed_cost.evaluation_estimated_usd > 0
       ? `; ${usd(data.observed_cost.evaluation_measured_usd)} measured · `
         + `${usd(data.observed_cost.evaluation_estimated_usd)} estimated`
       : "";
+    // Local capacity is a labelled component only when the catalog prices it;
+    // otherwise its calls are in `serving_gaps.local_calls` and the note says
+    // the total is short of them.
+    const localCapacity = data.observed_cost.local_capacity_usd === null
+      ? ""
+      : ` + ${usd(data.observed_cost.local_capacity_usd)} local capacity (configured price)`;
     $("eval-combined-note").textContent =
       `${usd(data.observed_cost.serving_usd)} serving (${costLabel(data.observed_cost.serving_basis)})`
+      + localCapacity
       + ` + ${usd(data.observed_cost.evaluation_usd)} evaluation (${costLabel(data.observed_cost.evaluation_basis)}${evaluationSplit})`
       + ` · covers ${costLabel(data.observed_cost.covers)}`
       + (data.observed_cost.incomplete ? ` · incomplete: ${short.join(", ")}` : "");
@@ -854,10 +861,10 @@ that the API does not have, so a hard refresh loses nothing.
     // strongest possible conclusion from the number least able to support it.
     if (data.observed_cost.serving_gaps.local_calls > 0) {
       notes.push(`<strong>${nf.format(data.observed_cost.serving_gaps.local_calls)} calls were served by
-        our own fleet</strong>, which bills nobody. Their GPU time is a real cost and this page does not
-        price it: the combined figure covers ${esc(costLabel(data.observed_cost.covers))} and nothing else. What
-        those turns <em>would</em> have cost hosted is the routing saving above, which is a
-        counterfactual rather than a bill.`);
+        our own fleet</strong>, which bills nobody. Their GPU time is a real cost and the catalog sets no
+        <code>local_capacity_price</code>, so this page does not price it: the combined figure covers
+        ${esc(costLabel(data.observed_cost.covers))} and nothing else, and the routing saving above is the
+        gross hosted counterfactual, not net of what local cost.`);
     }
     if (data.evaluation.settlement.unconfirmed_calls > 0) {
       notes.push(`<strong>${nf.format(data.evaluation.settlement.unconfirmed_calls)} evaluation settlements
@@ -905,8 +912,13 @@ that the API does not have, so a hard refresh loses nothing.
     $("savings-cache").textContent = usd(data.savings.cache_savings_usd);
     $("savings-routing").textContent = usd(data.savings.routing_savings_usd);
     $("savings-quoted").textContent = usd(data.savings.routing_savings_at_decision_usd);
+    // Net or gross, said every time: a routing saving that silently omitted
+    // local cost would read as proof that local serving is free.
     $("savings-routing-note").textContent =
-      `Priced against each local model's correlary, gated at ±${data.capability_band.toFixed(2)} of quality prior.`;
+      `Priced against each local model's correlary, gated at ±${data.capability_band.toFixed(2)} of quality prior. `
+      + (data.local_capacity_priced
+        ? `Net of ${usd(data.savings.local_capacity_usd)} local capacity at the catalog's configured price.`
+        : "Local capacity is unpriced, so this is gross of GPU time.");
 
     const citation = $("savings-citation");
     citation.hidden = !data.quality_prior_citation;

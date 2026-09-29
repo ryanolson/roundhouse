@@ -41,8 +41,8 @@ use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, Candidate, Decision, DecisionRecord, DecisionSource,
-    DispatchAttempt, LocalQuoteSkip, RoutingContext, RoutingError, RoutingPolicy,
-    SelectionSnapshot, Target, Tier, TierRecipe,
+    DispatchAttempt, LocalCapacityPrice, LocalQuoteSkip, RoutingContext, RoutingError,
+    RoutingPolicy, SelectionSnapshot, Target, Tier, TierRecipe,
 };
 use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
@@ -507,6 +507,13 @@ pub struct EngineConfig {
     /// to go is not held to it (see `Engine::local_quote`). Settable from the
     /// catalog; see `catalog_config::engine_config`.
     pub fleet_quote_deadline_ms: u64,
+    /// What a local turn's capacity costs, per million tokens, or `None` to
+    /// quote local at zero dollars.
+    ///
+    /// Configuration, like every price: set from the catalog's
+    /// `local_capacity_price` by `catalog_config::engine_config`, and read by
+    /// `LocalQuote::to_candidate`, whose doc says what it charges.
+    pub local_capacity_price: Option<LocalCapacityPrice>,
     pub expected_output_tokens: u32,
     /// Bounds the model work of a single turn.
     ///
@@ -543,6 +550,7 @@ impl Default for EngineConfig {
             local_base_ttft_ms: DEFAULT_LOCAL_BASE_TTFT_MS,
             local_ttft_ms_per_prefill_token: 0.0,
             fleet_quote_deadline_ms: DEFAULT_FLEET_QUOTE_DEADLINE_MS,
+            local_capacity_price: None,
             expected_output_tokens: 256,
             turn_deadline_ms: 120_000,
             arm_salt: String::new(),
@@ -2157,10 +2165,15 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
 
         let mut candidates: Vec<Candidate> = Vec::new();
         if let Some(quote) = &local_quote {
+            // Output priced at the same `expected_output_tokens` the hosted
+            // quotes above were given, so a local and a hosted dollar figure
+            // are estimates of the same turn.
             candidates.push(quote.to_candidate(
                 self.config.local_quality_prior,
                 self.config.local_base_ttft_ms,
                 self.config.local_ttft_ms_per_prefill_token,
+                self.config.local_capacity_price,
+                self.config.expected_output_tokens,
             ));
         }
         candidates.extend(frontier_quotes);

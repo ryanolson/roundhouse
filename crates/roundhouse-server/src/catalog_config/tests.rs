@@ -533,6 +533,130 @@ fn a_misspelled_fleet_quote_deadline_key_is_refused() {
     assert!(matches!(err, CatalogError::Parse { .. }), "{err}");
 }
 
+/// **A local capacity price loads and reaches both readers.** Ruling 6 of the
+/// 2026-09-28 addendum: the router quotes local turns at it and the dashboard
+/// reports local spend at it, so the engine config and the metrics config must
+/// carry the one value the file wrote.
+#[test]
+fn a_local_capacity_price_reaches_the_engine_and_the_dashboard() {
+    let config = CatalogConfig::from_json(
+        &with_local_section(
+            r#",
+          "local_capacity_price": {
+            "input_per_mtok_usd": 0.4,
+            "output_per_mtok_usd": 1.6
+          }"#,
+        ),
+        "test",
+    )
+    .expect("a local capacity price is sayable");
+    let price = LocalCapacityPrice {
+        input_per_mtok_usd: 0.4,
+        output_per_mtok_usd: 1.6,
+    };
+    assert_eq!(config.local_capacity_price, Some(price));
+    assert_eq!(
+        engine_config(Some(&config)).local_capacity_price,
+        Some(price),
+        "the router must quote local at the file's price"
+    );
+    assert_eq!(
+        config.metrics_config().local_capacity_price,
+        Some(price),
+        "the dashboard must report local spend at the price the router quoted"
+    );
+}
+
+/// **CONTROL.** Absent means unpriced, on every path: the catalog, the engine,
+/// the dashboard, and the no-catalog deployment.
+#[test]
+fn an_absent_local_capacity_price_leaves_local_unpriced() {
+    let config = CatalogConfig::from_json(&with_local_section(""), "test").unwrap();
+    assert_eq!(config.local_capacity_price, None);
+    assert_eq!(engine_config(Some(&config)).local_capacity_price, None);
+    assert_eq!(config.metrics_config().local_capacity_price, None);
+    assert_eq!(engine_config(None).local_capacity_price, None);
+}
+
+/// **A negative capacity rate is refused at load**, for the reason a negative
+/// hosted rate is: it quotes local as paying us to serve, so the router sends
+/// it everything and the dashboard reports the payment as a saving.
+#[test]
+fn a_negative_local_capacity_rate_is_refused_at_load() {
+    for (field, section) in [
+        (
+            "local_capacity_price.input_per_mtok_usd",
+            r#","local_capacity_price": { "input_per_mtok_usd": -0.1, "output_per_mtok_usd": 1.0 }"#,
+        ),
+        (
+            "local_capacity_price.output_per_mtok_usd",
+            r#","local_capacity_price": { "input_per_mtok_usd": 0.1, "output_per_mtok_usd": -1.0 }"#,
+        ),
+    ] {
+        let error = CatalogConfig::from_json(&with_local_section(section), "test")
+            .expect_err("a negative capacity rate makes local look cheaper than free");
+        assert!(
+            matches!(&error, CatalogError::InvalidValue { field: named, .. }
+                if *named == field),
+            "{field}: {error}"
+        );
+    }
+
+    // CONTROL: zero is a price an operator may write, so the refusal above is
+    // about the sign and not about the section being present.
+    let config = CatalogConfig::from_json(
+        &with_local_section(
+            r#","local_capacity_price": { "input_per_mtok_usd": 0.0, "output_per_mtok_usd": 0.0 }"#,
+        ),
+        "test",
+    )
+    .expect("a zero capacity price is sayable");
+    assert!(config.local_capacity_price.is_some());
+}
+
+/// **A non-finite capacity rate never loads.** JSON has no `NaN` or infinity
+/// literal and `serde_json` refuses a number it cannot represent as `f64`, so
+/// the refusal happens at parse -- the reason `validate` carries no finiteness
+/// guard. This pins that rationale for the new field: if the parser ever began
+/// accepting `1e400` as infinity, this is what goes red.
+#[test]
+fn a_non_finite_local_capacity_rate_is_refused_at_parse() {
+    let error = CatalogConfig::from_json(
+        &with_local_section(
+            r#","local_capacity_price": { "input_per_mtok_usd": 1e400, "output_per_mtok_usd": 1.0 }"#,
+        ),
+        "test",
+    )
+    .expect_err("an infinite rate is not a price");
+    assert!(
+        matches!(error, CatalogError::Parse { .. }) && error.to_string().contains("out of range"),
+        "the parser must refuse the number itself, not the field: {error}"
+    );
+}
+
+/// **An unknown key inside the price is refused**, not loaded and dropped. The
+/// likeliest one is a cache rate copied from a hosted entry: local has none,
+/// and a file that wrote one believes a number is in effect that is not.
+#[test]
+fn an_unknown_key_inside_the_local_capacity_price_is_refused() {
+    let error = CatalogConfig::from_json(
+        &with_local_section(
+            r#","local_capacity_price": {
+                "input_per_mtok_usd": 0.4,
+                "output_per_mtok_usd": 1.6,
+                "cached_input_per_mtok_usd": 0.04
+            }"#,
+        ),
+        "test",
+    )
+    .expect_err("local capacity has no cache rate");
+    assert!(
+        matches!(error, CatalogError::Parse { .. })
+            && error.to_string().contains("cached_input_per_mtok_usd"),
+        "the refusal must name the inner key: {error}"
+    );
+}
+
 /// **The router's capability gate and the dashboard's read one local prior.**
 /// The dashboard prices the local model at the catalog's `local_quality` entry,
 /// or its `default_local_quality` when the model has none. A router left at the

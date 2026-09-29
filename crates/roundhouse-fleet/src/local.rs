@@ -22,7 +22,7 @@ use dynamo_kv_router::services::selection::{
     PromptRequest, ReservationRequest, SelectRequest, SelectionService, WorkerRequest,
 };
 use roundhouse_core::context::TokenBuffer;
-use roundhouse_core::routing::{Candidate, Target};
+use roundhouse_core::routing::{Candidate, LocalCapacityPrice, Target};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FleetError {
@@ -169,9 +169,23 @@ impl LocalQuote {
 
     /// Project onto the common comparison axis.
     ///
-    /// Local execution is priced at zero dollars: its cost is capacity, already
-    /// captured by `expected_prefill_tokens` and `load`. Mixing an amortized
-    /// GPU cost in here would double-count.
+    /// **Dollars are the configured capacity price, or zero without one**
+    /// (ruled 2026-09-28, ruling 6 in
+    /// `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`). A
+    /// quote of zero wins every cost comparison against a hosted target and
+    /// says nothing about cost effectiveness, so a catalog may set
+    /// `local_capacity_price`, and this quote then charges the residency
+    /// answer's `effective_prefill_tokens` at its input rate plus
+    /// `expected_output_tokens` at its output rate.
+    ///
+    /// **Matched local tokens are free.** The scheduler's
+    /// `effective_prefill_tokens` already leaves out the prefix the worker
+    /// holds, and a local cache hit costs almost no capacity — the skipped
+    /// prefill is the work the price stands for. Charging matched tokens
+    /// would make a warm local worker look dearer than it is. The capacity
+    /// price is not a double count of `expected_prefill_tokens` or `load`
+    /// either: those two feed the prefill and load axes, and this is the cost
+    /// axis, which was otherwise empty for local.
     ///
     /// TTFT is `base_ttft_ms` plus the residency answer's own
     /// `effective_prefill_tokens` times a per-token slope, mirroring how a
@@ -185,6 +199,8 @@ impl LocalQuote {
         quality_prior: f64,
         base_ttft_ms: f64,
         ttft_ms_per_prefill_token: f64,
+        capacity_price: Option<LocalCapacityPrice>,
+        expected_output_tokens: u32,
     ) -> Candidate {
         Candidate {
             target: self.target(),
@@ -192,7 +208,12 @@ impl LocalQuote {
             matched_prefix_tokens: self.longest_matched_tokens as u64,
             expected_ttft_ms: base_ttft_ms
                 + self.effective_prefill_tokens as f64 * ttft_ms_per_prefill_token,
-            expected_cost_usd: 0.0,
+            expected_cost_usd: capacity_price.map_or(0.0, |price| {
+                price.price_tokens(
+                    self.effective_prefill_tokens as f64,
+                    f64::from(expected_output_tokens),
+                )
+            }),
             quality_prior,
             load: self.load,
         }
@@ -563,11 +584,11 @@ mod tests {
             load: Some(24_000.0),
         };
 
-        let candidate = quote.to_candidate(0.6, 90.0, 0.0);
+        let candidate = quote.to_candidate(0.6, 90.0, 0.0, None, 256);
         assert_eq!(candidate.expected_prefill_tokens, 512.0);
         assert_eq!(
             candidate.expected_cost_usd, 0.0,
-            "local capacity is not priced in dollars"
+            "without a configured capacity price, local quotes zero dollars"
         );
         assert_eq!(candidate.load, Some(24_000.0));
         assert!(candidate.cache_hit_ratio(4_096) > 0.87);
@@ -601,8 +622,12 @@ mod tests {
         let cold = quote_with_prefill(900);
         let per_token = 0.5;
 
-        let warm_ttft = warm.to_candidate(0.6, 60.0, per_token).expected_ttft_ms;
-        let cold_ttft = cold.to_candidate(0.6, 60.0, per_token).expected_ttft_ms;
+        let warm_ttft = warm
+            .to_candidate(0.6, 60.0, per_token, None, 256)
+            .expected_ttft_ms;
+        let cold_ttft = cold
+            .to_candidate(0.6, 60.0, per_token, None, 256)
+            .expected_ttft_ms;
 
         assert_eq!(
             cold_ttft - warm_ttft,
@@ -617,7 +642,7 @@ mod tests {
     fn a_zero_slope_reproduces_the_flat_quote() {
         let cold = quote_with_prefill(10_000);
 
-        let candidate = cold.to_candidate(0.6, 60.0, 0.0);
+        let candidate = cold.to_candidate(0.6, 60.0, 0.0, None, 256);
 
         assert_eq!(
             candidate.expected_ttft_ms, 60.0,
@@ -625,5 +650,35 @@ mod tests {
              quote exactly, regardless of how much prefill the residency \
              answer reports"
         );
+    }
+
+    #[test]
+    fn a_capacity_price_charges_uncached_prefill_and_expected_output() {
+        // 512 uncached of 4 096: the 3 584 matched tokens must cost nothing.
+        let quote = LocalQuote {
+            longest_matched_tokens: 3_584,
+            ..quote_with_prefill(512)
+        };
+        let price = LocalCapacityPrice {
+            input_per_mtok_usd: 0.5,
+            output_per_mtok_usd: 2.0,
+        };
+
+        let candidate = quote.to_candidate(0.6, 60.0, 0.0, Some(price), 256);
+
+        let expected = 512.0 * 0.5 / 1e6 + 256.0 * 2.0 / 1e6;
+        assert!(
+            (candidate.expected_cost_usd - expected).abs() < 1e-15,
+            "prefill tokens at the input rate plus expected output at the \
+             output rate, and nothing for the matched prefix: got {}, want {expected}",
+            candidate.expected_cost_usd
+        );
+    }
+
+    #[test]
+    fn without_a_capacity_price_a_local_quote_stays_at_zero() {
+        let candidate = quote_with_prefill(512).to_candidate(0.6, 60.0, 0.0, None, 256);
+
+        assert_eq!(candidate.expected_cost_usd, 0.0);
     }
 }

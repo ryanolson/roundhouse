@@ -548,9 +548,9 @@ pub async fn a_settle_at_or_below_the_watermark_is_a_no_op<L: SpendLedger>(ledge
 }
 
 pub async fn an_exhausted_project_grants_zero_rather_than_erroring<L: SpendLedger>(ledger: &L) {
-    // Zero is an ordinary answer. Degrade-to-local is one predicate — local
-    // candidates are priced at zero dollars — so a zero grant excludes frontier
-    // and admits local with no branch anywhere. An error here would instead have
+    // Zero is an ordinary answer. Degrade-to-local is one predicate — the
+    // budget admits local candidates by target — so a zero grant excludes
+    // frontier and admits local with no branch anywhere. An error here would instead have
     // to be caught and translated into that same behavior by every caller.
     let ada = fresh_principal("ada");
     let terms = terms(10.0, Allocation::Pooled);

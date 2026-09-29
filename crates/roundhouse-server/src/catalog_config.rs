@@ -34,6 +34,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use roundhouse_core::metrics::{DEFAULT_CAPABILITY_BAND, MetricsConfig};
+use roundhouse_core::routing::LocalCapacityPrice;
 use roundhouse_fleet::anthropic_messages::CacheLifetime;
 use roundhouse_fleet::{CacheLifetimeError, FrontierModelSpec, StaticFrontierCatalog};
 
@@ -109,6 +110,18 @@ pub struct CatalogConfig {
     /// engine's default when omitted. Zero is refused at load.
     #[serde(default = "default_fleet_quote_deadline_ms")]
     pub fleet_quote_deadline_ms: u64,
+    /// What our own fleet's capacity costs, per million uncached input tokens
+    /// and per million output tokens. Absent means local is unpriced.
+    ///
+    /// Ruled 2026-09-28 (ruling 6 in
+    /// `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`). The
+    /// router quotes local turns at it, and the dashboard reports local
+    /// capacity spend and a routing saving net of it. Without it local quotes
+    /// stay at zero dollars and the dashboard marks local cost unpriced rather
+    /// than free. An approximate figure is fine; the one rule is that it must
+    /// not make local look cheaper than it is.
+    #[serde(default)]
+    pub local_capacity_price: Option<LocalCapacityPrice>,
     /// The citation for imported `quality_prior`s, if a provenance file was
     /// found beside this catalog. Never read from the catalog JSON itself —
     /// see [`quality_prior_citation`].
@@ -706,6 +719,34 @@ impl CatalogConfig {
             }
         }
 
+        // The local capacity price, held to the hosted rule. A negative rate
+        // quotes local as being paid to serve: the router sends it every turn
+        // and the dashboard reports the payment as a saving. Zero is allowed;
+        // it is a price an operator may mean, and the dashboard still reports
+        // local as priced at it.
+        if let Some(price) = &self.local_capacity_price {
+            for (field, value) in [
+                (
+                    "local_capacity_price.input_per_mtok_usd",
+                    price.input_per_mtok_usd,
+                ),
+                (
+                    "local_capacity_price.output_per_mtok_usd",
+                    price.output_per_mtok_usd,
+                ),
+            ] {
+                if value < 0.0 {
+                    return Err(CatalogError::InvalidValue {
+                        path: path.to_string(),
+                        model: "<catalog>".to_string(),
+                        field,
+                        value,
+                        expected: "rates and latencies cannot be negative",
+                    });
+                }
+            }
+        }
+
         // Zero is not "no bound": it abandons the residency call before any
         // fleet can answer, so a healthy fleet loses every local candidate to
         // `fleet_timeout` and a local deployment silently serves hosted.
@@ -781,6 +822,11 @@ impl CatalogConfig {
         if let Some(citation) = &self.quality_prior_citation {
             config = config.with_quality_prior_citation(citation);
         }
+        // The price the router quotes local turns at, so local spend and the
+        // net routing saving are reported at the rate the turn was chosen on.
+        if let Some(price) = self.local_capacity_price {
+            config = config.with_local_capacity_price(price);
+        }
         config
     }
 }
@@ -798,8 +844,8 @@ pub fn from_env() -> Result<Option<CatalogConfig>, CatalogError> {
     }
 }
 
-/// Apply the catalog's local latency values, local quality prior, and fleet
-/// residency bound to the engine defaults.
+/// Apply the catalog's local latency values, local quality prior, local
+/// capacity price, and fleet residency bound to the engine defaults.
 ///
 /// The no-catalog path uses the same defaults as an omitted field. Keeping this
 /// composition beside the loader lets tests exercise it without booting a server.
@@ -824,6 +870,7 @@ pub fn engine_config(config: Option<&CatalogConfig>) -> EngineConfig {
         local_base_ttft_ms: config.local_base_ttft_ms,
         local_ttft_ms_per_prefill_token: config.local_ttft_ms_per_prefill_token,
         fleet_quote_deadline_ms: config.fleet_quote_deadline_ms,
+        local_capacity_price: config.local_capacity_price,
         ..defaults
     }
 }

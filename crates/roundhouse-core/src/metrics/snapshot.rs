@@ -23,8 +23,8 @@ pub use columns::{
 };
 pub use cost::{
     EVALUATION_PRICE_BASIS, EvaluationMetrics, EvaluationModelMetrics, EvaluationSettlement,
-    EvaluationTokens, EvaluationUnbooked, OBSERVED_COST_SCOPE, ObservedCost, SERVING_PRICE_BASIS,
-    ServingCostGaps,
+    EvaluationTokens, EvaluationUnbooked, OBSERVED_COST_SCOPE,
+    OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY, ObservedCost, SERVING_PRICE_BASIS, ServingCostGaps,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -35,6 +35,7 @@ use crate::event::Usage;
 use crate::metrics::ServingMode;
 use crate::metrics::fold::{MetricsFold, Scope};
 use crate::metrics::pricing::{Correlary, ReferenceModel, ShadowPricing, TokenShape};
+use crate::routing::LocalCapacityPrice;
 
 /// Token counts for one grouping, split the way a reader asks about them.
 ///
@@ -169,6 +170,17 @@ pub enum ModelAccounting {
         /// seat's. See the hosted arm's own field for why this is a count
         /// beside `seat_tokens` rather than folded into it.
         seat_estimated_calls: u64,
+        /// What this row's GPU time cost at the catalog's
+        /// `local_capacity_price`, or `null` when the catalog sets none.
+        ///
+        /// **`null` and never `0.0` when unpriced**: a zero here would read as
+        /// traffic that cost nothing, which is the claim ruling 6 of the
+        /// 2026-09-28 addendum exists to stop. Over the whole row, a seat's
+        /// share included, because the hardware is this deployment's whoever
+        /// the caller's hosted alternative would have billed. Charged on
+        /// uncached prompt plus output, the router's own rule; a serving plane
+        /// that reports no cache reads is therefore charged its whole prompt.
+        capacity_usd: Option<f64>,
     },
     /// Issued to an external endpoint: bills real money.
     Frontier {
@@ -294,6 +306,15 @@ impl ModelMetrics {
         }
     }
 
+    /// Local capacity spend, or `None` for a hosted row or an unpriced local
+    /// one. See [`ModelAccounting::Local::capacity_usd`].
+    pub fn capacity_usd(&self) -> Option<f64> {
+        match self.accounting {
+            ModelAccounting::Local { capacity_usd, .. } => capacity_usd,
+            ModelAccounting::Frontier { .. } => None,
+        }
+    }
+
     pub fn cache_savings_usd(&self) -> f64 {
         match self.accounting {
             ModelAccounting::Local { .. } => 0.0,
@@ -364,6 +385,11 @@ pub struct Rollup {
     pub billed_measured_usd: f64,
     pub billed_estimated_usd: f64,
     pub shadow_usd: f64,
+    /// Local capacity spend over the rows that are priced, or `null` when no
+    /// row in this aggregate carries a capacity price — a hosted aggregate, or
+    /// local traffic the catalog does not price. Never a `0.0` that reads as
+    /// free.
+    pub capacity_usd: Option<f64>,
     pub cache_savings_usd: f64,
 }
 
@@ -378,6 +404,9 @@ impl Rollup {
         self.billed_measured_usd += row.billed_measured_usd();
         self.billed_estimated_usd += row.billed_estimated_usd();
         self.shadow_usd += row.shadow_usd();
+        if let Some(capacity) = row.capacity_usd() {
+            self.capacity_usd = Some(self.capacity_usd.unwrap_or(0.0) + capacity);
+        }
         self.cache_savings_usd += row.cache_savings_usd();
     }
 }
@@ -437,17 +466,35 @@ pub struct Savings {
     /// observable bears on what a remote cache did, so an estimated call
     /// contributes exactly zero here rather than a guess.
     pub cache_savings_usd: f64,
+    /// Local capacity spend: our own fleet's GPU time at the catalog's
+    /// `local_capacity_price`, over every local row. `None` when the catalog
+    /// sets no price, so an unpriced fleet never reads as a free one.
+    ///
+    /// A spend beside `frontier_spend_usd`, not part of it: that figure is
+    /// money hosted providers billed, and this is a configured approximation
+    /// of hardware this deployment already owns.
+    pub local_capacity_usd: Option<f64>,
     /// Estimated. What local traffic would have cost on its correlary — a call
-    /// that never happened, priced against a model chosen by [`pricing`].
+    /// that never happened, priced against a model chosen by [`pricing`] —
+    /// **less what it cost in local capacity** when the catalog prices it.
     ///
     /// A *saving*, so it counts only the local turns whose hosted alternative
     /// would have been this deployment's money. A pass-through project's local
     /// turn passed over a call its caller's seat would have paid for, and there
     /// is no sense in which roundhouse saved that.
+    ///
+    /// **Net, and allowed to go negative.** Serving locally is a saving only by
+    /// the amount the hosted call would have cost *more* than the GPU time, so
+    /// the capacity cost of the same priceable turns is subtracted. It is
+    /// subtracted only on rows whose correlary is priced: a row with no hosted
+    /// counterpart makes no saving claim to net against, and its capacity cost
+    /// is still in `local_capacity_usd`. A negative figure is the honest signal
+    /// that local cost more than the hosted alternative, and is not clamped.
     pub routing_savings_usd: f64,
     /// Estimated, independently. The same quantity as `routing_savings_usd`
     /// but taken from the router's own quotes at decision time rather than
-    /// from a correlary.
+    /// from a correlary: the cheapest hosted quote less the local quote the
+    /// turn was served on, which carries the capacity price the router used.
     ///
     /// Kept as a cross-check, not added into the total. Two estimates of one
     /// counterfactual built from different inputs — one from a rate card and a
@@ -549,6 +596,13 @@ pub struct MetricsSnapshot {
     /// rather than any one figure. The dashboard renders it under the savings
     /// hero, which is where the derived number it attributes is published.
     pub quality_prior_citation: Option<String>,
+    /// Whether the catalog sets a local capacity price.
+    ///
+    /// `false` means every local figure on this document that could be a
+    /// dollar is unpriced — `savings.local_capacity_usd` and each local row's
+    /// `capacity_usd` are `null`, and `routing_savings_usd` is the gross
+    /// counterfactual — so a reader cannot take local serving as free.
+    pub local_capacity_priced: bool,
 }
 
 /// What the snapshot needs beyond the fold: rate cards, declared correlaries,
@@ -573,6 +627,14 @@ pub struct MetricsConfig {
     /// provenance file beside the catalog; see `catalog_config` in
     /// `roundhouse-server` (M10 review G12).
     pub quality_prior_citation: Option<String>,
+    /// What our own fleet's capacity costs, or `None` when the catalog sets no
+    /// price.
+    ///
+    /// The same value the router quotes local turns at (`catalog_config` in
+    /// `roundhouse-server` hands one figure to both), so local capacity spend
+    /// and the net routing saving are priced at the rate the decision was made
+    /// on. `None` publishes local cost as unpriced, never as zero.
+    pub local_capacity_price: Option<LocalCapacityPrice>,
 }
 
 impl MetricsConfig {
@@ -582,7 +644,13 @@ impl MetricsConfig {
             local_quality_priors: HashMap::new(),
             default_local_quality_prior: 0.5,
             quality_prior_citation: None,
+            local_capacity_price: None,
         }
+    }
+
+    pub fn with_local_capacity_price(mut self, price: LocalCapacityPrice) -> Self {
+        self.local_capacity_price = Some(price);
+        self
     }
 
     pub fn with_quality_prior_citation(mut self, citation: impl Into<String>) -> Self {
@@ -645,6 +713,13 @@ impl MetricsSnapshot {
         let rows = &view.rows;
         let frontier_shapes = view.frontier_shapes();
 
+        let capacity_price = config.local_capacity_price;
+        // The capacity cost of the priceable local turns whose saving is
+        // counted, taken off `routing_savings_usd` below. Summed here rather
+        // than through `Rollup`, because it is not a figure any row publishes:
+        // each local row publishes its whole capacity spend (a seat's share
+        // included), and this is the part of that spend the saving offsets.
+        let mut routing_capacity_offset_usd = 0.0;
         let mut models = Vec::with_capacity(rows.len());
         for (key, counters) in rows.iter() {
             let total_usage = counters.total_usage();
@@ -733,6 +808,15 @@ impl MetricsSnapshot {
                         // operator wrote down — `resolve` holds that order.
                         counters.declared_baseline.resolved(),
                     );
+                    // Netted only where there is a saving to net: a row with
+                    // no priced correlary claims none, so subtracting its
+                    // capacity would publish a loss against an alternative
+                    // nobody could price.
+                    if let Some(price) = capacity_price
+                        && correlary.reference().is_some()
+                    {
+                        routing_capacity_offset_usd += price.price(priceable.tokens());
+                    }
                     ModelAccounting::Local {
                         // Pooled like a hosted row's, though today no local
                         // dispatch reports a cache write and every one of them
@@ -745,6 +829,7 @@ impl MetricsSnapshot {
                         correlary,
                         seat_tokens,
                         seat_estimated_calls,
+                        capacity_usd: capacity_price.map(|price| price.price(&total_usage)),
                     }
                 }
             };
@@ -791,14 +876,18 @@ impl MetricsSnapshot {
             totals.absorb(model);
         }
 
+        let routing_savings_usd = totals.shadow_usd - routing_capacity_offset_usd;
         let savings = Savings {
             frontier_spend_usd: totals.billed_usd,
             frontier_spend_measured_usd: totals.billed_measured_usd,
             frontier_spend_estimated_usd: totals.billed_estimated_usd,
             cache_savings_usd: totals.cache_savings_usd,
-            routing_savings_usd: totals.shadow_usd,
-            routing_savings_at_decision_usd: rows.values().map(|c| c.quoted_alternative_usd).sum(),
-            total_usd: totals.cache_savings_usd + totals.shadow_usd,
+            // `Some(0.0)` on a priced deployment with no local traffic: the
+            // price exists and nothing was spent at it.
+            local_capacity_usd: capacity_price.map(|_| totals.capacity_usd.unwrap_or(0.0)),
+            routing_savings_usd,
+            routing_savings_at_decision_usd: rows.values().map(|c| c.quoted_saving_usd).sum(),
+            total_usd: totals.cache_savings_usd + routing_savings_usd,
             // Summed straight off the rows rather than through `Rollup`, which
             // is the accumulator every *catalog-priced* figure above goes
             // through. Keeping it out of that pass is the mechanical half of
@@ -824,6 +913,7 @@ impl MetricsSnapshot {
         // the only input to the half beside it.
         let observed_cost = ObservedCost::build(
             savings.frontier_spend_usd,
+            savings.local_capacity_usd,
             ServingCostGaps::of(&models, &totals.coverage),
             &evaluation,
         );
@@ -849,6 +939,7 @@ impl MetricsSnapshot {
             serving_modes,
             capability_band: config.pricing.capability_band(),
             quality_prior_citation: config.quality_prior_citation.clone(),
+            local_capacity_priced: capacity_price.is_some(),
         }
     }
 }

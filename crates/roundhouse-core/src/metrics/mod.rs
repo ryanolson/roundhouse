@@ -38,9 +38,10 @@
 //!   its two published rates. Measured.
 //! - [`Savings::routing_savings_usd`] is a **counterfactual**: what our own
 //!   fleet's traffic would have cost had it gone to a comparable hosted model
-//!   instead. There is no measurement of a call that never happened, so this
-//!   rests entirely on the correlary chosen in [`pricing`], and it is only as
-//!   good as that choice.
+//!   instead, less that traffic's local capacity cost when the catalog sets a
+//!   `local_capacity_price`. There is no measurement of a call that never
+//!   happened, so this rests entirely on the correlary chosen in [`pricing`],
+//!   and it is only as good as that choice.
 //!
 //! A single total would hide that distinction, so the snapshot reports all
 //! three and lets the reader decide which claim to make.
@@ -69,13 +70,17 @@
 //! routing savings, which is a different question with a different answer.
 //!
 //! **It is also not all economic cost, and it says so.** What it covers is
-//! money that left the building —
-//! [`OBSERVED_COST_SCOPE`] names it on the wire. Two kinds of traffic are
-//! counted everywhere else here and priced nowhere, so the total passes over
-//! both: a turn our own fleet answered, and a turn on a forwarded subscription
-//! seat. Neither has a per-token price this projection could state without
-//! inventing one, so both are published as counts —
-//! [`ServingCostGaps::local_calls`] and [`MetricsSnapshot::seat_tokens`].
+//! money that left the building, plus our own fleet's GPU time when the
+//! catalog sets a `local_capacity_price` —
+//! [`OBSERVED_COST_SCOPE`] or [`OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY`]
+//! names which on the wire. Otherwise two kinds of traffic are counted
+//! everywhere else here and priced nowhere, so the total passes over both: a
+//! turn our own fleet answered, and a turn on a forwarded subscription seat.
+//! Neither has a per-token price this projection could state without inventing
+//! one, so both are published as counts — [`ServingCostGaps::local_calls`] and
+//! [`MetricsSnapshot::seat_tokens`]. A configured capacity price is the
+//! deployment's own statement of what its GPU time is worth, so with one the
+//! local turns are priced at it (ruled 2026-09-28) and are no longer a gap.
 //!
 //! Only the first makes the total *incomplete*, and the difference is whose
 //! money it is: GPU time is this deployment's cost, paid in hardware rather than
@@ -127,9 +132,10 @@ pub use snapshot::{
     CacheReuseEvidence, Coverage, EVALUATION_PRICE_BASIS, EvaluationMetrics,
     EvaluationModelMetrics, EvaluationSettlement, EvaluationTokens, EvaluationUnbooked,
     FIRST_OUTPUT_BASIS, IntervalMetric, MetricsConfig, MetricsSnapshot, ModelAccounting,
-    ModelMetrics, OBSERVED_CACHE_BASIS, OBSERVED_COST_SCOPE, ObservedCost, PREDICTED_CACHE_BASIS,
-    ProviderMetrics, Rollup, SERVING_PRICE_BASIS, Savings, ServingCostGaps, ServingModeMetrics,
-    TURN_ELAPSED_BASIS, TokenBreakdown,
+    ModelMetrics, OBSERVED_CACHE_BASIS, OBSERVED_COST_SCOPE,
+    OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY, ObservedCost, PREDICTED_CACHE_BASIS, ProviderMetrics,
+    Rollup, SERVING_PRICE_BASIS, Savings, ServingCostGaps, ServingModeMetrics, TURN_ELAPSED_BASIS,
+    TokenBreakdown,
 };
 
 /// The provider name local targets are grouped under.
@@ -150,7 +156,8 @@ pub const LOCAL_PROVIDER: &str = "dynamo";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServingMode {
-    /// Served by our own Dynamo fleet. Bills nothing; costs GPU time.
+    /// Served by our own Dynamo fleet. Bills nobody; costs GPU time, which the
+    /// catalog may price with `local_capacity_price`.
     Local,
     /// Issued to an external endpoint. Bills real money.
     Frontier,
@@ -308,7 +315,7 @@ mod tests {
     use crate::event::{Accounting, IncompleteReason, SessionEventKind, Usage};
     use crate::ids::{ResponseId, TurnId};
     use crate::metrics::fold::tests::{LogBuilder, candidate, frontier, local, principal, usage};
-    use crate::routing::{DecisionRecord, ProviderPricing};
+    use crate::routing::{DecisionRecord, LocalCapacityPrice, ProviderPricing};
 
     const HOSTED: ProviderPricing = ProviderPricing {
         input_per_mtok_usd: 3.0,
@@ -943,5 +950,191 @@ mod tests {
         let shadow = 100_000.0 * 3.75e-6 + 1_000.0 * 15.0e-6;
         assert!((paid.savings.routing_savings_usd - shadow).abs() < 1e-12);
         assert!((paid.savings.routing_savings_at_decision_usd - 0.05).abs() < 1e-12);
+    }
+
+    /// A local capacity price at 0.5 / 2.0 per Mtok, distinct from every
+    /// hosted rate so a term billed at the wrong rate cannot cancel out.
+    const CAPACITY: LocalCapacityPrice = LocalCapacityPrice {
+        input_per_mtok_usd: 0.5,
+        output_per_mtok_usd: 2.0,
+    };
+
+    fn priced_snapshot(fold: &MetricsFold) -> MetricsSnapshot {
+        MetricsSnapshot::build(
+            fold,
+            Scope::Deployment,
+            &config().with_local_capacity_price(CAPACITY),
+            9_999,
+        )
+    }
+
+    /// **With a price, local capacity spend is reported and the routing saving
+    /// is net of it** (ruling 6, 2026-09-28). Both savings estimates move: the
+    /// correlary one loses the capacity cost, and the at-decision one loses
+    /// the local quote the router actually served on.
+    #[test]
+    fn a_priced_local_capacity_is_reported_and_nets_the_routing_saving() {
+        let mut log = LogBuilder::new("s1");
+        log.turn(
+            "r1",
+            local("llama"),
+            vec![candidate(frontier("anthropic", "claude"), 0.05)],
+            usage(100_000, 90_000, 1_000, 0),
+        )
+        .quoted(0.004);
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        let priced = priced_snapshot(&fold);
+
+        // 10k uncached at 0.5 plus 1k output at 2.0: the 90k cached tokens are free.
+        let capacity = 10_000.0 * 0.5e-6 + 1_000.0 * 2.0e-6;
+        let shadow = 10_000.0 * 3.75e-6 + 90_000.0 * 0.3e-6 + 1_000.0 * 15.0e-6;
+        assert!(priced.local_capacity_priced);
+        let reported = priced
+            .savings
+            .local_capacity_usd
+            .expect("a priced catalog reports local capacity spend");
+        assert!(
+            (reported - capacity).abs() < 1e-12,
+            "{reported} is not {capacity}"
+        );
+        let row = priced
+            .models
+            .iter()
+            .find(|row| row.mode() == ServingMode::Local)
+            .expect("the local turn has a row");
+        assert!((row.capacity_usd().unwrap() - capacity).abs() < 1e-12);
+        assert!(
+            (row.shadow_usd() - shadow).abs() < 1e-12,
+            "the row's shadow stays gross"
+        );
+        assert!(
+            (priced.savings.routing_savings_usd - (shadow - capacity)).abs() < 1e-12,
+            "the routing saving must be net of local capacity: {}",
+            priced.savings.routing_savings_usd
+        );
+        assert!(
+            (priced.savings.total_usd
+                - (priced.savings.cache_savings_usd + priced.savings.routing_savings_usd))
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (priced.savings.routing_savings_at_decision_usd - (0.05 - 0.004)).abs() < 1e-12,
+            "the router's own saving is its hosted quote less its local quote: {}",
+            priced.savings.routing_savings_at_decision_usd
+        );
+        let local_mode = priced
+            .serving_modes
+            .iter()
+            .find(|mode| mode.mode == ServingMode::Local)
+            .unwrap();
+        assert!((local_mode.totals.capacity_usd.unwrap() - capacity).abs() < 1e-12);
+
+        // The combined cost carries it as a labelled component, and local is
+        // no longer a gap in it.
+        let cost = &priced.observed_cost;
+        assert!((cost.local_capacity_usd.unwrap() - capacity).abs() < 1e-12);
+        assert!(
+            (cost.total_usd - (cost.serving_usd + capacity + cost.evaluation_usd)).abs() < 1e-12
+        );
+        assert_eq!(
+            cost.serving_gaps.local_calls, 0,
+            "priced local calls are not a gap"
+        );
+        assert_eq!(cost.covers, OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY);
+    }
+
+    /// **Capacity spend covers a seat's local turn; the net saving subtracts
+    /// only the capacity of the turns whose saving it counts.** The GPU is
+    /// ours whoever pays for the hosted alternative, so the spend is whole; a
+    /// seat's turn contributes no saving, so it has nothing to be netted from.
+    #[test]
+    fn local_capacity_covers_a_seats_turn_but_nets_only_the_saving_it_offsets() {
+        let mut log = LogBuilder::new("s1");
+        log.turn(
+            "r1",
+            local("llama"),
+            vec![candidate(frontier("anthropic", "claude"), 0.05)],
+            usage(100_000, 0, 1_000, 0),
+        );
+        log.seat_turn(
+            "r2",
+            local("llama"),
+            vec![candidate(frontier("anthropic", "claude"), 0.05)],
+            usage(40_000, 0, 500, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        let priced = priced_snapshot(&fold);
+
+        let billed_capacity = 100_000.0 * 0.5e-6 + 1_000.0 * 2.0e-6;
+        let seat_capacity = 40_000.0 * 0.5e-6 + 500.0 * 2.0e-6;
+        let shadow = 100_000.0 * 3.75e-6 + 1_000.0 * 15.0e-6;
+        assert!(
+            (priced.savings.local_capacity_usd.unwrap() - (billed_capacity + seat_capacity)).abs()
+                < 1e-12
+        );
+        assert!(
+            (priced.savings.routing_savings_usd - (shadow - billed_capacity)).abs() < 1e-12,
+            "only the billed turn's capacity offsets the billed turn's saving: {}",
+            priced.savings.routing_savings_usd
+        );
+    }
+
+    /// **Without a price, the document marks local cost unpriced rather than
+    /// free**, and every figure is what it was before the price existed.
+    #[test]
+    fn without_a_local_capacity_price_local_cost_is_marked_unpriced() {
+        let mut log = LogBuilder::new("s1");
+        log.turn(
+            "r1",
+            local("llama"),
+            vec![candidate(frontier("anthropic", "claude"), 0.05)],
+            usage(100_000, 0, 1_000, 0),
+        );
+
+        let mut fold = MetricsFold::new();
+        fold.extend(log.events());
+        let unpriced = snapshot(&fold);
+
+        assert!(!unpriced.local_capacity_priced);
+        assert_eq!(unpriced.savings.local_capacity_usd, None);
+        let shadow = 100_000.0 * 3.75e-6 + 1_000.0 * 15.0e-6;
+        assert!((unpriced.savings.routing_savings_usd - shadow).abs() < 1e-12);
+        assert!((unpriced.savings.routing_savings_at_decision_usd - 0.05).abs() < 1e-12);
+        assert_eq!(unpriced.observed_cost.local_capacity_usd, None);
+        assert_eq!(unpriced.observed_cost.serving_gaps.local_calls, 1);
+        assert!(unpriced.observed_cost.incomplete);
+        assert_eq!(unpriced.observed_cost.covers, OBSERVED_COST_SCOPE);
+
+        // On the wire: an explicit `false` and `null`s, never a zero that
+        // reads as free.
+        let json = serde_json::to_value(&unpriced).unwrap();
+        assert_eq!(json["local_capacity_priced"], false);
+        assert!(
+            json["savings"]["local_capacity_usd"].is_null(),
+            "{}",
+            json["savings"]
+        );
+        let row = json["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["mode"] == "local")
+            .unwrap();
+        assert!(row["capacity_usd"].is_null(), "{row}");
+        let local_mode = json["serving_modes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|mode| mode["mode"] == "local")
+            .unwrap();
+        assert!(
+            local_mode["capacity_usd"].is_null(),
+            "an unpriced aggregate must not publish a zero: {local_mode}"
+        );
     }
 }

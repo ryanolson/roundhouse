@@ -36,7 +36,10 @@ pub mod policy;
 pub mod selection;
 pub mod stage;
 
-pub use ledger::{BlockMarker, CacheLedger, CacheModel, LedgerEntry, PooledUsage, ProviderPricing};
+pub use ledger::{
+    BlockMarker, CacheLedger, CacheModel, LedgerEntry, LocalCapacityPrice, PooledUsage,
+    ProviderPricing,
+};
 pub use policy::{AffinityPolicy, EscalationPolicy};
 pub use selection::{
     AffinityEvidence, FEATURE_EXTRACTOR_REVISION, LocalFeatures, SelectionSnapshot, SelectorBranch,
@@ -913,9 +916,9 @@ impl DecisionRecord {
     /// and therefore worth reporting beside that one rather than instead of it.
     ///
     /// On the record rather than in the fold that first needed it, because it is
-    /// a question about a decision and there are now two readers: the metrics
-    /// fold sums it into `routing_savings_at_decision_usd`, and the Relay
-    /// emission publishes it per turn. Two copies of a `min` over the same
+    /// a question about a decision with more than one reader: the Relay
+    /// emission publishes it per turn, and [`Self::quoted_routing_saving_usd`]
+    /// nets it for the metrics fold. Two copies of a `min` over the same
     /// vector would agree until one of them learned about a new candidate kind.
     ///
     /// `None` for a hosted dispatch, and that is not the same as zero: there is
@@ -929,6 +932,24 @@ impl DecisionRecord {
             .filter(|candidate| !candidate.target.is_local())
             .map(|candidate| candidate.expected_cost_usd)
             .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    /// What choosing local saved by the router's own quotes: the cheapest
+    /// hosted quote less the local quote this decision served on, or `None`
+    /// when it did not choose local or no hosted target was quoted.
+    ///
+    /// What the metrics fold sums into `routing_savings_at_decision_usd`. The
+    /// Relay emission still publishes the gross alternative; netting it there
+    /// is a follow-up (see `agent-docs/PLAN-cache-affinity.md`, the
+    /// 2026-09-28 local capacity note). The local quote is zero while the
+    /// catalog sets no `local_capacity_price`, so every log written before
+    /// one could be set reads exactly as it did. With a price, the saving is
+    /// net of the capacity cost the router itself used, and it can be
+    /// negative: a local turn the router chose on other axes can cost more
+    /// than the hosted one it passed over.
+    pub fn quoted_routing_saving_usd(&self) -> Option<f64> {
+        self.quoted_frontier_alternative_usd()
+            .map(|alternative| alternative - self.expected_cost_usd)
     }
 }
 

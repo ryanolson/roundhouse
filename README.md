@@ -1005,7 +1005,7 @@ them into one:
 |---|---|
 | Spent on hosted endpoints | **Split.** Reported against the rate card, and reported *apart* from the part priced off our own tokenizer when a provider stayed silent — see below. |
 | Provider cache discount | **Measured**, wholly, even at partial coverage. An unreported call records zero cache reads rather than a guess, so it contributes nothing here. |
-| Served locally instead | **Estimated.** A counterfactual: what our own fleet's traffic would have cost on a comparable hosted model. |
+| Served locally instead | **Estimated.** A counterfactual: what our own fleet's traffic would have cost on a comparable hosted model, less its local capacity cost when the catalog sets `local_capacity_price`. |
 
 Hosted spend is not one number labelled measured. The fold keeps
 provider-reported and self-counted tokens in separate accumulators and prices
@@ -1029,7 +1029,7 @@ still see the traffic it is carrying. The turn's decision records which it is,
 so the ledger, a successor process repairing a lost settle, and the dashboard
 all read one recorded fact rather than three re-derivations of it.
 
-Only the third needs an argument. A local worker bills nothing, so its saving is
+Only the third needs an argument. A local worker bills nobody, so its saving is
 the difference against a call that never happened — which means naming a hosted
 model it stands in for. That stand-in is a model's **correlary**, chosen by
 declaration where someone has stated one (the only kind of answer that can
@@ -1057,11 +1057,13 @@ routing there all along, its prefix cache would have been warm about as often as
 our own is.
 
 As a cross-check the snapshot also carries what the router itself quoted for the
-best hosted alternative at the moment it chose local, taken from the decision
-record rather than from a rate card. Two independent estimates of one
+best hosted alternative at the moment it chose local, less the local quote it
+served on, taken from the decision record rather than from a rate card. Two independent estimates of one
 counterfactual should land near each other; when they do not, one of the two
 models is wrong, and that disagreement is worth more than either number alone.
 It is reported beside the total, never added into it.
+
+**Local capacity cost.** Local GPU time is not free, and a saving that ignores it overstates what serving locally saved. When the catalog sets `local_capacity_price` (see the catalog section), the snapshot reports `savings.local_capacity_usd` and each local row's `capacity_usd`: uncached prompt tokens at the input rate plus output tokens at the output rate. Cached local tokens are free, because a local cache hit skips the prefill the price stands for. A serving plane that reports no cache reads is charged its whole prompt, which errs towards more cost. The capacity spend covers every local turn, including a forwarded seat's, because the hardware is this deployment's. `routing_savings_usd` then subtracts the capacity cost of the same priceable turns whose saving it counts, only on rows with a priced correlary, and it can go negative. `routing_savings_at_decision_usd` is the router's cheapest hosted quote less the local quote it served on, which already carries the price. Without a price, `local_capacity_priced` is `false`, both capacity fields are `null`, and `routing_savings_usd` is the gross counterfactual. The dashboard says which case applies. The Relay emission still publishes the gross figures.
 
 ### Classifier evaluation costs
 
@@ -1071,13 +1073,13 @@ Cost and settlement are separate observations. An unconfirmed settlement does no
 
 The `evaluation.models` rows distinguish the requested model from the service-reported model. Missing reported identity stays unknown. The existing access rules apply: admin credentials see deployment totals, while turn credentials see their principal's totals.
 
-The `observed_cost` object adds catalog-priced serving spend and recorded classifier cost, with both price bases stated. Its `evaluation_usd` is `evaluation_measured_usd` plus `evaluation_estimated_usd`, the same measured/estimated split that hosted spend uses. The booked estimates are in the total so that a classifier call that may have been billed never reads as free. Judge side calls remain in serving spend and count once. This sum is not an invoice or a measure of local hardware costs. Forwarded subscription seats remain outside the dollar amounts. `savings.total_usd` retains its existing meaning: cache savings plus routing savings.
+The `observed_cost` object adds catalog-priced serving spend, local capacity spend when the catalog prices it (`local_capacity_usd`, otherwise `null`), and recorded classifier cost, with both price bases stated. Its `evaluation_usd` is `evaluation_measured_usd` plus `evaluation_estimated_usd`, the same measured/estimated split that hosted spend uses. The booked estimates are in the total so that a classifier call that may have been billed never reads as free. Judge side calls remain in serving spend and count once. This sum is not an invoice. Its local capacity part is a configured approximation, not a measurement of hardware cost. Forwarded subscription seats remain outside the dollar amounts. `savings.total_usd` retains its existing meaning: cache savings plus routing savings.
 
-The `covers` field identifies the included costs as `hosted_serving_and_classifier_calls`. The `serving_gaps` object reports estimated usage, hosted model rows without a reported price, and locally served calls. Local calls contribute to `serving_gaps.local_calls` because this projection does not price GPU time. These counts can overlap and must not be added together.
+The `covers` field identifies the included costs as `hosted_serving_and_classifier_calls`, or `hosted_serving_local_capacity_and_classifier_calls` when local capacity is priced. The `serving_gaps` object reports estimated usage, hosted model rows without a reported price, and locally served calls without a capacity price. Local calls contribute to `serving_gaps.local_calls` only while the catalog sets no `local_capacity_price`. These counts can overlap and must not be added together.
 
 Hosted model rows expose `priced_by_catalog` to distinguish a configured zero rate from a missing catalog entry. Missing-price counts and dashboard warnings use this field. A zero-dollar total alone does not imply missing pricing.
 
-The combined `incomplete` flag includes serving gaps and incomplete evaluation cost. Complete classifier accounting therefore cannot make an incomplete serving total appear complete. On a deployment with local traffic, this flag remains true even with fully reported token usage. Use the individual gap counts to distinguish excluded hardware costs from missing usage or pricing.
+The combined `incomplete` flag includes serving gaps and incomplete evaluation cost. Complete classifier accounting therefore cannot make an incomplete serving total appear complete. On a deployment with local traffic and no local capacity price, this flag remains true even with fully reported token usage. Use the individual gap counts to distinguish excluded hardware costs from missing usage or pricing.
 
 ### Usage has to be asked for
 
@@ -1161,6 +1163,8 @@ plane's deployment/project/member tiers.
 **Local latency configuration.** The catalog accepts `local_base_ttft_ms` and `local_ttft_ms_per_prefill_token` alongside the hosted models' latency fields. They default to `60.0` ms and `0.0`. Negative values stop catalog loading.
 
 For a measured prefill rate, set the slope to `1000 / tokens_per_second`. The quote is the base plus that slope times Dynamo's effective prefill tokens. Leave the slope at zero until a measurement exists. The server loads these values into its engine configuration, but the current binary does not attach a local fleet.
+
+**Local capacity price.** The catalog accepts an optional `local_capacity_price`: `{ "input_per_mtok_usd": ..., "output_per_mtok_usd": ... }`, in dollars per million tokens. It has no cache rates, and an unknown key inside it stops catalog loading, as does a negative rate. With it, a local candidate's `expected_cost_usd` is Dynamo's effective prefill tokens at the input rate plus the engine's expected output tokens at the output rate, so a local worker can lose on cost to a cheaper hosted target. Matched local tokens are free. Without it, local candidates quote `$0` and the dashboard marks local cost unpriced. A budget never refuses a local candidate because of this price: it is GPU time the deployment owns, not budget spend, so an exhausted budget still degrades to local.
 
 **Fleet residency bound.** The catalog also accepts `fleet_quote_deadline_ms`, which defaults to `500`. Zero stops catalog loading, because it would drop every local candidate as `fleet_timeout` while the fleet is healthy. The bound applies to the Dynamo residency call on a turn that can fail open. If the fleet returns an error or does not answer in time, the turn drops the local candidate, routes among its hosted targets, and records `local_quote_skipped` as `fleet_error` or `fleet_timeout`. A turn that cannot fail open does not use this bound. That is a turn whose policy admits only local targets, a turn where no credential reaches any hosted provider, or a turn whose frontier cadence is spent. Such a turn waits up to the turn deadline, and a fleet failure still fails the turn, so a local-only session never goes to a hosted model.
 
