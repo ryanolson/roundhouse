@@ -95,6 +95,11 @@ e2e-frontier = []
 # pre-M8 integration binaries keep mounting the routers with the planes they
 # already build, and it does not compile into `cargo build`.
 roundhouse-server = { path = ".", features = ["test-support"] }
+# `full` does not carry `test-util`; the learner delivery timeout tests need
+# `#[tokio::test(start_paused = true)]` so a timeout race is decided by virtual
+# time instead of the box's load. Resolver v3 keeps a dev-dependency feature
+# out of `cargo build`, so this widens no shipped binary's graph.
+tokio = { workspace = true, features = ["test-util"] }
 # The end-to-end cache-hit proof drives a real mock engine that publishes KV
 # events into the embedded selection service. See tests/mocker_cache_hits.rs.
 dynamo-mocker = { workspace = true }

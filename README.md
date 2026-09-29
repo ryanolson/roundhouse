@@ -526,7 +526,7 @@ A project with a `"tiers"` recipe can also add a `"learner"` block. The learner 
 - An `off` block keeps its `apply_timeout_ms`. A session of a project that is now `off` still delivers its pending entries, and it waits that long for each apply. With no block, or no value in an `off` block, it waits 250 ms (`UNCONFIGURED_APPLY_TIMEOUT_MS`).
 - `exploration` is accepted only on `live` projects. A turn explores only on a session whose validation arm consults the judge, and only to a strategy that is cheaper than the served one and meets every hard constraint.
 
-The engine reads the learner store once per learned turn, bounded by `read_timeout_ms`. After the turn's terminal event and the settle, it delivers the session's pending learning entries in one apply, bounded by `apply_timeout_ms`, then clears the session's source mark and appends `LearningApplied`. A failed delivery leaves the entries marked for the next turn. A session whose project is later set to `off` still has its pending entries delivered, and its turns make no store read.
+The engine reads the learner store once per learned turn, bounded by `read_timeout_ms`. After the turn's terminal event and the settle, it delivers the session's pending learning entries in one apply per page (the gap and refill paths can add one more each), bounded by `apply_timeout_ms`, then appends `LearningApplied` and clears the session's source mark. A failed delivery leaves the entries marked for the next turn. A session whose project is later set to `off` still has its pending entries delivered, and its turns make no store read.
 
 The binary does not attach a learner store yet. Milestone M9 composes one at startup. Until then, the loader checks a `learner` block in a deployment's file, and the block has no effect and gives no warning. `Engine::with_learner` attaches a store.
 
@@ -1118,6 +1118,8 @@ A review can arrive before or after the answer. Each session keeps at most 256 (
 ### Learner decisions and delivery
 
 The `learning` object counts what the online learner decided, in the same scopes as the rest of the document. `decisions` counts learned turns, one for each turn however many dispatches it made. `modes` splits them into `shadow` and `live`. `served` counts the strategy whose plan served each turn: `rules` for every `shadow` turn and every infeasible turn. `choices` counts `exploit`, `explore`, and `constraint_unmet`. `unmet` counts infeasible turns by each constraint that some plan failed (`quality`, `latency`, `grant`), so one turn can count more than once. `read_failures` counts turns whose store read failed, by reason. `acknowledgements` counts `LearningApplied` events.
+
+A `refuse` project's turn that fails on a store outage or an infeasible plan writes no `Routed` at all, so it counts under none of `decisions`, `unmet`, or `read_failures`. It terminates as `PolicyRefused` instead, alongside every other policy refusal; it is not a fourth `read_failures` reason.
 
 `delivery` is not a projection of the log. A failed delivery writes nothing to the log by design, so the engine counts the outcomes in process memory, and they reset when the process restarts. It reports these counts:
 

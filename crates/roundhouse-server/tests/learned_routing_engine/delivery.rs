@@ -21,7 +21,7 @@ use roundhouse_core::ids::SessionId;
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::learn_store::contract::LearnerStoreControl;
-use roundhouse_core::learn_store::{LearnerError, LearnerStore, LearningBatch};
+use roundhouse_core::learn_store::{Applied, LearnerError, LearnerStore, LearningBatch};
 use roundhouse_core::routing::learn::{LearnerMode, LearnerTerms, Strategy};
 use roundhouse_core::session::LEARNING_PAGE;
 use roundhouse_core::store::SessionStore;
@@ -29,6 +29,7 @@ use roundhouse_core::validate::{
     ArmShares, IntervalLabel, ValidationTerms, Validator, ValidatorConfig,
 };
 use roundhouse_server::Admission;
+use roundhouse_server::test_support::captured_warnings;
 
 use crate::common::validate::{AlwaysFires, ON_TRACK, ScriptedJudge, open_trigger};
 use crate::rig::{
@@ -44,8 +45,8 @@ fn admission_with_default_timeouts(project: &str) -> Admission {
     admission(project, Some(shadow()))
 }
 
-/// One read in `plan`, and in the tail one apply, one mark clear and one
-/// `LearningApplied` append, per learner turn with entries pending. The keys
+/// One read in `plan`, and in the tail one apply, one `LearningApplied`
+/// append and one mark clear, per learner turn with entries pending. The keys
 /// the read visits are the keys the decision records.
 #[tokio::test]
 async fn a_learner_turn_makes_one_read_one_apply_one_clear_and_one_append() {
@@ -223,9 +224,42 @@ async fn a_refused_ack_then_a_new_entry_applies_only_the_new_entry() {
     assert_eq!(rig.acknowledged(&session).await.len(), 1);
 }
 
+/// A refused acknowledgement append must not be preceded by a mark clear: if
+/// the clear ran first and the append then failed (or the process crashed
+/// between the two), the mark would be gone while the log still shows
+/// nothing applied, and the recovery task would have no reason to revisit a
+/// session it has no record of ever owing. Appending first and skipping the
+/// clear on that failure keeps the mark for the next turn or the recovery
+/// task in every failure branch.
+#[tokio::test]
+async fn a_refused_ack_append_leaves_the_pending_mark() {
+    let rig = Rig::new(RigConfig::default());
+    let session = SessionId::new("markheld/ada/s");
+    let admission = admission("markheld", Some(shadow()));
+    rig.sessions.refuse_acks(true);
+    rig.turn(&session, "t1", &admission).await.expect("served");
+    assert!(rig.acknowledged(&session).await.is_empty());
+    let pending = rig
+        .sessions
+        .pending_learning(None, 0, std::num::NonZeroUsize::new(16).unwrap())
+        .await
+        .expect("the index reads");
+    assert!(
+        pending
+            .sessions
+            .iter()
+            .any(|marked| marked.session_id == session),
+        "the mark stays because the append that would confirm delivery failed: {pending:?}"
+    );
+}
+
 /// An apply that landed and did not answer within `apply_timeout_ms`: no
 /// acknowledgement, and the retry applies each entry once.
-#[tokio::test]
+///
+/// `start_paused` puts every `sleep` and `timeout` on the same virtual clock,
+/// so which one elapses first is decided by the durations compared, not by
+/// how loaded the box running the test happens to be.
+#[tokio::test(start_paused = true)]
 async fn an_apply_timeout_then_retry_applies_each_entry_once() {
     let rig = Rig::new(RigConfig::default());
     let session = SessionId::new("stall/ada/s");
@@ -243,8 +277,8 @@ async fn an_apply_timeout_then_retry_applies_each_entry_once() {
     assert_eq!(residuals(&rig, "stall").await, 1);
     assert_eq!(delivery(&rig).timed_out, 1);
 
-    // The retry runs under the ordinary timeout, so a loaded machine cannot
-    // drop the real apply this test counts.
+    // The retry runs under the ordinary timeout, comfortably above the
+    // instant reply the exhausted script now gives.
     rig.turn(&session, "t2", &admission_with_default_timeouts("stall"))
         .await
         .expect("served");
@@ -554,7 +588,12 @@ async fn owing(rig: &Rig, session: &SessionId, project_name: &str) {
 /// under `UNCONFIGURED_APPLY_TIMEOUT_MS`: long enough for an apply that
 /// answers in tens of milliseconds, and not forever. The stalls are literals,
 /// so a change to the constant cannot move both sides of the test.
-#[tokio::test]
+///
+/// `start_paused` puts the stalls and `UNCONFIGURED_APPLY_TIMEOUT_MS` on one
+/// virtual clock, so the 40 ms case landing inside the timeout and the 1.5 s
+/// case landing outside it are guaranteed by the durations, not by luck under
+/// load.
+#[tokio::test(start_paused = true)]
 async fn a_session_without_a_learner_block_delivers_under_the_unconfigured_timeout() {
     let rig = Rig::new(RigConfig::default());
     let quick = SessionId::new("bare/ada/quick");
@@ -587,7 +626,7 @@ async fn a_session_without_a_learner_block_delivers_under_the_unconfigured_timeo
 /// An `off` block's written apply timeout is the one its sessions deliver
 /// under: an apply that answers in 600 ms lands under a written 2 s, where
 /// the unconfigured timeout would have given up.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_off_block_delivers_under_its_written_apply_timeout() {
     let rig = Rig::new(RigConfig::default());
     let session = SessionId::new("quiet/ada/s");
@@ -668,4 +707,96 @@ async fn a_refuse_project_fails_the_turn_on_a_store_outage_and_a_serve_rules_pro
             other.map(|r| r.decision)
         ),
     }
+}
+
+/// Store-read failures during an outage warn once, not once per turn: a line
+/// repeated on every read is the line an operator learns to filter, the same
+/// reasoning `fair_use_unreachable_warned` already uses for the fair-use
+/// ledger.
+///
+/// `captured_warnings` installs a thread-local subscriber, so this drives its
+/// own current-thread runtime rather than `#[tokio::test]`'s, which is free to
+/// resume the future on a thread the subscriber was never installed on.
+#[test]
+fn store_read_failures_during_an_outage_warn_once() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let rig = Rig::new(RigConfig::default());
+    rig.learner.fail_reads(true);
+    let admission = admission("readwarn", Some(shadow()));
+    let warned = captured_warnings(|| {
+        rt.block_on(async {
+            rig.turn(&SessionId::new("readwarn/ada/a"), "t1", &admission)
+                .await
+                .expect("serve_rules serves through the outage");
+            rig.turn(&SessionId::new("readwarn/ada/b"), "t2", &admission)
+                .await
+                .expect("serve_rules serves through the outage");
+        });
+    });
+    let warns = warned
+        .matches("the learner store read failed; the turn takes the infeasible path")
+        .count();
+    assert_eq!(
+        warns, 1,
+        "two failing turns produce one warn transition, not two: {warned}"
+    );
+}
+
+/// The same once-per-outage rule for deliveries the store answers
+/// `Unavailable` or `WrongType`.
+#[test]
+fn apply_failures_during_an_outage_warn_once() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let rig = Rig::new(RigConfig::default());
+    let session = SessionId::new("applywarn/ada/s");
+    let admission = admission("applywarn", Some(shadow()));
+    rig.learner
+        .script(ApplyScript::Refuse(LearnerError::Unavailable(
+            "down".into(),
+        )));
+    rig.learner
+        .script(ApplyScript::Refuse(LearnerError::Unavailable(
+            "down".into(),
+        )));
+    let warned = captured_warnings(|| {
+        rt.block_on(async {
+            rig.turn(&session, "t1", &admission).await.expect("served");
+            rig.turn(&session, "t2", &admission).await.expect("served");
+        });
+    });
+    let warns = warned
+        .matches("the learner store did not take this session's entries; they stay pending")
+        .count();
+    assert_eq!(
+        warns, 1,
+        "two failing applies produce one warn transition, not two: {warned}"
+    );
+}
+
+/// Mutation survivor 8a: no test drove a store that reports more entries
+/// applied than the batch it was sent. `duplicates` is
+/// `entries.len().saturating_sub(applied.applied)`, not a bare subtraction,
+/// because the store's own count is untrusted input to a metric, not a value
+/// the engine can prove bounded by what it sent.
+#[tokio::test]
+async fn an_over_reported_apply_count_does_not_underflow_duplicates() {
+    let rig = Rig::new(RigConfig::default());
+    let session = SessionId::new("overcount/ada/s");
+    let admission = admission("overcount", Some(shadow()));
+    rig.learner.script(ApplyScript::Answer(Applied {
+        applied: 5,
+        watermark: 1,
+    }));
+    rig.turn(&session, "t1", &admission).await.expect("served");
+    let delivery = delivery(&rig);
+    assert_eq!(
+        delivery.duplicate_entries, 0,
+        "an over-report is not turned into a negative duplicate count"
+    );
 }

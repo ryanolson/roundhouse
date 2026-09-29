@@ -7,6 +7,12 @@
 //! how often its store read failed, and how its entries were delivered. The
 //! decisions are folded from the log; `delivery` is process memory, see
 //! [`crate::metrics::learning`].
+//!
+//! **A `refuse` project's refused turn is not here.** A turn refused for a
+//! store outage or an infeasible plan writes no `Routed`, so it is counted
+//! under none of `decisions`, `unmet`, or `read_failures`; it terminates as
+//! `PolicyRefused` like any other policy refusal. Giving it a `read_failures`
+//! reason of its own would count the same event twice under two names.
 
 use serde::Serialize;
 

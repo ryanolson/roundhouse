@@ -21,7 +21,7 @@
 //!
 //! | Answer | Tail |
 //! |---|---|
-//! | `Applied { watermark }` | clear the source mark through it, then append `LearningApplied` |
+//! | `Applied { watermark }` | append `LearningApplied` through it, then clear the source mark |
 //! | `ChainGap { watermark }` | one backfill from it, applied in the same tail |
 //! | `ChainDiverged` | stop this session's delivery and report it, never backfill |
 //! | `CounterRange`, `Malformed` | stop this session's delivery and report it |
@@ -39,7 +39,8 @@
 //! memory: a restart tries each stopped session once more, meets the same
 //! refusal, and stops it again.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -82,22 +83,41 @@ pub(crate) struct RoutingLearner {
     /// Sessions whose delivery stopped on a refusal no retry fixes: a
     /// diverged chain, a counter out of range, or a malformed batch. See the
     /// module doc for why no stop is a project's.
-    stopped_sessions: Mutex<HashSet<(ProjectId, SessionId)>>,
+    ///
+    /// Keyed by project first so the read every tail makes (`is_stopped`)
+    /// looks up by borrowed keys and clones nothing; only `stop`, which runs
+    /// once per stopped session rather than once per tail, pays for owned
+    /// keys.
+    stopped_sessions: Mutex<HashMap<ProjectId, HashSet<SessionId>>>,
+    /// Set on the first learner-store read failure since the last success,
+    /// cleared on the next one. Same pattern as
+    /// [`fair_use_unreachable_warned`](super::Engine::fair_use_refusal): a
+    /// `tracing::warn` on every turn of an outage is the line an operator
+    /// learns to filter, so only the transition into the outage warns.
+    read_unreachable_warned: AtomicBool,
+    /// The same pattern for deliveries the store answered `Unavailable` or
+    /// `WrongType`.
+    apply_unreachable_warned: AtomicBool,
 }
 
 impl RoutingLearner {
-    fn stopped(&self) -> std::sync::MutexGuard<'_, HashSet<(ProjectId, SessionId)>> {
+    fn stopped(&self) -> std::sync::MutexGuard<'_, HashMap<ProjectId, HashSet<SessionId>>> {
         self.stopped_sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn is_stopped(&self, project: &ProjectId, session: &SessionId) -> bool {
-        self.stopped().contains(&(project.clone(), session.clone()))
+        self.stopped()
+            .get(project)
+            .is_some_and(|sessions| sessions.contains(session))
     }
 
     fn stop(&self, project: &ProjectId, session: &SessionId) {
-        self.stopped().insert((project.clone(), session.clone()));
+        self.stopped()
+            .entry(project.clone())
+            .or_default()
+            .insert(session.clone());
     }
 }
 
@@ -142,7 +162,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         self.learner = Some(Arc::new(RoutingLearner {
             store,
             salt: self.config.arm_salt.clone(),
-            stopped_sessions: Mutex::new(HashSet::new()),
+            stopped_sessions: Mutex::new(HashMap::new()),
+            read_unreachable_warned: AtomicBool::new(false),
+            apply_unreachable_warned: AtomicBool::new(false),
         }));
         self
     }
@@ -228,9 +250,23 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         )
         .await
         {
-            Ok(Ok(view)) => StoreRead::Read(view),
+            Ok(Ok(view)) => {
+                // The outage, if there was one, is over: the next one gets
+                // its own warning rather than inheriting this success's
+                // silence.
+                learner
+                    .read_unreachable_warned
+                    .store(false, Ordering::Relaxed);
+                StoreRead::Read(view)
+            }
             Ok(Err(error)) => {
-                tracing::warn!(%project, %error, "the learner store read failed; the turn takes the infeasible path");
+                if !learner
+                    .read_unreachable_warned
+                    .swap(true, Ordering::Relaxed)
+                {
+                    tracing::warn!(%project, %error, "the learner store read failed; the turn takes the infeasible path");
+                }
+                tracing::debug!(%project, %error, "the learner store read failed; the turn takes the infeasible path");
                 StoreRead::Unavailable {
                     reason: ReadFailure::StoreUnavailable,
                 }
@@ -323,6 +359,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             };
             match tokio::time::timeout(apply_timeout, learner.store.apply(&batch)).await {
                 Ok(Ok(applied)) => {
+                    // The outage, if there was one, is over: see the read
+                    // side's reset above for why this stays silent.
+                    learner
+                        .apply_unreachable_warned
+                        .store(false, Ordering::Relaxed);
                     delivery.record(
                         &project,
                         DeliveryOutcome::Applied {
@@ -376,7 +417,16 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 Ok(Err(
                     error @ (LearnerError::Unavailable(_) | LearnerError::WrongType { .. }),
                 )) => {
-                    tracing::warn!(
+                    if !learner
+                        .apply_unreachable_warned
+                        .swap(true, Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            %project, session = %session_id, %error,
+                            "the learner store did not take this session's entries; they stay pending"
+                        );
+                    }
+                    tracing::debug!(
                         %project, session = %session_id, %error,
                         "the learner store did not take this session's entries; they stay pending"
                     );
@@ -392,19 +442,30 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             }
         };
 
-        // Clear, then acknowledge. Either failing leaves the mark, and the
-        // next turn or the recovery task confirms it: the store skips every
-        // entry it already holds.
-        let cleared = self
-            .store
-            .clear_learning_mark(&session_id, watermark)
-            .await
-            .map_err(|error| error.to_string());
+        // Acknowledge, then clear. A failed append must not be followed by a
+        // clear: the mark is this session's only durable record that entries
+        // are still owed, and clearing it ahead of the append that confirms
+        // delivery would let a crash between the two drop the mark while the
+        // log still shows nothing applied -- the recovery task would then
+        // never revisit a session it has no reason to think finished. Either
+        // step failing leaves the mark, and the next turn or the recovery
+        // task confirms it: the store skips every entry it already holds.
         let appended = session
             .record_learning_applied(watermark)
             .await
             .map_err(|error| error.to_string());
-        if let Err(error) = cleared.and(appended) {
+        // The clear only runs once the append has landed: see the comment
+        // above for why an append failure must short-circuit it.
+        let outcome = match appended {
+            Ok(()) => self
+                .store
+                .clear_learning_mark(&session_id, watermark)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
             tracing::warn!(
                 %project, session = %session_id, watermark, %error,
                 "the learner store applied this session's entries, and acknowledging them failed; \
@@ -446,4 +507,52 @@ fn page_epochs(entries: &[LearningEntry]) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[cfg(test)]
+mod page_epochs_tests {
+    //! Mutation survivor 8b: `page_epochs` had no test of its own, so the
+    //! `if !epochs.contains(&epoch)` de-duplication could be deleted without
+    //! turning any suite red. A refused batch's log line would then repeat
+    //! the same epoch once per entry instead of naming it once.
+
+    use super::page_epochs;
+    use roundhouse_core::routing::learn::{EpochId, LEARNING_CREDIT_REVISION};
+    use roundhouse_core::session::{Deltas, LearningEntry};
+    use roundhouse_core::validate::REVIEW_RULE_REVISION;
+
+    fn entry(seq: u64, epoch: EpochId) -> LearningEntry {
+        LearningEntry {
+            seq,
+            prev_seq: seq.saturating_sub(1),
+            credit_revision: LEARNING_CREDIT_REVISION,
+            review_rule_revision: REVIEW_RULE_REVISION,
+            deltas: Some(Deltas {
+                epoch,
+                quality: Vec::new(),
+                targets: Vec::new(),
+                overhead: Default::default(),
+                jev: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn repeated_epochs_collapse_to_one_entry() {
+        let epoch = EpochId::new([0x11; 16]);
+        let entries = vec![entry(1, epoch), entry(2, epoch), entry(3, epoch)];
+        assert_eq!(page_epochs(&entries), epoch.to_string());
+    }
+
+    #[test]
+    fn distinct_epochs_are_named_once_each_in_page_order() {
+        let first = EpochId::new([0x22; 16]);
+        let second = EpochId::new([0x33; 16]);
+        let entries = vec![entry(1, first), entry(2, second), entry(3, first)];
+        assert_eq!(
+            page_epochs(&entries),
+            format!("{first},{second}"),
+            "a later repeat of the first epoch does not add a second entry"
+        );
+    }
 }

@@ -184,6 +184,11 @@ pub enum ApplyScript {
     /// Apply to the store, then stall past any timeout: the result the engine
     /// sees is unknown, and the store has the entries.
     LandThenStall(Duration),
+    /// Answer with this `Applied` directly, writing nothing to the inner
+    /// store: the mutation-8a fixture needs a store that reports more
+    /// entries applied than the batch held, which the real memory store
+    /// never does because it only counts what it actually took.
+    Answer(Applied),
 }
 
 /// The memory learner store, counted and sabotageable.
@@ -256,6 +261,7 @@ impl LearnerStore for ProbeStore {
                 tokio::time::sleep(stall).await;
                 landed
             }
+            Some(ApplyScript::Answer(applied)) => Ok(applied),
         }
     }
 
