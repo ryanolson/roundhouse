@@ -338,3 +338,22 @@ Each milestone is one PR, branched from `main`. Tests come first in each.
 - Queue ordering, capacity holds, and leases inside Roundhouse. Those belong to the pool's router. Roundhouse supplies the program, the priority band, and the phase.
 - An exact KV index in Roundhouse. Tier 2 keeps whatever index the pool has.
 - Any change to prefix admission, to the conversation name, or to the refusal for a Responses request with no name.
+
+## Addendum, 2026-09-29: owner ruling on section 7
+
+The owner rejected the core of this proposal. The text above stays as the record of what was proposed and why. Where it disagrees with this addendum, this addendum wins. The design that replaces it is `prefix-anchored-routing-proposal.md`, which is written to these rulings.
+
+- **The unit is KV overlap, not the agent task tree (D1, D2).** A sub-agent that starts a new root is a new request. This includes a fresh spawn and a partial fork that drops the root. One program id for sequences with little or no shared prefix does not help routing. The llm-d North Star program `(tenant, root)` is wrong on this point for the purpose of Roundhouse.
+- **The derivation is anchored on the prefix.** It is the first block hash, or a hash of the concatenated messages `0..N`, where `N` is the number of messages that makes the sequence unique. The owner gave this as a direction, not as an exact form. The replacement design must find the exact form and test it.
+- **Client-specific extraction is an accelerator only.** Roundhouse can use declared headers and the emitted-item link only when it detects the client with very high probability. They are never the general mechanism.
+- **A session id is a label.** Route a session to the same place. A session id that was never seen is the trigger that makes a request new.
+- **A pool is a Dynamo deployment with its own router (D6).** Roundhouse is very sticky to the pool that it selects. Its job is to get a program to the same Dynamo router every time. Inside the pool, Dynamo can make a decision that is not about KV. It can recover overlap when it moves KV east-west to the instance with the best overlap.
+- **Graceful bring-up.** Roundhouse routes new first-turn sessions to a Dynamo instance that was just brought up. This staggers the prefill that lands on it in a window.
+- **A guard rail on net-new prefill.** Net-new prefill is the prefill that is left after cache hits. A limit sets how much of it is accepted in a window.
+- **D3 and D4** adapt to the new identifier. **D8:** the learner groups by the KV-overlap pattern that routing uses.
+
+Orchestrator readings that the owner has not ruled. The replacement design treats each one as open and gives a recommendation:
+
+- **Worker hints.** The ruling says that the goal of Roundhouse is the same Dynamo router. It does not say whether Roundhouse still sends a worker hint (section 3.3 tier 2, and P4) inside the pool.
+- **The egress class of a pool (D6).** The ruling says what a pool is. It does not say whether a pool is a local target or an external one. That class decides the failover rule and the no-egress rule for a local-only session.
+- **Instance or pool.** The bring-up rule and the guard rail name an instance. If Roundhouse is sticky at the level of the pool, it possibly never sees an instance. The design must say where each limit applies and what Roundhouse must observe for it.
