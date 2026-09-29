@@ -147,12 +147,10 @@ impl AgreementFold {
     ) {
         let tier = served_tier(decision);
         // In place when the session already has an entry: every turn after the
-        // first, and every failover of a turn, which re-clones nothing but a
-        // response id that actually changed.
+        // first, and every failover of a turn. `clone_from` reuses the id's
+        // buffer, so nothing is allocated for either.
         if let Some((latest, served)) = self.served.get_mut(session) {
-            if latest != response_id {
-                latest.clone_from(response_id);
-            }
+            latest.clone_from(response_id);
             *served = tier;
         } else {
             self.served
@@ -207,7 +205,7 @@ impl AgreementFold {
         let found = self.open.get_mut(session).and_then(|slots| {
             let at = slots
                 .iter()
-                .rposition(|slot| slot.response_id == record.source_response_id)?;
+                .position(|slot| slot.response_id == record.source_response_id)?;
             let slot = slots.remove(at)?;
             Some((slots, at, slot))
         });
@@ -217,13 +215,22 @@ impl AgreementFold {
             (None, _) => None,
             // The slot was evicted, or no intent opened one.
             (Some(_), None) => Some(Booking::NotComparable),
-            (Some(answer), Some((slots, at, slot))) => Some(match (slot.served, slot.state) {
-                (None, _) => Booking::NotComparable,
-                (Some(served), _) if served == answer.tier() => Booking::Agree,
-                (Some(_), SlotState::AwaitingAnswer { label: Some(label) }) => {
-                    Booking::Disagree(answer, Some(label))
+            (Some(answer), Some((slots, at, slot))) => match (slot.served, slot.state) {
+                // An answer for a slot that was already answered. Unreachable
+                // today: the engine mints one call per response and the
+                // evaluation join accepts one result per call. Should that
+                // ever change, the slot goes back untouched and nothing is
+                // booked twice.
+                (_, SlotState::AwaitingLabel) => {
+                    slots.insert(at, slot);
+                    None
                 }
-                (Some(_), SlotState::AwaitingAnswer { label: None } | SlotState::AwaitingLabel) => {
+                (None, _) => Some(Booking::NotComparable),
+                (Some(served), _) if served == answer.tier() => Some(Booking::Agree),
+                (Some(_), SlotState::AwaitingAnswer { label: Some(label) }) => {
+                    Some(Booking::Disagree(answer, Some(label)))
+                }
+                (Some(_), SlotState::AwaitingAnswer { label: None }) => {
                     slots.insert(
                         at,
                         Slot {
@@ -231,9 +238,9 @@ impl AgreementFold {
                             ..slot
                         },
                     );
-                    Booking::Disagree(answer, None)
+                    Some(Booking::Disagree(answer, None))
                 }
-            }),
+            },
         };
         self.prune(session);
         let Some(booking) = booking else {
