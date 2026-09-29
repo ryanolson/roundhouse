@@ -122,6 +122,38 @@ async fn a_backfill_below_a_stale_hint_refills_from_the_floor() {
     assert_eq!(state.learning_hint(), all[5], "the hint is still recorded");
 }
 
+/// **A floor backfill that overflows its page still counts what lies beyond
+/// it**, even after an acknowledgement of the newest entry. A reset of
+/// `beyond` on `LearningApplied` would stop recovery a page early.
+#[tokio::test]
+async fn a_floor_backfill_past_a_page_counts_beyond_through_an_acknowledgement() {
+    let mut script = many(LEARNING_PAGE + 5);
+    let all = produced(&script);
+    script.applied(*all.last().expect("entries were produced"));
+
+    let state = script.backfill(all[1]).await;
+    let held: Vec<u64> = state
+        .learning_page()
+        .iter()
+        .map(|entry| entry.seq)
+        .collect();
+    assert_eq!(
+        held,
+        all[2..2 + LEARNING_PAGE],
+        "one full page above the floor"
+    );
+    let past_the_page = (all.len() - 2 - LEARNING_PAGE) as u64;
+    assert!(
+        past_the_page > 0,
+        "the premise: the backfill overflows its page"
+    );
+    assert_eq!(
+        state.learning_beyond(),
+        past_the_page,
+        "exactly the entries past the page"
+    );
+}
+
 #[tokio::test]
 async fn learning_applied_moves_the_hint() {
     let mut script = many(4);
