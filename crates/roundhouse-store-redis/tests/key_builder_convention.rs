@@ -54,6 +54,7 @@ const FAMILY_FILES: &[&str] = &[
     "src/correlation.rs",
     "src/directory.rs",
     "src/scripts/learning.rs",
+    "src/learn.rs",
 ];
 
 /// Every `fn <name>(` a family file defines outside its own `#[cfg(test)]`
@@ -228,4 +229,89 @@ fn every_key_family_has_a_row_in_the_module_doc_table() {
              `Family | Version | Module` table"
         );
     }
+}
+
+/// Whether the key argument of one `redis.call(` is exactly `KEYS[...]`:
+/// the command, a comma, then `KEYS[` with its bracket closed and nothing
+/// after it but the next argument or the end of the call. `KEYS[1] .. ':x'`
+/// starts like a `KEYS` entry and is a key the builder never named.
+fn key_is_a_keys_entry(args: &str) -> bool {
+    let Some((_, key)) = args.split_once(',') else {
+        return false;
+    };
+    let Some(index) = key.trim_start().strip_prefix("KEYS[") else {
+        return false;
+    };
+    let mut depth = 1;
+    for (offset, ch) in index.char_indices() {
+        match ch {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    let after = index[offset + 1..].trim_start();
+                    return after.starts_with(',') || after.starts_with(')');
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// M7 of the online routing learner: every key of the `learn` family is built
+/// by the shared builder, and its scripts name no key of their own.
+///
+/// Two halves. Each of the four key shapes of draft section 11.4 is a named
+/// `fn *_key` in `src/learn.rs`, so the scan above holds it to `build_key`,
+/// and each one names `KeyFamily::Learn`, so none borrows another family's
+/// version. And every `redis.call` in `src/learn/scripts.rs` reaches its key
+/// through `KEYS[...]`: a script that concatenated a key from `ARGV` would
+/// write a key the builder never named, whatever the Rust side built. The
+/// live half, that a real apply writes exactly the keys these functions
+/// name, is `the_store_writes_only_the_keys_its_key_functions_name` in
+/// `learn_contract.rs`.
+#[test]
+fn every_learn_key_is_built_by_the_shared_builder() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    assert!(
+        FAMILY_FILES.contains(&"src/learn.rs"),
+        "src/learn.rs must be scanned by every_key_function_calls_the_shared_builder"
+    );
+
+    let src = fs::read_to_string(Path::new(manifest_dir).join("src/learn.rs"))
+        .expect("the learn family lives in src/learn.rs");
+    let names = scan_key_function_names(&src);
+    for shape in ["watermark_key", "quality_key", "ops_key", "seen_key"] {
+        assert!(
+            names.iter().any(|name| name == shape),
+            "src/learn.rs has no `fn {shape}(`; found {names:?}"
+        );
+    }
+    for name in &names {
+        let body = function_body(&src, name);
+        assert!(
+            body.contains("build_key(") && body.contains("KeyFamily::Learn"),
+            "src/learn.rs::{name} does not build its key with build_key under \
+             KeyFamily::Learn:\n{body}"
+        );
+    }
+
+    let scripts = fs::read_to_string(Path::new(manifest_dir).join("src/learn/scripts.rs"))
+        .expect("the learn scripts live in src/learn/scripts.rs");
+    let mut calls = 0;
+    for (index, line) in scripts.lines().enumerate() {
+        let mut rest = line;
+        while let Some(at) = rest.find("redis.call(") {
+            calls += 1;
+            let args = &rest[at + "redis.call(".len()..];
+            assert!(
+                key_is_a_keys_entry(args),
+                "src/learn/scripts.rs:{}: a redis.call whose key is not exactly KEYS[...]: {line}",
+                index + 1
+            );
+            rest = args;
+        }
+    }
+    assert!(calls > 0, "no redis.call found in src/learn/scripts.rs");
 }

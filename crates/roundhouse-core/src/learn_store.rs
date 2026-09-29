@@ -27,9 +27,10 @@
 //! **All or nothing.** `apply` checks the whole batch before it writes
 //! anything: the chain, every new counter value against its range, and (in a
 //! backend that has them) key types. A refused batch leaves the store as it
-//! was. The Redis backend of M7 cannot undo a write once its script has made
-//! one, so the check has to come first there, and the memory backend keeps the
-//! same order so that one contract judges both.
+//! was. The Redis backend (`roundhouse-store-redis`'s `learn` module) cannot
+//! undo a write once its script has made one, so the check has to come first
+//! there, and the memory backend keeps the same order so that one contract
+//! judges both.
 //!
 //! **Integers within `2^53 - 1`.** The Redis backend adds in Lua, whose numbers
 //! are doubles and hold integers exactly only up to [`MAX_EXACT`]. Sequences
@@ -69,9 +70,9 @@ pub trait LearnerStore: Send + Sync + 'static {
     /// on every learned `Routed`, so two backends that shaped it differently
     /// would write different logs for the same state.
     ///
-    /// Fails only with [`LearnerError::Unavailable`] (M7 adds the wrong-type
-    /// refusal, which a read can meet too). The other variants judge a batch,
-    /// and a read carries none.
+    /// Fails only with [`LearnerError::Unavailable`] or
+    /// [`LearnerError::WrongType`]. The other variants judge a batch, and a
+    /// read carries none.
     async fn read(&self, request: &ReadRequest) -> Result<ReadView, LearnerError>;
 
     /// Apply the entries above the `(project, session)` watermark, all or
@@ -278,14 +279,11 @@ pub struct Applied {
 ///
 /// `ChainGap` asks for a backfill. `ChainDiverged` does not go away on a
 /// retry or a backfill: the engine stops delivery for that one session and
-/// reports it, and the project's other sessions carry on. `CounterRange` and
-/// `Malformed` do not go away on a retry either: the engine stops updates for
-/// the project epoch and a new epoch is the recovery (draft section 11.3).
-/// `Unavailable` leaves the result unknown, and a resend is safe under the
-/// identity rule.
-///
-/// A wrong-type refusal joins with the Redis backend (M7), the only backend
-/// that can hold a key of the wrong type.
+/// reports it, and the project's other sessions carry on. `CounterRange`,
+/// `Malformed` and `WrongType` do not go away on a retry either: the engine
+/// stops updates for the project epoch and a new epoch is the recovery (draft
+/// section 11.3). `Unavailable` leaves the result unknown, and a resend is
+/// safe under the identity rule.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LearnerError {
     /// The batch skips an entry. Backfill from `store_watermark`, the
@@ -305,6 +303,12 @@ pub enum LearnerError {
     /// The batch is invalid whatever the store holds. Nothing was written.
     #[error("malformed learning batch: {reason}")]
     Malformed { reason: String },
+    /// A key the call names holds another type than the layout gives it,
+    /// written by something other than this store. Only the Redis backend can
+    /// meet it. Nothing was written: the Redis script checks every key's type
+    /// before its first write, because it cannot undo one.
+    #[error("learner store key `{key}` holds the wrong type")]
+    WrongType { key: String },
     /// The store did not answer. Whether the call took effect is unknown.
     #[error("learner store unavailable: {0}")]
     Unavailable(String),

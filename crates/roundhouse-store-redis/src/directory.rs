@@ -196,7 +196,7 @@ fn backend(error: redis::RedisError) -> DocumentStoreError {
 /// acts on has to say *what to go and look at*. Redis answers `WRONGTYPE` for
 /// a directory key some other writer owns, and `WRONGTYPE: Operation against a
 /// key holding the wrong kind of value` on its own tells a deployment nothing
-/// it can use — there are five families in this Redis and the message names
+/// it can use — there are six families in this Redis and the message names
 /// none of them. `decode_version` below already names the key for the failure
 /// it catches; this is the same courtesy for the failures Redis itself
 /// catches, so both halves of "this key is not ours" read the same way in a

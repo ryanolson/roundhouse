@@ -44,7 +44,7 @@ use std::fmt;
 /// A `family: &str` at `build_key`'s call sites was four literals typed at
 /// eleven places with nothing to check them against — a typo or a fifth
 /// family both compiled. The variant is the check: a family that is not one
-/// of these five does not compile, and the module-doc table test
+/// of these six does not compile, and the module-doc table test
 /// (`tests/key_builder_convention.rs`) reads every name this enum's own
 /// `name` method produces out of `keys.rs`'s source rather than a second
 /// hand-copied list, so a doc-table row cannot drift from the variant it
@@ -60,8 +60,13 @@ pub(crate) enum KeyFamily {
     /// The fifth family, and the only one whose whole key space is a single
     /// key: `<ns>:v1:dir:records`. See [`crate::directory`] for why one key
     /// rather than one per entity, and why it carries no hash tag when the
-    /// other four do.
+    /// other families do.
     Directory,
+    /// The online routing learner's shared counters (M7 of
+    /// `agent-docs/PLAN-online-routing-learner.md`): per project, a watermark
+    /// hash, and per epoch the quality hashes, the operations hash and the
+    /// `seen` sets. See [`crate::learn`] for the layout.
+    Learn,
 }
 
 impl KeyFamily {
@@ -71,12 +76,13 @@ impl KeyFamily {
     /// `name`'s match arms instead, since an integration test cannot see a
     /// `pub(crate)` item.
     #[cfg(test)]
-    const ALL: [KeyFamily; 5] = [
+    const ALL: [KeyFamily; 6] = [
         KeyFamily::Session,
         KeyFamily::Spend,
         KeyFamily::FairUse,
         KeyFamily::Correlation,
         KeyFamily::Directory,
+        KeyFamily::Learn,
     ];
 
     /// The family segment [`build_key`] writes.
@@ -87,6 +93,7 @@ impl KeyFamily {
             KeyFamily::FairUse => "fairuse",
             KeyFamily::Correlation => "corr",
             KeyFamily::Directory => "dir",
+            KeyFamily::Learn => "learn",
         }
     }
 
@@ -108,6 +115,7 @@ impl KeyFamily {
             KeyFamily::FairUse => "v1",
             KeyFamily::Correlation => "v1",
             KeyFamily::Directory => "v1",
+            KeyFamily::Learn => "v1",
         }
     }
 }

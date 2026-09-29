@@ -9,6 +9,7 @@
 
 use roundhouse_core::control::{Principal, ProjectId};
 use roundhouse_core::ids::SessionId;
+use roundhouse_core::routing::learn::{EpochId, LevelKey};
 
 use crate::KeyNamespace;
 use crate::correlation::call_key as correlation_call_key_impl;
@@ -202,4 +203,157 @@ impl roundhouse_core::store::contract::LeaseControl for RedisSessionStore {
             .await
             .expect("the test Redis must accept a DEL");
     }
+}
+
+/// The learner store under test, connected under `namespace`.
+pub async fn connect_learner_in(namespace: KeyNamespace) -> crate::RedisLearnerStore {
+    crate::RedisLearnerStore::connect_namespaced(url_from_env(), namespace)
+        .await
+        .expect("Redis named by the env var must be reachable")
+}
+
+/// The learner family's watermark hash of `project`.
+pub fn learn_watermark_key(namespace: &KeyNamespace, project: &ProjectId) -> String {
+    crate::learn::watermark_key(namespace, project)
+}
+
+/// One quality hash of `project` under `epoch`.
+pub fn learn_quality_key(
+    namespace: &KeyNamespace,
+    project: &ProjectId,
+    epoch: EpochId,
+    key: LevelKey,
+) -> String {
+    crate::learn::quality_key(namespace, project, epoch, key)
+}
+
+/// The operations hash of `project` under `epoch`.
+pub fn learn_ops_key(namespace: &KeyNamespace, project: &ProjectId, epoch: EpochId) -> String {
+    crate::learn::ops_key(namespace, project, epoch)
+}
+
+/// The `seen` set of `session` in `project` under `epoch`.
+pub fn learn_seen_key(
+    namespace: &KeyNamespace,
+    project: &ProjectId,
+    epoch: EpochId,
+    session: &SessionId,
+) -> String {
+    crate::learn::seen_key(namespace, project, epoch, session)
+}
+
+/// Every key under `pattern`, by a full `SCAN`.
+async fn scan(conn: &mut redis::aio::ConnectionManager, pattern: &str) -> Vec<String> {
+    let mut cursor = 0u64;
+    let mut keys = Vec::new();
+    loop {
+        let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(1000)
+            .query_async(conn)
+            .await
+            .expect("the test Redis must accept a SCAN");
+        keys.extend(batch);
+        if next == 0 {
+            break;
+        }
+        cursor = next;
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// `text` as a `SCAN MATCH` pattern that matches only itself: a namespace may
+/// hold `*`, `?`, `[` or `]`, and a project id anything.
+fn glob_literal(text: &str) -> String {
+    let mut pattern = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern
+}
+
+/// The learner store's snapshot lever: `SCAN` over the project's key prefix,
+/// then `DUMP` each key; a restore deletes every key under the prefix and
+/// `RESTORE`s the snapshot's. The snapshot holds the watermark hash and the
+/// `seen` sets with the counters, so a staged store loss takes the `seen`
+/// members with it.
+///
+/// **An absent project is the empty key set**, because Redis holds no empty
+/// key, and restoring it deletes every key under the prefix. A snapshot is
+/// compared by its `DUMP` bytes, which change with any write to a key; a
+/// restored key may dump differently from the original, so compare only
+/// snapshots taken without a restore between them.
+///
+/// The prefix ends at the `}:` after the project's hash tag, so a project id
+/// that itself contains `}:` could match another project's keys. Every test
+/// mints `proj_<hex>` ids.
+#[async_trait::async_trait]
+impl roundhouse_core::learn_store::contract::LearnerStoreControl for crate::RedisLearnerStore {
+    type Snapshot = std::collections::BTreeMap<String, Vec<u8>>;
+
+    async fn snapshot(&self, project: &ProjectId) -> Self::Snapshot {
+        let mut conn = self.connection();
+        let pattern = format!(
+            "{}*",
+            glob_literal(&crate::learn::project_prefix(self.namespace(), project))
+        );
+        let mut snapshot = std::collections::BTreeMap::new();
+        for key in scan(&mut conn, &pattern).await {
+            let dump: Option<Vec<u8>> = redis::cmd("DUMP")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .expect("the test Redis must accept a DUMP");
+            if let Some(dump) = dump {
+                snapshot.insert(key, dump);
+            }
+        }
+        snapshot
+    }
+
+    async fn restore(&self, project: &ProjectId, snapshot: Self::Snapshot) {
+        let mut conn = self.connection();
+        let pattern = format!(
+            "{}*",
+            glob_literal(&crate::learn::project_prefix(self.namespace(), project))
+        );
+        let live = scan(&mut conn, &pattern).await;
+        if !live.is_empty() {
+            let _: i64 = redis::cmd("DEL")
+                .arg(&live)
+                .query_async(&mut conn)
+                .await
+                .expect("the test Redis must accept a DEL");
+        }
+        for (key, dump) in snapshot {
+            let _: () = redis::cmd("RESTORE")
+                .arg(&key)
+                .arg(0)
+                .arg(dump)
+                .query_async(&mut conn)
+                .await
+                .expect("the test Redis must accept a RESTORE of its own DUMP");
+        }
+    }
+}
+
+/// Every key under `namespace`, for the test that proves the learner store
+/// writes no key outside the ones its key functions name.
+pub async fn keys_in(namespace: &KeyNamespace) -> Vec<String> {
+    let mut conn = crate::connect_manager(&url_from_env())
+        .await
+        .expect("Redis named by the env var must be reachable");
+    scan(
+        &mut conn,
+        &format!("{}:*", glob_literal(&namespace.to_string())),
+    )
+    .await
 }
