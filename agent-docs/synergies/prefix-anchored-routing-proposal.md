@@ -340,3 +340,12 @@ Each milestone is one PR, cut from `main`. Tests come first. Every run is bounde
 - **Question 4 (D5): accepted.** Roundhouse holds the response headers until the routing decision or the refusal, and for a pool until the response headers of the pool. A rail refusal or an upstream 429 then reaches the client as HTTP 429 with `Retry-After`.
 - **Question 9: accepted, with a follow-up.** Roundhouse strips the Claude Code attribution block from the dispatch projection toward non-Anthropic targets, and only on the exact match. The owner asked whether the block can serve as a Claude session id. The orchestrator answer: not as an id. It is 12 bits, so two concurrent sessions collide at a probability of 1 in 4,096 per pair, and every prompt that is shorter than 5 characters maps to one value for each version. Exact detection of the block is a reliable signal that the client is Claude Code. Claude Code already sends `x-claude-code-session-id`, which is the exact label.
 - **Question 2 (D6, the egress class of a pool): open.** The owner asked for more detail before a ruling.
+
+## Addendum, 2026-09-29: owner ruling on section 12, second round
+
+- **Question 2 (D6): a Dynamo deployment is local.** The layer that this design builds sits above the deployments. It sees several Dynamo deployments, and each session is sticky to one of them.
+- **A hash never selects the deployment.** There is no modulo and no rendezvous choice over the deployment set, because operators drain deployments and bring up new ones. The rule is:
+  - **A matched session goes to its bound deployment.** The binding is stored. It can be held against an outstanding budget.
+  - **A new session goes to the deployment with the lowest total KV load.** New sessions are spread evenly by that measure.
+  - **The rail can override that choice.** If the net-new prefill per unit of time on that deployment is over its limit, the new session can go to a different deployment.
+- **Session detection is its own crate.** It can depend on some Roundhouse crates, and a later refactor can make it one unified crate. Deriving the session id is the key input to routing.
