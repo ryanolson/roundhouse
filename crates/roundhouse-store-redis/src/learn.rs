@@ -5,7 +5,10 @@
 //! counters (draft section 11.4 of `agent-docs/DRAFT-online-routing-learner.md`,
 //! milestone M7 of `agent-docs/PLAN-online-routing-learner.md`).
 //!
-//! **Nothing calls it yet.** The engine composes a learner store in M8.
+//! **The engine calls it through [`LearnerStore`]** (the server's
+//! `engine::learning`, milestone M8): one `read` per learned turn and one
+//! `apply` per turn tail with entries pending. Nothing in the binary selects
+//! this backend until the startup composition of milestone M9.
 //!
 //! One project maps to these keys, all sharing a hash tag on the project id:
 //!

@@ -166,6 +166,8 @@ pub fn terms(mode: LearnerMode) -> LearnerTerms {
         cache_min_samples: MIN_SAMPLES,
         on_infeasible: OnInfeasible::default(),
         exploration: None,
+        read_timeout_ms: 25,
+        apply_timeout_ms: 250,
     }
 }
 

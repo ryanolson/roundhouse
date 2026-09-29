@@ -555,6 +555,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
             credentials: TurnCredentials::unrestricted(),
             budget_counts,
             tiers: None,
+            learner: None,
         }
     }
 

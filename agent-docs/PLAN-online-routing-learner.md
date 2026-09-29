@@ -102,7 +102,7 @@ The draft's section 2 seam map was read at `1658633`. This table records what th
 | Seam | File | State at `520eda5` |
 |---|---|---|
 | `pick_tier`, `tier_pool`, `StagePolicy::choose`, `DecisionSource` with `CostGuard`, `is_signal_driven` | `crates/roundhouse-core/src/routing/stage.rs` | Present. No `route_pick`. No `Strategy` source. |
-| `RoutingContext`, `admissible`, `LocalQuoteSkip` | `crates/roundhouse-core/src/routing/mod.rs` | Present. No `learning` field. |
+| `RoutingContext`, `admissible`, `LocalQuoteSkip` | `crates/roundhouse-core/src/routing/mod.rs` | Present. No `learning` field, and M8 adds none: the learner's inputs travel as a `LearningTurn` beside the context. |
 | `SelectionSnapshot`, `SelectorBranch` (`Affinity`, `EscalationAudit`, `Stage`), `STAGE_SELECTOR_REVISION` | `crates/roundhouse-core/src/routing/selection.rs` | Present. No `Learned` branch. |
 | `ProviderPricing::price_tokens`, `effective_write_per_mtok_usd`, `CacheLedger::model_for`, `BlockMarker`, `TargetState::last_block_marker` | `crates/roundhouse-core/src/routing/ledger.rs` | Present. The marker fact landed on this branch on 2026-09-28. |
 | `ClassificationAxis`, `TurnIntent`, `TurnComplexity`, `ContextDependence`, `Graded`, `TurnClassification`, `ClassificationRecord`, `ClassificationWindow`, `TAXONOMY_VERSION = 1` | `crates/roundhouse-core/src/classify/mod.rs` | Present. No tier axis. |
@@ -115,20 +115,20 @@ The draft's section 2 seam map was read at `1658633`. This table records what th
 | `SettlementKey::SessionWatermark`, `OncePerCall` | `crates/roundhouse-core/src/control/spend.rs` | Present. |
 | `SessionStore::append_events(lease, kinds, mark)`, `clear_learning_mark`, `requeue_learning`, `pending_learning`, `learning_sessions`, `LearningMark`, `MarkedSession`, `LearningCursor`, `ClearOutcome` | `crates/roundhouse-core/src/store.rs`, `store/learning.rs`, `store/contract/learning.rs` | Present. L3b is built and mutation-checked. |
 | `KeyFamily`, `build_key`, the key-convention test | `crates/roundhouse-store-redis/src/keys.rs` | Present. No `Learn` family at `520eda5`; M7 adds it. |
-| `Engine::plan`, `Engine::run_turn`, `opened_a_tier_escalation` | `crates/roundhouse-server/src/engine.rs` | Present. Selection capture moved to `engine/selection.rs` (`SelectionInputs`, `selection_inputs`, `local_quote_skip`). Classifier lifecycle is in `engine/classification.rs`. |
-| `ProjectEntry` (`policy`, `budget`, `fair_use`, `validate`, `credentials`, `tiers`) | `crates/roundhouse-server/src/control_config/config.rs` | Present. No `learner` block. |
+| `Engine::plan`, `Engine::run_turn`, `opened_a_tier_escalation` | `crates/roundhouse-server/src/engine.rs` | Present. Selection capture moved to `engine/selection.rs` (`SelectionInputs`, `selection_inputs`, `local_quote_skip`). Classifier lifecycle is in `engine/classification.rs`. M8 added `engine/learning.rs`: the learned choice and the tail's delivery. |
+| `ProjectEntry` (`policy`, `budget`, `fair_use`, `validate`, `credentials`, `tiers`) | `crates/roundhouse-server/src/control_config/config.rs` | Present. M8 added the boxed `learner` block (`control_config/learner.rs`). |
 | `ValidateConfig` | `crates/roundhouse-server/src/control_config/validate.rs` | Present. |
 | `TypeSafeShadow::questions`, `prepare`, `NotRun::NoAdmittedFrontier` | `crates/roundhouse-server/src/typesafe_shadow.rs` | Present. Three questions: intent, complexity, context dependence. |
 | `ChoiceQuestion`, `SystemOneRequest`, `SystemOneClient` | `crates/roundhouse-fleet/src/typesafe.rs` | Present. A map of choice questions is supported. |
-| `MetricsFold::apply`, `MetricsSnapshot`, the evaluation section | `crates/roundhouse-core/src/metrics/fold.rs`, `snapshot.rs`, `evaluation.rs` | Present. No learning or agreement section. |
+| `MetricsFold::apply`, `MetricsSnapshot`, the evaluation section | `crates/roundhouse-core/src/metrics/fold.rs`, `snapshot.rs`, `evaluation.rs` | Present. M1 added the agreement section and M8 the `learning` section (`metrics/learning.rs`). |
 | `/v1/metrics`, dashboard `renderEvaluation` | `crates/roundhouse-server/src/metrics_api.rs`, `dashboard.html` | Present. |
 | `shared_backend::open`, `serve` | `crates/roundhouse-server/src/shared_backend.rs`, `main.rs` | Present. No learner store, no recovery task. |
 | Local quotes at `expected_cost_usd: 0.0` | `crates/roundhouse-fleet/src/local.rs` | Present. The catalog price is a separate follow-up. |
 | Existing binaries | `crates/roundhouse-server/src/bin/import-benchmarks` | The calibrator follows this layout. |
 
-Files this plan creates, now built: `crates/roundhouse-core/src/routing/learn/` (M2 to M4), `crates/roundhouse-core/src/learn_store.rs` with `learn_store/` (M6), and `crates/roundhouse-store-redis/src/learn.rs` with `learn/scripts.rs` (M7).
+Files this plan creates, now built: `crates/roundhouse-core/src/routing/learn/` (M2 to M4, and `learn/artifact.rs` in M8), `crates/roundhouse-core/src/learn_store.rs` with `learn_store/` (M6), `crates/roundhouse-store-redis/src/learn.rs` with `learn/scripts.rs` (M7), and `crates/roundhouse-server/src/engine/learning.rs`, `crates/roundhouse-server/src/control_config/learner.rs` and `crates/roundhouse-core/src/metrics/learning.rs` (M8).
 
-Files this plan creates, still pending: `crates/roundhouse-server/src/engine/learning.rs` (M8), `crates/roundhouse-server/src/control_config/learner.rs` (M8), `crates/roundhouse-server/src/learner_recovery.rs` (M9), `crates/roundhouse-core/src/routing/learn/offline.rs` and `crates/roundhouse-server/src/bin/learner-calibrate/` (M10).
+Files this plan creates, still pending: `crates/roundhouse-server/src/learner_recovery.rs` (M9), `crates/roundhouse-core/src/routing/learn/offline.rs` and `crates/roundhouse-server/src/bin/learner-calibrate/` (M10).
 
 ## 6. Milestones
 
@@ -514,7 +514,7 @@ Owner approval is also required for: the merge of PR #18, which every milestone 
 | M5 entries, credit, ops rows, Jev counts, cursor, marks | L2 | implemented on `ai/learner-m5-credit`, awaiting review | |
 | M6 learner store contract and memory store | L3 | implemented on `ai/learner-m6-store`, awaiting review | |
 | M7 Redis learner store | L4 | implemented on `ai/learner-m7-redis`, awaiting review | |
-| M8 configuration, engine path, delivery, metrics | L5 part 1 | not started | |
+| M8 configuration, engine path, delivery, metrics | L5 part 1 | implemented on `ai/learner-m8-engine`, awaiting review | |
 | M9 startup, recovery task, audit | L5 part 2 | not started | |
 | M10 calibrator and promotion report | L7 | not started | |
 | M11 live enablement | L8 | owner procedure | |
@@ -720,3 +720,81 @@ These mutations failed their tests: an apply that writes each counter as it stag
 - **Mutation: a read that takes a non-integer stored value as 0.** The case above fails under it, in all seven cases.
 - **Mutation: a `SCAN` pattern without the `}:` after the tag. Partly valid.** The review named `project_prefix` in `learn.rs`. The byte pin `every_learn_key_is_pinned_by_byte` already fails when that function drops the `}:`. The line that no test held is the pattern in test support, now `learn_project_pattern`, which snapshot and restore share. Project ids never shared a prefix, so a pattern there without the `}:` survived. `a_restore_leaves_a_project_whose_id_extends_it_alone` uses `proj_ab` and `proj_ab12`. Under that mutation the byte pin passes, and the snapshot of `proj_ab` holds the three keys of `proj_ab12`.
 - Smaller points. The convention test now also requires every script command to be `TYPE`, `HGET`, `HMGET`, `HSET`, `SISMEMBER`, or `SADD`; a `COPY` whose key is `KEYS[1]` fails it. A reply position outside `KEYS` or `ARGV` is now always refused as an unexpected reply; before, one path printed `<unknown key>`. The target counters and their signs are one table, which both the read and the apply use. Not fixed: the read script still sends all operations fields to `HMGET` in one `unpack`. A read of more than about 1333 distinct targets fails as `Unavailable`. It writes nothing, so this is not an atomicity defect. The test-support snapshot says that `SCAN MATCH` walks the whole keyspace and that a restore deletes only under the project prefix. Draft section 11.4 has a dated addendum that points here.
+
+**M8 status, 2026-09-29.** M8 is implemented test-first on `ai/learner-m8-engine`, from `5cd0c7b`. The configuration is `LearnerConfig` in `crates/roundhouse-server/src/control_config/learner.rs`, resolved into `Admission.learner: Option<Arc<LearnerTerms>>` beside `tiers`. The engine seams are in `crates/roundhouse-server/src/engine/learning.rs`: `Engine::with_learner`, the learned choice in `plan`, and `Engine::deliver_learning` in the `run_turn` tail. The artifact format and the epoch id are in `crates/roundhouse-core/src/routing/learn/artifact.rs`. The metrics are the `learning` section, folded in `crates/roundhouse-core/src/metrics/learning.rs`. The engine tests are `crates/roundhouse-server/tests/learned_routing_engine.rs` with `learned_routing_engine/{rig,delivery,classified}.rs`. The binary attaches no learner store yet: M9 composes one at startup.
+
+What changes for an existing deployment: nothing. With no `learner` block, or `mode: off`, a turn calls the composed policy exactly as before, and the tail returns before any store call because the session has no learned history. With `shadow`, each learned turn makes one store read bounded by `read_timeout_ms`, writes `SelectorBranch::Learned` and a learned rationale on every `Routed`, and serves the `rules` decision whole (target, fallbacks, budget state, admitted list). Each tail with entries pending makes one apply, one mark clear and one `LearningApplied` append. The policy name on the record does not change until M9 composes `learned`.
+
+These settled points overrode the M8 text, as the stage brief ruled:
+
+- **No `RoutingContext.learning` field.** The context is built in part in `control/credential/`. The engine passes a `LearningTurn` beside the context and calls `LearnedPolicy::choose` itself. The read and the decision use the same signals, window, accepted classifications and tool flag, so they name one key. Two tests check the visited keys against the recorded input, one of them with a classification window.
+- **The mode branch comes first.** `Engine::learning_for` returns `None` for no learner, no block, or `off`, before anything reads the store or draws.
+- **Delivery follows the log, not the mode** (draft section 23). The tail runs for any session with a non-empty page, whatever the project's current mode.
+- **Store errors.** A read error maps to `StoreUnavailable`, and a late read maps to `ReadTimedOut`. The `apply` answers map as follows:
+  - `ChainGap`: one backfill from the store watermark.
+  - `ChainDiverged`: stop the delivery of that session and report it. Never backfill.
+  - `CounterRange` and `Malformed`: stop the project epoch.
+  - `Unavailable`, `WrongType` and a timeout: leave the entries pending. The draft stopped the epoch for `WrongType`. The `LearnerError` doc now gives the new rule.
+
+The milestone did not settle these points, so the implementation made these decisions:
+
+- **Addendum to draft 11.5 step 6: a gap's backfill is applied in the same tail.** The draft sends the backfilled page "on the next turn". That cannot work: the live fold's page still starts above the store watermark on the next turn, so the store answers with the same gap, forever. The tail applies the backfilled page at once: one backfill and a second apply. `a_gap_is_backfilled_once_and_applied_in_the_same_tail` holds it.
+- **The artifact format is draft 14.5**, parsed in core so that M10 writes what the server reads. Every field is required and unknown fields are refused. It must match this build's input, selector and credit revisions, name the gate `wilson-v1`, and give a valid strategy list. A prior entry must name a listed strategy, once, with `pos <= n`. The epoch is SHA-256 over the SHA-256 of the artifact bytes, the ordered strategy list, `LEARNING_INPUT_REVISION`, `LEARNED_SELECTOR_REVISION`, `STAGE_SELECTOR_REVISION` and `LEARNING_CREDIT_REVISION`, truncated to 16 bytes. The stage revision is included because it versions the `rules` pick. The loader reads the file at validation, so an unreadable artifact stops the boot and an admin mutation that references one is refused.
+- **`LearnerTerms` gains `read_timeout_ms` and `apply_timeout_ms`**, which keeps the settled type `Arc<LearnerTerms>`. The policy never reads them.
+- **An `off` block resolves to `None`**, not to terms with mode `off`. Present fields are still checked in every mode. A block on a project without `tiers` is refused even when `off`.
+- **`ProjectEntry.learner` is boxed and skipped on the wire when absent.** A document with no learner block is byte-identical to one written before M8, so an older node reads it. A document with a block is the one-way door of draft section 13, and the directory schema stays at 1. The pinned directory document now carries a full block.
+- **A refusal is `EngineError::LearnerRefused { unmet }`**, terminated as `IncompleteReason::PolicyRefused`. The change adds no `IncompleteReason` variant, because a new variant is a wire change that an older node cannot decode.
+- **The read names every candidate target**, not only the recipe's, because a plan can degrade to a local worker the recipe does not name.
+- **A session whose project no longer configures a learner** is delivered under `UNCONFIGURED_APPLY_TIMEOUT_MS` (250 ms, the section 4 starting value), because its project has no `apply_timeout_ms` any more.
+- **Stops are process memory.** A diverged session, and a stopped `(project, epoch)`, are held in the engine until it restarts. A restart meets the same refusal and stops again, and a new artifact resumes a stopped project.
+- **The acknowledgement is appended even when the mark clear fails.** The append only moves the hint, and the kept mark lets the recovery task confirm the delivery.
+- **Delivery outcomes are not in the log.** Applied and duplicate entries, backfills, gaps, stops, outages, timeouts and failed acknowledgements are counted in `LearningDelivery` beside the metrics fold, in process memory, and reported as `learning.delivery` in the deployment and project scopes and as `null` in a member's scope. The fold still reproduces from the log. Review causes are not in the section: the credit rule decides them in the session fold, and a second spelling would drift.
+
+- **The epoch includes `STAGE_SELECTOR_REVISION`. This needs a ruling.** Draft section 6 names three revisions. The fourth is included because it versions the `rules` pick. An owner who disagrees removes it before any project runs `shadow`, because the epoch is a key part of every stored counter.
+- **`TurnResult.last_seq` now includes the `LearningApplied` event** on a turn that delivers, because delivery runs before the tail reads `last_seq`.
+
+Two points are left for M9:
+
+- **The artifact is a node-local input to directory compilation.** The directory compiles only when the stored document changes, so the file read is not on every admission. But `CompiledUnder` does not record the artifact bytes. Two nodes with different bytes at one path run two epochs, and no divergence is reported. A node that cannot read the path fails that compile and serves its last compiled plane, as for any configuration that its environment cannot satisfy.
+- **The binary attaches no learner store**, so a `learner` block in a deployment's file has no effect and gives no warning until M9 composes one.
+
+Red lines. The first run used a skeleton:
+
+- `learning_for` returned `None`, and `deliver_learning` returned at once.
+- The loader resolved every block to `None`, without `deny_unknown_fields`.
+- The metrics fold was not wired.
+
+21 of the 22 engine tests written first failed on their own claim:
+
+- Row 1 and the exploration row served `large` where `small` was expected.
+- Rows 3 to 8, the store outage, two projects, row 2 and the Jev test found no learned record.
+- The count test read `(0, 0, 0, 0)` where it expected `(1, 1, 1, 1)`. The review test read `(0, 0)` units.
+- The refused-ack, timeout, successor, gap and diverged tests read 0 residuals or 0 applies. The steered test read 0 applies where it expected 2.
+- The metrics test read 0 decisions where it expected 2.
+
+`an_off_project_records_no_learned_evidence` passed there and is a control. All 10 configuration tests failed: 7 with `expected LearnerRejected, got Ok(..)`, two on a `None` learner, and the unknown-field test on an `Ok`. With the implementation, the review test first failed with `(3000, 3000)` where it expected `(1000, 1000)`. One interval credits `CREDIT_SCALE` at each of the three levels, so the test was corrected.
+
+These tests were written after the implementation, and mutations hold them:
+
+- `a_project_turned_off_still_delivers_its_sessions_pending_entries`.
+- `a_learned_route_fails_over_to_a_passing_plan_and_counts_one_decision`. It checks the draft 7.6 fallbacks, one selection on both dispatches, one metrics decision, and one failover row on `small`.
+- `the_epoch_matches_a_golden_digest`, with a value computed outside the crate, and `every_content_rule_refuses_its_artifact` (gate, prior range, repeated prior, input and selector revisions).
+
+These mutations each failed their tests:
+
+- A timed-out read reported as `StoreUnavailable`, and a read with no timeout: row 6.
+- Delivery moved to the start of the turn: 11 delivery tests.
+- Delivery only on dispatched turns: the steered test.
+- `off` treated as `shadow`: the off test and the turned-off test.
+- Delivery gated on the current mode: the turned-off test.
+- `ChainDiverged` backfilled like a gap, and stopped sessions not checked: the diverged test.
+- A gap's backfill sent on the next turn: the gap test.
+- The draw salted with the empty string: the exploration row.
+- The read keyed without the window: row 2.
+- Each configuration refusal removed (no tiers, exploration outside `live`, the artifact list, `deny_unknown_fields`, the zero timeout, the strategy-list check), `on_infeasible` resolved to `refuse`, and a default rate of 0.1: the configuration tests.
+- Acknowledgements not folded, decisions not folded, and every dispatch counted as a decision: the metrics and failover tests.
+- The epoch without the credit revision, with another prefix, or over the raw bytes: the golden digest. The gate, prior-range, repeated-prior and selector checks removed: the content-rule test.
+
+Delivery after the lease release does not compile, because `release` consumes the session.
+
+**Orchestrator ruling, 2026-09-29 (M8 decision 3).** The learner epoch id includes `STAGE_SELECTOR_REVISION`. That revision versions the `rules` pick, which every learned key embeds (`rules_pick` is part of every level). A change to the rules picker therefore starts a new epoch rather than reusing credit earned under a different meaning of the key.

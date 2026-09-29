@@ -14,11 +14,13 @@
 //! passes the [`StoreRead`] and the [`Draw`] in a [`LearningTurn`], and the
 //! record keeps both, so replay reaches the same decision without either.
 //!
-//! **Not a [`RoutingPolicy`](crate::routing::RoutingPolicy) yet.** The learner
+//! **Not a [`RoutingPolicy`](crate::routing::RoutingPolicy).** The learner
 //! needs inputs that [`RoutingContext`] does not carry, and adding a field
 //! there reaches every constructor of the context, including the credential
-//! module. The engine seam, and the error mapping for [`LearnedError`], are the
-//! M8 milestone of `agent-docs/PLAN-online-routing-learner.md`.
+//! module. So the inputs travel as a [`LearningTurn`] beside the context, and
+//! the server's engine (`engine::learning`) calls [`LearnedPolicy::choose`]
+//! directly for a `shadow` or `live` project; it maps [`LearnedError::Refused`]
+//! to a turn that fails as a policy refusal.
 
 use super::corrections::{Corrections, grant};
 use super::evidence::{

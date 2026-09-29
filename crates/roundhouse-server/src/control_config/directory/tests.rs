@@ -107,6 +107,7 @@ fn project(id: &str) -> ProjectEntry {
         validate: None,
         credentials: None,
         tiers: None,
+        learner: None,
     }
 }
 

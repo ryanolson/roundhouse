@@ -18,6 +18,11 @@
 //! does not survive a restart — which is safe only because every write in it is
 //! a *narrowing* or a projection of something the log already holds, and losing
 //! either degrades to the deployment's own ceiling rather than past it.
+//!
+//! `learning` is the online routing learner: the learned choice `plan` makes
+//! for a `shadow` or `live` project, and the delivery of pending learning
+//! entries in the turn's tail. It answers to the learner store, whose watermark
+//! is the authority on what has been delivered.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -62,6 +67,7 @@ use crate::control_config::Admission;
 mod classification;
 mod control;
 mod fair_use;
+mod learning;
 mod selection;
 pub(crate) mod spend;
 
@@ -136,6 +142,22 @@ pub enum EngineError {
          cannot be told about a toolbox at all"
     )]
     NoToolCapableTarget { tools: usize, why: String },
+    /// A `live` learner under `on_infeasible = refuse` found no strategy
+    /// that met its constraints, a store outage included.
+    ///
+    /// The project's own configuration refused the turn, which is why it is
+    /// filed as a policy refusal rather than an upstream error: the remedy is
+    /// the project's `learner` block (`serve_rules`, the ruled default, would
+    /// have served the `rules` route), not the fleet. No new
+    /// `IncompleteReason` is added for it, because a new reason is a wire
+    /// change an older node could not decode.
+    #[error(
+        "the project's learner refuses turns it cannot validate, and no strategy met {}",
+        unmet.iter().map(|unmet| unmet.label()).collect::<Vec<_>>().join(", ")
+    )]
+    LearnerRefused {
+        unmet: Vec<roundhouse_core::routing::learn::Unmet>,
+    },
     #[error("chosen target `{0:?}` had no matching quote")]
     UnresolvableTarget(Target),
     #[error("turn exceeded its deadline of {0} ms")]
@@ -729,6 +751,9 @@ impl Failed {
     fn incomplete_reason(&self) -> IncompleteReason {
         match &self.error {
             EngineError::Routing(RoutingError::PolicyRefused) => IncompleteReason::PolicyRefused,
+            // See `EngineError::LearnerRefused` for why a learner refusal is a
+            // policy refusal.
+            EngineError::LearnerRefused { .. } => IncompleteReason::PolicyRefused,
             // The one failure a retry can legitimately fix without anyone
             // touching a policy: an admin raises the limit, or the month rolls
             // over. See `IncompleteReason::BudgetExhausted`.
@@ -943,6 +968,13 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// separately. Recording the intent to classify is not: it runs after
     /// the terminal event, ahead of the lease being handed back.
     classifier: Option<Arc<ClassificationRuntime<T>>>,
+    /// The online routing learner's store and delivery state, when the
+    /// composition root attached one.
+    ///
+    /// **`None` is the shipped state**, and with it every turn routes through
+    /// [`Self::policy`] exactly as before, whatever a project's `learner` block
+    /// says. See [`learning`] for what a learner turn adds.
+    learner: Option<Arc<learning::RoutingLearner>>,
 }
 
 /// `'static` since the classification runtime: a background worker outlives the
@@ -1017,6 +1049,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             unread_recipe: std::sync::Once::new(),
             fair_use_unreachable_warned: std::sync::atomic::AtomicBool::new(false),
             classifier: None,
+            learner: None,
         }
     }
 
@@ -1543,6 +1576,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // projects fair use actually governs. See `Engine::record_fair_use_draw`.
         self.record_fair_use_draw(&session, &response_id, admission)
             .await;
+        // The learner's pending entries, last, while the lease is still held:
+        // the acknowledgement is an append. After the settle and the draw, so
+        // a slow learner store delays neither the money nor the counters. See
+        // `Engine::deliver_learning`.
+        self.deliver_learning(&mut session, admission).await;
         let last_seq = session.last_seq();
         // Stop renewing before handing the lease back, so no renewal can land
         // after the release and re-own a session this node has finished with.
@@ -2407,37 +2445,59 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 );
             });
         }
-        let decision = self
-            .bounded(
-                deadline_at,
-                self.policy.choose(&RoutingContext {
-                    session_id: session.session_id(),
-                    turn_index,
-                    isl_tokens,
-                    candidates: &candidates,
-                    ledger: session.ledger(),
-                    turn_policy,
-                    // The turns before this one. `record_routing` below folds
-                    // this turn's own dispatch in afterwards, which is what
-                    // makes the window a trailing one rather than one that
-                    // counts the decision being taken.
-                    frontier_history: &session.state().frontier_history,
-                    // What the ledger just granted, or `Unlimited` where there
-                    // was no ledger to ask. The router applies it as one more
-                    // axis of the same admissibility question the policy is
-                    // applied through, and produces the overflow state that
-                    // exists nowhere upstream of it.
-                    budget: &budget,
-                    // Derived above from the committed log. `Some` on every
-                    // turn including the first, whose signals are simply empty.
-                    signals: Some(&features.signals),
-                    // The project's recipe, resolved at admission beside the
-                    // policy. `None` on every project that configured none,
-                    // which is what makes the stage router a no-op for them.
-                    tiers: admission.tiers.as_deref(),
-                }),
-            )
-            .await
+        let ctx = RoutingContext {
+            session_id: session.session_id(),
+            turn_index,
+            isl_tokens,
+            candidates: &candidates,
+            ledger: session.ledger(),
+            turn_policy,
+            // The turns before this one. `record_routing` below folds
+            // this turn's own dispatch in afterwards, which is what
+            // makes the window a trailing one rather than one that
+            // counts the decision being taken.
+            frontier_history: &session.state().frontier_history,
+            // What the ledger just granted, or `Unlimited` where there
+            // was no ledger to ask. The router applies it as one more
+            // axis of the same admissibility question the policy is
+            // applied through, and produces the overflow state that
+            // exists nowhere upstream of it.
+            budget: &budget,
+            // Derived above from the committed log. `Some` on every
+            // turn including the first, whose signals are simply empty.
+            signals: Some(&features.signals),
+            // The project's recipe, resolved at admission beside the
+            // policy. `None` on every project that configured none,
+            // which is what makes the stage router a no-op for them.
+            tiers: admission.tiers.as_deref(),
+        };
+        // The learner, for a project whose learner is `shadow` or `live` on an
+        // engine that has one; today's policy for everything else. See
+        // `engine::learning` for why an `off` project never reads the store.
+        let chosen = match self.learning_for(admission) {
+            Some((learner, terms, mode)) => {
+                self.bounded(
+                    deadline_at,
+                    self.choose_learned(
+                        learner,
+                        &ctx,
+                        learning::LearnedTurnInputs {
+                            terms,
+                            mode,
+                            project: &admission.principal.project,
+                            response_id,
+                            arm: session.state().arm(),
+                            tool_turn: declarations.declares_tools(),
+                            window: classifications.as_ref(),
+                            available: session.state().classifications(),
+                        },
+                    ),
+                )
+                .await
+            }
+            None => self.bounded(deadline_at, self.policy.choose(&ctx)).await,
+        };
+        let decision = chosen
             // **The other half of F2, and the one that reads wrong without
             // this.** With local excluded above, an exhausted budget leaves a
             // tool-declaring turn nothing to degrade *to*: `NoViableCandidate`

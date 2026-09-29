@@ -359,6 +359,7 @@ mod tests {
             credentials: TurnCredentials::unrestricted(),
             budget_counts: Default::default(),
             tiers: None,
+            learner: None,
         }
     }
 

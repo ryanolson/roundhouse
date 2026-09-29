@@ -96,7 +96,7 @@ resumption (`starting_after`), reconnect replay for the bidirectional
 transports, and the routing audit trail.
 
 **Conversation items and the routing ledger are projections of that log**, not
-separately stored collections. `SessionStore` supplies the shared append and replay path, lease management, and a durable index for learning recovery. The recovery index is implemented, but ordinary session writes do not yet populate it.
+separately stored collections. `SessionStore` supplies the shared append and replay path, lease management, and a durable index for learning recovery. Every append that carries a learning entry marks the session in that index, and the engine clears the mark once the learner store confirms delivery. The recovery task that reads the index for idle sessions is not built yet.
 
 **A single-writer lease with fencing.** Event appends require a `Lease`. An owner that stalled, was partitioned, or died and came back fails its next append rather than interleaving with its successor. Learning-index acknowledgement and requeue use log-sequence checks, so recovery can run without owning the writer lease.
 
@@ -493,6 +493,41 @@ gate**: declared-and-gated prices on the `Declared` basis, declared-and-refused
 is `Unpriced` naming the model and the band, and an unresolvable value is
 recorded verbatim while pricing falls back to inference on the `Inferred`
 basis, never a silent upgrade. No line of routing reads it.
+
+### The online routing learner
+
+A project with a `"tiers"` recipe can also add a `"learner"` block. The learner chooses a serving strategy for each turn: `rules` (the stage router's own pick), `efficient`, or `capable`. It picks the cheapest strategy whose frontier reviews pass the quality floor, within the latency limit and the budget grant. The design and the rulings are in `agent-docs/PLAN-online-routing-learner.md`.
+
+```json
+"learner": {
+  "mode": "shadow",
+  "strategies": ["rules", "efficient", "capable"],
+  "artifact": "/etc/roundhouse/learner/acme.json",
+  "quality": { "floor": 0.8, "z": 1.96, "min_evidence": 5000, "min_sessions": 20 },
+  "latency_limit_ms": 10000,
+  "latency_min_samples": 20,
+  "cache_min_samples": 20,
+  "on_infeasible": "serve_rules",
+  "read_timeout_ms": 25,
+  "apply_timeout_ms": 250
+}
+```
+
+- `mode` is `off` (the default), `shadow`, or `live`. An `off` block, or no block, routes exactly as before: no learner-store read and no draw. `shadow` serves the `rules` route and records what the learner would have chosen. `live` serves the learner's choice.
+- Two fields have defaults. `on_infeasible` defaults to `serve_rules`, which serves the `rules` route when no strategy meets the constraints. `refuse` fails such a turn, including every turn during a learner-store outage, as a policy refusal. `exploration.rate` defaults to `0.05` when an `exploration` block is present.
+- Every other field is required in `shadow` and `live`. The values above are the ruled starting numbers. Code supplies none of them.
+- The loader refuses these blocks:
+  - a block on a project without `tiers`,
+  - a floor outside `0.0..=1.0`, a `z` that is not positive, or a zero timeout,
+  - fewer than 2 strategies, a repeated or unknown strategy, or a list without `rules`,
+  - an artifact that the loader cannot read, that is not in the artifact format, or that lists other strategies,
+  - an `exploration` block on a project that is not `live`, or a rate outside `(0, 1]`.
+- The artifact is the calibration file (draft section 14.5). Its bytes and the strategy list decide the epoch id, so a new artifact starts new counters.
+- `exploration` is accepted only on `live` projects. A turn explores only on a session whose validation arm consults the judge, and only to a strategy that is cheaper than the served one and meets every hard constraint.
+
+The engine reads the learner store once per learned turn, bounded by `read_timeout_ms`. After the turn's terminal event and the settle, it delivers the session's pending learning entries in one apply, bounded by `apply_timeout_ms`, then clears the session's source mark and appends `LearningApplied`. A failed delivery leaves the entries marked for the next turn. A session whose project is later set to `off` still has its pending entries delivered, and its turns make no store read.
+
+The binary does not attach a learner store yet. Milestone M9 composes one at startup. Until then, the loader checks a `learner` block in a deployment's file, and the block has no effect and gives no warning. `Engine::with_learner` attaches a store.
 
 ## Hooking up Codex
 
@@ -1078,6 +1113,22 @@ The `evaluation.agreement` object compares the served tier with the tier answer 
 `answered` counts the results that have a tier answer. Each answer is in one of `agree`, `disagree`, or `not_comparable`. `not_comparable` counts answers that have no served tier to compare. There are four reasons: no tier recipe routed the turn, the target is in neither recipe list, the route is not the session's latest route in the folded log, or the fold stopped waiting for the answer at the per-session limit below. `disagreements` splits the disagreements by direction. It also splits them by the label of the frontier review that covered the turn: `positive`, `negative`, `unknown`, or `unlabeled`.
 
 A review can arrive before or after the answer. Each session keeps at most 256 (`MAX_REVIEW_DECISIONS`) turns that wait for an answer or a label. `evicted` counts the unlabeled disagreements that the fold dropped at this limit. The dashboard shows the object in the "Tier agreement" tile.
+
+### Learner decisions and delivery
+
+The `learning` object counts what the online learner decided, in the same scopes as the rest of the document. `decisions` counts learned turns, one for each turn however many dispatches it made. `modes` splits them into `shadow` and `live`. `served` counts the strategy whose plan served each turn: `rules` for every `shadow` turn and every infeasible turn. `choices` counts `exploit`, `explore`, and `constraint_unmet`. `unmet` counts infeasible turns by each constraint that some plan failed (`quality`, `latency`, `grant`), so one turn can count more than once. `read_failures` counts turns whose store read failed, by reason. `acknowledgements` counts `LearningApplied` events.
+
+`delivery` is not a projection of the log. A failed delivery writes nothing to the log by design, so the engine counts the outcomes in process memory, and they reset when the process restarts. It reports these counts:
+
+- entries applied, and entries that the store skipped as duplicates,
+- backfill replays and gaps,
+- sessions stopped on a diverged chain, and project epochs stopped on a counter out of range or a malformed batch,
+- applies that were unavailable or timed out,
+- acknowledgements that failed after an apply.
+
+Admin credentials and the project reconciliation view see `delivery`. A turn key sees `null`, because the counts are per project.
+
+Why an accepted review credited nothing is not in this object. The credit rule decides it in the session fold. A second copy of that rule here can drift from the first.
 
 The `observed_cost` object adds catalog-priced serving spend, local capacity spend when the catalog prices it (`local_capacity_usd`, otherwise `null`), and recorded classifier cost, with both price bases stated. Its `evaluation_usd` is `evaluation_measured_usd` plus `evaluation_estimated_usd`, the same measured/estimated split that hosted spend uses. The booked estimates are in the total so that a classifier call that may have been billed never reads as free. Judge side calls remain in serving spend and count once. This sum is not an invoice. Its local capacity part is a configured approximation, not a measurement of hardware cost. Forwarded subscription seats remain outside the hosted dollar amounts. A seat's local turns still count in `local_capacity_usd`, because the hardware is this deployment's. `savings.total_usd` retains its existing meaning: cache savings plus routing savings.
 

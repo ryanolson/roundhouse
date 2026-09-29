@@ -466,6 +466,8 @@ At most one backfill runs in each turn tail. A backfill is a full read-only repl
 
 A learner turn makes one learner-store read in `plan`. When entries are pending, the tail makes one learner-store script call, one session-store mark clear, and one append. An append that marks the session adds one hash write and one sorted-set write to the existing append script. Slice L5 counts these calls. This brief makes no claim about elapsed time.
 
+**Addendum, 2026-09-29.** Step 6 is superseded by the plan's M8 status note (`PLAN-online-routing-learner.md` section 9): the backfilled page is applied in the same tail, because the live fold's page on the next turn still starts above the store watermark and would meet the same gap forever. `ChainDiverged` (M6) stops the session's delivery and is never backfilled, and `WrongType` leaves the entries pending.
+
 ### 11.6 Recovery cases
 
 | Case | Result |

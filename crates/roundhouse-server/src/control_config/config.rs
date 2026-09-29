@@ -54,10 +54,12 @@ use super::Admission;
 use super::budget::{AllocationConfig, BudgetConfig, budget_terms};
 use super::credentials::CredentialsConfig;
 use super::fair_use::{FairUseConfig, fair_use_terms};
+use roundhouse_core::routing::learn::LearnerTerms;
 use roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD;
 use roundhouse_core::routing::{PickerMode, TierRecipe, TierRecipeError};
 use roundhouse_core::validate::ValidationTerms;
 
+use super::learner::{LearnerConfig, LearnerConfigError};
 use super::validate::ValidateConfig;
 
 /// One entry of the config's `"projects"` array.
@@ -134,6 +136,25 @@ pub struct ProjectEntry {
     /// that shape means there is no place to write the sentence at all.
     #[serde(default)]
     pub tiers: Option<TiersConfig>,
+    /// Whether this project's turns are routed by the online learner, and
+    /// how. Absent, or `"mode": "off"`, is today's routing exactly: no store
+    /// read, no draw, no learned evidence. See [`LearnerConfig`].
+    ///
+    /// **Skipped on the wire when absent**, unlike the axes above: a stored
+    /// directory document or an admin response that gained `"learner": null`
+    /// would be refused by an older node's `deny_unknown_fields`, and nothing
+    /// about a project that never configured a learner should read differently
+    /// to one.
+    ///
+    /// On the project for the reason `tiers` is: a strategy is a tier pick
+    /// over the project's recipe, and a key has no place choosing which model
+    /// answers.
+    ///
+    /// Boxed because the block is wide and nearly always absent: inline it
+    /// would more than double every `ProjectEntry`, and with it every
+    /// directory mutation that carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub learner: Option<Box<LearnerConfig>>,
 }
 
 /// The shape of a project's `"tiers"` object.
@@ -566,6 +587,12 @@ pub enum ControlPlaneError {
         entry: String,
         min_quality: f64,
     },
+    #[error("control-plane config `{path}`: {entry}'s `learner` block is refused -- {source}")]
+    LearnerRejected {
+        path: String,
+        entry: String,
+        source: LearnerConfigError,
+    },
     #[error("control-plane config `{path}`: {entry}'s `tiers` block is refused -- {source}")]
     TierRecipeRejected {
         path: String,
@@ -937,6 +964,12 @@ impl ControlPlaneConfig {
         // not on the day somebody notices every turn is landing on the picker
         // default.
         let mut project_tiers: HashMap<&str, Option<Arc<TierRecipe>>> = HashMap::new();
+        // And every project's learner, `None` meaning it is off or absent.
+        // Resolved here for the reason the recipe is, and refused here for the
+        // same sharper one: an artifact that does not match its strategy list
+        // has to stop the boot on the day it is written, not on the first turn
+        // that reads it.
+        let mut project_learners: HashMap<&str, Option<Arc<LearnerTerms>>> = HashMap::new();
         // The deployment's own keys, resolved once: every project's resolution
         // reads them, and reading the environment per project would let one
         // variable be judged twice and -- if it changed underneath us -- judged
@@ -1012,6 +1045,13 @@ impl ControlPlaneConfig {
                 }
                 None => None,
             };
+            let learner = match &project.learner {
+                Some(learner_config) => {
+                    learner_config.to_terms(path, &entry, project.tiers.is_some())?
+                }
+                None => None,
+            };
+            project_learners.insert(project.id.as_str(), learner);
             project_tiers.insert(project.id.as_str(), tiers);
 
             if project.credentials.is_some() {
@@ -1209,6 +1249,11 @@ impl ControlPlaneConfig {
                     tiers: project_tiers
                         .get(key.project.as_str())
                         .expect("a project checked present above was resolved to tiers above")
+                        .clone(),
+                    // The project's, for the reason `tiers` is.
+                    learner: project_learners
+                        .get(key.project.as_str())
+                        .expect("a project checked present above was resolved to a learner above")
                         .clone(),
                 },
             );

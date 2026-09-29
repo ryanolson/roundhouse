@@ -153,6 +153,7 @@ async fn a_ceiling_patched_in_after_boot_is_counted_in_the_shared_buckets() {
                     validate: None,
                     credentials: None,
                     tiers: None,
+                    learner: None,
                 },
             },
             now,
