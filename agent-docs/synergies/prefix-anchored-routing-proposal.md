@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Prefix-anchored routing to sticky Dynamo pools
 
-> **Status: proposal, 2026-09-29. Not ruled.** Written to the owner's ruling in the addendum of `program-identity-proposal.md`, which it replaces. Evidence: `../research/prefix-anchored-routing-evidence.md` (cited as "evidence §n"). Written against Roundhouse `2dd40dd`, Codex pin `6344a65`, and Dynamo pin `ac7b751`. Section 12 lists the questions for the owner. When the owner rules, add a dated addendum. Do not rewrite this text.
+> **Status: proposal, 2026-09-29. Not ruled.** Written to the owner's ruling in the addendum of `session-identity-first-proposal.md`, which it replaces. Evidence: `../research/prefix-anchored-routing-evidence.md` (cited as "evidence §n"). Written against Roundhouse `2dd40dd`, Codex pin `6344a65`, and Dynamo pin `ac7b751`. Section 12 lists the questions for the owner. When the owner rules, add a dated addendum. Do not rewrite this text.
 
 ## 0. Summary
 

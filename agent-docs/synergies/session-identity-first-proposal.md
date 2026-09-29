@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Program identity and program-level routing
 
-> **Status: proposal, 2026-09-29. Not ruled.** Evidence: `../research/program-identity-evidence.md`. Written against Roundhouse `39353e5`, Codex pin `6344a65`, Dynamo pin `ac7b751`, and the llm-d "Flow Control: North Star" proposal (baseline `8bd261f1`). Section 7 lists the decisions that only the owner can make. When the owner rules, add a dated addendum. Do not rewrite this text.
+> **Status: proposal, 2026-09-29. Not ruled.** Evidence: `../research/session-identity-evidence.md`. Written against Roundhouse `39353e5`, Codex pin `6344a65`, Dynamo pin `ac7b751`, and the llm-d "Flow Control: North Star" proposal (baseline `8bd261f1`). Section 7 lists the decisions that only the owner can make. When the owner rules, add a dated addendum. Do not rewrite this text.
 
 ## 0. Summary
 
@@ -357,3 +357,7 @@ Orchestrator readings that the owner has not ruled. The replacement design treat
 - **Worker hints.** The ruling says that the goal of Roundhouse is the same Dynamo router. It does not say whether Roundhouse still sends a worker hint (section 3.3 tier 2, and P4) inside the pool.
 - **The egress class of a pool (D6).** The ruling says what a pool is. It does not say whether a pool is a local target or an external one. That class decides the failover rule and the no-egress rule for a local-only session.
 - **Instance or pool.** The bring-up rule and the guard rail name an instance. If Roundhouse is sticky at the level of the pool, it possibly never sees an instance. The design must say where each limit applies and what Roundhouse must observe for it.
+
+## Addendum, 2026-09-29: terminology
+
+The owner renamed this workstream from "program identity" to **session and sequence identity**. The term "program" is retired here and in the documents that follow. It stays only in quotations of the llm-d North Star proposal. The file of this proposal was renamed from `program-identity-proposal.md`, and its evidence file was renamed from `program-identity-evidence.md`. The text above is kept as the record.

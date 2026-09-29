@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Program identity signals per client
 
-> **Status: evidence base, 2026-09-29.** Read against Roundhouse `39353e5` (branch `ai/learner-m8-engine`), the Codex Cargo pin `6344a655a5966f92e009a74928fb0559b41f9093`, the Dynamo Cargo pin `ac7b7513790ef1d619b46f805aea03c9f21200ba`, and the llm-d "Flow Control: North Star" proposal (baseline llm-d-router `8bd261f1`, text captured 2026-09-29). No code changed. No Cargo command ran. Add dated notes when an upstream changes. Do not silently revise this snapshot. The ruling that uses this evidence is `../synergies/program-identity-proposal.md`.
+> **Status: evidence base, 2026-09-29.** Read against Roundhouse `39353e5` (branch `ai/learner-m8-engine`), the Codex Cargo pin `6344a655a5966f92e009a74928fb0559b41f9093`, the Dynamo Cargo pin `ac7b7513790ef1d619b46f805aea03c9f21200ba`, and the llm-d "Flow Control: North Star" proposal (baseline llm-d-router `8bd261f1`, text captured 2026-09-29). No code changed. No Cargo command ran. Add dated notes when an upstream changes. Do not silently revise this snapshot. The ruling that uses this evidence is `../synergies/session-identity-first-proposal.md`.
 
 ## 0. Result
 

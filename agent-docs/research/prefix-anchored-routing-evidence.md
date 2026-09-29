@@ -154,7 +154,7 @@ The tool schemas were not measured for Codex. A live capture at the pin line is 
 
 ## 7. Codex: the fork copy is not a byte prefix
 
-- `spawn_agent` v2 accepts `fork_turns`, default `all` (from `program-identity-evidence.md` §3.3, fact-checked).
+- `spawn_agent` v2 accepts `fork_turns`, default `all` (from `session-identity-evidence.md` §3.3, fact-checked).
 - For a full-history fork, the child history is the parent's rollout with three edits. `AgentMessage` items are removed. Developer messages that equal a multi-agent v2 usage-hint text, or that match the current-time reminder, are removed. The parent's developer instructions are replaced by sub-agent instructions when a role or an override applies [codex@6344a65 core/src/agent/control/spawn.rs:86-101, :684-700, :719-760].
 - The root usage hint is a standalone developer message placed before the contextual user message (section 6). When the root carried it, the child's canonical items diverge from the parent's at that index, which is item 2.
 - `MultiAgentV2` is `Stage::Stable` with `default_enabled: false` [codex@6344a65 features/src/lib.rs:1077-1082]. The v1 `Collab` feature is on by default [codex@6344a65 features/src/lib.rs:1071-1076]. A v1 spawn forks history only with `fork_context: true`, and the v2 usage-hint filter list is empty for v1 [codex@6344a65 core/src/agent/control/spawn.rs:684-700].
@@ -177,7 +177,7 @@ In both orders that include tools, the tools come before the attribution block. 
 | `x-tenant-id` | [dynamo@ac7b751 lib/llm/src/protocols/common/extensions.rs:245, :345] | A tenant label toward the pool. Its effect in the router was not traced. |
 | `nvext.extra_fields: ["worker_id"]` returns `prefill_worker_id` and `decode_worker_id` | [dynamo@ac7b751 lib/llm/src/protocols/common/extensions.rs:163-175, :571] | Roundhouse can observe which instance served a request, after dispatch. |
 | `usage.prompt_tokens_details.cached_tokens`, copied from the backend's `completion_usage` | [dynamo@ac7b751 lib/llm/src/protocols/openai/chat_completions/delta.rs:259-269], [lib/llm/src/preprocessor.rs:3075], [lib/llm/src/protocols/anthropic/stream_converter.rs:1029-1032] | An observed cache count from the engine. Whether every backend fills it was not established. A grep of `lib/mocker` for `prompt_tokens_details` found no producer. The mocker's vLLM server test reads only `prompt_tokens` and `completion_tokens` from `completion_usage` [dynamo@ac7b751 lib/mocker/servers/vllm/tests/sidecar.rs:153-154]. So the mocker at the pin does not appear to report cached tokens. |
-| `x-dynamo-session-id`, `x-dynamo-parent-session-id`, `x-dynamo-session-final` | [dynamo@ac7b751 lib/llm/src/protocols/agents.rs:14-16] | Session metadata. The router reads no `session_id` for placement (`program-identity-evidence.md` §11, claim 6). |
+| `x-dynamo-session-id`, `x-dynamo-parent-session-id`, `x-dynamo-session-final` | [dynamo@ac7b751 lib/llm/src/protocols/agents.rs:14-16] | Session metadata. The router reads no `session_id` for placement (`session-identity-evidence.md` §11, claim 6). |
 
 ## 10. Roundhouse state the design reuses
 
