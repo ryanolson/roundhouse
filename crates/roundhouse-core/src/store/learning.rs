@@ -219,10 +219,12 @@ pub enum RequeueOutcome {
 /// never walks the whole index.
 #[derive(Default)]
 pub(super) struct MemoryIndex {
-    /// The permanent marks. Never shrinks.
+    /// The permanent marks. Never shrinks, outside the test lever
+    /// (`orphan` below removes an entry to stand in for a foreign `HDEL`).
     marks: BTreeMap<SessionId, StoredMark>,
     /// The sessions whose current mark is not yet confirmed delivered. Every
-    /// member has an entry in `marks`.
+    /// member has an entry in `marks`, outside the test lever: `orphan`
+    /// removes a pending member's entry without removing the member.
     pending: BTreeSet<SessionId>,
     /// Marks the store treats as unreadable: the in-memory stand-in for a
     /// stored mark a Redis index cannot parse. Only a test lever

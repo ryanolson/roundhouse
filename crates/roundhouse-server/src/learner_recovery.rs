@@ -63,9 +63,16 @@
 //! per session and mark: again only after the session is delivered or marked
 //! anew, or after a full pass that did not hold it again this way. A member
 //! with no stored mark at all and one whose stored mark cannot be parsed are
-//! both named as unreadable, and each warns once per session until it is
-//! readable again. A stop logs one error when it stops the session, and the
-//! task does not visit the session again until a restart. An apply that
+//! both named as unreadable, and each warns once per pass while it stays
+//! unreadable -- once until it is readable again, if the audit meets it
+//! every pass. A member with no stored mark heals on its own the next time
+//! the session is marked again, since the append finds no existing value to
+//! check; an out-of-range seq or marked-at heals the same way, because
+//! Lua's own parser still accepts it and the append overwrites it -- but a
+//! mark that fails Lua's own parse (`BADMARK`) blocks that append instead of
+//! healing it, and needs an operator to rewrite or remove the field
+//! directly. A stop logs one error when it stops the session, and the task
+//! does not visit the session again until a restart. An apply that
 //! times out and a gap the backfill cannot close are counted in
 //! `learning.delivery` and not logged.
 //!

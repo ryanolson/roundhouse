@@ -941,12 +941,17 @@ async fn all_unreadable<S: SessionStore>(store: &S, index: Index) -> Vec<Session
 /// nothing, and answer `Unmarked` -- the same as a session that was never
 /// marked -- so neither removes it from `pending`. The orphan therefore
 /// cannot leave `pending` on its own; it is named on every later pass until
-/// an operator repairs the index (restores the field, or `ZREM`s the member).
-/// That is acceptable because the condition is already an operator-visible
-/// anomaly no normal operation produces, it never stalls the sweep or the
-/// sessions behind it, and the recovery task's held set still warns about it
-/// only once per pass (see the `recovery_warnings` suite in
-/// `roundhouse-server`) rather than on every sweep.
+/// an operator repairs the index (restores the field, or `ZREM`s the member)
+/// -- or until the session turns again, since a new marked append rewrites
+/// the marks field and heals the orphan with no operator action. "Until an
+/// operator repairs it" therefore only holds for a session that never turns
+/// again. That is acceptable because the condition is already an
+/// operator-visible anomaly no normal operation produces, it never stalls
+/// the sweep or the sessions behind it, and the recovery task's held set
+/// warns about it once per pass while it stays unreadable -- once until it
+/// is readable again, if the audit meets it every pass (see the
+/// `recovery_warnings` suite in `roundhouse-server`) -- rather than on every
+/// sweep.
 pub async fn an_orphaned_pending_member_is_named_and_the_page_goes_on<S: LearningMarkControl>(
     store: &S,
 ) {

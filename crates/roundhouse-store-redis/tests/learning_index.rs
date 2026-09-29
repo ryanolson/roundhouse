@@ -358,3 +358,162 @@ async fn an_unmarked_batch_crossing_the_exact_range_writes_nothing() {
     assert_eq!(events[0].seq, LAST_EXACT_SEQ);
     assert_eq!(rig.log_len(&sid).await, 2);
 }
+
+/// **A stored mark whose seq overflows `u64` is named, and the page goes
+/// on** (M9 round-4, item 1). Lua's `parse_mark` accepts any digit run,
+/// unbounded; Rust's `u64` is not. Before, `decode_page` failed the whole
+/// page as `Backend` on the first entry it could not parse this way, turning
+/// one session's overflowed mark into an outage for every project behind it.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_seq_that_overflows_u64_is_named_and_the_page_goes_on() {
+    let rig = rig().await;
+    let [marks, _, pending] = learning_index_keys(&rig.namespace);
+    let _: i64 = redis::cmd("ZADD")
+        .arg(&pending)
+        .arg(0)
+        .arg("sess_x")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg("sess_x")
+        .arg("18446744073709551616:1:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let page = rig
+        .store
+        .pending_learning(None, 0, NonZeroUsize::new(8).unwrap())
+        .await
+        .expect("an overflowed seq must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![SessionId::new("sess_x")],
+        "it is named rather than fatal"
+    );
+    assert!(page.sessions.is_empty());
+}
+
+/// The same overflow, in the marked-at field, against the permanent
+/// enumeration rather than pending (M9 round-4, item 1).
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_marked_at_that_overflows_u64_is_named_and_the_page_goes_on() {
+    let rig = rig().await;
+    let [marks, marked, _] = learning_index_keys(&rig.namespace);
+    let _: i64 = redis::cmd("ZADD")
+        .arg(&marked)
+        .arg(0)
+        .arg("sess_y")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg("sess_y")
+        .arg("1:18446744073709551616:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let page = rig
+        .store
+        .learning_sessions(None, NonZeroUsize::new(8).unwrap())
+        .await
+        .expect("an overflowed marked_at must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![SessionId::new("sess_y")],
+        "it is named rather than fatal"
+    );
+    assert!(page.sessions.is_empty());
+}
+
+/// A non-UTF-8 project in a stored mark is named the same way (M9 round-4,
+/// item 1): `str_at` already answers `None` on invalid UTF-8, but
+/// `decode_page` used to fold that into a page-wide `Backend` failure.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_non_utf8_project_is_named_and_the_page_goes_on() {
+    let rig = rig().await;
+    let [marks, _, pending] = learning_index_keys(&rig.namespace);
+    let _: i64 = redis::cmd("ZADD")
+        .arg(&pending)
+        .arg(0)
+        .arg("sess_z")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let mut mark = b"1:1:".to_vec();
+    mark.extend_from_slice(&[0xFF, 0xFE]);
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg("sess_z")
+        .arg(mark)
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let page = rig
+        .store
+        .pending_learning(None, 0, NonZeroUsize::new(8).unwrap())
+        .await
+        .expect("a non-UTF-8 project must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![SessionId::new("sess_z")],
+        "it is named rather than fatal"
+    );
+    assert!(page.sessions.is_empty());
+}
+
+/// **A clear's `NEWER` reply carrying an overflowed seq is this session's
+/// fault, not the store's** (M9 round-4, item 1, secondary path). `seq_at`
+/// used to fold an unparseable `NEWER`/`MISMATCH` seq into `unexpected`
+/// (`Backend`), which the recovery task reads as an outage for every
+/// project; `ARGV[1]` keys the `HGET` by this session's own id, so the value
+/// is always this session's data.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_clear_whose_newer_reply_carries_an_overflowed_seq_is_corrupt_not_backend() {
+    let rig = rig().await;
+    let [marks, _, _] = learning_index_keys(&rig.namespace);
+    let sid = SessionId::new("sess_w");
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg(sid.as_str())
+        .arg("18446744073709551616:1:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let cleared = rig.store.clear_learning_mark(&sid, 0).await;
+    assert!(
+        matches!(&cleared, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == sid),
+        "an overflowed seq in the NEWER reply must be this session's fault, got {cleared:?}"
+    );
+}
+
+/// The same fix on the requeue side: a `MISMATCH` reply carrying an
+/// overflowed seq is this session's fault, not the store's (M9 round-4,
+/// item 1, secondary path). `requeue`'s own `seq_at` call shares the same
+/// helper `clear`'s does, and had the identical `unexpected` (`Backend`)
+/// fallback.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_requeue_whose_mismatch_reply_carries_an_overflowed_seq_is_corrupt_not_backend() {
+    let rig = rig().await;
+    let [marks, _, _] = learning_index_keys(&rig.namespace);
+    let sid = SessionId::new("sess_v");
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg(sid.as_str())
+        .arg("18446744073709551616:1:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let requeued = rig.store.requeue_learning(&sid, 1).await;
+    assert!(
+        matches!(&requeued, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == sid),
+        "an overflowed seq in the MISMATCH reply must be this session's fault, got {requeued:?}"
+    );
+}

@@ -399,20 +399,21 @@ impl Scripts {
                  append before writing any event",
                 str_at(&reply, 1).unwrap_or("<unreadable>")
             ))),
-            (Some("BADMARK"), ..) => Err(crate::corrupt_log(
-                &SessionId::new(
-                    batch
-                        .mark
-                        .as_ref()
-                        .expect("BADMARK is returned only from the marked branch")
-                        .session_id,
-                ),
-                format!(
-                    "its stored learning mark is unreadable (`{}`); refusing the marked \
-                     append before writing any event",
-                    str_at(&reply, 1).unwrap_or("<unreadable>")
-                ),
-            )),
+            (Some("BADMARK"), ..) => match &batch.mark {
+                Some(mark) => Err(crate::corrupt_log(
+                    &SessionId::new(mark.session_id),
+                    format!(
+                        "its stored learning mark is unreadable (`{}`); refusing the marked \
+                         append before writing any event",
+                        str_at(&reply, 1).unwrap_or("<unreadable>")
+                    ),
+                )),
+                // The script only returns BADMARK from the marked branch, so
+                // this is unreachable in practice; a script reply this store
+                // did not ask for is exactly what `unexpected` is for,
+                // never a panic (M9 round-4, nit).
+                None => Err(unexpected(&reply)),
+            },
             (Some("RANGE"), Some(last), _) => Err(StoreError::Backend(anyhow::anyhow!(
                 "log `{log_key}` is at seq {last}; this batch would pass seq {LAST_EXACT_SEQ}, \
                  the last one the append script writes exactly, so the append is refused \

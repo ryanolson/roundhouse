@@ -341,6 +341,20 @@ fn backend(error: redis::RedisError) -> StoreError {
 /// `release` fall back to `Backend` there. Harmless: no lease caller branches
 /// on `CorruptLog` versus `Backend` for these three, so a 6.x deployment only
 /// loses the more specific classification, never correctness.
+///
+/// **Deliberately not where a redis-rs response-decode failure is
+/// classified** (M9 round-4, item 3, low): `RedisError::kind() ==
+/// ErrorKind::Parse` covers both a client-side `FromRedisValue` conversion
+/// on an already-received reply (this session's data) and the low-level RESP
+/// parser's own failure to decode the wire at all (a connection fault, which
+/// must stay `Backend`) -- the two are not distinguishable from the kind
+/// alone. `read_events` and `last_seq` sidestep the ambiguity instead of
+/// resolving it here: they decode the pipeline's reply as a generic `Value`
+/// through this same `one_session` mapper (so a real protocol failure still
+/// surfaces as `Backend`), then convert that already-received `Value` into
+/// `StreamRangeReply` themselves and map only *that* local conversion's
+/// error to `CorruptLog` (`undecodable_log`), which cannot fail on a wire
+/// problem because the wire already produced the `Value` it starts from.
 fn one_session(session_id: &SessionId) -> impl FnOnce(redis::RedisError) -> StoreError + '_ {
     move |error| match is_wrong_type(&error) {
         true => corrupt_log(
@@ -393,6 +407,24 @@ fn corrupt_log(session_id: &SessionId, detail: String) -> StoreError {
         session_id: session_id.clone(),
         detail,
     }
+}
+
+/// `read_events` and `last_seq` could not convert the `Value` the pipeline
+/// already received into `StreamRangeReply` -- a field this store never
+/// wrote, such as a non-UTF-8 field name, fails the conversion's own
+/// `String` decode. Unlike `one_session`'s `RedisError` classification, this
+/// conversion runs entirely on bytes already off the wire, so its failure
+/// can only be this session's stored content, never a connection or
+/// protocol fault (M9 round-4, item 3, low).
+fn undecodable_log(
+    session_id: &SessionId,
+    log_key: &str,
+    error: &redis::ParsingError,
+) -> StoreError {
+    corrupt_log(
+        session_id,
+        format!("log `{log_key}` could not be decoded as this store's own shape: {error}"),
+    )
 }
 
 /// Rebuild a [`SessionEvent`] from one stream entry.
@@ -649,13 +681,24 @@ impl SessionStore for RedisSessionStore {
         // `(` is an exclusive start. Ids are always `<seq>-0`, so excluding
         // exactly `after_seq-0` is precisely "seq > after_seq" — with no
         // arithmetic on `after_seq` that could overflow at u64::MAX.
-        let (exists, range): (bool, StreamRangeReply) = redis::pipe()
+        //
+        // Decoded as `Value` first, not straight into `StreamRangeReply`
+        // (M9 round-4, item 3, low): the pipeline's own decode can fail only
+        // on a genuine wire-protocol problem, which is `Backend`, same as
+        // before. Converting the already-received `Value` into
+        // `StreamRangeReply` ourselves isolates the one failure that is
+        // this session's data -- a field this store never wrote, such as a
+        // non-UTF-8 field name -- so only that local conversion's error maps
+        // to `CorruptLog`.
+        let (exists, range): (bool, redis::Value) = redis::pipe()
             .exists(meta_key(&self.namespace, session_id))
             .xrange_count(&log_key, format!("({after_seq}-0"), "+", redis_limit)
             .query_async(&mut self.conn.clone())
             .await
             .map_err(one_session(session_id))?;
         Self::require_session(exists, session_id)?;
+        let range: StreamRangeReply = redis::from_redis_value(range)
+            .map_err(|error| undecodable_log(session_id, &log_key, &error))?;
 
         let events: Vec<SessionEvent> = range
             .ids
@@ -686,7 +729,10 @@ impl SessionStore for RedisSessionStore {
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         let log_key = log_key(&self.namespace, session_id);
-        let (exists, len, newest): (bool, u64, StreamRangeReply) = redis::pipe()
+        // See `read_events`: `Value` first, `StreamRangeReply` decoded
+        // locally, so only this session's own stored bytes can answer
+        // `CorruptLog` here.
+        let (exists, len, newest): (bool, u64, redis::Value) = redis::pipe()
             .exists(meta_key(&self.namespace, session_id))
             .xlen(&log_key)
             .xrevrange_count(&log_key, "+", "-", 1)
@@ -694,6 +740,8 @@ impl SessionStore for RedisSessionStore {
             .await
             .map_err(one_session(session_id))?;
         Self::require_session(exists, session_id)?;
+        let newest: StreamRangeReply = redis::from_redis_value(newest)
+            .map_err(|error| undecodable_log(session_id, &log_key, &error))?;
 
         let last = newest
             .ids

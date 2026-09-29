@@ -603,3 +603,98 @@ async fn an_orphaned_pending_member_holds_its_session_and_the_sweep_goes_on_on_r
     assert_eq!(node.residuals(&bad_project).await, 0, "the held one is not");
     assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
 }
+
+/// **A stored mark whose seq overflows `u64` holds its session, not the
+/// sweep** (M9 round-4, item 1). Lua's `parse_mark` accepts any digit run,
+/// unbounded; before, `decode_page` failed the whole page as `Backend` on
+/// the first entry it could not parse this way, so every sweep was an
+/// outage at that member, for every project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn an_overflowed_seq_holds_its_session_and_the_sweep_goes_on_on_redis() {
+    let namespace = fresh_namespace();
+    let (bad_project, good_project) = (fresh_project(), fresh_project());
+    let node = node(&namespace, "node-a", 2).await;
+    // `a/...` sorts before `b/...`, so the bad session is the page's first.
+    let bad = SessionId::new(format!("a/{bad_project}/s"));
+    let good = SessionId::new(format!("b/{good_project}/s"));
+    node.turn(&bad, "t1", &admission(&bad_project)).await;
+    node.turn(&good, "t1", &admission(&good_project)).await;
+    assert_eq!(node.pending().await, 2);
+
+    let mut raw = redis::Client::open(url_from_env().as_str())
+        .expect("a Redis URL")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("a raw connection");
+    let [marks, _, _] = learning_index_keys(&namespace);
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg(bad.as_str())
+        .arg(format!("18446744073709551616:1:{bad_project}"))
+        .query_async(&mut raw)
+        .await
+        .expect("the overflowed mark writes");
+
+    idle();
+    let mut task = node.engine.learner_recovery(cadence()).expect("a learner");
+    let report = task.sweep().await;
+    assert!(
+        !report.outage,
+        "one session's overflowed seq is not an outage"
+    );
+    assert_eq!(
+        node.residuals(&good_project).await,
+        1,
+        "the session behind it is delivered"
+    );
+    assert_eq!(node.residuals(&bad_project).await, 0, "the held one is not");
+    assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
+}
+
+/// **A non-UTF-8 watermark field holds its session, not the sweep** (M9
+/// round-4, item 2, low). Before, `watermark`'s `HGET` decoded straight into
+/// a `String`; invalid UTF-8 bytes failed that decode with a code-less
+/// client error, which `watermark` read as `Unavailable` -- an outage that
+/// ended every sweep at this session, for every project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_non_utf8_watermark_field_holds_its_session_and_the_sweep_goes_on_on_redis() {
+    let namespace = fresh_namespace();
+    let (bad_project, good_project) = (fresh_project(), fresh_project());
+    let node = node(&namespace, "node-a", 2).await;
+    // `a/...` sorts before `b/...`, so the bad session is the page's first.
+    let bad = SessionId::new(format!("a/{bad_project}/s"));
+    let good = SessionId::new(format!("b/{good_project}/s"));
+    node.turn(&bad, "t1", &admission(&bad_project)).await;
+    node.turn(&good, "t1", &admission(&good_project)).await;
+    assert_eq!(node.pending().await, 2);
+
+    let mut raw = redis::Client::open(url_from_env().as_str())
+        .expect("a Redis URL")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("a raw connection");
+    let _: () = redis::cmd("HSET")
+        .arg(learn_watermark_key(&namespace, &bad_project))
+        .arg(bad.as_str())
+        .arg(vec![0xFFu8, 0xFE])
+        .query_async(&mut raw)
+        .await
+        .expect("the non-UTF-8 value writes");
+
+    idle();
+    let mut task = node.engine.learner_recovery(cadence()).expect("a learner");
+    let report = task.sweep().await;
+    assert!(
+        !report.outage,
+        "one session's non-UTF-8 watermark field is not an outage"
+    );
+    assert_eq!(
+        node.residuals(&good_project).await,
+        1,
+        "the session behind it is delivered"
+    );
+    assert_eq!(node.pending().await, 1, "the bad session stays pending");
+    assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
+}

@@ -228,7 +228,7 @@ impl LearningScripts {
         match tag_of(&reply) {
             Some("COVERED") => Ok(ClearOutcome::Covered),
             Some("NEWER") => Ok(ClearOutcome::Newer {
-                mark_seq: seq_at(&reply, 1)?,
+                mark_seq: seq_at(&reply, 1).map_err(|_| corrupt_seq(&reply, session_id))?,
             }),
             Some("UNMARKED") => Ok(ClearOutcome::Unmarked),
             Some("BADMARK") => Err(bad_mark(&reply, session_id)),
@@ -255,7 +255,7 @@ impl LearningScripts {
         match tag_of(&reply) {
             Some("REQUEUED") => Ok(RequeueOutcome::Requeued),
             Some("MISMATCH") => Ok(RequeueOutcome::Mismatch {
-                mark_seq: seq_at(&reply, 1)?,
+                mark_seq: seq_at(&reply, 1).map_err(|_| corrupt_seq(&reply, session_id))?,
             }),
             Some("UNMARKED") => Ok(RequeueOutcome::Unmarked),
             Some("BADMARK") => Err(bad_mark(&reply, session_id)),
@@ -299,6 +299,12 @@ fn decode_page(reply: &[Value], limit: NonZeroUsize) -> Result<LearningPage, Sto
         _ => return Err(unexpected(reply)),
     }
     let examined = int_at(reply, 1).ok_or_else(|| unexpected(reply))?;
+    // `last` (the cursor) and every already-`ORPHAN`/unparseable member Lua
+    // named in `unreadable` are members `ZRANGE` returned, so each is
+    // decoded as a `SessionId` here too -- and each still fails the whole
+    // page if it is not UTF-8, for the same unruled reason as the member
+    // decoded per found chunk below: there is no `SessionId` to name it
+    // with in `unreadable`, or to resume a cursor from.
     let last = str_at(reply, 2).ok_or_else(|| unexpected(reply))?;
     let unreadable_count = int_at(reply, 3)
         .and_then(|count| usize::try_from(count).ok())
@@ -320,18 +326,35 @@ fn decode_page(reply: &[Value], limit: NonZeroUsize) -> Result<LearningPage, Sto
     if !fields.len().is_multiple_of(4) {
         return Err(unexpected(reply));
     }
-    let sessions = fields
-        .chunks_exact(4)
-        .map(|entry| {
-            let text = |index| str_at(entry, index).ok_or_else(|| unexpected(reply));
-            Ok(MarkedSession {
-                session_id: SessionId::new(text(0)?),
-                seq: parse_seq(text(1)?, reply)?,
-                marked_at_ms: parse_seq(text(2)?, reply)?,
-                project: ProjectId::new(text(3)?),
-            })
-        })
-        .collect::<Result<Vec<_>, StoreError>>()?;
+    // The three mark fields (seq, marked-at, project) are one session's
+    // stored mark: a seq or marked-at above `u64` (Lua's `parse_mark`
+    // accepts any digit run) or a non-UTF-8 project each move the chunk to
+    // `unreadable` instead of failing every session behind it (M9 round-4,
+    // item 1). The member itself (index 0) can be foreign too -- nothing
+    // stops a foreign `ZADD` from adding one that is not UTF-8 -- but an
+    // undecodable member still fails the whole page here: `SessionId` (and
+    // the cursor built from it) cannot carry non-UTF-8 bytes, so there is no
+    // id to name it with in `unreadable` the way an orphan or an unparseable
+    // mark is named. Unruled residual, not fixed by this item -- see
+    // `agent-docs/PLAN-online-routing-learner.md` section 9, M9 round-4.
+    let mut unreadable = unreadable;
+    let mut sessions = Vec::with_capacity(fields.len() / 4);
+    for entry in fields.chunks_exact(4) {
+        let session_id = str_at(entry, 0).ok_or_else(|| unexpected(reply))?;
+        let decoded = str_at(entry, 1)
+            .and_then(|text| text.parse::<u64>().ok())
+            .zip(str_at(entry, 2).and_then(|text| text.parse::<u64>().ok()))
+            .zip(str_at(entry, 3));
+        match decoded {
+            Some(((seq, marked_at_ms), project)) => sessions.push(MarkedSession {
+                session_id: SessionId::new(session_id),
+                seq,
+                marked_at_ms,
+                project: ProjectId::new(project),
+            }),
+            None => unreadable.push(SessionId::new(session_id)),
+        }
+    }
     // A full page may have more behind it; a short one reached the end.
     let next = (usize::try_from(examined).ok() == Some(limit.get()))
         .then(|| LearningCursor::after(SessionId::new(last)));
@@ -359,6 +382,22 @@ fn bad_mark(reply: &[Value], session_id: &SessionId) -> StoreError {
         session_id: session_id.clone(),
         detail: format!(
             "its stored learning mark is unreadable (`{}`)",
+            str_at(reply, 1).unwrap_or("<unreadable>")
+        ),
+    }
+}
+
+/// The seq a `NEWER` or `MISMATCH` reply carries when it does not parse as a
+/// `u64` (M9 round-4, item 1, secondary path): `ARGV[1]` keys the `HGET` by
+/// this session's own id, so the value is always this session's stored
+/// mark, never ambiguous the way a `WRONGTYPE` on one of the append's six
+/// keys can be. `CorruptLog`, not `Backend`, for the same reason `bad_mark`
+/// is.
+fn corrupt_seq(reply: &[Value], session_id: &SessionId) -> StoreError {
+    StoreError::CorruptLog {
+        session_id: session_id.clone(),
+        detail: format!(
+            "its stored learning mark's seq is unreadable (`{}`)",
             str_at(reply, 1).unwrap_or("<unreadable>")
         ),
     }

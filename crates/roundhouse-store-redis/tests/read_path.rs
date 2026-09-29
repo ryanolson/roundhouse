@@ -202,6 +202,42 @@ async fn a_wrong_typed_session_key_is_corrupt_not_a_backend_failure() {
     assert!(is_corrupt(&released, &sid), "release_lease: {released:?}");
 }
 
+/// **A foreign stream entry with a non-UTF-8 field name is corrupt, not a
+/// backend failure** (M9 round-4, item 3, low). Decoding the pipeline's
+/// reply into a `StreamId` fails inside redis-rs itself -- a client-side
+/// parse error with no server error code for `is_wrong_type` to read, so the
+/// old classification fell through to `Backend`. The fault is still this
+/// one session's stored bytes, never ambiguous the way a `WRONGTYPE` on a
+/// call touching more than one session's keys can be, so it must answer
+/// `CorruptLog`.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_non_utf8_stream_field_name_is_corrupt_not_a_backend_failure() {
+    let mut rig = rig().await;
+    let sid = rig.fresh_session().await;
+    let _: String = redis::cmd("XADD")
+        .arg(log_key(&sid))
+        .arg("1-0")
+        .arg(vec![0xFFu8, 0xFE])
+        .arg("x")
+        .query_async(&mut rig.raw)
+        .await
+        .unwrap();
+    let read = rig.store.read_events(&sid, 0, 16).await;
+    assert!(
+        matches!(read, Err(StoreError::CorruptLog { ref session_id, .. }) if *session_id == sid),
+        "a non-UTF-8 field name must be this session's fault, got {read:?}"
+    );
+    // `last_seq` decodes the same reply shape (`StreamRangeReply`) through
+    // its own, separate local `Value` conversion -- not exercised by
+    // `read_events` above, so it needs its own assertion.
+    let last = rig.store.last_seq(&sid).await;
+    assert!(
+        matches!(last, Err(StoreError::CorruptLog { ref session_id, .. }) if *session_id == sid),
+        "last_seq must answer the same way: {last:?}"
+    );
+}
+
 /// **F12 (M14.0 review).** The finding: `create_session`'s Redis-side
 /// coverage in this crate only ever calls it once per session id (this
 /// file's other tests, `common::Rig::fresh_session`), so the `SET ... NX`

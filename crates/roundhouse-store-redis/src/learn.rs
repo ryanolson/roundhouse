@@ -518,7 +518,14 @@ impl LearnerStore for RedisLearnerStore {
         session: &SessionId,
     ) -> Result<u64, LearnerError> {
         let key = watermark_key(&self.namespace, project);
-        let stored: Option<String> = redis::cmd("HGET")
+        // Bytes, not `String`: a field this store never writes may not be
+        // UTF-8 at all, and a `String` decode's failure carries no code, so
+        // it fell into `_ => unavailable(error)` below -- `Unavailable`,
+        // which the recovery task reads as the store being down and ends
+        // its sweep at this same session, every sweep, for every project
+        // behind it. Bytes let the UTF-8 check join the digit check below as
+        // the same session's foreign data: `WrongType` (M9 round-4, item 2).
+        let stored: Option<Vec<u8>> = redis::cmd("HGET")
             .arg(&key)
             .arg(session.as_str())
             .query_async(&mut self.conn.clone())
@@ -534,7 +541,10 @@ impl LearnerStore for RedisLearnerStore {
         // sweep, for every project behind it.
         match stored {
             None => Ok(0),
-            Some(text) => stored_count(&text).ok_or(LearnerError::WrongType { key }),
+            Some(bytes) => std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(stored_count)
+                .ok_or(LearnerError::WrongType { key }),
         }
     }
 }
