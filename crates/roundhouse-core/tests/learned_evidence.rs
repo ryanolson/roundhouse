@@ -512,3 +512,35 @@ fn rules_stage_reads_the_rules_plan_when_another_strategy_served() {
     assert_eq!(stage.recipe, learned.recipe);
     assert_eq!(stage.source(), Some(DecisionSource::Override));
 }
+
+/// **An explored record holds the exploration it names.** The choice's member
+/// must index the recorded set and name the chosen strategy. Otherwise the
+/// calibrator, which weights by the recorded set and propensity, would be the
+/// first reader to meet a malformed record, far from the writer.
+#[test]
+fn an_explored_record_without_its_exploration_is_refused() {
+    let explore = LearnedChoice::Explore {
+        strategy: Strategy::Efficient,
+        member: 0,
+    };
+
+    // The control: the fixture's set is [efficient] and member 0 names it.
+    assert!(LearnedEvidence::new(parts(ActiveMode::Live, explore.clone())).is_ok());
+
+    let mut no_exploration = parts(ActiveMode::Live, explore.clone());
+    no_exploration.exploration = None;
+    let mut out_of_range = parts(ActiveMode::Live, explore.clone());
+    out_of_range.exploration.as_mut().unwrap().set = vec![];
+    let mut wrong_member = parts(ActiveMode::Live, explore);
+    wrong_member.exploration.as_mut().unwrap().set = vec![Strategy::Capable];
+    for (case, broken) in [
+        ("no exploration", no_exploration),
+        ("member outside the set", out_of_range),
+        ("member names another strategy", wrong_member),
+    ] {
+        assert!(
+            LearnedEvidence::new(broken).is_err(),
+            "{case}: an explored record must hold the exploration it names"
+        );
+    }
+}

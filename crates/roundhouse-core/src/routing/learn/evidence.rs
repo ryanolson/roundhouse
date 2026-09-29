@@ -94,11 +94,18 @@ pub enum LearnedEvidenceError {
     /// The record served or chose a strategy it holds no plan for.
     #[error("the record names the `{strategy}` strategy and holds no plan for it")]
     MissingPlan { strategy: Strategy },
+    /// The record explored a member that its recorded exploration set does
+    /// not hold at that index, or it holds no exploration at all.
+    #[error(
+        "the record explored member {member} as `{strategy}` and its exploration set does not hold it"
+    )]
+    Exploration { strategy: Strategy, member: u64 },
 }
 
 /// One learned decision's evidence, checked.
 ///
-/// **Every plan the record names is present.** The plans are one per
+/// **Everything the record names is present.** An explored choice's member
+/// indexes the recorded exploration set and names the chosen strategy. The plans are one per
 /// configured strategy with `rules` among them, and the served and chosen
 /// strategies each have one. Without that, [`Self::source`] would answer
 /// `None` and [`Self::rationale`] would drop its served clause, so a record
@@ -129,6 +136,17 @@ impl LearnedEvidence {
         {
             if parts.plan(strategy).is_none() {
                 return Err(LearnedEvidenceError::MissingPlan { strategy });
+            }
+        }
+        // One comparison covers a missing exploration, a member outside the
+        // set, and a member that names another strategy.
+        if let LearnedChoice::Explore { strategy, member } = parts.choice {
+            let recorded = parts
+                .exploration
+                .as_ref()
+                .and_then(|exploration| exploration.set.get(usize::try_from(member).ok()?));
+            if recorded != Some(&strategy) {
+                return Err(LearnedEvidenceError::Exploration { strategy, member });
             }
         }
         Ok(Self(parts))

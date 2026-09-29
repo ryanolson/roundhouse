@@ -112,8 +112,9 @@ pub enum StageOutcome {
     /// (2026-09-28 ruling 4), so a failover can dispatch an efficient member
     /// under a record that still carries this arm. A reader that needs the
     /// tier of a dispatched target reads it off the recipe lists by the
-    /// `Routed` record's own target ([`RecipeEvidence::tier_of`]), the way
-    /// `engine::opened_a_tier_escalation` does, never off this arm.
+    /// `Routed` record's own target ([`RecipeEvidence::tier_of`]), never off
+    /// this arm. `engine::opened_a_tier_escalation` asks the same question of
+    /// the live recipe's capable list.
     ///
     /// `displaced` is the head it dominated, by
     /// [`Target::policy_identity`](super::Target::policy_identity) — the same
