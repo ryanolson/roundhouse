@@ -554,3 +554,52 @@ async fn an_unreadable_mark_holds_its_session_and_the_sweep_goes_on_on_redis() {
     assert_eq!(node.residuals(&bad_project).await, 0, "the held one is not");
     assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
 }
+
+/// **An orphaned pending member holds its session, not the page** (M9
+/// round-3, item 1). A foreign `HDEL` of the first pending member's field in
+/// the marks hash leaves it a member with no mark at all -- before, `PAGE_BODY`
+/// answered `ORPHAN` and the page failed as `Backend`, so every sweep was an
+/// outage at that member, for every project. Now it is named in `unreadable`
+/// exactly like an unparseable mark, and the sweep delivers the session
+/// behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn an_orphaned_pending_member_holds_its_session_and_the_sweep_goes_on_on_redis() {
+    let namespace = fresh_namespace();
+    let (bad_project, good_project) = (fresh_project(), fresh_project());
+    let node = node(&namespace, "node-a", 2).await;
+    // `a/...` sorts before `b/...`, so the orphaned session is the page's first.
+    let bad = SessionId::new(format!("a/{bad_project}/s"));
+    let good = SessionId::new(format!("b/{good_project}/s"));
+    node.turn(&bad, "t1", &admission(&bad_project)).await;
+    node.turn(&good, "t1", &admission(&good_project)).await;
+    assert_eq!(node.pending().await, 2);
+
+    let mut raw = redis::Client::open(url_from_env().as_str())
+        .expect("a Redis URL")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("a raw connection");
+    let [marks, _, _] = learning_index_keys(&namespace);
+    let _: i64 = redis::cmd("HDEL")
+        .arg(&marks)
+        .arg(bad.as_str())
+        .query_async(&mut raw)
+        .await
+        .expect("the marks field deletes");
+
+    idle();
+    let mut task = node.engine.learner_recovery(cadence()).expect("a learner");
+    let report = task.sweep().await;
+    assert!(
+        !report.outage,
+        "one session's orphaned pending member is not an outage"
+    );
+    assert_eq!(
+        node.residuals(&good_project).await,
+        1,
+        "the session behind it is delivered"
+    );
+    assert_eq!(node.residuals(&bad_project).await, 0, "the held one is not");
+    assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
+}

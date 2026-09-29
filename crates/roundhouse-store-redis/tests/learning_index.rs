@@ -205,6 +205,13 @@ async fn an_unmarked_append_never_touches_the_index_keys() {
 /// **A stored mark the store cannot parse refuses the append before any
 /// write**, rather than being overwritten: it may hold the project the
 /// session belongs to, and replacing it unread would skip the project check.
+///
+/// **The refusal is `CorruptLog`, not `Backend`** (M9 round-3, item 3):
+/// `ARGV[3]` keys the marks-hash `HGET` by this session's own id, so an
+/// unreadable field there is always this session's data, never ambiguous the
+/// way a `WRONGTYPE` on one of the six append keys can be. Before, it was
+/// `Backend`, the same as `WRONGTYPE`, on a rationale that did not actually
+/// apply to it (see `scripts.rs`'s corrected note by `APPEND_BODY`).
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn an_unreadable_stored_mark_refuses_the_append_before_any_write() {
@@ -224,8 +231,8 @@ async fn an_unreadable_stored_mark_refuses_the_append_before_any_write() {
         .append_events(&lease, vec![event("a")], mark(0))
         .await;
     assert!(
-        matches!(refused, Err(StoreError::Backend(_))),
-        "an unreadable stored mark must refuse the append, got {refused:?}"
+        matches!(&refused, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == sid),
+        "an unreadable stored mark must refuse the append as this session's fault, got {refused:?}"
     );
     assert_eq!(rig.store.last_seq(&sid).await.unwrap(), 0);
     assert_eq!(rig.key_type(&marked).await, "none");
@@ -239,13 +246,16 @@ async fn an_unreadable_stored_mark_refuses_the_append_before_any_write() {
     assert_eq!(stored, "not a mark");
 }
 
-/// **A pending member with no stored mark fails the page loudly.** The index
-/// only ever adds a pending member together with its mark, so a member
-/// without one is corruption; skipping it would silently drop a session from
-/// recovery.
+/// **A pending member with no stored mark is named, and the page goes on**
+/// (M9 round-3, item 1). Only a foreign `HDEL`/`DEL` of the marks field, or an
+/// `allkeys-lru` eviction of the whole hash, produces this: the index only
+/// ever adds a pending member together with its mark. Failing the whole page
+/// on it would stop every pass at that member for every project, the same
+/// reason an unparseable mark is named rather than fatal, so a member with no
+/// mark is named in `unreadable` the same way.
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn a_pending_member_without_a_mark_fails_the_page() {
+async fn a_pending_member_without_a_mark_is_named_and_the_page_goes_on() {
     let rig = rig().await;
     let [_, _, pending] = learning_index_keys(&rig.namespace);
     let _: i64 = redis::cmd("ZADD")
@@ -258,11 +268,14 @@ async fn a_pending_member_without_a_mark_fails_the_page() {
     let page = rig
         .store
         .pending_learning(None, 0, NonZeroUsize::new(8).unwrap())
-        .await;
-    assert!(
-        matches!(page, Err(StoreError::Backend(_))),
-        "a pending member without a mark must fail the page, got {page:?}"
+        .await
+        .expect("a member with no mark must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![SessionId::new("sess_orphan")],
+        "it is named rather than skipped or fatal"
     );
+    assert!(page.sessions.is_empty());
 }
 
 /// **A marked append stops at the last sequence the script renders

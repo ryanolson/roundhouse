@@ -226,7 +226,10 @@ pub(super) struct MemoryIndex {
     pending: BTreeSet<SessionId>,
     /// Marks the store treats as unreadable: the in-memory stand-in for a
     /// stored mark a Redis index cannot parse. Only a test lever
-    /// (`contract::LearningMarkControl`) adds to it.
+    /// (`contract::LearningMarkControl`) adds to it, so the field and its
+    /// check in [`Self::mark_of`] exist only where that lever does (M9
+    /// round-3, item 4).
+    #[cfg(any(test, feature = "test-support"))]
     unreadable: BTreeSet<SessionId>,
 }
 
@@ -279,6 +282,7 @@ impl MemoryIndex {
     /// The session's stored mark, if it has one, or `CorruptLog` when the
     /// store cannot read it: that one session's data is at fault.
     fn mark_of(&self, session_id: &SessionId) -> Result<Option<&StoredMark>, StoreError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.unreadable.contains(session_id) {
             return Err(unreadable_mark(session_id));
         }
@@ -330,11 +334,12 @@ impl MemoryIndex {
     ) -> Result<LearningPage, StoreError> {
         let mut page = PageBuilder::default();
         for session_id in self.pending.range(range_after(after)).take(limit.get()) {
-            if !self.marks.contains_key(session_id) {
-                return Err(StoreError::Backend(anyhow::anyhow!(
-                    "pending learning session `{session_id}` has no mark"
-                )));
-            }
+            // A pending member with no entry in `marks` is corruption of the
+            // index -- only a foreign removal of the marks field, or the test
+            // lever below, produces one -- but it is one session's, not the
+            // store's: named in `unreadable` exactly like an unparseable
+            // mark, so the cursor moves past it instead of failing every pass
+            // at that member for every project.
             page.examine(session_id, self.mark_of(session_id), |stored| {
                 cutoff.is_some_and(|cutoff| stored.marked_at_ms <= cutoff)
             });
@@ -382,8 +387,11 @@ impl<'a> PageBuilder<'a> {
         self.last = Some(session_id);
         match mark {
             Ok(Some(stored)) if returned(stored) => self.sessions.push(stored.marked(session_id)),
-            Ok(_) => {}
-            Err(_) => self.unreadable.push(session_id.clone()),
+            Ok(Some(_)) => {}
+            // No stored mark at all (an orphaned pending member) and a mark
+            // the store cannot parse are named the same way: both are one
+            // session's data, not the store's.
+            Ok(None) | Err(_) => self.unreadable.push(session_id.clone()),
         }
     }
 
@@ -397,6 +405,7 @@ impl<'a> PageBuilder<'a> {
 }
 
 /// A stored mark the store cannot read: one session's data, never an outage.
+#[cfg(any(test, feature = "test-support"))]
 fn unreadable_mark(session_id: &SessionId) -> StoreError {
     StoreError::CorruptLog {
         session_id: session_id.clone(),
@@ -409,6 +418,14 @@ impl MemoryIndex {
     #[cfg(any(test, feature = "test-support"))]
     pub(super) fn make_unreadable(&mut self, session_id: &SessionId) {
         self.unreadable.insert(session_id.clone());
+    }
+
+    /// Remove `session_id`'s stored mark without touching its pending
+    /// membership: the in-memory stand-in for a foreign `HDEL` of a Redis
+    /// index's marks field. Test-only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn orphan(&mut self, session_id: &SessionId) {
+        self.marks.remove(session_id);
     }
 }
 

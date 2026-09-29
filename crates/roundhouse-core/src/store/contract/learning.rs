@@ -39,12 +39,23 @@ use crate::store::MemoryStore;
 #[async_trait::async_trait]
 pub trait LearningMarkControl: SessionStore {
     async fn make_mark_unreadable(&self, session_id: &SessionId);
+
+    /// Strip `session_id`'s stored mark while it stays a pending member, as a
+    /// foreign `HDEL`/`DEL` of a Redis index's marks field (or an
+    /// `allkeys-lru` eviction of the whole hash) leaves it. The contracted
+    /// effect is that the session reads as unreadable to every page, and as
+    /// never marked to a clear or a requeue. Test-only.
+    async fn orphan_pending_mark(&self, session_id: &SessionId);
 }
 
 #[async_trait::async_trait]
 impl LearningMarkControl for MemoryStore {
     async fn make_mark_unreadable(&self, session_id: &SessionId) {
         self.make_learning_mark_unreadable(session_id).await;
+    }
+
+    async fn orphan_pending_mark(&self, session_id: &SessionId) {
+        self.orphan_pending_learning_mark(session_id).await;
     }
 }
 
@@ -881,6 +892,103 @@ pub async fn an_unreadable_mark_is_named_and_the_page_goes_on<S: LearningMarkCon
         matches!(&requeued, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == bad),
         "so is a requeue: {requeued:?}"
     );
+    assert_eq!(
+        store.clear_learning_mark(&rest[0], u64::MAX).await.unwrap(),
+        ClearOutcome::Covered,
+        "control: the session behind it clears"
+    );
+}
+
+/// Every unreadable member of a page, walked to the end of the pass. Not
+/// filtered by `only`: the two orphan tests care about the raw membership a
+/// clear or requeue can or cannot change, not about a shared backend's other
+/// marks.
+async fn all_unreadable<S: SessionStore>(store: &S, index: Index) -> Vec<SessionId> {
+    let mut unreadable = Vec::new();
+    let mut cursor: Option<LearningCursor> = None;
+    for _ in 0..MAX_PAGES_PER_PASS {
+        let page = page(store, index, cursor.as_ref(), 64).await;
+        unreadable.extend(page.unreadable);
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    unreadable
+}
+
+/// **A pending member with no stored mark at all is named, and the page goes
+/// on** (M9 round-3, item 1). Only a foreign `HDEL`/`DEL` of the marks field,
+/// or an `allkeys-lru` eviction of the whole hash, produces this in Redis;
+/// nothing in the normal write path leaves a pending member unmarked. The
+/// pending page names it in `unreadable` exactly like an unparseable mark,
+/// and returns the members behind it.
+///
+/// **Pending only, not the permanent enumeration.** In Redis the marked and
+/// pending sets are independent of the marks hash, so an `HDEL` there leaves
+/// membership in both untouched and either pass would name it; the fix this
+/// pins is scoped to `pending_page` (the recovery task's own path), and
+/// `MemoryStore`'s permanent enumeration is the marks map itself, so a lever
+/// that empties one entry to stand in for a foreign `HDEL` necessarily drops
+/// it from that backend's permanent membership too. The Redis-only
+/// `a_pending_member_without_a_mark_is_named_and_the_page_goes_on`
+/// (`learning_index.rs`) and
+/// `an_orphaned_pending_member_holds_its_session_and_the_sweep_goes_on_on_redis`
+/// (`learner_recovery_redis.rs`) cover the real per-key behavior end to end.
+///
+/// **Unlike an unparseable mark, this one does not answer `CorruptLog` to a
+/// clear or a requeue.** Both read the marks field directly (`HGET`), find
+/// nothing, and answer `Unmarked` -- the same as a session that was never
+/// marked -- so neither removes it from `pending`. The orphan therefore
+/// cannot leave `pending` on its own; it is named on every later pass until
+/// an operator repairs the index (restores the field, or `ZREM`s the member).
+/// That is acceptable because the condition is already an operator-visible
+/// anomaly no normal operation produces, it never stalls the sweep or the
+/// sessions behind it, and the recovery task's held set still warns about it
+/// only once per pass (see the `recovery_warnings` suite in
+/// `roundhouse-server`) rather than on every sweep.
+pub async fn an_orphaned_pending_member_is_named_and_the_page_goes_on<S: LearningMarkControl>(
+    store: &S,
+) {
+    let mut own = Vec::new();
+    for _ in 0..3 {
+        let (sid, lease) = held(store).await;
+        marked_append(store, &lease, 1, 0, acme()).await;
+        own.push(sid);
+    }
+    own.sort();
+    let (bad, rest) = (own[0].clone(), own[1..].to_vec());
+    store.orphan_pending_mark(&bad).await;
+    let own: BTreeSet<SessionId> = own.into_iter().collect();
+
+    let (mut returned, mut unreadable) = (Vec::new(), Vec::new());
+    let mut cursor: Option<LearningCursor> = None;
+    for _ in 0..MAX_PAGES_PER_PASS {
+        let page = page(store, PENDING, cursor.as_ref(), 1).await;
+        returned.extend(ids(&only(page.sessions, &own)));
+        unreadable.extend(page.unreadable.into_iter().filter(|sid| own.contains(sid)));
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(returned, rest, "the members behind it are returned");
+    assert_eq!(unreadable, vec![bad.clone()], "and it is named");
+
+    assert_eq!(
+        store.clear_learning_mark(&bad, u64::MAX).await.unwrap(),
+        ClearOutcome::Unmarked,
+        "the marks field is gone, so a clear finds nothing to disagree with"
+    );
+    assert_eq!(
+        store.requeue_learning(&bad, 1).await.unwrap(),
+        RequeueOutcome::Unmarked
+    );
+    assert!(
+        all_unreadable(store, PENDING).await.contains(&bad),
+        "the clear did not remove it from pending: it is named again"
+    );
+
     assert_eq!(
         store.clear_learning_mark(&rest[0], u64::MAX).await.unwrap(),
         ClearOutcome::Covered,

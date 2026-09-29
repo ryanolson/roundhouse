@@ -308,6 +308,45 @@ fn an_unreadable_mark_is_skipped_warned_once_and_the_sweep_goes_on() {
     assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
 }
 
+/// **M9 round-3, item 1: an orphaned pending member holds its session, and
+/// the sweep delivers the ones behind it.** A foreign `HDEL` of the marks
+/// field, not just an unparseable value, still lands in the same
+/// `unreadable` bucket, so the page names it rather than failing, and the
+/// task warns once for it however many sweeps meet it -- the same bound as
+/// an unparseable mark.
+#[test]
+fn an_orphaned_pending_member_is_skipped_warned_once_and_the_sweep_goes_on() {
+    let rt = paused_runtime();
+    let rig = Rig::new(RigConfig::default());
+    let (bad, mut task) = rt.block_on(async {
+        let bad = bad_then_good(&rig, "a-orphan").await;
+        rig.sessions.inner.orphan_pending_learning_mark(&bad).await;
+        (bad, recovery(&rig))
+    });
+    let warned = warned_over(&rt, &mut task, 2);
+    assert_eq!(
+        warned
+            .matches("the stored learning mark of this session is unreadable")
+            .count(),
+        1,
+        "two sweeps, one line: {warned}"
+    );
+    rt.block_on(async {
+        assert_eq!(residuals(&rig, "good").await, 1, "the session behind it");
+        assert_eq!(residuals(&rig, "abad").await, 0, "nothing of the held one");
+        let page = SessionStore::pending_learning(
+            rig.sessions.as_ref(),
+            None,
+            0,
+            NonZeroUsize::new(1_000).unwrap(),
+        )
+        .await
+        .expect("the index reads");
+        assert_eq!(page.unreadable, vec![bad], "it stays, named as unreadable");
+    });
+    assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
+}
+
 /// **Item 2: a clear that finds the mark unreadable holds that session.** The
 /// mark was readable when the page named it and is not when the clear reads
 /// it: `CorruptLog`, one session's data, and not the session store being

@@ -218,6 +218,15 @@ impl roundhouse_core::store::contract::learning::LearningMarkControl for RedisSe
             .await
             .expect("the test Redis must accept an HSET");
     }
+
+    async fn orphan_pending_mark(&self, session_id: &SessionId) {
+        let _: i64 = redis::cmd("HDEL")
+            .arg(crate::scripts::learning::IndexKeys::new(&self.namespace).marks)
+            .arg(session_id.as_str())
+            .query_async(&mut self.conn.clone())
+            .await
+            .expect("the test Redis must accept an HDEL");
+    }
 }
 
 /// The learner store under test, connected under `namespace`.

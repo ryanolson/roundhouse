@@ -102,11 +102,13 @@ return {'REQUEUED'}
 /// start (`-` or `(<session id>`), the limit, and the idle window in ms or
 /// `''` for none. The idle cutoff is computed from `TIME` here, the clock the
 /// append stamped the marks with. Every examined member moves the cursor,
-/// idle or not. A member with no stored mark is corruption of the index and
-/// fails the page rather than being skipped, since skipping would drop it
-/// from recovery. A member whose stored mark cannot be parsed is one
-/// session's data: it is named in the reply and the page goes on, because a
-/// page that failed on it would stop every pass at that member.
+/// idle or not. A member with no stored mark at all -- only a foreign
+/// `HDEL`/`DEL` of the marks field, or an `allkeys-lru` eviction of the whole
+/// hash, produces one -- is named in the reply exactly like a member whose
+/// stored mark cannot be parsed, because a page that failed on it would stop
+/// every pass at that member for every project. An eviction of the whole
+/// hash names each pending member once as the cursor reaches it, which is
+/// bounded by the pending set.
 ///
 /// Reply: `OK`, the number examined, the last member examined (or `''`), the
 /// number of unreadable members and their ids, then four fields per returned
@@ -121,8 +123,10 @@ end
 local unreadable, found = {}, {}
 for _, member in ipairs(members) do
   local stored = redis.call('HGET', KEYS[1], member)
-  if not stored then return {'ORPHAN', member} end
-  local seq, at, project = parse_mark(stored)
+  local seq, at, project
+  if stored then
+    seq, at, project = parse_mark(stored)
+  end
   if not seq then
     unreadable[#unreadable + 1] = member
   elseif cutoff == nil or tonumber(at) <= cutoff then
@@ -285,24 +289,13 @@ impl LearningScripts {
             .invoke_async(conn)
             .await
             .map_err(crate::backend)?;
-        decode_page(&reply, set, limit)
+        decode_page(&reply, limit)
     }
 }
 
-fn decode_page(
-    reply: &[Value],
-    set: &str,
-    limit: NonZeroUsize,
-) -> Result<LearningPage, StoreError> {
+fn decode_page(reply: &[Value], limit: NonZeroUsize) -> Result<LearningPage, StoreError> {
     match tag_of(reply) {
         Some("OK") => {}
-        Some("ORPHAN") => {
-            return Err(StoreError::Backend(anyhow::anyhow!(
-                "`{set}` lists session `{}` with no stored learning mark; refusing \
-                 to page an index that would drop it from recovery",
-                str_at(reply, 1).unwrap_or("<unreadable>")
-            )));
-        }
         _ => return Err(unexpected(reply)),
     }
     let examined = int_at(reply, 1).ok_or_else(|| unexpected(reply))?;

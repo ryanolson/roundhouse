@@ -58,15 +58,16 @@
 //! next session's watermark read is what probes the store.
 //!
 //! **Which holds warn, and how often.** A foreign watermark, a replay or
-//! backfill that cannot replay the log, an apply that meets a foreign key, and a clear that
-//! fails, times out or cannot read the mark each warn once per session and
-//! mark: again only after the session is delivered or marked anew, or after
-//! a full pass that did not hold it again this way. An
-//! unreadable mark warns once per session until it is readable again. A
-//! stop logs one error when it stops the session, and the task does not
-//! visit the session again until a restart. An apply that times out and a
-//! gap the backfill cannot close are counted in `learning.delivery` and not
-//! logged.
+//! backfill that cannot replay the log, an apply that meets a foreign key,
+//! and a clear that fails, times out or cannot read the mark each warn once
+//! per session and mark: again only after the session is delivered or marked
+//! anew, or after a full pass that did not hold it again this way. A member
+//! with no stored mark at all and one whose stored mark cannot be parsed are
+//! both named as unreadable, and each warns once per session until it is
+//! readable again. A stop logs one error when it stops the session, and the
+//! task does not visit the session again until a restart. An apply that
+//! times out and a gap the backfill cannot close are counted in
+//! `learning.delivery` and not logged.
 //!
 //! **The pass cursors are this task's memory.** Each index is walked in
 //! session id order and resumes after the last session a sweep finished; a
@@ -89,7 +90,7 @@ use roundhouse_core::store::{
 };
 
 use crate::engine::learning::RoutingLearner;
-use crate::engine::learning::delivery::{Delivered, Delivery, HeldSessions, Source};
+use crate::engine::learning::delivery::{Delivered, Delivery, HeldMark, HeldSessions, Source};
 
 /// The most intervals one backoff waits: 8, reached after three outages in a
 /// row. Long enough that an outage costs a store a handful of probes per
@@ -283,7 +284,10 @@ impl<S: SessionStore> LearnerRecovery<S> {
             session,
             apply_timeout: self.cadence.apply_timeout,
             source_timeout: Some(self.cadence.source_timeout),
-            held: Some((&self.held, *mark)),
+            held: Some(HeldMark {
+                sessions: &self.held,
+                mark: *mark,
+            }),
         };
         for _ in 0..self.cadence.pages_per_session_per_sweep.get() {
             let Some(state) = self.replay(project, session, confirmed, *mark).await? else {

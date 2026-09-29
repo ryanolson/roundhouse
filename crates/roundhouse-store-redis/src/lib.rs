@@ -327,8 +327,20 @@ fn backend(error: redis::RedisError) -> StoreError {
 /// holds another type (a foreign writer replaced it), so it is that one
 /// session's [`StoreError::CorruptLog`], never `Backend`: the recovery task
 /// reads `Backend` as an outage and would stop every project's sweep at this
-/// session. A call that also touches the namespace-wide learning index (the
-/// marked append) cannot tell whose key it was, and stays `Backend`.
+/// session. A call that also touches the namespace-wide learning index (a
+/// `WRONGTYPE` on the marked append) cannot tell whose key it was, and stays
+/// `Backend`.
+///
+/// **Redis-version scoped** (M9 round-3, item 2, low): `is_wrong_type` reads
+/// `WRONGTYPE` from the server errors a pipeline or a script's own command
+/// raised. A plain pipelined command — `read_events`, `last_seq` — classifies
+/// on every version this crate supports (`README`'s Redis ≥ 6.2 floor is
+/// unchanged). A Lua script's `WRONGTYPE` reaches the client this way only on
+/// Redis 7 and later; Redis 6.x wraps a script's raised error as `ERR Error
+/// running script ...` with no code to read, so `acquire`, `renew` and
+/// `release` fall back to `Backend` there. Harmless: no lease caller branches
+/// on `CorruptLog` versus `Backend` for these three, so a 6.x deployment only
+/// loses the more specific classification, never correctness.
 fn one_session(session_id: &SessionId) -> impl FnOnce(redis::RedisError) -> StoreError + '_ {
     move |error| match is_wrong_type(&error) {
         true => corrupt_log(

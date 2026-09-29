@@ -104,6 +104,18 @@ const LAST_EXACT_SEQ: u64 = 99_999_999_999_999;
 /// Redis Cluster; an unmarked append still touches only its three
 /// hash-tagged keys.
 ///
+/// **`WRONGTYPE` and `BADMARK` are not the same kind of failure, and are
+/// reported differently** (M9 round-3, item 3, correcting the round-2
+/// addendum's claim that both stay `Backend`). `is_type_or_absent` type-checks
+/// the three index keys before anything reads them, so a real `WRONGTYPE`
+/// answers with its own tag naming the key — but that key could be any of the
+/// six, shared across the namespace or this session's own, and the script
+/// cannot tell which caller's fault a namespace-wide key is: `Backend` stays
+/// right for it. `BADMARK` is different: it can only come from `HGET(KEYS[4],
+/// ARGV[3])`, keyed by this session's own id, so it is always this session's
+/// entry in the shared hash, never ambiguous — `CorruptLog`, the same as the
+/// index scripts' own `bad_mark` in [`learning`].
+///
 /// KEYS: meta, lease, log [, marks, marked, pending].
 /// ARGV: node id, fencing token, session id, 1-based position of the marked
 /// event in the batch, project, then one payload per event. The three mark
@@ -387,11 +399,20 @@ impl Scripts {
                  append before writing any event",
                 str_at(&reply, 1).unwrap_or("<unreadable>")
             ))),
-            (Some("BADMARK"), ..) => Err(StoreError::Backend(anyhow::anyhow!(
-                "the stored learning mark for this session is unreadable (`{}`); \
-                 refusing the marked append before writing any event",
-                str_at(&reply, 1).unwrap_or("<unreadable>")
-            ))),
+            (Some("BADMARK"), ..) => Err(crate::corrupt_log(
+                &SessionId::new(
+                    batch
+                        .mark
+                        .as_ref()
+                        .expect("BADMARK is returned only from the marked branch")
+                        .session_id,
+                ),
+                format!(
+                    "its stored learning mark is unreadable (`{}`); refusing the marked \
+                     append before writing any event",
+                    str_at(&reply, 1).unwrap_or("<unreadable>")
+                ),
+            )),
             (Some("RANGE"), Some(last), _) => Err(StoreError::Backend(anyhow::anyhow!(
                 "log `{log_key}` is at seq {last}; this batch would pass seq {LAST_EXACT_SEQ}, \
                  the last one the append script writes exactly, so the append is refused \

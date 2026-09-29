@@ -264,7 +264,9 @@ pub trait SessionStore: Send + Sync + 'static {
     /// least `idle_for_ms` ago by the store's own clock — the clock that
     /// stamped the marks, so a node clock that runs behind cannot hide every
     /// session. The cursor moves past every examined member, idle or not; see
-    /// the `learning` module doc for what a pass guarantees.
+    /// the `learning` module doc for what a pass guarantees. A member the
+    /// store cannot read a mark for — including one with no mark at all — is
+    /// named in [`LearningPage::unreadable`] rather than failing the page.
     async fn pending_learning(
         &self,
         after: Option<&LearningCursor>,
@@ -274,7 +276,9 @@ pub trait SessionStore: Send + Sync + 'static {
 
     /// One page of every session ever marked, in session id byte order after
     /// `after`, whether pending or not. For the audit and offline
-    /// enumeration: the permanent marks outlive every clear.
+    /// enumeration: the permanent marks outlive every clear. As with
+    /// [`Self::pending_learning`], an unreadable member is named in
+    /// [`LearningPage::unreadable`], not a page failure.
     async fn learning_sessions(
         &self,
         after: Option<&LearningCursor>,
@@ -341,6 +345,14 @@ impl MemoryStore {
             .await
             .learning
             .make_unreadable(session_id);
+    }
+
+    /// Strip `session_id`'s stored mark while it stays a pending member, as a
+    /// foreign `HDEL` of a Redis index's marks field leaves it. Test hook
+    /// behind `contract::LearningMarkControl`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn orphan_pending_learning_mark(&self, session_id: &SessionId) {
+        self.state.write().await.learning.orphan(session_id);
     }
 
     /// Force-expire a session's lease. Test hook for simulating a dead owner

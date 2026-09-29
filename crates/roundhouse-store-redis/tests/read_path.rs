@@ -134,6 +134,17 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
 /// store answered, and the fault is in one session's keys: `CorruptLog`,
 /// never `Backend`, which the recovery task reads as an outage for every
 /// project.
+///
+/// **The log assertions hold on every supported Redis; the lease ones need
+/// Redis 7** (M9 round-3, item 2, low). `read_events` and `last_seq` are
+/// plain pipelined commands, so their `WRONGTYPE` classifies on any Redis
+/// this crate supports. `acquire_lease`, `renew_lease` and `release_lease`
+/// run a Lua script, and only Redis 7 and later propagates a script's raised
+/// `WRONGTYPE` with its code intact for `is_wrong_type` to read; Redis 6.x
+/// wraps it as a generic `ERR Error running script ...`, so the lease
+/// assertions below need a Redis 7-or-later target even though the crate's
+/// own floor stays ≥ 6.2. Harmless in production either way: nothing here
+/// branches on `CorruptLog` versus `Backend` for a lease call.
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn a_wrong_typed_session_key_is_corrupt_not_a_backend_failure() {

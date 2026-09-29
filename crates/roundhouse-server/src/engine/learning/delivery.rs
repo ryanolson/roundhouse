@@ -148,7 +148,15 @@ pub(crate) struct Delivery<'a, S: SessionStore> {
     /// backfill that cannot replay, an apply that meets a foreign key, and
     /// an acknowledgement that fails or times out. `None` for the engine's
     /// tail, which warns every time: a turn is not a periodic sweep.
-    pub(crate) held: Option<(&'a HeldSessions, u64)>,
+    pub(crate) held: Option<HeldMark<'a>>,
+}
+
+/// The recovery task's held set, and the mark it pended this session under.
+/// See [`Delivery::held`].
+#[derive(Clone, Copy)]
+pub(crate) struct HeldMark<'a> {
+    pub(crate) sessions: &'a HeldSessions,
+    pub(crate) mark: u64,
 }
 
 /// Sessions already warned about as held, each under the mark it was held
@@ -445,7 +453,7 @@ impl<S: SessionStore> Delivery<'_, S> {
     /// per session and mark for the recovery task.
     fn first_hold(&self) -> bool {
         self.held
-            .is_none_or(|(held, mark)| held.first_hold(self.session, Some(mark)))
+            .is_none_or(|held| held.sessions.first_hold(self.session, Some(held.mark)))
     }
 
     /// A read-only replay whose page holds the entries above `floor`, the
