@@ -419,7 +419,7 @@ impl ScriptedDirectoryStore {
                 DirectoryRecords::default()
             };
             store
-                .commit(at, payload)
+                .commit(at, payload, Vec::new())
                 .await
                 .expect("a fresh store's own commits against its own versions never conflict");
         }
@@ -467,7 +467,7 @@ impl ScriptedDirectoryStore {
     async fn bump_with(&self, records: DirectoryRecords) {
         let inner = self.inner.read().await;
         if let Ok(current) = inner.load().await {
-            let _ = inner.commit(current.version, records).await;
+            let _ = inner.commit(current.version, records, Vec::new()).await;
         }
     }
 
@@ -629,6 +629,7 @@ impl DirectoryStore for ScriptedDirectoryStore {
         &self,
         expected_version: u64,
         records: DirectoryRecords,
+        artifacts: Vec<String>,
     ) -> Result<StoredVersion, StoreFailure> {
         // The wrapped store's own compare-and-set decides Concurrent-or-not
         // and, on success, is already mutated by the time this returns -- so
@@ -639,7 +640,7 @@ impl DirectoryStore for ScriptedDirectoryStore {
         // first, the seam the directory's own commit-to-publish race needs.
         let new_version = {
             let inner = self.inner.read().await;
-            inner.commit(expected_version, records).await?
+            inner.commit(expected_version, records, artifacts).await?
         };
         let gate = self
             .commit_gate

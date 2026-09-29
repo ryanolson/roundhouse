@@ -60,10 +60,13 @@ fn document(learner: serde_json::Value, tiers: bool) -> String {
             "efficient": ["openai/small"]
         });
     }
+    // Every document writes the recovery block a `shadow` or `live` learner
+    // requires (M9), so these tests stay about the `learner` block itself.
     serde_json::json!({
         "projects": [project],
         "users": [{ "id": "ada" }],
-        "keys": [{ "project": "acme", "user": "ada", "key_sha256": TURN_HASH }]
+        "keys": [{ "project": "acme", "user": "ada", "key_sha256": TURN_HASH }],
+        "learner_recovery": crate::control_config::learner_recovery::tests::recovery()
     })
     .to_string()
 }

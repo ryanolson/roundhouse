@@ -159,6 +159,9 @@ pub enum LearnerConfigError {
 pub(super) struct ResolvedLearner {
     pub(super) terms: Option<Arc<LearnerTerms>>,
     pub(super) apply_timeout_ms: Option<u64>,
+    /// The SHA-256 of the artifact bytes `terms` was resolved from, the digest
+    /// its epoch hashes; `None` exactly when `terms` is.
+    pub(super) artifact_sha256: Option<String>,
 }
 
 fn labels(strategies: &[Strategy]) -> String {
@@ -179,22 +182,31 @@ impl LearnerConfig {
         entry: &str,
         has_tiers: bool,
     ) -> Result<ResolvedLearner, ControlPlaneError> {
-        let terms =
+        let resolved =
             self.resolve(has_tiers)
                 .map_err(|source| ControlPlaneError::LearnerRejected {
                     path: path.to_string(),
                     entry: entry.to_string(),
                     source,
                 })?;
+        let (terms, artifact_sha256) = match resolved {
+            Some((terms, sha256)) => (Some(terms), Some(sha256)),
+            None => (None, None),
+        };
         // Whatever the mode: an `off` project still delivers what its
         // sessions owe, and it delivers under the number written here.
         Ok(ResolvedLearner {
             terms,
             apply_timeout_ms: self.apply_timeout_ms,
+            artifact_sha256,
         })
     }
 
-    fn resolve(&self, has_tiers: bool) -> Result<Option<Arc<LearnerTerms>>, LearnerConfigError> {
+    /// The terms and the digest of the artifact bytes they were read from.
+    fn resolve(
+        &self,
+        has_tiers: bool,
+    ) -> Result<Option<(Arc<LearnerTerms>, String)>, LearnerConfigError> {
         if !has_tiers {
             return Err(LearnerConfigError::NoTiers);
         }
@@ -274,8 +286,9 @@ impl LearnerConfig {
                 configured: strategies.as_slice().to_vec(),
             });
         }
+        let sha256 = artifact.sha256().to_string();
         let (_, prior, epoch) = artifact.into_parts();
-        Ok(Some(Arc::new(LearnerTerms {
+        let terms = Arc::new(LearnerTerms {
             mode: self.mode,
             strategies,
             epoch,
@@ -294,7 +307,8 @@ impl LearnerConfig {
                 rate: exploration.rate,
             }),
             read_timeout_ms,
-        })))
+        });
+        Ok(Some((terms, sha256)))
     }
 }
 

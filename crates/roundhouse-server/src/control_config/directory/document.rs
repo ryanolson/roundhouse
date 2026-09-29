@@ -162,20 +162,38 @@ pub struct CompiledUnder {
     /// difference actually came from.
     #[serde(default)]
     pub judge: Option<String>,
+    /// `{project}={sha256}` for every learner artifact the writer's compile
+    /// of this version resolved, sorted (milestone M9 of the routing
+    /// learner). The SHA-256 is of the artifact's bytes, the digest its epoch
+    /// hashes.
+    ///
+    /// **Per version, not per handle.** The other axes are what this process
+    /// was built with. An artifact is read from a node-local path whenever a
+    /// plane compiles, and a path can arrive with an admin write as well as
+    /// with the file, so the writer stamps the axis of the plane it compiled
+    /// for each commit, and a reader compares the axis of its own compile of
+    /// the same records. Two nodes that read different bytes at one path run
+    /// two epochs, and this is where they say so.
+    ///
+    /// Skipped when empty, so a document with no learner is byte-identical to
+    /// one written before the axis existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
 }
 
 impl CompiledUnder {
-    /// Which of the four inputs this fingerprint and `other` disagree about
+    /// Which of the inputs this fingerprint and `other` disagree about
     /// (R-D9), in a fixed order, empty when they agree.
     ///
-    /// A list rather than a `bool`, because the four axes have four different
+    /// A list rather than a `bool`, because the axes have different
     /// remedies: a file that differs is a rolling config change (or a node
     /// pointed at the wrong file), a catalog that differs is a node priced
     /// against models its neighbours do not have, a fleet that differs is a
-    /// node whose cross-checks would refuse a plane its neighbours accept, and
-    /// a TTL that differs is only a disagreement about how long a revocation
-    /// may take. An operator told "the directory diverges" learns nothing;
-    /// told *which* input, they know where to look.
+    /// node whose cross-checks would refuse a plane its neighbours accept, a
+    /// TTL that differs is only a disagreement about how long a revocation
+    /// may take, and artifacts that differ are nodes counting one project's
+    /// learning under two epochs. An operator told "the directory diverges"
+    /// learns nothing; told *which* input, they know where to look.
     ///
     /// Order is declaration order and is stable, so a test may pin the vector
     /// rather than sorting it — and so two nodes reporting the same divergence
@@ -197,12 +215,15 @@ impl CompiledUnder {
         if self.judge != other.judge {
             differs.push(DivergentInput::Judge);
         }
+        if self.artifacts != other.artifacts {
+            differs.push(DivergentInput::Artifacts);
+        }
         differs
     }
 }
 
-/// One of the four inputs a stored document's writer and its reader can
-/// disagree about.
+/// One of the inputs a stored document's writer and its reader can disagree
+/// about.
 ///
 /// Named rather than reported as a diff of two fingerprints, because the two
 /// fingerprints are large (a catalog is every model this deployment prices)
@@ -220,6 +241,8 @@ pub enum DivergentInput {
     Ttl,
     /// `ROUNDHOUSE_JUDGE_MODEL`'s resolved identity (M18, H3).
     Judge,
+    /// The bytes of a learner artifact, by project (routing learner M9).
+    Artifacts,
 }
 
 impl DivergentInput {
@@ -231,6 +254,7 @@ impl DivergentInput {
             DivergentInput::Fleet => "fleet",
             DivergentInput::Ttl => "admission_cache_ttl_ms",
             DivergentInput::Judge => "judge",
+            DivergentInput::Artifacts => "learner_artifacts",
         }
     }
 }
@@ -385,11 +409,15 @@ impl DirectoryStore for DocumentDirectoryStore {
         &self,
         expected_version: u64,
         records: DirectoryRecords,
+        artifacts: Vec<String>,
     ) -> Result<StoredVersion, StoreFailure> {
         let document = DirectoryDocument {
             schema: DIRECTORY_DOCUMENT_SCHEMA,
             records,
-            compiled_under: self.compiled_under.clone(),
+            compiled_under: CompiledUnder {
+                artifacts,
+                ..self.compiled_under.clone()
+            },
         };
         // Mapped rather than unwrapped. `serde_json` refuses a non-finite
         // float, and these records carry operator-supplied dollar amounts --

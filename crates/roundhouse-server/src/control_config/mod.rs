@@ -93,6 +93,7 @@ pub mod crosscheck;
 pub mod directory;
 pub mod fair_use;
 pub mod learner;
+pub mod learner_recovery;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
@@ -237,6 +238,9 @@ pub async fn boot_directory(
                 ),
                 // M18, H3: the judge's own axis, beside the fleet's.
                 judge: checks.judge_identity(),
+                // Per version, not per handle: the directory stamps the axis
+                // of the plane each commit compiled (routing learner M9).
+                artifacts: Vec::new(),
             };
             ControlDirectory::new(
                 file.config,
@@ -674,7 +678,23 @@ pub enum ControlPlane {
         /// at load time. Read by the composition root on its way into
         /// [`EngineConfig`](crate::EngineConfig) and by nothing else.
         arm_salt: String,
+        /// What the plane says about the online routing learner beyond each
+        /// admission's terms (M9). Boxed so the variant stays the size it
+        /// was: every surface clones the plane's `Arc`, never this.
+        learner: Box<PlaneLearner>,
     },
+}
+
+/// The deployment-level learner facts a compiled plane carries.
+#[derive(Debug, Clone, Default)]
+pub struct PlaneLearner {
+    /// The learner recovery task's cadence, when the file writes a
+    /// `learner_recovery` block. Read by the composition root, like the
+    /// salt, and by nothing else.
+    recovery: Option<crate::learner_recovery::RecoveryCadence>,
+    /// `{project}={sha256}` for every resolved learner artifact, sorted: the
+    /// artifact axis of the directory fingerprint.
+    artifacts: Vec<String>,
 }
 
 impl ControlPlane {
@@ -731,13 +751,22 @@ impl ControlPlane {
             // may be served before the directory recompiles is the directory's
             // question, and it reads the field itself.
             admission_cache_ttl_ms: _,
+            // Named and ignored: `validate` resolved it into
+            // `recovery_cadence`, which is what the plane carries.
+            learner_recovery: _,
             turn_keys,
+            recovery_cadence,
+            learner_artifacts,
         } = config;
         ControlPlane::Configured {
             turn_keys,
             admin_keys: admin_keys.into_iter().collect(),
             refusals,
             arm_salt: arm_salt.unwrap_or_default(),
+            learner: Box::new(PlaneLearner {
+                recovery: recovery_cadence,
+                artifacts: learner_artifacts,
+            }),
         }
     }
 
@@ -915,6 +944,27 @@ impl ControlPlane {
         match self {
             ControlPlane::Open => "",
             ControlPlane::Configured { arm_salt, .. } => arm_salt,
+        }
+    }
+
+    /// The learner recovery task's cadence, or `None` for a deployment whose
+    /// file writes no `learner_recovery` block. `validate` has refused every
+    /// plane with an enabled learner and no block, so a learner plane always
+    /// has one.
+    pub fn learner_recovery(&self) -> Option<crate::learner_recovery::RecoveryCadence> {
+        match self {
+            ControlPlane::Open => None,
+            ControlPlane::Configured { learner, .. } => learner.recovery,
+        }
+    }
+
+    /// `{project}={sha256}` for every learner artifact this plane resolved,
+    /// sorted: what this node's directory fingerprint records about the
+    /// artifact bytes it read (M9).
+    pub fn learner_artifacts(&self) -> &[String] {
+        match self {
+            ControlPlane::Open => &[],
+            ControlPlane::Configured { learner, .. } => &learner.artifacts,
         }
     }
 
@@ -1144,6 +1194,8 @@ impl ControlPlane {
                 // not bear on identity. A field added here that authentication
                 // does have to read should make this line stop compiling.
                 arm_salt: _,
+                // The learner's cadence and artifacts decide no identity.
+                learner: _,
             } => {
                 let secret = presented.ok_or(AuthError::MissingKey)?;
                 if !has_valid_key_shape(secret) {

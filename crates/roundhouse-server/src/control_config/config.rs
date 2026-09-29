@@ -59,7 +59,9 @@ use roundhouse_core::routing::{PickerMode, TierRecipe, TierRecipeError};
 use roundhouse_core::validate::ValidationTerms;
 
 use super::learner::{LearnerConfig, LearnerConfigError, ResolvedLearner};
+use super::learner_recovery::{LearnerRecoveryConfig, LearnerRecoveryError};
 use super::validate::ValidateConfig;
+use crate::learner_recovery::RecoveryCadence;
 
 /// One entry of the config's `"projects"` array.
 ///
@@ -495,6 +497,10 @@ pub struct ControlPlaneConfig {
     /// store's version has actually moved.
     #[serde(default)]
     pub admission_cache_ttl_ms: Option<u64>,
+    /// The learner recovery task's cadence (milestone M9). Required once any
+    /// project enables the learner; see [`super::learner_recovery`].
+    #[serde(default)]
+    pub learner_recovery: Option<LearnerRecoveryConfig>,
     /// The finished turn-key lookup table: `key_sha256` to the complete
     /// [`Admission`] the key resolves to — its membership, its fully-resolved
     /// [`TurnPolicy`] (its project's policy narrowed by its own overrides),
@@ -519,6 +525,19 @@ pub struct ControlPlaneConfig {
     /// own way.
     #[serde(skip)]
     pub(super) turn_keys: HashMap<String, Admission>,
+    /// [`Self::learner_recovery`], resolved by [`Self::validate`]. Built there
+    /// and not by `serde` for the reason `turn_keys` is: whether a missing
+    /// block is a refusal depends on the projects, which only `validate` has
+    /// resolved.
+    #[serde(skip)]
+    pub(super) recovery_cadence: Option<RecoveryCadence>,
+    /// `{project}={sha256}` for every project whose learner resolved an
+    /// artifact, sorted: the artifact axis of this node's directory
+    /// fingerprint (`CompiledUnder::artifacts`). Built by [`Self::validate`]
+    /// from the bytes the compile read, so the fingerprint names exactly the
+    /// bytes the epochs were derived from.
+    #[serde(skip)]
+    pub(super) learner_artifacts: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -591,6 +610,13 @@ pub enum ControlPlaneError {
         path: String,
         entry: String,
         source: LearnerConfigError,
+    },
+    #[error(
+        "control-plane config `{path}`: the learner recovery configuration is refused -- {source}"
+    )]
+    LearnerRecoveryRejected {
+        path: String,
+        source: LearnerRecoveryError,
     },
     #[error("control-plane config `{path}`: {entry}'s `tiers` block is refused -- {source}")]
     TierRecipeRejected {
@@ -1287,7 +1313,37 @@ impl ControlPlaneConfig {
             }
         }
 
+        // Checked after every project resolved its learner, because whether a
+        // missing block is a refusal depends on them: see
+        // `learner_recovery`'s module doc.
+        let enabling = self
+            .projects
+            .iter()
+            .find(|project| {
+                project_learners
+                    .get(project.id.as_str())
+                    .is_some_and(|learner| learner.terms.is_some())
+            })
+            .map(|project| project.id.as_str());
+        let recovery_cadence = super::learner_recovery::resolve(self.learner_recovery, enabling)
+            .map_err(|source| ControlPlaneError::LearnerRecoveryRejected {
+                path: path.to_string(),
+                source,
+            })?;
+        let mut learner_artifacts: Vec<String> = project_learners
+            .iter()
+            .filter_map(|(project, learner)| {
+                learner
+                    .artifact_sha256
+                    .as_ref()
+                    .map(|sha256| format!("{project}={sha256}"))
+            })
+            .collect();
+        learner_artifacts.sort();
+
         self.turn_keys = turn_keys;
+        self.recovery_cadence = recovery_cadence;
+        self.learner_artifacts = learner_artifacts;
         Ok(())
     }
 }

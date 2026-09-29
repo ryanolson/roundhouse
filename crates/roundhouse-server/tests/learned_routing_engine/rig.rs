@@ -199,6 +199,10 @@ pub struct ProbeStore {
     applies: AtomicUsize,
     read_delay: Mutex<Option<Duration>>,
     fail_reads: AtomicBool,
+    fail_watermarks: AtomicBool,
+    watermarks: AtomicUsize,
+    wrong_typed: Mutex<Vec<ProjectId>>,
+    wrong_typed_applies: Mutex<Vec<ProjectId>>,
     script: Mutex<VecDeque<ApplyScript>>,
     refused: Mutex<HashMap<SessionId, LearnerError>>,
 }
@@ -218,6 +222,39 @@ impl ProbeStore {
 
     pub fn fail_reads(&self, fail: bool) {
         self.fail_reads.store(fail, Ordering::SeqCst);
+    }
+
+    /// Fail every `watermark` call, as a learner store that is down does.
+    pub fn fail_watermarks(&self, fail: bool) {
+        self.fail_watermarks.store(fail, Ordering::SeqCst);
+    }
+
+    /// Answer every `watermark` and `apply` for `project` with `WrongType`,
+    /// as a store holding a foreign key under that project's prefix does.
+    pub fn wrong_type_for(&self, project: &str) {
+        self.wrong_typed
+            .lock()
+            .unwrap()
+            .push(ProjectId::from(project));
+    }
+
+    /// Answer every `apply` for `project` with `WrongType`, while its
+    /// watermark reads still answer: a foreign counter key, not a foreign
+    /// watermark.
+    pub fn wrong_type_applies_for(&self, project: &str) {
+        self.wrong_typed_applies
+            .lock()
+            .unwrap()
+            .push(ProjectId::from(project));
+    }
+
+    fn is_wrong_typed(&self, project: &ProjectId) -> bool {
+        self.wrong_typed.lock().unwrap().contains(project)
+    }
+
+    /// `watermark` calls so far, failed or not.
+    pub fn watermarks(&self) -> usize {
+        self.watermarks.load(Ordering::SeqCst)
     }
 
     pub fn script(&self, step: ApplyScript) {
@@ -248,6 +285,17 @@ impl LearnerStore for ProbeStore {
 
     async fn apply(&self, batch: &LearningBatch<'_>) -> Result<Applied, LearnerError> {
         self.applies.fetch_add(1, Ordering::SeqCst);
+        if self.is_wrong_typed(batch.project)
+            || self
+                .wrong_typed_applies
+                .lock()
+                .unwrap()
+                .contains(batch.project)
+        {
+            return Err(LearnerError::WrongType {
+                key: format!("{}:wm", batch.project),
+            });
+        }
         let refused = self.refused.lock().unwrap().get(batch.session).cloned();
         if let Some(error) = refused {
             return Err(error);
@@ -270,6 +318,15 @@ impl LearnerStore for ProbeStore {
         project: &ProjectId,
         session: &SessionId,
     ) -> Result<u64, LearnerError> {
+        self.watermarks.fetch_add(1, Ordering::SeqCst);
+        if self.fail_watermarks.load(Ordering::SeqCst) {
+            return Err(LearnerError::Unavailable("the probe is down".into()));
+        }
+        if self.is_wrong_typed(project) {
+            return Err(LearnerError::WrongType {
+                key: format!("{project}:wm"),
+            });
+        }
         self.inner.watermark(project, session).await
     }
 }
