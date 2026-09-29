@@ -259,6 +259,10 @@ fn key_is_a_keys_entry(args: &str) -> bool {
     false
 }
 
+/// The commands the learn scripts may call: the type check, the reads, and
+/// the two writes the module doc allows. Each takes exactly one key.
+const LEARN_SCRIPT_COMMANDS: [&str; 6] = ["TYPE", "HGET", "HMGET", "HSET", "SISMEMBER", "SADD"];
+
 /// M7 of the online routing learner: every key of the `learn` family is built
 /// by the shared builder, and its scripts name no key of their own.
 ///
@@ -273,10 +277,6 @@ fn key_is_a_keys_entry(args: &str) -> bool {
 /// anywhere else. The live half, that a real apply writes exactly the keys these functions
 /// name, is `the_store_writes_only_the_keys_its_key_functions_name` in
 /// `learn_contract.rs`.
-/// The commands the learn scripts may call: the type check, the reads, and
-/// the two writes the module doc allows. Each takes exactly one key.
-const LEARN_SCRIPT_COMMANDS: [&str; 6] = ["TYPE", "HGET", "HMGET", "HSET", "SISMEMBER", "SADD"];
-
 #[test]
 fn every_learn_key_is_built_by_the_shared_builder() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");

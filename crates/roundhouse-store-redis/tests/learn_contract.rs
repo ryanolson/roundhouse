@@ -28,8 +28,10 @@ use roundhouse_core::learn_store::contract::{
 };
 use roundhouse_core::learn_store::{LearnerError, LearnerStore, ReadRequest};
 use roundhouse_core::routing::Tier;
-use roundhouse_core::routing::learn::{EpochId, JevCounts, Strategy};
-use roundhouse_core::session::LearningEntry;
+use roundhouse_core::routing::learn::{
+    CacheReuse, EpochId, JevCounts, LatencySum, Strategy, Units,
+};
+use roundhouse_core::session::{Deltas, JevDelta, LearningEntry, QualityDelta, TargetDelta};
 use roundhouse_store_redis::test_support::{
     connect_learner_in, fresh_namespace, keys_in, learn_ops_key, learn_quality_key, learn_seen_key,
     learn_watermark_key,
@@ -425,4 +427,165 @@ async fn a_restore_leaves_a_project_whose_id_extends_it_alone() {
         long_before,
         "proj_ab12 changed"
     );
+}
+
+/// Pins every stored field to its literal byte spelling, not just its
+/// position in `TARGET_COUNTERS` or the quality hash's counter list.
+///
+/// The trait-level suite above only ever reads a field back through the same
+/// table that wrote it, so a reorder of `TARGET_COUNTERS` — say `cache_obs`
+/// before `cache_pred` — relabels durable data while every generated test
+/// stays green: `apply` and `read` walk the reordered table together and
+/// agree with each other, just not with what is already on disk under the
+/// old order. One entry gives every field of one target's ops row and one
+/// strategy's quality row a distinct value, and a raw `HGET` by the field's
+/// exact name is the only way to catch a field landing under the wrong one.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn every_stored_field_is_pinned_by_its_literal_name() {
+    let namespace = fresh_namespace();
+    let store = connect_learner_in(namespace.clone()).await;
+    let mut raw = raw_from_env().await;
+    let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
+    let turn = input(Tier::Capable, false);
+    let key = l0(&turn);
+    let target = frontier("large");
+    let identity = target.policy_identity();
+
+    let deltas = Deltas {
+        epoch: e,
+        quality: vec![QualityDelta {
+            key,
+            strategy: Strategy::Rules,
+            units: Units { pos: 11, n: 22 },
+        }],
+        targets: vec![TargetDelta {
+            target: identity.clone(),
+            latency: LatencySum { sum_ms: -33, n: 44 },
+            failover: 55,
+            cache: CacheReuse {
+                predicted_permille: 66,
+                observed_permille: 77,
+                n: 88,
+            },
+        }],
+        overhead: LatencySum { sum_ms: 99, n: 100 },
+        jev: vec![JevDelta {
+            key,
+            counts: JevCounts {
+                capable: 111,
+                efficient: 122,
+            },
+        }],
+    };
+    store
+        .apply(&batch(&project, &session, &[entry(10, 0, Some(deltas))]))
+        .await
+        .unwrap();
+
+    let quality_key = learn_quality_key(&namespace, &project, e, key);
+    let ops_key = learn_ops_key(&namespace, &project, e);
+    let quality_fields = [
+        ("rules:pos", 11i64),
+        ("rules:n", 22),
+        ("rules:sessions", 1),
+        ("jev_capable", 111),
+        ("jev_efficient", 122),
+    ];
+    let ops_fields = [
+        (format!("{identity}:lat_sum"), -33i64),
+        (format!("{identity}:lat_n"), 44),
+        (format!("{identity}:failover"), 55),
+        (format!("{identity}:cache_pred"), 66),
+        (format!("{identity}:cache_obs"), 77),
+        (format!("{identity}:cache_n"), 88),
+        ("turn:pre_sum".to_owned(), 99),
+        ("turn:pre_n".to_owned(), 100),
+    ];
+    let mut missed = Vec::new();
+    for (field, expected) in quality_fields {
+        let stored: Option<String> = redis::cmd("HGET")
+            .arg(&quality_key)
+            .arg(field)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        if stored.as_deref() != Some(expected.to_string().as_str()) {
+            missed.push(format!(
+                "{quality_key} {field} = {stored:?}, expected {expected}"
+            ));
+        }
+    }
+    for (field, expected) in &ops_fields {
+        let stored: Option<String> = redis::cmd("HGET")
+            .arg(&ops_key)
+            .arg(field)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        if stored.as_deref() != Some(expected.to_string().as_str()) {
+            missed.push(format!(
+                "{ops_key} {field} = {stored:?}, expected {expected}"
+            ));
+        }
+    }
+    assert!(missed.is_empty(), "{missed:#?}");
+}
+
+/// A large counter is stored in plain decimal digits, not scientific
+/// notation.
+///
+/// The apply script stores every counter as a Lua number computed by
+/// arithmetic (`counter(...) + delta`), and it is Redis's Lua-to-RESP
+/// argument conversion — not this crate's code — that turns that number into
+/// the bytes `HSET` writes. The strict parser `read` and `watermark` both
+/// apply accepts decimal digits alone, so a value Redis happened to write as
+/// `1e+15` would come back foreign forever. Both counters here are under
+/// `2^53 - 1`, the range this store promises exactly.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_large_counter_is_stored_in_plain_digits() {
+    let namespace = fresh_namespace();
+    let store = connect_learner_in(namespace.clone()).await;
+    let mut raw = raw_from_env().await;
+    let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
+    let turn = input(Tier::Capable, false);
+    let target = frontier("large");
+    let identity = target.policy_identity();
+    let (sum_ms, n): (i64, u64) = (1_000_000_000_000_000, 100_000_000);
+
+    let deltas = Deltas {
+        epoch: e,
+        quality: Vec::new(),
+        targets: vec![TargetDelta {
+            target: identity.clone(),
+            latency: LatencySum { sum_ms, n },
+            failover: 0,
+            cache: CacheReuse::default(),
+        }],
+        overhead: LatencySum::default(),
+        jev: Vec::new(),
+    };
+    store
+        .apply(&batch(&project, &session, &[entry(10, 0, Some(deltas))]))
+        .await
+        .unwrap();
+
+    let request = ReadRequest::new(project.clone(), e, &turn, &all_strategies(), [&target]);
+    let view = store.read(&request).await.unwrap();
+    assert_eq!(view.targets[0].latency, LatencySum { sum_ms, n });
+
+    let ops_key = learn_ops_key(&namespace, &project, e);
+    for (field, expected) in [
+        (format!("{identity}:lat_sum"), sum_ms.to_string()),
+        (format!("{identity}:lat_n"), n.to_string()),
+    ] {
+        let stored: String = redis::cmd("HGET")
+            .arg(&ops_key)
+            .arg(&field)
+            .query_async(&mut raw)
+            .await
+            .unwrap();
+        assert_eq!(stored, expected, "{field}");
+    }
 }

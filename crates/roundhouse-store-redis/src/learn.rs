@@ -212,6 +212,17 @@ fn unavailable(error: redis::RedisError) -> LearnerError {
     LearnerError::Unavailable(error.to_string())
 }
 
+/// A stored count: decimal digits alone, within `2^53 - 1`. The same rule the
+/// apply script's `counter` applies to an unsigned field; a bare `parse`
+/// would also take `+5`, which the script refuses, and the two would then
+/// disagree on whether a session has a watermark.
+fn stored_count(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<u64>().ok().filter(|count| *count <= MAX_EXACT)
+}
+
 /// What one read asks the script for: the four keys of the turn and the
 /// fields of each, in the order the view is built from.
 struct ReadPlan {
@@ -387,7 +398,15 @@ impl Layout {
     /// with its type the first time it is named.
     fn position(&mut self, key: String, kind: char) -> i64 {
         let index = match self.keys.iter().position(|existing| *existing == key) {
-            Some(index) => index,
+            Some(index) => {
+                debug_assert_eq!(
+                    self.types.as_bytes()[index],
+                    kind as u8,
+                    "`{key}` was named {} but is now requested as {kind}",
+                    self.types.as_bytes()[index] as char
+                );
+                index
+            }
             None => {
                 self.keys.push(key);
                 self.types.push(kind);
@@ -505,21 +524,13 @@ impl LearnerStore for RedisLearnerStore {
                 Some("WRONGTYPE") => LearnerError::WrongType { key: key.clone() },
                 _ => unavailable(error),
             })?;
-        // The same rule as the apply script's `counter` for an unsigned
-        // field: decimal digits alone, within 2^53 - 1. A bare `parse`
-        // would also take `+5`, which the script refuses, and the two would
-        // disagree on whether the session has a watermark.
         match stored {
             None => Ok(0),
-            Some(text) => Some(&text)
-                .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|text| text.parse::<u64>().ok())
-                .filter(|watermark| *watermark <= MAX_EXACT)
-                .ok_or_else(|| {
-                    LearnerError::Unavailable(format!(
-                        "`{key}` holds `{text}` for session `{session}`, not a watermark"
-                    ))
-                }),
+            Some(text) => stored_count(&text).ok_or_else(|| {
+                LearnerError::Unavailable(format!(
+                    "`{key}` holds `{text}` for session `{session}`, not a watermark"
+                ))
+            }),
         }
     }
 }

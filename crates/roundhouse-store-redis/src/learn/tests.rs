@@ -17,8 +17,8 @@ use roundhouse_core::routing::learn::{EpochId, Strategy, StrategySet};
 use roundhouse_core::session::LearningEntry;
 
 use super::{
-    ApplyPlan, Arg, OP_SESSION, ReadPlan, RedisLearnerStore, ops_key, project_prefix, quality_key,
-    seen_key, watermark_key,
+    ApplyPlan, Arg, HASH, OP_SESSION, ReadPlan, RedisLearnerStore, SET, ops_key, project_prefix,
+    quality_key, seen_key, stored_count, watermark_key,
 };
 use crate::keys::KeyNamespace;
 
@@ -201,7 +201,7 @@ async fn a_seen_set_past_the_lua_unpack_limit_applies_whole() {
     }
     let mut args = vec![
         Arg::Text(session.as_str().to_owned()),
-        Arg::Text("hhs".to_owned()),
+        Arg::Text(format!("{HASH}{HASH}{SET}")),
         Arg::Int(1),
         Arg::Int(10),
         Arg::Int(0),
@@ -240,4 +240,20 @@ async fn a_seen_set_past_the_lua_unpack_limit_applies_whole() {
         .await
         .unwrap();
     assert_eq!((members, sessions), (MEMBERS, Some(MEMBERS)));
+}
+
+/// The same rule `watermark` applies to a stored field: decimal digits alone,
+/// within `2^53 - 1`. No real Redis needed, unlike every other test in this
+/// file: this is a pure parse.
+#[test]
+fn stored_count_accepts_only_a_plain_digit_string_within_max_exact() {
+    assert_eq!(stored_count("5"), Some(5));
+    assert_eq!(stored_count("+5"), None);
+    assert_eq!(stored_count("0x5"), None);
+    assert_eq!(stored_count(""), None);
+    assert_eq!(
+        stored_count("9007199254740991"),
+        Some(9_007_199_254_740_991)
+    );
+    assert_eq!(stored_count("9007199254740992"), None);
 }
