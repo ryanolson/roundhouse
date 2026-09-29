@@ -38,8 +38,9 @@
 //! and the arithmetic is `Correlary::shadow_cost_usd`, `ProviderPricing`'s
 //! own methods, and, when the catalog prices local capacity,
 //! `LocalCapacityPrice::price` — so a priced local turn's actual cost and net
-//! saving are the dashboard's figures for that turn, and an unpriced one's
-//! actual cost is our fleet's zero bill. A second pricing walk here would be a
+//! saving are the dashboard's figures for that turn, and an unpriced one
+//! publishes no actual cost, because unpriced capacity is unknown, not free.
+//! A second pricing walk here would be a
 //! second answer to what a turn cost, and the two would disagree on the day a
 //! rate card was corrected.
 //! In particular the **capability gate's outcome is carried, never recomputed**:

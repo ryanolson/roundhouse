@@ -16,6 +16,7 @@
 
 mod columns;
 mod cost;
+mod local;
 
 pub use columns::{
     CacheReuseEvidence, FIRST_OUTPUT_BASIS, IntervalMetric, OBSERVED_CACHE_BASIS,
@@ -32,9 +33,9 @@ use std::collections::{BTreeMap, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::event::Usage;
-use crate::metrics::ServingMode;
-use crate::metrics::fold::{MetricsFold, Scope};
-use crate::metrics::pricing::{Correlary, ReferenceModel, ShadowPricing, TokenShape};
+use crate::metrics::fold::{Counters, MetricsFold, Scope};
+use crate::metrics::pricing::{Correlary, ReferenceModel, ShadowPricing};
+use crate::metrics::{ModelKey, ServingMode};
 use crate::routing::LocalCapacityPrice;
 
 /// Token counts for one grouping, split the way a reader asks about them.
@@ -389,6 +390,11 @@ pub struct Rollup {
     /// row in this aggregate carries a capacity price — a hosted aggregate, or
     /// local traffic the catalog does not price. Never a `0.0` that reads as
     /// free.
+    ///
+    /// The local serving mode's row is seeded `0.0` on a priced deployment,
+    /// so there `null` means unpriced and only that: with no local calls yet
+    /// it agrees with `savings.local_capacity_usd`, which is `0.0` for the
+    /// same reason.
     pub capacity_usd: Option<f64>,
     pub cache_savings_usd: f64,
 }
@@ -502,6 +508,12 @@ pub struct Savings {
     /// router was actually choosing from — should land near each other. When
     /// they do not, one of the two models is wrong, and that disagreement is
     /// worth more than either number alone.
+    ///
+    /// **One disagreement is not a wrong model.** A decision quoted local at a
+    /// different capacity price, or at none — a $0 quote, so its figure here
+    /// stays gross — while `routing_savings_usd` nets the same turn at the
+    /// current price. Over such history the two differ by the difference in
+    /// capacity cost.
     pub routing_savings_at_decision_usd: f64,
     /// `cache_savings_usd + routing_savings_usd`.
     pub total_usd: f64,
@@ -596,13 +608,18 @@ pub struct MetricsSnapshot {
     /// rather than any one figure. The dashboard renders it under the savings
     /// hero, which is where the derived number it attributes is published.
     pub quality_prior_citation: Option<String>,
-    /// Whether the catalog sets a local capacity price.
+    /// The local capacity price every local dollar here was priced at, or
+    /// `null` when the catalog sets none.
     ///
-    /// `false` means every local figure on this document that could be a
-    /// dollar is unpriced — `savings.local_capacity_usd` and each local row's
-    /// `capacity_usd` are `null`, and `routing_savings_usd` is the gross
-    /// counterfactual — so a reader cannot take local serving as free.
-    pub local_capacity_priced: bool,
+    /// The price itself rather than a flag, so the document is self-describing:
+    /// the dashboard shows the rate beside the spend, and a reader of this
+    /// snapshot — the Relay summary among them — needs no second handle on the
+    /// config it was built from. `null` means every local figure on this
+    /// document that could be a dollar is unpriced — `savings.local_capacity_usd`
+    /// and each local row's `capacity_usd` are `null`, and `routing_savings_usd`
+    /// is the gross counterfactual — so a reader cannot take local serving as
+    /// free.
+    pub local_capacity_price: Option<LocalCapacityPrice>,
 }
 
 /// What the snapshot needs beyond the fold: rate cards, declared correlaries,
@@ -714,148 +731,57 @@ impl MetricsSnapshot {
         let frontier_shapes = view.frontier_shapes();
 
         let capacity_price = config.local_capacity_price;
-        // The capacity cost of the priceable local turns whose saving is
-        // counted, taken off `routing_savings_usd` below. Summed here rather
-        // than through `Rollup`, because it is not a figure any row publishes:
-        // each local row publishes its whole capacity spend (a seat's share
-        // included), and this is the part of that spend the saving offsets.
-        let mut routing_capacity_offset_usd = 0.0;
-        let mut models = Vec::with_capacity(rows.len());
-        for (key, counters) in rows.iter() {
-            let total_usage = counters.total_usage();
-            let tokens = TokenBreakdown::from_usage(&total_usage);
-            let coverage = Coverage {
-                calls: counters.calls,
-                reported_calls: counters.calls.saturating_sub(counters.estimated_calls),
-                estimated_calls: counters.estimated_calls,
-                // Across both pots: coverage asks whether the *provider*
-                // counted a turn, which is a different axis from whose money
-                // paid for it. A seat turn the provider reported is reported.
-                reported_tokens: counters.reported_usage().total(),
-                estimated_tokens: counters.estimated_usage().total(),
-            };
-
-            // Everything below prices this and never `total_usage`: the seat's
-            // share of a row is measured and unpriceable, and the one place
-            // that rule can be kept for good is the value the rate card is
-            // handed. See `Counters::seat`.
-            let priceable = counters.billed.total();
-            let seat_tokens = TokenBreakdown::from_usage(counters.seat.total().tokens());
-            let seat_estimated_calls = counters.seat_estimated_calls;
-
-            let accounting = match key.mode {
-                ServingMode::Frontier => {
-                    // A hosted model with no rate card bills an unknown amount,
-                    // and zero is the wrong guess. It is reported as zero
-                    // dollars against non-zero tokens, which is visible on the
-                    // dashboard as a row that used tokens for free — the shape
-                    // of a missing rate card rather than of a bargain.
-                    let rate = config.rate_card(&key.provider, &key.model);
-                    // Priced per provenance, which costs nothing extra because a
-                    // pot's price is linear in the axes `PooledUsage`
-                    // accumulates, and is the only way the two parts can be
-                    // reported apart afterwards.
-                    //
-                    // Through `price_pooled` and never `price` on a summed
-                    // `Usage`: each call's cache-write share was decided at fold
-                    // time, so this row's dollars are the sum of its turns'
-                    // dollars by construction. Pricing summed tokens instead
-                    // understated a row mixing measured and unmeasured writes,
-                    // and the understatement reappeared as `drift_usd` in the
-                    // reconciliation view (M11.0 review F2).
-                    let billed = Billed {
-                        measured: rate
-                            .map_or(0.0, |r| r.pricing.price_pooled(&counters.billed.reported)),
-                        estimated: rate
-                            .map_or(0.0, |r| r.pricing.price_pooled(&counters.billed.estimated)),
-                    };
-                    // Wholly measured: an unreported call carries
-                    // `cached_input_tokens: 0`, so it contributes nothing here
-                    // rather than a guess.
-                    ModelAccounting::Frontier {
-                        priced_by_catalog: rate.is_some(),
-                        billed_usd: billed.total(),
-                        billed_measured_usd: billed.measured,
-                        billed_estimated_usd: billed.estimated,
-                        // Off the pot's tokens rather than through
-                        // `price_pooled`, and it needs no pooling of its own:
-                        // the discount is `cached_input_tokens` times a rate
-                        // gap, and cache reads are an ordinary additive count
-                        // with no per-call branch over them.
-                        cache_savings_usd: rate
-                            .map_or(0.0, |r| r.pricing.cache_savings(priceable.tokens())),
-                        seat_tokens,
-                        seat_estimated_calls,
+        // Each row with the capacity cost of the priceable local turns whose
+        // saving is counted, taken off `routing_savings_usd` below. Summed
+        // here rather than through `Rollup`, because it is not a figure any
+        // row publishes: see `LocalRow::routing_capacity_offset_usd`.
+        let (mut models, offsets): (Vec<ModelMetrics>, Vec<f64>) = rows
+            .iter()
+            .map(|(key, counters)| {
+                let total_usage = counters.total_usage();
+                let coverage = Coverage {
+                    calls: counters.calls,
+                    reported_calls: counters.calls.saturating_sub(counters.estimated_calls),
+                    estimated_calls: counters.estimated_calls,
+                    // Across both pots: coverage asks whether the *provider*
+                    // counted a turn, which is a different axis from whose
+                    // money paid for it. A seat turn the provider reported is
+                    // reported.
+                    reported_tokens: counters.reported_usage().total(),
+                    estimated_tokens: counters.estimated_usage().total(),
+                };
+                let (accounting, offset) = match key.mode {
+                    ServingMode::Frontier => (frontier_row(key, counters, config), 0.0),
+                    ServingMode::Local => {
+                        let row = local::local_row(&key.model, counters, config, &frontier_shapes);
+                        (row.accounting, row.routing_capacity_offset_usd)
                     }
-                }
-                ServingMode::Local => {
-                    // The correlary is inferred from the *whole* row's shape and
-                    // priced over the priceable part of it. Two different
-                    // questions: which hosted model this traffic resembles is
-                    // answered by the traffic, all of it, while what it would
-                    // have saved is answered only for the turns whose
-                    // alternative would have been this deployment's money.
-                    let shape = TokenShape::from_rollup(&total_usage, counters.calls);
-                    let correlary = config.pricing.resolve(
-                        &key.model,
-                        config.local_quality(&key.model),
-                        shape,
-                        &frontier_shapes,
-                        // What this row's turns said they were talking to,
-                        // where they agreed. The counterfactual a client named
-                        // is a better answer than one inferred from traffic
-                        // shape, and a worse one than a procurement decision an
-                        // operator wrote down — `resolve` holds that order.
-                        counters.declared_baseline.resolved(),
-                    );
-                    // Netted only where there is a saving to net: a row with
-                    // no priced correlary claims none, so subtracting its
-                    // capacity would publish a loss against an alternative
-                    // nobody could price.
-                    if let Some(price) = capacity_price
-                        && correlary.reference().is_some()
-                    {
-                        routing_capacity_offset_usd += price.price(priceable.tokens());
-                    }
-                    ModelAccounting::Local {
-                        // Pooled like a hosted row's, though today no local
-                        // dispatch reports a cache write and every one of them
-                        // takes the conservative branch. Pricing the pot keeps
-                        // the counterfactual additive by construction rather
-                        // than by that accident, so a serving plane that starts
-                        // reporting one does not quietly move a published
-                        // saving.
-                        shadow_usd: correlary.shadow_cost_pooled(&priceable),
-                        correlary,
-                        seat_tokens,
-                        seat_estimated_calls,
-                        capacity_usd: capacity_price.map(|price| price.price(&total_usage)),
-                    }
-                }
-            };
-
-            models.push(ModelMetrics {
-                provider: key.provider.clone(),
-                model: key.model.clone(),
-                calls: counters.calls,
-                tokens,
-                coverage,
-                first_output: IntervalMetric::publish(
-                    &counters.timing.first_output,
-                    FIRST_OUTPUT_BASIS,
-                ),
-                completed_turn_elapsed: IntervalMetric::publish(
-                    &counters.timing.completed_elapsed,
-                    TURN_ELAPSED_BASIS,
-                ),
-                incomplete_turn_elapsed: IntervalMetric::publish(
-                    &counters.timing.incomplete_elapsed,
-                    TURN_ELAPSED_BASIS,
-                ),
-                cache_reuse_evidence: CacheReuseEvidence::publish(&counters.cache_reuse),
-                accounting,
-            });
-        }
+                };
+                let row = ModelMetrics {
+                    provider: key.provider.clone(),
+                    model: key.model.clone(),
+                    calls: counters.calls,
+                    tokens: TokenBreakdown::from_usage(&total_usage),
+                    coverage,
+                    first_output: IntervalMetric::publish(
+                        &counters.timing.first_output,
+                        FIRST_OUTPUT_BASIS,
+                    ),
+                    completed_turn_elapsed: IntervalMetric::publish(
+                        &counters.timing.completed_elapsed,
+                        TURN_ELAPSED_BASIS,
+                    ),
+                    incomplete_turn_elapsed: IntervalMetric::publish(
+                        &counters.timing.incomplete_elapsed,
+                        TURN_ELAPSED_BASIS,
+                    ),
+                    cache_reuse_evidence: CacheReuseEvidence::publish(&counters.cache_reuse),
+                    accounting,
+                };
+                (row, offset)
+            })
+            .unzip();
+        let routing_capacity_offset_usd: f64 = offsets.iter().sum();
 
         // Biggest spend first, then biggest shadow price: the row a reader
         // wants is almost always the expensive one, and a stable secondary key
@@ -869,7 +795,7 @@ impl MetricsSnapshot {
         });
 
         let providers = roll_up_providers(&models);
-        let serving_modes = roll_up_modes(&models);
+        let serving_modes = roll_up_modes(&models, capacity_price.is_some());
 
         let mut totals = Rollup::default();
         for model in &models {
@@ -939,7 +865,7 @@ impl MetricsSnapshot {
             serving_modes,
             capability_band: config.pricing.capability_band(),
             quality_prior_citation: config.quality_prior_citation.clone(),
-            local_capacity_priced: capacity_price.is_some(),
+            local_capacity_price: capacity_price,
         }
     }
 }
@@ -957,6 +883,51 @@ struct Billed {
 impl Billed {
     fn total(&self) -> f64 {
         self.measured + self.estimated
+    }
+}
+
+/// Price one hosted row.
+///
+/// Everything here prices the row's priceable pot and never its total usage:
+/// the seat's share of a row is measured and unpriceable, and the one place
+/// that rule can be kept for good is the value the rate card is handed. See
+/// `Counters::seat`.
+fn frontier_row(key: &ModelKey, counters: &Counters, config: &MetricsConfig) -> ModelAccounting {
+    // A hosted model with no rate card bills an unknown amount, and zero is
+    // the wrong guess. It is reported as zero dollars against non-zero tokens,
+    // which is visible on the dashboard as a row that used tokens for free —
+    // the shape of a missing rate card rather than of a bargain.
+    let rate = config.rate_card(&key.provider, &key.model);
+    // Priced per provenance, which costs nothing extra because a pot's price
+    // is linear in the axes `PooledUsage` accumulates, and is the only way the
+    // two parts can be reported apart afterwards.
+    //
+    // Through `price_pooled` and never `price` on a summed `Usage`: each
+    // call's cache-write share was decided at fold time, so this row's dollars
+    // are the sum of its turns' dollars by construction. Pricing summed tokens
+    // instead understated a row mixing measured and unmeasured writes, and the
+    // understatement reappeared as `drift_usd` in the reconciliation view
+    // (M11.0 review F2).
+    let billed = Billed {
+        measured: rate.map_or(0.0, |r| r.pricing.price_pooled(&counters.billed.reported)),
+        estimated: rate.map_or(0.0, |r| r.pricing.price_pooled(&counters.billed.estimated)),
+    };
+    // Wholly measured: an unreported call carries `cached_input_tokens: 0`, so
+    // it contributes nothing here rather than a guess.
+    ModelAccounting::Frontier {
+        priced_by_catalog: rate.is_some(),
+        billed_usd: billed.total(),
+        billed_measured_usd: billed.measured,
+        billed_estimated_usd: billed.estimated,
+        // Off the pot's tokens rather than through `price_pooled`, and it needs
+        // no pooling of its own: the discount is `cached_input_tokens` times a
+        // rate gap, and cache reads are an ordinary additive count with no
+        // per-call branch over them.
+        cache_savings_usd: rate.map_or(0.0, |r| {
+            r.pricing.cache_savings(counters.billed.total().tokens())
+        }),
+        seat_tokens: TokenBreakdown::from_usage(counters.seat.total().tokens()),
+        seat_estimated_calls: counters.seat_estimated_calls,
     }
 }
 
@@ -989,7 +960,7 @@ fn roll_up_providers(models: &[ModelMetrics]) -> Vec<ProviderMetrics> {
     providers
 }
 
-fn roll_up_modes(models: &[ModelMetrics]) -> Vec<ServingModeMetrics> {
+fn roll_up_modes(models: &[ModelMetrics], capacity_priced: bool) -> Vec<ServingModeMetrics> {
     // Both modes are always present, even at zero calls. A dashboard that made
     // the local row vanish when nothing had been routed locally would show its
     // most alarming state — no local serving at all — as an empty space.
@@ -997,7 +968,11 @@ fn roll_up_modes(models: &[ModelMetrics]) -> Vec<ServingModeMetrics> {
         .into_iter()
         .map(|mode| ServingModeMetrics {
             mode,
-            totals: Rollup::default(),
+            totals: Rollup {
+                // See `Rollup::capacity_usd`: priced and idle is `0.0`.
+                capacity_usd: (capacity_priced && mode == ServingMode::Local).then_some(0.0),
+                ..Rollup::default()
+            },
         })
         .collect();
     for model in models {

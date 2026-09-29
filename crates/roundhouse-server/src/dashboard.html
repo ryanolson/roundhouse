@@ -502,6 +502,14 @@ that the API does not have, so a hard refresh loses nothing.
     return "$" + n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits });
   }
 
+  /* A local figure's capacity spend, set beside what it avoided. `null` is a
+     catalog with no capacity price: unknown rather than free, so it reads
+     "capacity unpriced" and never $0.00. `== null` also catches a field the
+     document stopped publishing, which errs the same way. */
+  const capacityNote = (c) => c == null
+    ? '<span class="sub">capacity unpriced</span>'
+    : `<span class="sub">${usd(c)} capacity</span>`;
+
   const pct = (x) => (x * 100).toFixed(x >= 0.995 || x === 0 ? 0 : 1) + "%";
 
   function ago(ms) {
@@ -595,12 +603,15 @@ that the API does not have, so a hard refresh loses nothing.
         "num"));
 
       // Local rows show what they would have cost, marked as the estimate it
-      // is; hosted rows show what they did cost.
+      // is, and what they did cost in capacity; hosted rows show what they did
+      // cost. "No stand-in" and "capacity unpriced" are two different gaps and
+      // are labelled apart.
       tr.appendChild(cell(
         m.mode === "local"
-          ? (m.shadow_usd > 0
+          ? (m.correlary && m.correlary.reference
               ? `<span class="dim">${usd(m.shadow_usd)}</span><span class="sub">avoided</span>`
-              : '<span class="dim">unpriced</span>')
+              : '<span class="dim">—</span><span class="sub">no stand-in</span>')
+            + capacityNote(m.capacity_usd)
           : m.billed_estimated_usd > 0
             ? `${usd(m.billed_usd)}<span class="sub">${usd(m.billed_measured_usd)} measured</span>`
             : usd(m.billed_usd),
@@ -632,6 +643,7 @@ that the API does not have, so a hard refresh loses nothing.
       tr.appendChild(cell(
         p.mode === "local"
           ? `<span class="dim">${usd(p.shadow_usd)}</span><span class="sub">avoided</span>`
+            + capacityNote(p.capacity_usd)
           : usd(p.billed_usd),
         "num"));
       body.appendChild(tr);
@@ -654,6 +666,7 @@ that the API does not have, so a hard refresh loses nothing.
              style="width:${(share * 100).toFixed(2)}%"></div></div>
         <div class="mode-facts">
           <span>${local ? "Would have cost" : "Cost"}<b>${usd(local ? m.shadow_usd : m.billed_usd)}</b></span>
+          ${local ? `<span>Capacity<b>${m.capacity_usd == null ? "unpriced" : usd(m.capacity_usd)}</b></span>` : ""}
           <span>Calls<b>${nf.format(m.calls)}</b></span>
           <span>Tokens<b>${tokens(m.tokens.total)}</b></span>
         </div>`;
@@ -916,8 +929,9 @@ that the API does not have, so a hard refresh loses nothing.
     // local cost would read as proof that local serving is free.
     $("savings-routing-note").textContent =
       `Priced against each local model's correlary, gated at ±${data.capability_band.toFixed(2)} of quality prior. `
-      + (data.local_capacity_priced
-        ? `Net of ${usd(data.savings.local_capacity_usd)} local capacity at the catalog's configured price.`
+      + (data.local_capacity_price != null
+        ? `Net of ${usd(data.savings.local_capacity_usd)} local capacity at the catalog's configured price `
+          + `(${usd(data.local_capacity_price.input_per_mtok_usd)} / ${usd(data.local_capacity_price.output_per_mtok_usd)} per million uncached input / output tokens).`
         : "Local capacity is unpriced, so this is gross of GPU time.");
 
     const citation = $("savings-citation");

@@ -746,12 +746,13 @@ impl StagePolicy {
         // **The dominance guard, and the whole of T4.** The efficient tier
         // exists to save cost; a capable candidate that also quotes *less*
         // for this turn is better on function and cost at once, so serving
-        // the efficient head would be paying more for the weaker model. The
-        // only thing that produces that inversion in practice is cache
-        // affinity — a warm prefix on the capable target and a cold one on
-        // the efficient head — and the per-target ledger has already priced
-        // that into both quotes. Reading the quote is therefore how this
-        // policy sees warmth without holding a byte of session state.
+        // the efficient head would be paying more for the weaker model. Two
+        // things produce that inversion in practice: cache affinity — a warm
+        // prefix on the capable target and a cold one on the efficient head —
+        // and a `local_capacity_price` that makes an efficient-tier local
+        // target quote above a capable hosted one; both are already priced
+        // into the quotes. Reading the quote is therefore how this policy
+        // sees warmth and capacity cost without holding session state.
         //
         // **Efficient picks only**: an escalation says the cheap tier cannot
         // finish this turn, and no price makes it able to. Reached only when
