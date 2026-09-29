@@ -208,7 +208,7 @@ impl LearnedPolicy {
                 None if terms.on_infeasible == OnInfeasible::ServeRules => Some(&rules.target),
                 None => None,
             };
-            propensity(&plans, set, &route.0, default, *rate)
+            propensity(&plans, set, &route.target, default, *rate)
         });
 
         let evidence = LearnedEvidence::new(LearnedEvidenceParts {
@@ -333,6 +333,12 @@ impl Planner<'_> {
     }
 }
 
+/// The target a turn serves and where it fails over to, in order.
+struct Route {
+    target: Target,
+    fallbacks: Vec<Target>,
+}
+
 /// The target and fallbacks a turn serves, or the refusal.
 ///
 /// A `live` choice serves the chosen plan's first target with the passing
@@ -346,7 +352,7 @@ fn route(
     plans: &[PlanEvidence],
     order: &[usize],
     rules: &Decision,
-) -> Result<(Target, Vec<Target>), LearnedError> {
+) -> Result<Route, LearnedError> {
     match (mode, choice) {
         (ActiveMode::Live, LearnedChoice::ConstraintUnmet { unmet })
             if on_infeasible == OnInfeasible::Refuse =>
@@ -363,9 +369,15 @@ fn route(
                 .map(|plan| plan.first.clone())
                 .ok_or_else(|| policy_bug("the chosen strategy was planned"))?;
             let fallbacks = fallbacks(plans, order, &served);
-            Ok((served, fallbacks))
+            Ok(Route {
+                target: served,
+                fallbacks,
+            })
         }
-        _ => Ok((rules.target.clone(), rules.fallbacks.clone())),
+        _ => Ok(Route {
+            target: rules.target.clone(),
+            fallbacks: rules.fallbacks.clone(),
+        }),
     }
 }
 
@@ -437,12 +449,8 @@ fn unmet(plans: &[PlanEvidence], failure: Option<ReadFailure>) -> Vec<Unmet> {
 ///
 /// Minted through [`Admitted::decide`], so the budget state, the admitted
 /// list and the overflow note are admission's own, as for every other policy.
-fn decide(
-    admitted: &Admitted<'_>,
-    route: (Target, Vec<Target>),
-    evidence: LearnedEvidence,
-) -> Decision {
-    let (target, fallbacks) = route;
+fn decide(admitted: &Admitted<'_>, route: Route, evidence: LearnedEvidence) -> Decision {
+    let Route { target, fallbacks } = route;
     let rationale = evidence.rationale();
     let source = evidence.source();
     Decision {

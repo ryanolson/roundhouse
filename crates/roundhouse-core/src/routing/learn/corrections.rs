@@ -24,6 +24,7 @@
 //! log. Judge and classifier charges are not in this cost at all, because they
 //! are not known before selection.
 
+use super::enough;
 use super::evidence::{
     CacheReuse, CostCorrection, CostEvidence, GrantCheck, LatencySum, LatencyTerm, ReadView,
     TargetOps, TtftEvidence,
@@ -154,16 +155,6 @@ impl LatencyTerm {
             LatencyTerm::TooFewSamples => 0.0,
         }
     }
-}
-
-/// Whether `n` samples meet a configured minimum.
-///
-/// Zero samples never do, whatever the minimum: a configured minimum of zero
-/// would otherwise divide by zero, and no samples is no measurement. The gate
-/// applies the same rule to live units and sessions, so a prior never passes
-/// on its own under zero minimums.
-pub(super) fn enough(n: u64, min_samples: u64) -> bool {
-    n > 0 && n >= min_samples
 }
 
 /// The mean of a latency sum as a model term, or `TooFewSamples` below the

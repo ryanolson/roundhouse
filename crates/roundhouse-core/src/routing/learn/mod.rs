@@ -37,6 +37,16 @@ use super::selection::STAGE_SELECTOR_REVISION;
 use super::stage::{DecisionSource, Pick, RoutedPick, StagePolicy, Tier, TierRecipe};
 use super::{Admitted, RoutingError};
 
+/// Whether `n` samples meet a configured minimum.
+///
+/// Zero samples never do, whatever the minimum: a configured minimum of zero
+/// would otherwise divide by zero, and no samples is no measurement. The
+/// corrections apply it to their sample counts, and the gate to live units and
+/// sessions, so a prior never passes on its own under zero minimums.
+pub(crate) fn enough(n: u64, min_samples: u64) -> bool {
+    n > 0 && n >= min_samples
+}
+
 pub use corrections::{Corrections, adjusted_cached_tokens, grant, latency_term};
 pub use evidence::{
     CacheReuse, CostCorrection, CostEvidence, Draw, ExplorationEvidence, GateEvidence, GateResult,

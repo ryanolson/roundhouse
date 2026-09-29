@@ -174,7 +174,7 @@ Dependency order: M1 is independent and ships first. M2 to M4 build the pure pol
 
 **Settled points.**
 
-- `StagePolicy::route_pick(recipe, pick, admitted) -> Result<Decision, RoutingError>` is a behavior-preserving extraction. `rules` through `route_pick` equals `StagePolicy::choose`. The dominance cost guard, degrade-to-local, and the fallback order of ruling 4 stay inside it.
+- `StagePolicy::route_pick(recipe, pick, admitted) -> Result<Decision, RoutingError>` is a behavior-preserving extraction. (M4 changed the return type to `RoutedPick`; see the M4 review fixes note in section 9.) `rules` through `route_pick` equals `StagePolicy::choose`. The dominance cost guard, degrade-to-local, and the fallback order of ruling 4 stay inside it.
 - `DecisionSource::Strategy` is a new variant. `is_signal_driven` returns `false` for it. `rules` keeps the source that `pick_tier` returned.
 - Strategies are `rules`, `efficient`, `capable`, as draft section 4.1. No calibrated `rules` strategy in this revision.
 - `LEARNING_INPUT_REVISION = 1`. The input is `rules_pick`, `newest`, `prior`, `tool_turn`, with the bands and the three key levels of draft section 5. `K = 3`.

@@ -29,7 +29,7 @@
 //! the artifact holds nothing for that key and strategy. Neither is ever a
 //! reward: nothing here writes a count.
 
-use super::corrections::enough;
+use super::enough;
 use super::evidence::{GateEvidence, GateResult, JevCounts, ReadView};
 use super::input::{KeyLevel, LearnedInput};
 use super::{PriorUnits, QualityTerms, Strategy, Units};
