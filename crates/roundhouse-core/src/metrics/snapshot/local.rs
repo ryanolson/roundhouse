@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use super::{MetricsConfig, ModelAccounting, TokenBreakdown};
+use crate::event::Usage;
 use crate::metrics::fold::Counters;
 use crate::metrics::pricing::TokenShape;
 
@@ -31,10 +32,12 @@ pub(super) struct LocalRow {
 pub(super) fn local_row(
     model: &str,
     counters: &Counters,
+    // The row's whole usage, which the caller has already summed for the
+    // row's token breakdown.
+    total_usage: &Usage,
     config: &MetricsConfig,
     frontier_shapes: &HashMap<(String, String), TokenShape>,
 ) -> LocalRow {
-    let total_usage = counters.total_usage();
     // The saving prices this and never `total_usage`: the seat's share of a
     // row is measured and has no saving to claim (see `Counters::seat`). The
     // capacity spend is the exception, over the whole row, because the
@@ -45,7 +48,7 @@ pub(super) fn local_row(
     // this traffic resembles is answered by the traffic, all of it, while what
     // it would have saved is answered only for the turns whose alternative
     // would have been this deployment's money.
-    let shape = TokenShape::from_rollup(&total_usage, counters.calls);
+    let shape = TokenShape::from_rollup(total_usage, counters.calls);
     let correlary = config.pricing.resolve(
         model,
         config.local_quality(model),
@@ -77,7 +80,7 @@ pub(super) fn local_row(
             correlary,
             seat_tokens: TokenBreakdown::from_usage(counters.seat.total().tokens()),
             seat_estimated_calls: counters.seat_estimated_calls,
-            capacity_usd: capacity_price.map(|price| price.price(&total_usage)),
+            capacity_usd: capacity_price.map(|price| price.price(total_usage)),
         },
         routing_capacity_offset_usd,
     }

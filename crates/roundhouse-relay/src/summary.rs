@@ -379,8 +379,8 @@ pub fn for_decision(turn: &TurnRecord, baseline: &Baseline<'_>) -> Option<LlmOpt
             output: None,
             cache_read: None,
             cache_write: None,
-            // Our arithmetic in every arm: a hosted rate card, a configured
-            // capacity price, or the unpriced local zero.
+            // Our arithmetic in both arms: a hosted rate card, or a
+            // configured capacity price. Unpriced local publishes none.
             source: CostSource::ModelPricing,
             pricing_provider: Some(match capacity_cost {
                 Some(_) => LOCAL_CAPACITY_PRICING_PROVIDER.to_string(),
@@ -434,21 +434,20 @@ fn limitations(turn: &TurnRecord, baseline: &Baseline<'_>) -> Vec<String> {
     // or not, so nothing on the document would say the cost is missing rather
     // than zero. A seat's turn is left to its own entry: it publishes no cost
     // of any kind, priced or not.
-    if baseline.local_capacity_price.is_none()
-        && let Some(decision) = turn.decision()
-        && decision.chosen.is_local()
-        && decision.billing.is_billable()
-    {
-        limitations.push("roundhouse_local_capacity_unpriced".to_string());
-    }
-    // Not in the ruling's three, and added because omitting it would make the
-    // status field lie: a forwarded seat publishes no cost of any kind, and a
-    // summary with no money in it and `status: Complete` claims every requested
-    // calculation was available.
-    if let Some(decision) = turn.decision()
-        && !decision.billing.is_billable()
-    {
-        limitations.push("roundhouse_seat_forwarded".to_string());
+    if let Some(decision) = turn.decision() {
+        if baseline.local_capacity_price.is_none()
+            && decision.chosen.is_local()
+            && decision.billing.is_billable()
+        {
+            limitations.push("roundhouse_local_capacity_unpriced".to_string());
+        }
+        // Not in the ruling's three, and added because omitting it would make
+        // the status field lie: a forwarded seat publishes no cost of any
+        // kind, and a summary with no money in it and `status: Complete`
+        // claims every requested calculation was available.
+        if !decision.billing.is_billable() {
+            limitations.push("roundhouse_seat_forwarded".to_string());
+        }
     }
     limitations
 }

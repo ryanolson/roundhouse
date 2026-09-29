@@ -753,7 +753,13 @@ impl MetricsSnapshot {
                 let (accounting, offset) = match key.mode {
                     ServingMode::Frontier => (frontier_row(key, counters, config), 0.0),
                     ServingMode::Local => {
-                        let row = local::local_row(&key.model, counters, config, &frontier_shapes);
+                        let row = local::local_row(
+                            &key.model,
+                            counters,
+                            &total_usage,
+                            config,
+                            &frontier_shapes,
+                        );
                         (row.accounting, row.routing_capacity_offset_usd)
                     }
                 };
