@@ -648,16 +648,24 @@ impl GuardedFallbacks {
     /// the calling model's context by `explain_last_route`: naming "cheaper
     /// strong targets" when the winner was the only one tells that model about
     /// a failover option that does not exist.
-    fn describe(self, served: Tier, picked: Tier) -> String {
+    ///
+    /// **No `served`/`picked` arguments**: this type is only ever built where
+    /// the cost guard fires, which is only reached on an efficient pick
+    /// (`resolve`'s `pick.tier == Tier::Efficient` guard) that names a capable
+    /// target instead (`served: Tier::Capable`, always) -- so "strong" and
+    /// "weak" are the labels every caller would have passed in anyway, and
+    /// carrying them as parameters only left room for a caller to pass the
+    /// wrong pair.
+    fn describe(self) -> String {
         let mut groups = Vec::with_capacity(3);
         if self.cheaper_capable > 0 {
-            groups.push(format!("cheaper {} targets", served.label()));
+            groups.push("cheaper strong targets".to_string());
         }
         if self.efficient > 0 {
-            groups.push(format!("the {} tier", picked.label()));
+            groups.push("the weak tier".to_string());
         }
         if self.dearer_capable > 0 {
-            groups.push(format!("the rest of the {} tier", served.label()));
+            groups.push("the rest of the strong tier".to_string());
         }
         groups.join(", then ")
     }
@@ -1034,11 +1042,24 @@ impl RoutingPolicy for StagePolicy {
         // tiers only, no prices, for the reason the clauses above give.
         if !fallbacks.is_empty() {
             match guarded {
-                Some(groups) => rationale.push_str(&format!(
-                    "; {} fallback(s): {}",
-                    fallbacks.len(),
-                    groups.describe(served, pick.tier),
-                )),
+                Some(groups) => {
+                    // Two derivations of one partition: `fallbacks` is
+                    // `ordered[1..]` and `groups` is the same split counted
+                    // while `ordered` was assembled in `resolve`. They must
+                    // agree by construction; this is what would catch it
+                    // silently drifting if a future edit changed one without
+                    // the other.
+                    debug_assert_eq!(
+                        groups.cheaper_capable + groups.efficient + groups.dearer_capable,
+                        fallbacks.len(),
+                        "guarded fallback groups do not sum to the fallback list"
+                    );
+                    rationale.push_str(&format!(
+                        "; {} fallback(s): {}",
+                        fallbacks.len(),
+                        groups.describe(),
+                    ))
+                }
                 None => rationale.push_str(&format!(
                     "; {} fallback(s) in the same tier",
                     fallbacks.len()

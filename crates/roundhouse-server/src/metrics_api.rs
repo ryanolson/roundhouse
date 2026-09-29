@@ -579,6 +579,7 @@ mod tests {
         // way the hosted spend note does.
         for split in [
             "data.evaluation.estimated_usd",
+            "data.evaluation.estimated_calls",
             "data.observed_cost.evaluation_measured_usd",
             "data.observed_cost.evaluation_estimated_usd",
         ] {

@@ -177,6 +177,15 @@ pub struct EvaluationMetrics {
     /// than it is. [`ObservedCost::evaluation_estimated_usd`] carries the same
     /// figure into the combined total.
     pub estimated_usd: f64,
+    /// Of `unknown_usage_calls`, how many booked an estimate above zero.
+    ///
+    /// `unknown_usage_calls` also counts a call whose settle submitted `0.0`
+    /// because it provably never reached the service, and that call is not
+    /// one of the calls `estimated_usd` is spread over -- the dashboard's
+    /// "estimated for N unreported calls" sentence needs this count rather
+    /// than `unknown_usage_calls` for exactly that reason. Mirrors
+    /// [`ServingCostGaps::estimated_calls`].
+    pub estimated_calls: u64,
     /// Results established before any HTTP — a refused budget, an unreachable
     /// ledger, an expired call. Nothing was sent, so nothing was billed.
     pub refused_calls: u64,
@@ -209,6 +218,7 @@ impl EvaluationMetrics {
             tokens: EvaluationTokens::from(&counters.all),
             unknown_usage_calls: counters.all.unknown_usage_calls,
             estimated_usd: counters.all.estimated_usd,
+            estimated_calls: counters.all.estimated_calls,
             refused_calls: counters.all.refused_calls,
             settlement: EvaluationSettlement {
                 acknowledged_calls: view.acknowledged_calls(),

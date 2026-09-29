@@ -710,7 +710,7 @@ that the API does not have, so a hard refresh loses nothing.
       // so the tile never reads as all a classifier may have cost.
       + (data.evaluation.estimated_usd > 0
         ? ` · plus ${usd(data.evaluation.estimated_usd)} estimated for `
-          + `${nf.format(data.evaluation.unknown_usage_calls)} unreported calls`
+          + `${nf.format(data.evaluation.estimated_calls)} unreported calls`
         : "");
 
     $("eval-combined").textContent = usd(data.observed_cost.total_usd);

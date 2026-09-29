@@ -1701,6 +1701,42 @@ fn a_booked_estimate_enters_the_evaluation_total_as_its_estimated_part() {
     );
 }
 
+/// **`estimated_calls` counts a booked estimate, not every unreported call.**
+///
+/// `unknown_usage_calls` includes a call that provably never left (its settle
+/// submits `0.0`), and the dashboard's "plus $X estimated for N unreported
+/// calls" sentence must not count that call among the `N`: it booked nothing,
+/// so it is not one of the calls the estimated dollar figure is spread over.
+/// `estimated_calls` is the subset whose booked estimate is above zero, the
+/// same split `ServingCostGaps::estimated_calls` makes on the serving side.
+#[test]
+fn estimated_calls_counts_only_calls_whose_booked_estimate_is_above_zero() {
+    let mut log = Log::new("acme/ada/estimate-count", Some(ada()));
+    log.intent("c-booked", 1, "r1", "haiku");
+    log.intent("c-free", 1, "r2", "haiku");
+    log.result(unknown_booked(
+        "c-booked",
+        1,
+        "r1",
+        0.05,
+        SettlementAck::Committed,
+    ));
+    log.result(unknown_usage("c-free", 1, "r2"));
+    let document = evaluation_only(&log);
+
+    assert_eq!(
+        count(&document, &["evaluation", "unknown_usage_calls"]),
+        2,
+        "both calls had no usage reported"
+    );
+    assert_eq!(
+        count(&document, &["evaluation", "estimated_calls"]),
+        1,
+        "only the booked call has an estimate above zero; the $0 unknown call \
+         provably never left and must not inflate the estimated-calls count"
+    );
+}
+
 /// **A booked estimate counts while its settle is open, and once after a
 /// repair closes it.** The repair moves the settlement, never the cost.
 #[test]

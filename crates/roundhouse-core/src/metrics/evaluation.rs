@@ -74,10 +74,10 @@ pub(super) struct EvaluationModelKey {
 /// One accepted result's booking, on whatever grouping holds it -- the
 /// deployment-wide tally and each `(requested, reported)` row alike.
 ///
-/// A single type rather than two, because the two were the same six fields
+/// A single type rather than two, because the two were the same fields
 /// written out by hand in every arm of [`EvaluationFold::recorded`]: adding a
-/// seventh meant five edits that had to agree, and [`Self::book`] is now the
-/// one place that can disagree with itself.
+/// field meant an edit in every arm that had to agree with every other, and
+/// [`Self::book`] is now the one place that can disagree with itself.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct EvaluationCallTally {
     pub(super) calls: u64,
@@ -95,6 +95,14 @@ pub(super) struct EvaluationCallTally {
     /// Kept apart from `measured_usd` because it is a ledger booking, not a
     /// price anybody measured.
     pub(super) estimated_usd: f64,
+    /// Of `unknown_usage_calls`, how many booked an estimate above zero.
+    ///
+    /// `unknown_usage_calls` also holds a call that provably never left (its
+    /// settle submits `0.0`), and that call must not be counted as one of the
+    /// calls `estimated_usd` is spread over -- the same split
+    /// `ServingCostGaps::estimated_calls` makes for a serving row nobody
+    /// reported usage for.
+    pub(super) estimated_calls: u64,
     pub(super) refused_calls: u64,
     pub(super) input_tokens: u64,
     pub(super) output_tokens: u64,
@@ -116,6 +124,9 @@ impl EvaluationCallTally {
             Some(EvaluationSpend::Unknown { submitted_usd, .. }) => {
                 self.unknown_usage_calls += 1;
                 self.estimated_usd += submitted_usd;
+                if *submitted_usd > 0.0 {
+                    self.estimated_calls += 1;
+                }
             }
             // Nothing was sent, so nothing was billed -- the one class that
             // is free rather than unknown, and the one with no settlement.
@@ -131,6 +142,7 @@ impl EvaluationCallTally {
         self.measured_usd += other.measured_usd;
         self.unknown_usage_calls += other.unknown_usage_calls;
         self.estimated_usd += other.estimated_usd;
+        self.estimated_calls += other.estimated_calls;
         self.refused_calls += other.refused_calls;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
