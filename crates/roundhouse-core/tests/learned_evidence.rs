@@ -533,13 +533,31 @@ fn an_explored_record_without_its_exploration_is_refused() {
     out_of_range.exploration.as_mut().unwrap().set = vec![];
     let mut wrong_member = parts(ActiveMode::Live, explore);
     wrong_member.exploration.as_mut().unwrap().set = vec![Strategy::Capable];
+    // The chosen strategy is in the set, but not at the recorded index. A
+    // check that asked only "is the strategy in the set" would accept this.
+    let mut right_strategy_wrong_index = parts(
+        ActiveMode::Live,
+        LearnedChoice::Explore {
+            strategy: Strategy::Capable,
+            member: 0,
+        },
+    );
+    right_strategy_wrong_index.exploration.as_mut().unwrap().set =
+        vec![Strategy::Efficient, Strategy::Capable];
     for (case, broken) in [
         ("no exploration", no_exploration),
         ("member outside the set", out_of_range),
         ("member names another strategy", wrong_member),
+        (
+            "strategy present at another index",
+            right_strategy_wrong_index,
+        ),
     ] {
         assert!(
-            LearnedEvidence::new(broken).is_err(),
+            matches!(
+                LearnedEvidence::new(broken),
+                Err(LearnedEvidenceError::Exploration { .. })
+            ),
             "{case}: an explored record must hold the exploration it names"
         );
     }
