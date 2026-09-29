@@ -17,12 +17,19 @@
 //! pass a strategy no review of this epoch has seen, which is the one thing
 //! the Jev addendum rules out ("never passes the gate alone").
 //!
+//! **Zero never meets a minimum**, even a configured minimum of zero: the
+//! same rule the corrections apply to their sample counts (`enough`). A level
+//! with no live units is not opened, and a level no session reviewed does not
+//! pass, so `min_evidence: 0` or `min_sessions: 0` cannot let a prior pass on
+//! its own.
+//!
 //! Two priors, and the artifact's wins. The calibration artifact's units are
 //! review evidence carried across epochs. Jev's tier answers are a cold-start
 //! belief, worth [`JEV_PRIOR_PSEUDO_INTERVALS`] intervals, and apply only where
 //! the artifact holds nothing for that key and strategy. Neither is ever a
 //! reward: nothing here writes a count.
 
+use super::corrections::enough;
 use super::evidence::{GateEvidence, GateResult, JevCounts, ReadView};
 use super::input::{KeyLevel, LearnedInput};
 use super::{PriorUnits, QualityTerms, Strategy, Units};
@@ -186,7 +193,7 @@ pub fn read_gate(
         else {
             continue;
         };
-        if live.n_units < quality.min_evidence {
+        if !enough(live.n_units, quality.min_evidence) {
             continue;
         }
         let artifact = prior.get(&key, strategy);
@@ -205,7 +212,8 @@ pub fn read_gate(
             },
             quality.z,
         );
-        let result = if live.sessions >= quality.min_sessions && bounds.lower >= quality.floor {
+        let result = if enough(live.sessions, quality.min_sessions) && bounds.lower >= quality.floor
+        {
             GateResult::Pass
         } else if bounds.upper < quality.floor {
             GateResult::BelowFloor

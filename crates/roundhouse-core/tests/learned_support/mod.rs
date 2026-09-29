@@ -356,7 +356,12 @@ impl Rig {
     }
 
     pub fn choose(&self, turn: &Turn) -> Result<Decision, LearnedError> {
-        LearnedPolicy::choose(&self.ctx(), &turn.learning())
+        let mode = turn
+            .terms
+            .mode
+            .active()
+            .expect("an `off` project is the engine's branch and never reaches `choose`");
+        LearnedPolicy::choose(&self.ctx(), mode, &turn.learning())
     }
 
     pub fn chosen(&self, turn: &Turn) -> Decision {
@@ -373,7 +378,9 @@ impl Rig {
             self.recipe.picker(),
             self.recipe.confidence_threshold(),
         );
-        StagePolicy::route_pick(&self.recipe, pick, &admitted).expect("rules routes")
+        StagePolicy::route_pick(&self.recipe, pick, &admitted)
+            .expect("rules routes")
+            .decision
     }
 
     /// The learned input the policy encodes for `turn`.

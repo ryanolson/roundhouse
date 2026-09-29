@@ -809,7 +809,7 @@ impl RoutingPolicy for ForcedCapable {
             recipe.picker(),
             recipe.confidence_threshold(),
         );
-        match self.stamp {
+        let routed = match self.stamp {
             None => Strategy::Capable.plan(recipe, rules, &admitted),
             Some(source) => StagePolicy::route_pick(
                 recipe,
@@ -821,7 +821,8 @@ impl RoutingPolicy for ForcedCapable {
                 },
                 &admitted,
             ),
-        }
+        }?;
+        Ok(routed.decision)
     }
 }
 

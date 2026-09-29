@@ -156,9 +156,24 @@ impl Fixture {
     fn plan(&self, strategy: Strategy, candidates: &[Candidate]) -> Decision {
         let ctx = self.ctx(candidates);
         let admitted = ctx.admissible(None).expect("the pool holds something");
-        strategy
+        let routed = strategy
             .plan(&self.recipe, self.rules_pick(), &admitted)
-            .expect("every fixture pool can be planned")
+            .expect("every fixture pool can be planned");
+        // What `route_pick` returns beside the decision is what the decision
+        // records, on every branch these fixtures reach.
+        match &routed
+            .decision
+            .selector
+            .as_ref()
+            .map(|selector| &selector.branch)
+        {
+            Some(SelectorBranch::Stage(evidence)) => {
+                assert_eq!(routed.pick, evidence.pick, "{strategy}");
+                assert_eq!(routed.outcome, evidence.outcome, "{strategy}");
+            }
+            other => panic!("a plan is a stage decision, got {other:?}"),
+        }
+        routed.decision
     }
 }
 

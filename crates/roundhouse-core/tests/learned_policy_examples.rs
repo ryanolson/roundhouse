@@ -16,11 +16,11 @@ mod learned_support;
 use learned_support::*;
 use roundhouse_core::classify::TurnComplexity;
 use roundhouse_core::control::{BudgetState, Exhaustion, TurnBudget};
+use roundhouse_core::routing::PickerMode;
 use roundhouse_core::routing::learn::{
     ActiveMode, Band, GateResult, JevCounts, KeyLevel, LearnedChoice, LearnedError, LearnerMode,
     LearnerTerms, OnInfeasible, PriorBand, ReadFailure, StoreRead, Strategy, Unmet,
 };
-use roundhouse_core::routing::{PickerMode, SelectorBranch};
 
 fn none() -> JevCounts {
     JevCounts::default()
@@ -291,8 +291,8 @@ fn row_6_a_store_timeout_is_infeasible_with_its_reason() {
 
 /// Row 7, shadow: the state of row 1, mode `shadow`. The route is the stage
 /// router's to the byte, and the record shows `efficient` as the learned
-/// choice, not applied. Mode `off` is the stage decision itself, with no
-/// learned evidence at all.
+/// choice, not applied. Mode `off` never reaches `choose`: the engine serves
+/// the stage decision without reading the store or drawing.
 #[test]
 fn row_7_shadow_serves_rules_and_records_the_learned_choice() {
     let rig = rig();
@@ -321,13 +321,6 @@ fn row_7_shadow_serves_rules_and_records_the_learned_choice() {
         "{}",
         decision.rationale
     );
-
-    let off = rig.chosen(&Turn::new(terms(LearnerMode::Off), both_pass(&rig), STAY));
-    assert_eq!(off, rules);
-    assert!(matches!(
-        off.selector.unwrap().branch,
-        SelectorBranch::Stage(_)
-    ));
 }
 
 /// Row 8, no exploration: only the state serving can produce. `rules` served

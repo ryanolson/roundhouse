@@ -17,7 +17,7 @@
 use sha2::{Digest, Sha256};
 
 use super::Strategy;
-use super::evidence::{Draw, GateResult, GrantCheck, PlanEvidence};
+use super::evidence::{Draw, GateResult, PlanEvidence};
 use crate::ids::{ResponseId, SessionId};
 use crate::routing::Target;
 
@@ -75,16 +75,14 @@ impl Draw {
 /// bypass to learn nothing about cost. It also keeps every member's first
 /// target distinct from the reference's, which [`propensity`] relies on.
 ///
-/// **Every hard constraint:** admission (the plan was routed over the
-/// admitted pool), the grant on the corrected cost (an overflow admission
-/// keeps its status, draft 7.2), and the latency limit.
+/// **Every hard constraint**, by [`PlanEvidence::meets_hard`], the predicate
+/// the exploit path uses.
 pub fn eligible(plans: &[PlanEvidence], reference: &PlanEvidence) -> Vec<Strategy> {
     plans
         .iter()
         .filter(|plan| {
             plan.gate.result == GateResult::Unproven
-                && plan.latency_met
-                && plan.grant != GrantCheck::Exceeds
+                && plan.meets_hard()
                 && plan.cost.adjusted_usd < reference.cost.adjusted_usd
         })
         .map(|plan| plan.strategy)

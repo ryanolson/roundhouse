@@ -196,6 +196,81 @@ fn an_artifact_prior_alone_cannot_pass_the_gate() {
     assert_eq!(reading.result, GateResult::Unproven);
 }
 
+/// Zero never meets a minimum, even a configured minimum of zero, the rule
+/// the corrections already follow. Without it, `min_evidence: 0` opens a
+/// level holding no live units and `min_sessions: 0` passes one no session
+/// reviewed, so the artifact prior alone would pass the gate.
+#[test]
+fn a_prior_alone_cannot_pass_under_zero_minimums() {
+    let quality = QualityTerms {
+        min_evidence: 0,
+        min_sessions: 0,
+        ..quality()
+    };
+    let prior = PriorUnits::new(
+        input()
+            .keys()
+            .into_iter()
+            .map(|key| ((key, Strategy::Efficient), units(1_000_000, 1_000_000))),
+    );
+    let gate = |live: Counts| {
+        read_gate(
+            &view(vec![at(
+                KeyLevel::L2,
+                &[(Strategy::Efficient, live)],
+                no_jev(),
+            )]),
+            &input(),
+            Strategy::Efficient,
+            &prior,
+            &quality,
+            true,
+        )
+    };
+
+    // No live units: no level opens.
+    let empty = gate((0, 0, 0));
+    assert_eq!(empty.level, None);
+    assert_eq!(empty.result, GateResult::Unproven);
+
+    // Live units but no session: the level is read, and the huge positive
+    // prior rules out `BelowFloor`, but no session means no `Pass`.
+    let sessionless = gate((1_000, 1_000, 0));
+    assert_eq!(sessionless.level, Some(KeyLevel::L2));
+    assert_eq!(sessionless.result, GateResult::Unproven);
+}
+
+/// `BelowFloor` needs the upper bound strictly under the floor. An upper bound
+/// exactly at the floor is a strategy the evidence has not ruled out, so it
+/// is `Unproven`. The floor is computed from the same bound, so the two are
+/// bitwise equal; the lower bound is under it, so the strategy cannot pass.
+#[test]
+fn an_upper_bound_exactly_at_the_floor_is_unproven() {
+    let live = (4_500, 5_000, MIN_SESSIONS);
+    let upper = wilson_v1(units(live.0, live.1), Z).upper;
+    assert!(upper < 1.0);
+    let quality = QualityTerms {
+        floor: upper,
+        ..quality()
+    };
+    let reading = read_gate(
+        &view(vec![at(
+            KeyLevel::L2,
+            &[(Strategy::Efficient, live)],
+            no_jev(),
+        )]),
+        &input(),
+        Strategy::Efficient,
+        &PriorUnits::default(),
+        &quality,
+        false,
+    );
+    assert_eq!(reading.level, Some(KeyLevel::L2));
+    assert_eq!(reading.bounds.upper, quality.floor);
+    assert!(reading.bounds.lower < quality.floor);
+    assert_eq!(reading.result, GateResult::Unproven);
+}
+
 /// Jev is a scout. A thousand agreeing answers on a key with no live evidence
 /// leave every strategy unproven, and a thousand disagreeing ones do not sink
 /// one below the floor.

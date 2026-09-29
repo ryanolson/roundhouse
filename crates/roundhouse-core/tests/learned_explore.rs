@@ -415,3 +415,28 @@ fn the_draw_uses_the_routing_explore_domain_and_the_arm_salt() {
         rate_bits
     );
 }
+
+/// **Golden values computed outside this crate** (Python `hashlib.sha256` over
+/// `"v1\nrouting-explore\nsalt=salt-1\nsession=acme/ada/main\nresponse=resp_42\n"`,
+/// 2026-09-28), so a change to the version tag, the domain string, the field
+/// encoding or the bit extraction fails here. The test above rebuilds its
+/// expected string from [`LEARNER_DRAW_VERSION`], so it cannot see the tag
+/// move. A recorded draw must stay reproducible by the encoding that wrote it:
+/// moving any of these is a new `LEARNER_DRAW_VERSION` and a new golden.
+#[test]
+fn the_draw_matches_a_golden_digest() {
+    let draw = Draw::for_turn(
+        "salt-1",
+        &SessionId::new("acme/ada/main"),
+        &ResponseId::new("resp_42"),
+    );
+    // Digest d80ca25f3dfef2a4 ea0dc90526389cc1 ...: the top 53 bits of the
+    // first word, and the whole second word.
+    assert_eq!(
+        (draw.rate * (1u64 << 53) as f64) as u64,
+        7_601_560_811_454_430
+    );
+    assert_eq!(draw.member, 16_865_357_203_525_639_361);
+    assert_eq!(draw.member % 3, 2);
+    assert_eq!(LEARNER_DRAW_VERSION, "v1");
+}

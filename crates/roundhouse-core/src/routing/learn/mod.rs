@@ -34,8 +34,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::selection::STAGE_SELECTOR_REVISION;
-use super::stage::{DecisionSource, Pick, StagePolicy, Tier, TierRecipe};
-use super::{Admitted, Decision, RoutingError};
+use super::stage::{DecisionSource, Pick, RoutedPick, StagePolicy, Tier, TierRecipe};
+use super::{Admitted, RoutingError};
 
 pub use corrections::{Corrections, adjusted_cached_tokens, grant, latency_term};
 pub use evidence::{
@@ -140,7 +140,7 @@ impl Strategy {
         recipe: &TierRecipe,
         rules: Pick,
         admitted: &Admitted<'_>,
-    ) -> Result<Decision, RoutingError> {
+    ) -> Result<RoutedPick, RoutingError> {
         StagePolicy::route_pick(recipe, self.pick(rules), admitted)
     }
 }

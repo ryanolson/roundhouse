@@ -33,8 +33,9 @@ use super::{
     Strategy,
 };
 use crate::classify::{AvailableClassification, ClassificationWindow};
-use crate::routing::selection::{RecipeEvidence, SelectorBranch, SelectorSnapshot, StageOutcome};
-use crate::routing::stage::{Pick, StagePolicy, pick_tier};
+use crate::control::TurnBudget;
+use crate::routing::selection::{RecipeEvidence, SelectorSnapshot};
+use crate::routing::stage::{Pick, RoutedPick, TierRecipe, pick_tier};
 use crate::routing::{Admitted, Decision, RoutingContext, RoutingError, Target};
 use crate::validate::Arm;
 
@@ -89,33 +90,20 @@ fn labels(unmet: &[Unmet]) -> String {
 /// The learned router.
 pub struct LearnedPolicy;
 
-/// One strategy's plan, with the decision `route_pick` built for it.
-struct Planned {
-    evidence: PlanEvidence,
-    decision: Decision,
-}
-
-impl Planned {
-    /// The first target meets every hard constraint but the gate: admission
-    /// (it was routed over the admitted pool), the grant, and latency.
-    fn meets_hard(&self) -> bool {
-        self.evidence.grant != GrantCheck::Exceeds && self.evidence.latency_met
-    }
-
-    fn passes(&self) -> bool {
-        self.meets_hard() && self.evidence.gate.result == GateResult::Pass
-    }
-}
-
 impl LearnedPolicy {
     /// The decision for one turn, with its [`LearnedEvidence`] on the
     /// selector.
     ///
-    /// - `off`: the stage decision, with stage evidence and nothing learned.
     /// - `shadow`: the `rules` decision, route unchanged, and the learned
     ///   choice recorded as not applied.
     /// - `live`: the exploit strategy, an explored member, or the
     ///   `on_infeasible` path.
+    ///
+    /// **Takes an [`ActiveMode`], so an `off` project never reaches it.** An
+    /// `off` turn is the stage decision and needs no store read and no draw,
+    /// so the engine branches on [`LearnerMode::active`](super::LearnerMode::active)
+    /// before it reads or draws anything. `terms.mode` is not read here: the
+    /// mode passed is the one in force.
     ///
     /// **`serve_rules` and `shadow` serve the `rules` decision whole**: its
     /// target, its own fallbacks, its budget state. Only the rationale and the
@@ -123,6 +111,7 @@ impl LearnedPolicy {
     /// exactly as it did under `off`.
     pub fn choose(
         ctx: &RoutingContext<'_>,
+        mode: ActiveMode,
         turn: &LearningTurn<'_>,
     ) -> Result<Decision, LearnedError> {
         let recipe = ctx.tiers.ok_or(LearnedError::NoRecipe)?;
@@ -135,9 +124,6 @@ impl LearnedPolicy {
         let signals = ctx.signals.cloned().unwrap_or_default();
         let rules_pick = pick_tier(&signals, recipe.picker(), recipe.confidence_threshold());
         let terms = turn.terms;
-        let Some(mode) = terms.mode.active() else {
-            return Ok(StagePolicy::route_pick(recipe, rules_pick, &admitted)?);
-        };
         let input =
             LearnedInput::encode(rules_pick.tier, turn.tool_turn, turn.window, turn.available);
         let empty = ReadView::default();
@@ -153,134 +139,77 @@ impl LearnedPolicy {
             .iter()
             .any(|candidate| !candidate.target.is_local());
 
-        let corrections = Corrections::new(
+        let Plans {
+            plans,
+            rules_at,
+            rules,
+        } = Planner {
+            recipe,
+            rules_pick,
+            admitted: &admitted,
+            budget: ctx.budget,
+            corrections: Corrections::new(
+                view,
+                ctx.ledger,
+                ctx.isl_tokens,
+                terms.latency_min_samples,
+                terms.cache_min_samples,
+            ),
+            terms,
+            input: &input,
             view,
-            ctx.ledger,
-            ctx.isl_tokens,
-            terms.latency_min_samples,
-            terms.cache_min_samples,
-        );
-        let mut planned = Vec::with_capacity(terms.strategies.as_slice().len());
-        for &strategy in terms.strategies.as_slice() {
-            let decision = strategy.plan(recipe, rules_pick, &admitted)?;
-            let candidate = admitted
-                .pool()
-                .iter()
-                .copied()
-                .find(|candidate| candidate.target == decision.target)
-                .ok_or_else(|| policy_bug("a plan served a target outside the admitted pool"))?;
-            let (pick, outcome) = stage_parts(&decision)?;
-            let cost = corrections.cost(candidate);
-            let ttft = corrections.first_output(candidate);
-            let grant = grant(ctx.budget, decision.budget_state, candidate, &cost);
-            let latency_met = ttft.adjusted_ms <= terms.latency_limit_ms as f64;
-            // A failed read gives no gate result. `Unproven` with no level is
-            // the record's closest statement, and the read failure in the view
-            // and in the unmet list says why.
-            let gate = match failure {
-                Some(_) => GateEvidence {
-                    level: None,
-                    result: GateResult::Unproven,
-                },
-                None => read_gate(
-                    view,
-                    &input,
-                    strategy,
-                    &terms.prior,
-                    &terms.quality,
-                    frontier_admitted,
-                )
-                .evidence(),
-            };
-            planned.push(Planned {
-                evidence: PlanEvidence {
-                    strategy,
-                    pick,
-                    outcome,
-                    first: decision.target.clone(),
-                    cost,
-                    ttft,
-                    grant,
-                    latency_met,
-                    gate,
-                },
-                decision,
-            });
+            failure,
+            frontier_admitted,
         }
+        .plan_all()?;
 
-        let order = exploit_order(&planned);
-        let rules_at = planned
-            .iter()
-            .position(|plan| plan.evidence.strategy == Strategy::Rules)
-            .ok_or_else(|| policy_bug("a strategy set always holds `rules`"))?;
+        let order = exploit_order(&plans);
         let reference = order.first().copied().unwrap_or(rules_at);
 
         // Ruling 8: live only, a reviewed session only, a frontier target in
-        // the pool, and a read that gave gate results to explore on.
+        // the pool, and a read that gave gate results to explore on. The
+        // arena is the rate and the set, and exists only when a turn could
+        // explore and something is eligible, so the draw and the propensity
+        // read one guard.
         let rate = terms.exploration.map(|exploration| exploration.rate);
         let possible = mode == ActiveMode::Live
-            && rate.is_some()
             && turn.arm.is_some_and(Arm::consults_judge)
             && frontier_admitted
             && failure.is_none();
-        let plans: Vec<PlanEvidence> = planned.iter().map(|plan| plan.evidence.clone()).collect();
-        let set = match possible {
-            true => eligible(&plans, &plans[reference]),
-            false => Vec::new(),
-        };
-        let explored = match rate {
-            Some(rate) if possible && !set.is_empty() && turn.draw.rate < rate => {
+        let arena = rate
+            .filter(|_| possible)
+            .map(|rate| (rate, eligible(&plans, &plans[reference])))
+            .filter(|(_, set)| !set.is_empty());
+        let explored = arena
+            .as_ref()
+            .filter(|(rate, _)| turn.draw.rate < *rate)
+            .map(|(_, set)| {
                 let member = turn.draw.member % set.len() as u64;
                 // `member < set.len()`, so the index is in range.
-                Some((set[member as usize], member))
-            }
-            _ => None,
-        };
+                (set[member as usize], member)
+            });
 
         let choice = match (explored, order.first()) {
             (Some((strategy, member)), _) => LearnedChoice::Explore { strategy, member },
             (None, Some(&exploit)) => LearnedChoice::Exploit {
-                strategy: planned[exploit].evidence.strategy,
+                strategy: plans[exploit].strategy,
             },
             (None, None) => LearnedChoice::ConstraintUnmet {
-                unmet: unmet(&planned, failure),
+                unmet: unmet(&plans, failure),
             },
         };
 
         // The route served, before any record exists to describe it.
-        let rules = &planned[rules_at].decision;
-        let route = match (mode, &choice) {
-            (ActiveMode::Live, LearnedChoice::ConstraintUnmet { unmet })
-                if terms.on_infeasible == OnInfeasible::Refuse =>
-            {
-                return Err(LearnedError::Refused {
-                    unmet: unmet.clone(),
-                });
-            }
-            (ActiveMode::Live, LearnedChoice::Exploit { strategy })
-            | (ActiveMode::Live, LearnedChoice::Explore { strategy, .. }) => {
-                let served = planned
-                    .iter()
-                    .find(|plan| plan.evidence.strategy == *strategy)
-                    .map(|plan| plan.evidence.first.clone())
-                    .ok_or_else(|| policy_bug("the chosen strategy was planned"))?;
-                let fallbacks = fallbacks(&planned, &order, &served);
-                (served, fallbacks)
-            }
-            _ => (rules.target.clone(), rules.fallbacks.clone()),
-        };
+        let route = route(mode, &choice, terms.on_infeasible, &plans, &order, &rules)?;
 
-        let propensity = match rate {
-            Some(rate) if possible && !set.is_empty() => {
-                let default = match order.first() {
-                    Some(&exploit) => Some(&planned[exploit].evidence.first),
-                    None if terms.on_infeasible == OnInfeasible::ServeRules => Some(&rules.target),
-                    None => None,
-                };
-                propensity(&plans, &set, &route.0, default, rate)
-            }
-            _ => 1.0,
-        };
+        let propensity = arena.as_ref().map_or(1.0, |(rate, set)| {
+            let default = match order.first() {
+                Some(&exploit) => Some(&plans[exploit].first),
+                None if terms.on_infeasible == OnInfeasible::ServeRules => Some(&rules.target),
+                None => None,
+            };
+            propensity(&plans, set, &route.0, default, *rate)
+        });
 
         let evidence = LearnedEvidence::new(LearnedEvidenceParts {
             mode,
@@ -295,12 +224,148 @@ impl LearnedPolicy {
             exploration: rate.map(|_| ExplorationEvidence {
                 draw: turn.draw,
                 possible,
-                set,
+                set: arena.map(|(_, set)| set).unwrap_or_default(),
             }),
             propensity,
         })
         .map_err(|error| policy_bug(&error.to_string()))?;
         Ok(decide(&admitted, route, evidence))
+    }
+}
+
+/// What every strategy of one turn is planned against: one recipe, one
+/// `rules` pick, one admitted pool, one store view.
+struct Planner<'a> {
+    recipe: &'a TierRecipe,
+    rules_pick: Pick,
+    admitted: &'a Admitted<'a>,
+    budget: &'a TurnBudget,
+    corrections: Corrections<'a>,
+    terms: &'a LearnerTerms,
+    input: &'a LearnedInput,
+    view: &'a ReadView,
+    failure: Option<ReadFailure>,
+    frontier_admitted: bool,
+}
+
+/// Every configured strategy's plan evidence, in configured order, and the
+/// `rules` decision.
+///
+/// **Only the `rules` decision is kept.** A learned route is assembled from
+/// the plans' first targets (draft 7.6), so the other strategies' decisions
+/// are never read; `shadow` and `serve_rules` serve the `rules` one whole.
+struct Plans {
+    plans: Vec<PlanEvidence>,
+    rules_at: usize,
+    rules: Decision,
+}
+
+impl Planner<'_> {
+    fn plan_all(&self) -> Result<Plans, LearnedError> {
+        let strategies = self.terms.strategies.as_slice();
+        let mut plans = Vec::with_capacity(strategies.len());
+        let mut rules = None;
+        for &strategy in strategies {
+            let (plan, decision) = self.plan(strategy)?;
+            if strategy == Strategy::Rules {
+                rules = Some((plans.len(), decision));
+            }
+            plans.push(plan);
+        }
+        let (rules_at, rules) =
+            rules.ok_or_else(|| policy_bug("a strategy set always holds `rules`"))?;
+        Ok(Plans {
+            plans,
+            rules_at,
+            rules,
+        })
+    }
+
+    /// One strategy's plan, its corrections, its hard constraints and its
+    /// gate.
+    fn plan(&self, strategy: Strategy) -> Result<(PlanEvidence, Decision), LearnedError> {
+        let RoutedPick {
+            decision,
+            pick,
+            outcome,
+        } = strategy.plan(self.recipe, self.rules_pick, self.admitted)?;
+        let candidate = self
+            .admitted
+            .pool()
+            .iter()
+            .copied()
+            .find(|candidate| candidate.target == decision.target)
+            .ok_or_else(|| policy_bug("a plan served a target outside the admitted pool"))?;
+        let cost = self.corrections.cost(candidate);
+        let ttft = self.corrections.first_output(candidate);
+        let grant = grant(self.budget, decision.budget_state, candidate, &cost);
+        let latency_met = ttft.adjusted_ms <= self.terms.latency_limit_ms as f64;
+        // A failed read gives no gate result. `Unproven` with no level is the
+        // record's closest statement, and the read failure in the view and in
+        // the unmet list says why.
+        let gate = match self.failure {
+            Some(_) => GateEvidence {
+                level: None,
+                result: GateResult::Unproven,
+            },
+            None => read_gate(
+                self.view,
+                self.input,
+                strategy,
+                &self.terms.prior,
+                &self.terms.quality,
+                self.frontier_admitted,
+            )
+            .evidence(),
+        };
+        let plan = PlanEvidence {
+            strategy,
+            pick,
+            outcome,
+            first: decision.target.clone(),
+            cost,
+            ttft,
+            grant,
+            latency_met,
+            gate,
+        };
+        Ok((plan, decision))
+    }
+}
+
+/// The target and fallbacks a turn serves, or the refusal.
+///
+/// A `live` choice serves the chosen plan's first target with the passing
+/// plans' first targets behind it. Everything else (`shadow`, and a `live`
+/// turn under `serve_rules` that nothing passed) serves the `rules` decision's
+/// target and its own fallbacks.
+fn route(
+    mode: ActiveMode,
+    choice: &LearnedChoice,
+    on_infeasible: OnInfeasible,
+    plans: &[PlanEvidence],
+    order: &[usize],
+    rules: &Decision,
+) -> Result<(Target, Vec<Target>), LearnedError> {
+    match (mode, choice) {
+        (ActiveMode::Live, LearnedChoice::ConstraintUnmet { unmet })
+            if on_infeasible == OnInfeasible::Refuse =>
+        {
+            Err(LearnedError::Refused {
+                unmet: unmet.clone(),
+            })
+        }
+        (ActiveMode::Live, LearnedChoice::Exploit { strategy })
+        | (ActiveMode::Live, LearnedChoice::Explore { strategy, .. }) => {
+            let served = plans
+                .iter()
+                .find(|plan| plan.strategy == *strategy)
+                .map(|plan| plan.first.clone())
+                .ok_or_else(|| policy_bug("the chosen strategy was planned"))?;
+            let fallbacks = fallbacks(plans, order, &served);
+            Ok((served, fallbacks))
+        }
+        _ => Ok((rules.target.clone(), rules.fallbacks.clone())),
     }
 }
 
@@ -310,12 +375,12 @@ impl LearnedPolicy {
 /// Configured order is the index itself, so a stable sort on the two numbers
 /// breaks the remaining ties by it. `total_cmp` keeps the order total even for
 /// a NaN a broken quote could carry.
-fn exploit_order(planned: &[Planned]) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..planned.len())
-        .filter(|&index| planned[index].passes())
+fn exploit_order(plans: &[PlanEvidence]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..plans.len())
+        .filter(|&index| plans[index].meets_hard() && plans[index].gate.result == GateResult::Pass)
         .collect();
     order.sort_by(|&left, &right| {
-        let (left, right) = (&planned[left].evidence, &planned[right].evidence);
+        let (left, right) = (&plans[left], &plans[right]);
         left.cost
             .adjusted_usd
             .total_cmp(&right.cost.adjusted_usd)
@@ -331,10 +396,10 @@ fn exploit_order(planned: &[Planned]) -> Vec<usize> {
 /// **Not a strategy's own second choices.** Its evidence is about its first
 /// target only; a fallback it never earned evidence for would be an unchecked
 /// target behind a checked one.
-fn fallbacks(planned: &[Planned], order: &[usize], served: &Target) -> Vec<Target> {
+fn fallbacks(plans: &[PlanEvidence], order: &[usize], served: &Target) -> Vec<Target> {
     let mut fallbacks: Vec<Target> = Vec::new();
     for &index in order {
-        let first = &planned[index].evidence.first;
+        let first = &plans[index].first;
         if first != served && !fallbacks.contains(first) {
             fallbacks.push(first.clone());
         }
@@ -347,8 +412,8 @@ fn fallbacks(planned: &[Planned], order: &[usize], served: &Target) -> Vec<Targe
 ///
 /// A failed read replaces quality, because quality was never evaluated: the
 /// record says the store did not answer, not that the reviews were bad.
-fn unmet(planned: &[Planned], failure: Option<ReadFailure>) -> Vec<Unmet> {
-    let any = |failed: fn(&PlanEvidence) -> bool| planned.iter().any(|plan| failed(&plan.evidence));
+fn unmet(plans: &[PlanEvidence], failure: Option<ReadFailure>) -> Vec<Unmet> {
+    let any = |failed: fn(&PlanEvidence) -> bool| plans.iter().any(failed);
     let quality = match failure {
         None => any(|plan| plan.gate.result != GateResult::Pass).then_some(Unmet::Quality),
         Some(_) => None,
@@ -384,14 +449,6 @@ fn decide(
         fallbacks,
         source,
         ..admitted.decide(target, rationale, SelectorSnapshot::learned(evidence))
-    }
-}
-
-/// The pick and outcome `route_pick` recorded for a plan.
-fn stage_parts(decision: &Decision) -> Result<(Pick, StageOutcome), LearnedError> {
-    match decision.selector.as_ref().map(|selector| &selector.branch) {
-        Some(SelectorBranch::Stage(evidence)) => Ok((evidence.pick, evidence.outcome.clone())),
-        _ => Err(policy_bug("route_pick records a stage branch")),
     }
 }
 
