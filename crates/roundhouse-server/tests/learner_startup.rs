@@ -24,7 +24,7 @@ use roundhouse_core::routing::{DecisionRecord, SelectorBranch};
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::{EchoFrontierClient, FrontierClients, StaticFrontierCatalog, WireProtocol};
 use roundhouse_server::control_config::{ControlPlaneError, learner::LearnerConfigError};
-use roundhouse_server::routing_composition::{self, RoutingComposition};
+use roundhouse_server::routing_composition::{self, EngineParts, RoutingComposition};
 use roundhouse_server::test_support::{captured_warnings, frontier_spec, single_model_catalog};
 use roundhouse_server::{
     Admission, Backends, ControlPlane, ControlPlaneConfig, EchoLocalExecutor, Engine, EngineConfig,
@@ -152,8 +152,8 @@ fn memory_store(backends: &Backends) -> Arc<MemoryStore> {
     }
 }
 
-/// An engine over `store` wired the way `serve` wires it: the composed
-/// policy, then the composed learner.
+/// An engine over `store`, built by the function `serve` builds its engine
+/// with, from `composition`.
 fn engine<S: SessionStore>(
     store: Arc<S>,
     composition: RoutingComposition,
@@ -161,19 +161,40 @@ fn engine<S: SessionStore>(
     Engine<S, ByteTokenizer>,
     Option<roundhouse_server::learner_recovery::LearnerRecovery<S>>,
 ) {
-    let RoutingComposition { policy, learner } = composition;
-    let engine = Engine::with_provider_clients(
-        store,
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
-        catalog(),
-        Arc::new(FrontierClients::uniform(Arc::new(EchoFrontierClient::new(
-            "answered",
-        )))),
-        policy,
-        EngineConfig::default(),
-    );
-    routing_composition::attach_learner(engine, learner)
+    routing_composition::build_engine(
+        EngineParts {
+            store,
+            tokenizer: ByteTokenizer,
+            local_executor: Arc::new(EchoLocalExecutor::new("local answer")),
+            frontier_catalog: catalog(),
+            frontier_clients: Arc::new(FrontierClients::uniform(Arc::new(
+                EchoFrontierClient::new("answered"),
+            ))),
+            config: EngineConfig::default(),
+        },
+        composition,
+    )
+}
+
+/// **Mutation survivor S4: the engine `serve` builds routes under the
+/// composed policy.** `build_engine` is the one place a composed policy
+/// reaches an engine, and the engine's own name is what every turn's record
+/// and `serve`'s boot line carry: `learned` for a `shadow` plane, and
+/// today's name for a plane with no learner.
+#[tokio::test]
+async fn the_built_engine_routes_under_the_composed_policy() {
+    for (plane, expected) in [
+        (shadow_plane(), "learned"),
+        (plane(&document(Acme::Tiers, false)), "stage"),
+        (plane(&document(Acme::Plain, false)), "affinity"),
+    ] {
+        let backends = per_process().await;
+        let composition = routing_composition::compose(&plane, &backends)
+            .await
+            .expect("the composition opens");
+        let (engine, _) = engine(memory_store(&backends), composition);
+        assert_eq!(engine.policy().name(), expected);
+    }
 }
 
 async fn turn<S: SessionStore>(

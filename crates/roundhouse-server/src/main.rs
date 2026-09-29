@@ -63,13 +63,13 @@ use roundhouse_fleet::{
 use roundhouse_mcp::ControlStore;
 use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
-use roundhouse_server::routing_composition::RoutingComposition;
+use roundhouse_server::routing_composition::{EngineParts, RoutingComposition};
 use roundhouse_server::{
     Backends, CLASSIFY_VAR, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations,
-    DirectoryError, EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig,
-    REDIS_NAMESPACE_VAR, REDIS_VAR, admin_api, catalog_config, classify_config, classify_runtime,
-    control_config, http, mcp_api, messages_api, metrics_api, relay_api, resolve_namespace,
-    responses_api, routing_composition, shared_backend,
+    DirectoryError, EchoLocalExecutor, EngineConfig, FleetJudge, JudgeConfig, REDIS_NAMESPACE_VAR,
+    REDIS_VAR, admin_api, catalog_config, classify_config, classify_runtime, control_config, http,
+    mcp_api, messages_api, metrics_api, relay_api, resolve_namespace, responses_api,
+    routing_composition, shared_backend,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -1024,25 +1024,29 @@ async fn serve<S: SessionStore>(
         ..engine_config
     };
 
-    let RoutingComposition { policy, learner } = composition;
-    let mut engine = Engine::with_provider_clients(
-        Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
-        catalog,
-        Arc::clone(&frontier),
-        // `affinity`, `stage` or `learned`, as `routing_composition::compose`
-        // chose from the booted plane. See its module doc for why no wrapper
-        // is composed unconditionally.
-        policy,
-        engine_config.clone(),
-    )
-    .with_spend_ledger(Arc::clone(&spend))
-    // Chosen by `fair_use_backend`, not here: this site takes whichever ledger
-    // the composition root resolved, so the boot log and the enforcement are
-    // the same decision.
-    .with_fair_use_ledger(fair_use)
-    .with_control_store(Arc::clone(&control));
+    // The router (`affinity`, `stage` or `learned`, as
+    // `routing_composition::compose` chose from the booted plane) and, when a
+    // project enables it, the learner and its recovery task over the engine's
+    // own learner. Built in the library, the one place the composed policy
+    // reaches an engine; see `build_engine` for why.
+    let (engine, recovery) = routing_composition::build_engine(
+        EngineParts {
+            store: Arc::clone(&store),
+            tokenizer: ByteTokenizer,
+            local_executor: Arc::new(EchoLocalExecutor::new("local answer")),
+            frontier_catalog: catalog,
+            frontier_clients: Arc::clone(&frontier),
+            config: engine_config.clone(),
+        },
+        composition,
+    );
+    let mut engine = engine
+        .with_spend_ledger(Arc::clone(&spend))
+        // Chosen by `fair_use_backend`, not here: this site takes whichever ledger
+        // the composition root resolved, so the boot log and the enforcement are
+        // the same decision.
+        .with_fair_use_ledger(fair_use)
+        .with_control_store(Arc::clone(&control));
 
     // Composed and its supervisor taken in `main`, before the bind — see the
     // composition site for why. This is just wiring what the caller already
@@ -1078,11 +1082,9 @@ async fn serve<S: SessionStore>(
             },
         )));
     }
-    // The learner, when a project enables it at boot, and its recovery task
-    // over the engine's own learner. The task is held for as long as this
-    // function serves, under a real name: a `_` binding would drop it, and
-    // with it every sweep, at the end of this statement.
-    let (engine, recovery) = routing_composition::attach_learner(engine, learner);
+    // The recovery task is held for as long as this function serves, under a
+    // real name: a `_` binding would drop it, and with it every sweep, at the
+    // end of this statement.
     let _recovery = recovery.map(|recovery| recovery.spawn());
     let engine = Arc::new(engine);
     // Read off the engine, not the composition: this is the name every

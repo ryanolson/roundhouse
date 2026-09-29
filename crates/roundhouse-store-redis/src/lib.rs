@@ -55,7 +55,10 @@
 //! An entry that violates the format — a missing field, an id some foreign
 //! writer auto-generated — fails the read loudly as
 //! [`StoreError::CorruptLog`]: the store answered, and the fault is in that
-//! one log, so no caller may read it as the store being down.
+//! one log, so no caller may read it as the store being down. So does a key
+//! of one session (its log or its lease) that a foreign writer replaced with
+//! another type: `WRONGTYPE` from a call that touches only that session's
+//! keys is that session's fault (`one_session` below).
 //! Skipping it would silently drop events from a replay, and a replay that
 //! quietly disagrees with what was appended is the one failure mode an
 //! event-sourced store must never have.
@@ -319,6 +322,34 @@ fn backend(error: redis::RedisError) -> StoreError {
     StoreError::Backend(anyhow::Error::new(error))
 }
 
+/// The error of a call that touches only `session_id`'s own keys: its meta,
+/// its lease, its log. `WRONGTYPE` there can only mean one of those keys
+/// holds another type (a foreign writer replaced it), so it is that one
+/// session's [`StoreError::CorruptLog`], never `Backend`: the recovery task
+/// reads `Backend` as an outage and would stop every project's sweep at this
+/// session. A call that also touches the namespace-wide learning index (the
+/// marked append) cannot tell whose key it was, and stays `Backend`.
+fn one_session(session_id: &SessionId) -> impl FnOnce(redis::RedisError) -> StoreError + '_ {
+    move |error| match is_wrong_type(&error) {
+        true => corrupt_log(
+            session_id,
+            format!("a key of this session holds another type: {error}"),
+        ),
+        false => backend(error),
+    }
+}
+
+/// Whether Redis answered `WRONGTYPE`, to one command or to any command of a
+/// pipeline. Not `RedisError::code`: the client has no kind for `WRONGTYPE`,
+/// and `code` reads a pipeline's failure only through its kind, so it answers
+/// `None` for the pipelined reads here.
+fn is_wrong_type(error: &redis::RedisError) -> bool {
+    error
+        .clone()
+        .into_server_errors()
+        .is_some_and(|errors| errors.iter().any(|(_, error)| error.code() == "WRONGTYPE"))
+}
+
 /// The `seq` a stream entry id encodes, i.e. `N` from `N-0`.
 ///
 /// The shape check alone cannot prove the entry is ours: a foreign writer
@@ -449,6 +480,7 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .acquire(
                 &mut self.conn.clone(),
+                session_id,
                 &meta_key(&self.namespace, session_id),
                 &lease_key(&self.namespace, session_id),
                 identity,
@@ -465,6 +497,7 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .renew(
                 &mut self.conn.clone(),
+                &lease.session_id,
                 &meta_key(&self.namespace, &lease.session_id),
                 &lease_key(&self.namespace, &lease.session_id),
                 identity,
@@ -486,6 +519,7 @@ impl SessionStore for RedisSessionStore {
         self.scripts
             .release(
                 &mut self.conn.clone(),
+                &lease.session_id,
                 &lease_key(&self.namespace, &lease.session_id),
                 identity,
             )
@@ -608,7 +642,7 @@ impl SessionStore for RedisSessionStore {
             .xrange_count(&log_key, format!("({after_seq}-0"), "+", redis_limit)
             .query_async(&mut self.conn.clone())
             .await
-            .map_err(backend)?;
+            .map_err(one_session(session_id))?;
         Self::require_session(exists, session_id)?;
 
         let events: Vec<SessionEvent> = range
@@ -646,7 +680,7 @@ impl SessionStore for RedisSessionStore {
             .xrevrange_count(&log_key, "+", "-", 1)
             .query_async(&mut self.conn.clone())
             .await
-            .map_err(backend)?;
+            .map_err(one_session(session_id))?;
         Self::require_session(exists, session_id)?;
 
         let last = newest

@@ -6,9 +6,12 @@
 //!
 //! **In the library for `shared_backend`'s reason** (M14.1 review, F1): a
 //! `[[bin]]` is not something a test can call, so a rule spelled only in
-//! `main.rs` can be mutated with every suite green. `serve` wires what
-//! [`compose`] and [`attach_learner`] return and decides nothing itself, and
-//! `tests/learner_startup.rs` calls the same two functions.
+//! `main.rs` can be mutated with every suite green. `serve` builds its engine
+//! with [`build_engine`] from what [`compose`] returns and decides nothing
+//! itself, and `tests/learner_startup.rs` calls the same two functions.
+//! [`build_engine`] is the one place the composed policy reaches an engine:
+//! when `serve` built the engine itself, it could wire another policy while
+//! its boot log and every library test still named the composed one.
 //!
 //! **Three routers, chosen by what the booted plane configures:**
 //!
@@ -39,10 +42,12 @@ use roundhouse_core::routing::learn::LearnedPolicy;
 use roundhouse_core::routing::{AffinityPolicy, RoutingPolicy, StagePolicy};
 use roundhouse_core::store::SessionStore;
 
-use crate::Engine;
+use roundhouse_fleet::{FrontierClients, StaticFrontierCatalog};
+
 use crate::control_config::ControlPlane;
 use crate::learner_recovery::{LearnerRecovery, RecoveryCadence};
 use crate::shared_backend::Backends;
+use crate::{Engine, EngineConfig, LocalExecutor};
 
 /// Does any project on this plane route between tiers? (M10.2, S3)
 ///
@@ -128,17 +133,38 @@ pub async fn compose(
     })
 }
 
-/// Attach the composed learner, if any, and build its recovery task over the
-/// engine's own learner, so the two share the store, the stopped sessions and
-/// the delivery counters.
+/// Everything besides the router that `serve` builds its engine from.
+pub struct EngineParts<S, T> {
+    pub store: Arc<S>,
+    pub tokenizer: T,
+    pub local_executor: Arc<dyn LocalExecutor>,
+    pub frontier_catalog: StaticFrontierCatalog,
+    pub frontier_clients: Arc<FrontierClients>,
+    pub config: EngineConfig,
+}
+
+/// The engine `serve` routes with: the composed policy, the composed learner
+/// attached, and the learner's recovery task built over the engine's own
+/// learner, so the two share the store, the stopped sessions and the
+/// delivery counters. Nothing after this can change the engine's policy.
 ///
 /// The task is returned rather than spawned, so a caller decides when it runs
 /// and holds its handle: `serve` spawns it and keeps the handle for as long
 /// as it serves; a test drives single sweeps.
-pub fn attach_learner<S: SessionStore, T: Tokenizer + Clone + 'static>(
-    engine: Engine<S, T>,
-    learner: Option<ComposedLearner>,
+pub fn build_engine<S: SessionStore, T: Tokenizer + Clone + 'static>(
+    parts: EngineParts<S, T>,
+    composition: RoutingComposition,
 ) -> (Engine<S, T>, Option<LearnerRecovery<S>>) {
+    let RoutingComposition { policy, learner } = composition;
+    let engine = Engine::with_provider_clients(
+        parts.store,
+        parts.tokenizer,
+        parts.local_executor,
+        parts.frontier_catalog,
+        parts.frontier_clients,
+        policy,
+        parts.config,
+    );
     let Some(ComposedLearner { store, cadence }) = learner else {
         return (engine, None);
     };

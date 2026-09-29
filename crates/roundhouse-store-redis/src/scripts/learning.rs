@@ -102,11 +102,15 @@ return {'REQUEUED'}
 /// start (`-` or `(<session id>`), the limit, and the idle window in ms or
 /// `''` for none. The idle cutoff is computed from `TIME` here, the clock the
 /// append stamped the marks with. Every examined member moves the cursor,
-/// idle or not; a member with no stored mark is corruption and fails the page
-/// rather than being skipped, since skipping would drop it from recovery.
+/// idle or not. A member with no stored mark is corruption of the index and
+/// fails the page rather than being skipped, since skipping would drop it
+/// from recovery. A member whose stored mark cannot be parsed is one
+/// session's data: it is named in the reply and the page goes on, because a
+/// page that failed on it would stop every pass at that member.
 ///
-/// Reply: `OK`, the number examined, the last member examined (or `''`), then
-/// four fields per returned member: id, seq, marked-at, project.
+/// Reply: `OK`, the number examined, the last member examined (or `''`), the
+/// number of unreadable members and their ids, then four fields per returned
+/// member: id, seq, marked-at, project.
 const PAGE_BODY: &str = r"
 local members = redis.call('ZRANGE', KEYS[2], ARGV[1], '+', 'BYLEX', 'LIMIT', 0, ARGV[2])
 local cutoff
@@ -114,19 +118,23 @@ if ARGV[3] ~= '' then
   local t = redis.call('TIME')
   cutoff = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000) - tonumber(ARGV[3])
 end
-local reply = {'OK', #members, members[#members] or ''}
+local unreadable, found = {}, {}
 for _, member in ipairs(members) do
   local stored = redis.call('HGET', KEYS[1], member)
   if not stored then return {'ORPHAN', member} end
   local seq, at, project = parse_mark(stored)
-  if not seq then return {'BADMARK', stored} end
-  if cutoff == nil or tonumber(at) <= cutoff then
-    reply[#reply + 1] = member
-    reply[#reply + 1] = seq
-    reply[#reply + 1] = at
-    reply[#reply + 1] = project
+  if not seq then
+    unreadable[#unreadable + 1] = member
+  elseif cutoff == nil or tonumber(at) <= cutoff then
+    found[#found + 1] = member
+    found[#found + 1] = seq
+    found[#found + 1] = at
+    found[#found + 1] = project
   end
 end
+local reply = {'OK', #members, members[#members] or '', #unreadable}
+for _, member in ipairs(unreadable) do reply[#reply + 1] = member end
+for _, field in ipairs(found) do reply[#reply + 1] = field end
 return reply
 ";
 
@@ -295,17 +303,27 @@ fn decode_page(
                 str_at(reply, 1).unwrap_or("<unreadable>")
             )));
         }
-        Some("BADMARK") => {
-            return Err(StoreError::Backend(anyhow::anyhow!(
-                "a stored learning mark behind `{set}` is unreadable (`{}`)",
-                str_at(reply, 1).unwrap_or("<unreadable>")
-            )));
-        }
         _ => return Err(unexpected(reply)),
     }
     let examined = int_at(reply, 1).ok_or_else(|| unexpected(reply))?;
     let last = str_at(reply, 2).ok_or_else(|| unexpected(reply))?;
-    let fields = &reply[3..];
+    let unreadable_count = int_at(reply, 3)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| unexpected(reply))?;
+    let (unreadable, fields) = reply
+        .get(4..)
+        .filter(|rest| rest.len() >= unreadable_count)
+        .map(|rest| rest.split_at(unreadable_count))
+        .ok_or_else(|| unexpected(reply))?;
+    let unreadable = unreadable
+        .iter()
+        .map(|member| match member {
+            Value::BulkString(bytes) => std::str::from_utf8(bytes)
+                .map(SessionId::new)
+                .map_err(|_| unexpected(reply)),
+            _ => Err(unexpected(reply)),
+        })
+        .collect::<Result<Vec<_>, StoreError>>()?;
     if !fields.len().is_multiple_of(4) {
         return Err(unexpected(reply));
     }
@@ -324,7 +342,11 @@ fn decode_page(
     // A full page may have more behind it; a short one reached the end.
     let next = (usize::try_from(examined).ok() == Some(limit.get()))
         .then(|| LearningCursor::after(SessionId::new(last)));
-    Ok(LearningPage { sessions, next })
+    Ok(LearningPage {
+        sessions,
+        next,
+        unreadable,
+    })
 }
 
 fn seq_at(reply: &[Value], index: usize) -> Result<u64, StoreError> {
@@ -336,11 +358,17 @@ fn parse_seq(text: &str, reply: &[Value]) -> Result<u64, StoreError> {
     text.parse().map_err(|_| unexpected(reply))
 }
 
+/// A stored mark this store cannot parse: that one session's data, so
+/// `CorruptLog` and never `Backend`, which the recovery task reads as an
+/// outage for every project.
 fn bad_mark(reply: &[Value], session_id: &SessionId) -> StoreError {
-    StoreError::Backend(anyhow::anyhow!(
-        "the stored learning mark for session `{session_id}` is unreadable (`{}`)",
-        str_at(reply, 1).unwrap_or("<unreadable>")
-    ))
+    StoreError::CorruptLog {
+        session_id: session_id.clone(),
+        detail: format!(
+            "its stored learning mark is unreadable (`{}`)",
+            str_at(reply, 1).unwrap_or("<unreadable>")
+        ),
+    }
 }
 
 #[cfg(test)]

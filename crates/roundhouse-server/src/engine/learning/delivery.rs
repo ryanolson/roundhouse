@@ -25,7 +25,7 @@
 //! [`Source::Live`]: a replay above a floor holds every entry above it up to
 //! the page size, so its page is empty only when nothing is owed.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -81,9 +81,15 @@ pub(crate) enum Hold {
     /// This session's apply ran past the apply timeout. Its result is
     /// unknown, and the resend skips what landed.
     ApplyTimedOut,
-    /// A key this session's batch names holds foreign data (`WrongType`):
-    /// the store answers, and this one session cannot be delivered until an
-    /// operator removes the key.
+    /// A key the batch names holds foreign data (`WrongType`): the
+    /// project's watermark hash, or one of its counter keys for the batch's
+    /// epoch. Those keys are the project's, not this session's, so every
+    /// session of the project whose batch names the key meets the same hold.
+    ///
+    /// **Held per session all the same**, because the store answers: it is
+    /// not down, and ending the sweep would starve every other project behind
+    /// this one. Each of the project's sessions is held and warned about on
+    /// its own until an operator removes the key.
     ForeignKey,
     /// A backfill could not replay this session's log: it is gone or
     /// corrupt (`CorruptLog`), or the replay ran past the source timeout.
@@ -96,6 +102,9 @@ pub(crate) enum Hold {
     AcknowledgementFailed,
     /// The store applied, and the mark clear ran past the source timeout.
     ClearTimedOut,
+    /// The store applied, and the mark clear found this session's stored
+    /// mark unreadable (`CorruptLog`): its data, not the session store.
+    MarkUnreadable,
 }
 
 impl Hold {
@@ -104,9 +113,10 @@ impl Hold {
     ///
     /// **Only what says the store itself is down**: an apply the learner
     /// store answered `Unavailable`, a backfill or an acknowledgement the
-    /// session store failed. A hold that belongs to one session -- a foreign
-    /// key, a stop, a gap the backfill did not close, a log that is gone, or
-    /// a call of this session's that ran past its timeout -- must not end the
+    /// session store failed with a backend error. A hold that belongs to one
+    /// session -- a foreign key, a stop, a gap the backfill did not close, a
+    /// log that is gone or corrupt, a mark the clear cannot read, or a call
+    /// of this session's that ran past its timeout -- must not end the
     /// sweep: the sweep would end with its cursor on that session, the next
     /// would start there, and one session nobody can finish would starve
     /// every session behind it in every project, which is the failure the
@@ -133,33 +143,68 @@ pub(crate) struct Delivery<'a, S: SessionStore> {
     /// the recovery task's `source_timeout`. `None` for the engine's tail,
     /// whose calls the turn's own deadline and lease already bound.
     pub(crate) source_timeout: Option<Duration>,
-    /// The recovery task's held set, so a backfill that fails on every sweep
-    /// warns once. `None` for the engine's tail, which warns every time: a
-    /// turn is not a periodic sweep.
-    pub(crate) held: Option<&'a HeldSessions>,
+    /// The recovery task's held set and the mark the pending page named for
+    /// this session, so a hold met on every sweep warns once per mark: a
+    /// backfill that cannot replay, an apply that meets a foreign key, and
+    /// an acknowledgement that fails or times out. `None` for the engine's
+    /// tail, which warns every time: a turn is not a periodic sweep.
+    pub(crate) held: Option<(&'a HeldSessions, u64)>,
 }
 
-/// Sessions already warned about as held. A session leaves the set when it
-/// is delivered, so a later hold is a new episode and warns again.
+/// Sessions already warned about as held, each under the mark it was held
+/// at. A new mark is a new episode and warns again, however the old one was
+/// delivered (the engine's tail clears marks the task never sees), and a
+/// session the task delivers leaves the set at once.
+///
+/// **Bounded by the pending set.** Each entry records the pass that last
+/// held it, and [`Self::end_pass`] keeps only the entries the finished pass
+/// held again: a session delivered by the tail, cleared, or re-marked is not
+/// held again under that mark, so it goes. Without that, every session ever
+/// held under every mark would stay for the life of the process.
 ///
 /// A mutex only so a sweep can share it across its awaits; it is never
 /// contended.
 #[derive(Default)]
-pub(crate) struct HeldSessions(Mutex<HashSet<SessionId>>);
+pub(crate) struct HeldSessions(Mutex<Held>);
+
+#[derive(Default)]
+struct Held {
+    /// Each held session and mark (`None`: a mark the store cannot read),
+    /// and the pass that last held it.
+    entries: HashMap<(SessionId, Option<u64>), u64>,
+    /// The pass in progress.
+    pass: u64,
+}
 
 impl HeldSessions {
-    /// Whether `session` is newly held, so its warning should fire.
-    pub(crate) fn first_hold(&self, session: &SessionId) -> bool {
-        let mut held = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        !held.contains(session) && held.insert(session.clone())
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    /// `session` was delivered: its next hold is a new one.
-    pub(crate) fn delivered(&self, session: &SessionId) {
-        self.0
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(session);
+    /// Record `session` as held under `mark` in this pass: `true` when it was
+    /// not held under that mark already, so its warning should fire.
+    pub(crate) fn first_hold(&self, session: &SessionId, mark: Option<u64>) -> bool {
+        let mut held = self.lock();
+        let pass = held.pass;
+        held.entries.insert((session.clone(), mark), pass).is_none()
+    }
+
+    /// `session` was delivered through `mark`: its next hold is a new one.
+    pub(crate) fn delivered(&self, session: &SessionId, mark: Option<u64>) {
+        self.lock().entries.remove(&(session.clone(), mark));
+    }
+
+    /// A full pass ended: keep only what it held again.
+    pub(crate) fn end_pass(&self) {
+        let mut held = self.lock();
+        let pass = held.pass;
+        held.entries.retain(|_, last| *last == pass);
+        held.pass = pass.wrapping_add(1);
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().entries.len()
     }
 }
 
@@ -300,10 +345,22 @@ impl<S: SessionStore> Delivery<'_, S> {
                 Ok(Err(
                     error @ (LearnerError::Unavailable(_) | LearnerError::WrongType { .. }),
                 )) => {
-                    if !learner
-                        .apply_unreachable_warned
-                        .swap(true, Ordering::Relaxed)
-                    {
+                    let hold = match error {
+                        LearnerError::WrongType { .. } => Hold::ForeignKey,
+                        _ => Hold::LearnerUnavailable,
+                    };
+                    // An outage warns once per outage, on the store's flag,
+                    // which the next good apply resets. A foreign key warns
+                    // once per session and mark in the recovery task: the
+                    // store is up, so a good apply behind it would reset the
+                    // flag and it would warn on every sweep.
+                    let warn = match (hold, self.held) {
+                        (Hold::ForeignKey, Some(_)) => self.first_hold(),
+                        _ => !learner
+                            .apply_unreachable_warned
+                            .swap(true, Ordering::Relaxed),
+                    };
+                    if warn {
                         tracing::warn!(
                             %project, %session, %error,
                             "the learner store did not take this session's entries; they stay pending"
@@ -315,10 +372,7 @@ impl<S: SessionStore> Delivery<'_, S> {
                         );
                     }
                     counters.record(project, DeliveryOutcome::Unavailable);
-                    return Delivered::Held(match error {
-                        LearnerError::WrongType { .. } => Hold::ForeignKey,
-                        _ => Hold::LearnerUnavailable,
-                    });
+                    return Delivered::Held(hold);
                 }
                 Err(_) => {
                     // The result is unknown: the apply may have landed. The
@@ -363,7 +417,10 @@ impl<S: SessionStore> Delivery<'_, S> {
             },
             Some(Err(error)) => {
                 self.acknowledgement_failed(watermark, &error.to_string());
-                Delivered::Held(Hold::AcknowledgementFailed)
+                Delivered::Held(match error {
+                    StoreError::CorruptLog { .. } => Hold::MarkUnreadable,
+                    _ => Hold::AcknowledgementFailed,
+                })
             }
             None => {
                 self.acknowledgement_failed(watermark, "the mark clear timed out");
@@ -373,13 +430,22 @@ impl<S: SessionStore> Delivery<'_, S> {
     }
 
     fn acknowledgement_failed(&self, watermark: u64, error: &str) {
-        tracing::warn!(
-            project = %self.project, session = %self.session, watermark, %error,
-            "the learner store applied this session's entries, and acknowledging them failed; \
-             the source mark stays for the next turn or the recovery task"
-        );
+        if self.first_hold() {
+            tracing::warn!(
+                project = %self.project, session = %self.session, watermark, %error,
+                "the learner store applied this session's entries, and acknowledging them failed; \
+                 the source mark stays for the next turn or the recovery task"
+            );
+        }
         self.counters
             .record(self.project, DeliveryOutcome::AcknowledgementFailed);
+    }
+
+    /// Whether this hold should warn: always for the engine's tail, and once
+    /// per session and mark for the recovery task.
+    fn first_hold(&self) -> bool {
+        self.held
+            .is_none_or(|(held, mark)| held.first_hold(self.session, Some(mark)))
     }
 
     /// A read-only replay whose page holds the entries above `floor`, the
@@ -401,7 +467,7 @@ impl<S: SessionStore> Delivery<'_, S> {
             Some(Err(error)) => (error.to_string(), Hold::SourceUnavailable),
             None => ("the replay timed out".to_owned(), Hold::SourceUnavailable),
         };
-        if self.held.is_none_or(|held| held.first_hold(self.session)) {
+        if self.first_hold() {
             tracing::warn!(
                 project = %self.project, session = %self.session, floor, %error,
                 "the learning backfill could not replay the log; the entries stay pending"

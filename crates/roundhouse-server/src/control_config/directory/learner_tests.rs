@@ -229,3 +229,32 @@ async fn the_artifact_digest_changes_compiled_under_when_the_bytes_at_one_path_c
         "a node that read other bytes at the same path names the artifact axis"
     );
 }
+
+/// **Mutation survivor S5: a write whose plane enables no learner stamps no
+/// artifact axis.** `None` is what keeps a document with no learner
+/// byte-identical to one written before the axis existed; without the
+/// emptiness guard in `CompiledUnder::stamped_artifacts`, every write stamps
+/// `Some([])`, and no byte-identity test notices, because they build their
+/// stamp by hand.
+#[tokio::test]
+async fn a_write_with_no_learner_stamps_no_artifact_axis() {
+    let documents: Arc<dyn DocumentStore> = Arc::new(MemoryDocumentStore::new());
+    let writer = node(Arc::clone(&documents), 0).await;
+    let plain: ProjectEntry =
+        serde_json::from_value(serde_json::json!({ "id": "plain" })).expect("a project entry");
+    writer
+        .apply(DirectoryMutation::CreateProject { entry: plain }, 1)
+        .await
+        .expect("a plain project is admitted");
+    assert!(
+        writer.plane(2).await.learner_artifacts().is_empty(),
+        "control: the writer's plane enables no learner"
+    );
+
+    let loaded = DocumentDirectoryStore::over(Arc::clone(&documents))
+        .load()
+        .await
+        .expect("the store answers");
+    assert_eq!(loaded.version, 1, "control: the write committed");
+    assert_eq!(loaded.compiled_under.artifacts, None);
+}

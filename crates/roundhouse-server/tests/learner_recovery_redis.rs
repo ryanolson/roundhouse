@@ -40,7 +40,7 @@ use roundhouse_server::test_support::captured_warnings;
 use roundhouse_server::test_support::{frontier_spec, single_model_catalog};
 use roundhouse_server::{Admission, EchoLocalExecutor, Engine, EngineConfig};
 use roundhouse_store_redis::test_support::{
-    fresh_namespace, learn_watermark_key, log_key_in, url_from_env,
+    fresh_namespace, learn_watermark_key, learning_index_keys, log_key_in, url_from_env,
 };
 use roundhouse_store_redis::{KeyNamespace, RedisLearnerStore, RedisSessionStore};
 
@@ -453,4 +453,104 @@ fn a_corrupt_log_holds_its_session_and_the_sweep_goes_on_on_redis() {
         1,
         "two sweeps, one line: {warned}"
     );
+}
+
+/// **A log key a foreign writer replaced with a string holds its session**
+/// (M9 round-2, item 1). Redis answers the replay's `XRANGE` with
+/// `WRONGTYPE`: the store answered, and the key is one session's, so the
+/// store reports `CorruptLog` and the task delivers the session behind it.
+/// As `Backend` it was an outage that ended every sweep at this session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_wrong_typed_log_key_holds_its_session_and_the_sweep_goes_on_on_redis() {
+    let namespace = fresh_namespace();
+    let (bad_project, good_project) = (fresh_project(), fresh_project());
+    let node = node(&namespace, "node-a", 2).await;
+    // `a/...` sorts before `b/...`, so the bad session is the page's first.
+    let bad = SessionId::new(format!("a/{bad_project}/s"));
+    let good = SessionId::new(format!("b/{good_project}/s"));
+    node.turn(&bad, "t1", &admission(&bad_project)).await;
+    node.turn(&good, "t1", &admission(&good_project)).await;
+    assert_eq!(node.pending().await, 2);
+
+    let mut raw = redis::Client::open(url_from_env().as_str())
+        .expect("a Redis URL")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("a raw connection");
+    let log = log_key_in(&namespace, &bad);
+    let _: () = redis::cmd("DEL")
+        .arg(&log)
+        .query_async(&mut raw)
+        .await
+        .expect("the log deletes");
+    let _: () = redis::cmd("SET")
+        .arg(&log)
+        .arg("x")
+        .query_async(&mut raw)
+        .await
+        .expect("the foreign value writes");
+
+    idle();
+    let mut task = node.engine.learner_recovery(cadence()).expect("a learner");
+    let report = task.sweep().await;
+    assert!(
+        !report.outage,
+        "one session's wrong-typed log is not an outage"
+    );
+    assert_eq!(
+        node.residuals(&good_project).await,
+        1,
+        "the session behind it is delivered"
+    );
+    assert_eq!(node.pending().await, 1, "the bad session stays pending");
+    assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
+}
+
+/// **An unreadable stored mark holds its session, not the page** (M9
+/// round-2, item 2). The first pending member's field in the marks hash is
+/// `"x"`: the page names it and returns the member behind it, and the sweep
+/// delivers that one. Before, the page failed as `Backend`, so every sweep
+/// was an outage at that member, for every project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn an_unreadable_mark_holds_its_session_and_the_sweep_goes_on_on_redis() {
+    let namespace = fresh_namespace();
+    let (bad_project, good_project) = (fresh_project(), fresh_project());
+    let node = node(&namespace, "node-a", 2).await;
+    // `a/...` sorts before `b/...`, so the bad session is the page's first.
+    let bad = SessionId::new(format!("a/{bad_project}/s"));
+    let good = SessionId::new(format!("b/{good_project}/s"));
+    node.turn(&bad, "t1", &admission(&bad_project)).await;
+    node.turn(&good, "t1", &admission(&good_project)).await;
+    assert_eq!(node.pending().await, 2);
+
+    let mut raw = redis::Client::open(url_from_env().as_str())
+        .expect("a Redis URL")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("a raw connection");
+    let [marks, _, _] = learning_index_keys(&namespace);
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg(bad.as_str())
+        .arg("x")
+        .query_async(&mut raw)
+        .await
+        .expect("the foreign value writes");
+
+    idle();
+    let mut task = node.engine.learner_recovery(cadence()).expect("a learner");
+    let report = task.sweep().await;
+    assert!(
+        !report.outage,
+        "one session's unreadable mark is not an outage"
+    );
+    assert_eq!(
+        node.residuals(&good_project).await,
+        1,
+        "the session behind it is delivered"
+    );
+    assert_eq!(node.residuals(&bad_project).await, 0, "the held one is not");
+    assert_eq!(task.next_delay(), cadence().sweep_interval, "no backoff");
 }

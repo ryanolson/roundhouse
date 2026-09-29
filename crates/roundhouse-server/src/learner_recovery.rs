@@ -38,22 +38,35 @@
 //! id, so a superseded generation is delivered and cleared like any other.
 //!
 //! **An outage ends the sweep, backs off, and logs once.** A store that says
-//! it is down -- a learner-store call that answers `Unavailable`, a
-//! watermark read that times out, a session-store call that fails with a
-//! backend error -- is met by the first session of a sweep and would be met
-//! by every other, so the sweep stops there with the marks in place, the
-//! next sweep waits twice as long (up to [`MAX_BACKOFF_FACTOR`] intervals),
-//! and one warning covers the outage however many sweeps and sessions it
-//! spans. The first clean sweep resets both.
+//! it is down -- a learner-store watermark read or apply that answers
+//! `Unavailable`, a watermark read that times out, a session-store call that
+//! fails with a backend error, or an index call (a page or a requeue) that
+//! times out -- is met by the first session of a sweep and would be met by
+//! every other, so the sweep stops there with the marks in place, the next
+//! sweep waits twice as long (up to [`MAX_BACKOFF_FACTOR`] intervals), and
+//! one warning covers the outage however many sweeps and sessions it spans.
+//! The first clean sweep resets both.
 //!
 //! **One session's trouble is not an outage.** A key or field holding
 //! foreign data (`WrongType`), a stop, a gap the backfill cannot close, a log
-//! that is gone, and an apply, replay, backfill or clear of this session that
-//! runs past its timeout each hold that session only, and the sweep goes on:
-//! ending it would leave the cursor on the same session, and one session
-//! nobody can finish would starve every project behind it. A timeout is one
-//! session's because the next session's watermark read is what probes the
-//! store. A held session warns once, until it is delivered.
+//! that is gone or corrupt (`CorruptLog`, which covers a log key of another
+//! type), a stored mark the index cannot read, and an apply, replay,
+//! backfill or clear of this session that runs past its timeout each hold
+//! that session only, and the sweep goes on: ending it would leave the
+//! cursor on the same session, and one session nobody can finish would
+//! starve every project behind it. A timeout is one session's because the
+//! next session's watermark read is what probes the store.
+//!
+//! **Which holds warn, and how often.** A foreign watermark, a replay or
+//! backfill that cannot replay the log, an apply that meets a foreign key, and a clear that
+//! fails, times out or cannot read the mark each warn once per session and
+//! mark: again only after the session is delivered or marked anew, or after
+//! a full pass that did not hold it again this way. An
+//! unreadable mark warns once per session until it is readable again. A
+//! stop logs one error when it stops the session, and the task does not
+//! visit the session again until a restart. An apply that times out and a
+//! gap the backfill cannot close are counted in `learning.delivery` and not
+//! logged.
 //!
 //! **The pass cursors are this task's memory.** Each index is walked in
 //! session id order and resumes after the last session a sweep finished; a
@@ -135,10 +148,20 @@ pub struct LearnerRecovery<S: SessionStore> {
     /// Sweeps in a row that met an outage: the backoff exponent, and the
     /// once-per-outage flag (the warning fires on the first).
     outages: u32,
-    /// Sessions already warned about as held, so one held on every sweep
-    /// warns once, here and in the delivery's gap backfill. A session leaves
-    /// it when it is delivered, so a later hold warns again.
+    /// The pending pass's sessions already warned about as held, each under
+    /// the mark its page named, so one held on every sweep warns once per
+    /// mark, here and in the delivery. Pruned at the end of each full pass
+    /// to the sessions that pass held again (see [`HeldSessions`]).
     held: HeldSessions,
+    /// The audit pass's own held set, pruned at the end of each audit pass.
+    /// Separate because the audit walks every marked session, pending or
+    /// not: pruned with the pending pass, a foreign watermark the audit meets
+    /// on a delivered session would warn again on every pending pass. An
+    /// unreadable mark is held here for both passes, under no mark, because
+    /// the audit is the pass that meets it whether it is pending or not: one
+    /// warning for it, forgotten at the end of the first audit pass that no
+    /// longer meets it.
+    audit_held: HeldSessions,
 }
 
 /// Why a sweep stopped early: a store did not answer.
@@ -169,6 +192,7 @@ impl<S: SessionStore> LearnerRecovery<S> {
             audit_after: None,
             outages: 0,
             held: HeldSessions::default(),
+            audit_held: HeldSessions::default(),
         }
     }
 
@@ -196,6 +220,13 @@ impl<S: SessionStore> LearnerRecovery<S> {
         report
     }
 
+    /// How many sessions the task holds as already warned about. Test-only:
+    /// the set must stay bounded by the sessions still pending.
+    #[cfg(feature = "test-support")]
+    pub fn held_len(&self) -> usize {
+        self.held.len()
+    }
+
     /// The wait before the next sweep: the interval, doubled for each sweep
     /// in a row that met an outage, up to [`MAX_BACKOFF_FACTOR`] intervals.
     pub fn next_delay(&self) -> Duration {
@@ -210,13 +241,14 @@ impl<S: SessionStore> LearnerRecovery<S> {
                 self.cadence.max_sessions_per_sweep,
             ))
             .await?;
+        self.unreadable_marks(&page.unreadable);
         for marked in &page.sessions {
-            if self
-                .deliver_session(&marked.project, &marked.session_id)
-                .await?
-            {
+            if self.deliver_session(marked).await? {
                 report.cleared += 1;
             }
+        }
+        if page.next.is_none() {
+            self.held.end_pass();
         }
         // Moved only once the whole page is done, so an outage retries the
         // session it could not reach first.
@@ -227,15 +259,20 @@ impl<S: SessionStore> LearnerRecovery<S> {
     /// Deliver one session's owed entries, up to the page budget, and clear
     /// its mark with the watermark the store confirmed. `Ok(true)` when the
     /// clear covered the mark.
-    async fn deliver_session(
-        &self,
-        project: &ProjectId,
-        session: &SessionId,
-    ) -> Result<bool, Outage> {
+    async fn deliver_session(&self, marked: &MarkedSession) -> Result<bool, Outage> {
+        let MarkedSession {
+            session_id: session,
+            project,
+            seq: mark,
+            ..
+        } = marked;
         if self.learner.is_stopped(project, session) {
             return Ok(false);
         }
-        let Watermark::At(mut confirmed) = self.watermark(project, session).await? else {
+        let Watermark::At(mut confirmed) = self
+            .watermark(project, session, (&self.held, *mark))
+            .await?
+        else {
             return Ok(false);
         };
         let delivery = Delivery {
@@ -246,10 +283,10 @@ impl<S: SessionStore> LearnerRecovery<S> {
             session,
             apply_timeout: self.cadence.apply_timeout,
             source_timeout: Some(self.cadence.source_timeout),
-            held: Some(&self.held),
+            held: Some((&self.held, *mark)),
         };
         for _ in 0..self.cadence.pages_per_session_per_sweep.get() {
-            let Some(state) = self.replay(project, session, confirmed).await? else {
+            let Some(state) = self.replay(project, session, confirmed, *mark).await? else {
                 // No log to deliver from: nothing more this task can do.
                 return Ok(false);
             };
@@ -265,7 +302,7 @@ impl<S: SessionStore> LearnerRecovery<S> {
                     cleared,
                     more,
                 } => {
-                    self.held.delivered(session);
+                    self.held.delivered(session, Some(*mark));
                     confirmed = watermark;
                     if !more {
                         return Ok(cleared == ClearOutcome::Covered);
@@ -290,10 +327,14 @@ impl<S: SessionStore> LearnerRecovery<S> {
                 self.cadence.audit_sessions_per_sweep,
             ))
             .await?;
+        self.unreadable_marks(&page.unreadable);
         for marked in &page.sessions {
             if self.audit_session(marked).await? {
                 report.requeued += 1;
             }
+        }
+        if page.next.is_none() {
+            self.audit_held.end_pass();
         }
         self.audit_after = page.next;
         Ok(())
@@ -311,13 +352,25 @@ impl<S: SessionStore> LearnerRecovery<S> {
             seq,
             ..
         } = marked;
-        match self.watermark(project, session_id).await? {
+        match self
+            .watermark(project, session_id, (&self.audit_held, *seq))
+            .await?
+        {
             Watermark::At(watermark) if watermark < *seq => {}
             Watermark::At(_) | Watermark::Foreign => return Ok(false),
         }
-        let requeued = self
+        let requeued = match self
             .source(self.sessions.requeue_learning(session_id, *seq))
-            .await?;
+            .await?
+        {
+            Ok(requeued) => requeued,
+            // The mark became unreadable after the page read it: that one
+            // session's data, not the index being down.
+            Err(_) => {
+                self.unreadable_marks(std::slice::from_ref(session_id));
+                return Ok(false);
+            }
+        };
         if requeued == RequeueOutcome::Requeued {
             tracing::debug!(
                 %project, session = %session_id, mark = seq,
@@ -327,10 +380,13 @@ impl<S: SessionStore> LearnerRecovery<S> {
         Ok(requeued == RequeueOutcome::Requeued)
     }
 
+    /// The learner store's watermark for `session`. A foreign one is held
+    /// under `held`'s mark, in the set of the pass that asked.
     async fn watermark(
         &self,
         project: &ProjectId,
         session: &SessionId,
+        (held, mark): (&HeldSessions, u64),
     ) -> Result<Watermark, Outage> {
         match tokio::time::timeout(
             self.cadence.read_timeout,
@@ -340,7 +396,7 @@ impl<S: SessionStore> LearnerRecovery<S> {
         {
             Ok(Ok(watermark)) => Ok(Watermark::At(watermark)),
             Ok(Err(error @ LearnerError::WrongType { .. })) => {
-                if self.held.first_hold(session) {
+                if held.first_hold(session, Some(mark)) {
                     tracing::warn!(
                         %project, %session, %error,
                         "the learner store holds foreign data for this session; the recovery \
@@ -372,7 +428,9 @@ impl<S: SessionStore> LearnerRecovery<S> {
         project: &ProjectId,
         session: &SessionId,
         floor: u64,
+        mark: u64,
     ) -> Result<Option<SessionState>, Outage> {
+        let first_hold = || self.held.first_hold(session, Some(mark));
         let replayed = tokio::time::timeout(
             self.cadence.source_timeout,
             SessionState::project_learning(self.sessions.as_ref(), session, floor),
@@ -390,7 +448,7 @@ impl<S: SessionStore> LearnerRecovery<S> {
             // session's fault, which an outage would stop the sweep on at
             // every attempt.
             Ok(Err(SessionError::Store(error @ StoreError::CorruptLog { .. }))) => {
-                if self.held.first_hold(session) {
+                if first_hold() {
                     tracing::warn!(
                         %project, %session, %error,
                         "the log of this session is corrupt; the recovery task holds it and goes \
@@ -400,7 +458,7 @@ impl<S: SessionStore> LearnerRecovery<S> {
                 Ok(None)
             }
             Ok(Err(SessionError::Store(StoreError::SessionNotFound(_)))) => {
-                if self.held.first_hold(session) {
+                if first_hold() {
                     tracing::warn!(
                         %project, %session,
                         "a session marked for learning is not in the log; the recovery task skips it"
@@ -409,7 +467,7 @@ impl<S: SessionStore> LearnerRecovery<S> {
                 Ok(None)
             }
             Ok(Err(error)) => {
-                if self.held.first_hold(session) {
+                if first_hold() {
                     tracing::warn!(%project, %session, %error, "the log replay failed; the session is held");
                 }
                 Ok(None)
@@ -418,7 +476,7 @@ impl<S: SessionStore> LearnerRecovery<S> {
             // not an outage, so a log too long for `source_timeout` cannot
             // stall the sessions behind it.
             Err(_) => {
-                if self.held.first_hold(session) {
+                if first_hold() {
                     tracing::warn!(%project, %session, "the log replay timed out; the session is held");
                 }
                 Ok(None)
@@ -430,16 +488,24 @@ impl<S: SessionStore> LearnerRecovery<S> {
         &self,
         call: impl Future<Output = Result<LearningPage, StoreError>>,
     ) -> Result<LearningPage, Outage> {
-        self.source(call).await
+        // A page names an unreadable mark rather than failing on it, so no
+        // page error is one session's.
+        self.source(call).await?.map_err(|error| {
+            tracing::debug!(%error, "a learning index page failed");
+            Outage
+        })
     }
 
-    /// One session-store call under the source timeout.
+    /// One session-store call under the source timeout. A `CorruptLog` is
+    /// one session's data, and comes back as `Ok(Err(..))` for the caller to
+    /// hold; any other failure, or the timeout, is the store, and an outage.
     async fn source<T>(
         &self,
         call: impl Future<Output = Result<T, StoreError>>,
-    ) -> Result<T, Outage> {
+    ) -> Result<Result<T, StoreError>, Outage> {
         match tokio::time::timeout(self.cadence.source_timeout, call).await {
-            Ok(Ok(value)) => Ok(value),
+            Ok(Ok(value)) => Ok(Ok(value)),
+            Ok(Err(error @ StoreError::CorruptLog { .. })) => Ok(Err(error)),
             Ok(Err(error)) => {
                 tracing::debug!(%error, "a learning index call failed");
                 Err(Outage)
@@ -447,6 +513,20 @@ impl<S: SessionStore> LearnerRecovery<S> {
             Err(_) => {
                 tracing::debug!("a learning index call timed out");
                 Err(Outage)
+            }
+        }
+    }
+
+    /// Sessions whose stored mark the store cannot read: each is held, and
+    /// warned about once, in the audit's set (see `audit_held`).
+    fn unreadable_marks(&self, sessions: &[SessionId]) {
+        for session in sessions {
+            if self.audit_held.first_hold(session, None) {
+                tracing::warn!(
+                    %session,
+                    "the stored learning mark of this session is unreadable; the recovery task \
+                     cannot deliver or audit it, and goes on with the rest"
+                );
             }
         }
     }

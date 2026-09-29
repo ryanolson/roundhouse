@@ -374,6 +374,12 @@ pub struct CountingStore {
     /// The fault, and the replays the session had when it was set.
     replay_faults: Mutex<HashMap<SessionId, (ReplayFault, usize)>>,
     hung_clears: Mutex<Vec<SessionId>>,
+    /// Every mark clear fails with a backend error: a session store that
+    /// went down between an apply and its clear.
+    fail_clears: AtomicBool,
+    /// Sessions whose mark a clear or a requeue finds unreadable, as one
+    /// corrupted between the index page and the call does.
+    corrupt_marks: Mutex<Vec<SessionId>>,
     /// Armed: the next index page answers, and every call after it fails.
     down_after_index: AtomicBool,
     down: AtomicBool,
@@ -417,6 +423,26 @@ impl CountingStore {
     /// Every mark clear of `session` hangs.
     pub fn hang_clears(&self, session: &SessionId) {
         self.hung_clears.lock().unwrap().push(session.clone());
+    }
+
+    /// Every clear and requeue of `session` answers `CorruptLog`.
+    pub fn corrupt_mark(&self, session: &SessionId) {
+        self.corrupt_marks.lock().unwrap().push(session.clone());
+    }
+
+    fn fail_if_corrupt(&self, session: &SessionId) -> Result<(), StoreError> {
+        match self.corrupt_marks.lock().unwrap().contains(session) {
+            true => Err(StoreError::CorruptLog {
+                session_id: session.clone(),
+                detail: "the fixture's mark is unreadable".into(),
+            }),
+            false => Ok(()),
+        }
+    }
+
+    /// Every mark clear fails with a backend error until `false`.
+    pub fn fail_clears(&self, fail: bool) {
+        self.fail_clears.store(fail, Ordering::SeqCst);
     }
 
     /// `true`: the next index page answers, and every session-store call
@@ -479,6 +505,10 @@ impl Delegating for CountingStore {
     ) -> Result<ClearOutcome, StoreError> {
         self.clears.fetch_add(1, Ordering::SeqCst);
         self.fail_if_down()?;
+        if self.fail_clears.load(Ordering::SeqCst) {
+            return Err(StoreError::Backend(anyhow::anyhow!("the clear failed")));
+        }
+        self.fail_if_corrupt(session_id)?;
         if self.hung_clears.lock().unwrap().contains(session_id) {
             std::future::pending::<()>().await;
         }
@@ -522,6 +552,7 @@ impl Delegating for CountingStore {
         mark_seq: u64,
     ) -> Result<RequeueOutcome, StoreError> {
         self.fail_if_down()?;
+        self.fail_if_corrupt(session_id)?;
         SessionStore::requeue_learning(&self.inner, session_id, mark_seq).await
     }
 

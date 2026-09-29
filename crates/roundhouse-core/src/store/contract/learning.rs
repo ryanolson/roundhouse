@@ -29,6 +29,24 @@ use crate::store::{
 };
 
 use super::{LeaseControl, TTL_MS, held, text_event};
+use crate::store::MemoryStore;
+
+/// Store-side lever for a stored learning mark the store cannot read: a
+/// foreign value in a Redis index's marks hash. What it does is the
+/// backend's business; the contracted effect is that the session's mark reads
+/// as unreadable to every page, clear and requeue. Test-only, like
+/// [`LeaseControl`].
+#[async_trait::async_trait]
+pub trait LearningMarkControl: SessionStore {
+    async fn make_mark_unreadable(&self, session_id: &SessionId);
+}
+
+#[async_trait::async_trait]
+impl LearningMarkControl for MemoryStore {
+    async fn make_mark_unreadable(&self, session_id: &SessionId) {
+        self.make_learning_mark_unreadable(session_id).await;
+    }
+}
 
 /// Pages one pass may take before the suite calls the cursor broken. A
 /// backend whose cursor stopped moving would otherwise spin the test forever
@@ -816,4 +834,56 @@ async fn create_and_hold<S: SessionStore>(store: &S, sid: &SessionId) -> Lease {
         .await
         .unwrap()
         .expect("nothing contends for a fresh session's lease")
+}
+
+/// **One unreadable stored mark does not fail the page** (M9 round-2, item
+/// 2). The page names it in `unreadable`, returns the members behind it, and
+/// moves its cursor past it, in both enumerations and with a page of one, so
+/// the unreadable member fills a page on its own. A clear or a requeue of
+/// that one session answers `CorruptLog`: its data, not the store, is at
+/// fault. Before, the page failed as `Backend`, and every pass stopped at
+/// that member for every project.
+pub async fn an_unreadable_mark_is_named_and_the_page_goes_on<S: LearningMarkControl>(store: &S) {
+    let mut own = Vec::new();
+    for _ in 0..3 {
+        let (sid, lease) = held(store).await;
+        marked_append(store, &lease, 1, 0, acme()).await;
+        own.push(sid);
+    }
+    own.sort();
+    let (bad, rest) = (own[0].clone(), own[1..].to_vec());
+    store.make_mark_unreadable(&bad).await;
+    let own: BTreeSet<SessionId> = own.into_iter().collect();
+
+    for index in [PENDING, Index::Permanent] {
+        let (mut returned, mut unreadable) = (Vec::new(), Vec::new());
+        let mut cursor: Option<LearningCursor> = None;
+        for _ in 0..MAX_PAGES_PER_PASS {
+            let page = page(store, index, cursor.as_ref(), 1).await;
+            returned.extend(ids(&only(page.sessions, &own)));
+            unreadable.extend(page.unreadable.into_iter().filter(|sid| own.contains(sid)));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(returned, rest, "the members behind it are returned");
+        assert_eq!(unreadable, vec![bad.clone()], "and it is named");
+    }
+
+    let cleared = store.clear_learning_mark(&bad, u64::MAX).await;
+    assert!(
+        matches!(&cleared, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == bad),
+        "a clear of the unreadable mark is that session's fault: {cleared:?}"
+    );
+    let requeued = store.requeue_learning(&bad, 1).await;
+    assert!(
+        matches!(&requeued, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == bad),
+        "so is a requeue: {requeued:?}"
+    );
+    assert_eq!(
+        store.clear_learning_mark(&rest[0], u64::MAX).await.unwrap(),
+        ClearOutcome::Covered,
+        "control: the session behind it clears"
+    );
 }

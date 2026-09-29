@@ -25,6 +25,7 @@ pub(crate) mod learning;
 
 use redis::Value;
 use redis::aio::ConnectionManager;
+use roundhouse_core::ids::SessionId;
 use roundhouse_core::store::StoreError;
 
 /// Claim or re-claim the lease.
@@ -250,6 +251,7 @@ impl Scripts {
     pub(crate) async fn acquire(
         &self,
         conn: &mut ConnectionManager,
+        session_id: &SessionId,
         meta_key: &str,
         lease_key: &str,
         identity: LeaseIdentity<'_>,
@@ -264,13 +266,14 @@ impl Scripts {
             .arg(ttl_ms)
             .invoke_async(conn)
             .await
-            .map_err(super::backend)?;
+            .map_err(super::one_session(session_id))?;
         decode_lease_reply(&reply)
     }
 
     pub(crate) async fn renew(
         &self,
         conn: &mut ConnectionManager,
+        session_id: &SessionId,
         meta_key: &str,
         lease_key: &str,
         identity: LeaseIdentity<'_>,
@@ -285,13 +288,14 @@ impl Scripts {
             .arg(ttl_ms)
             .invoke_async(conn)
             .await
-            .map_err(super::backend)?;
+            .map_err(super::one_session(session_id))?;
         decode_lease_reply(&reply)
     }
 
     pub(crate) async fn release(
         &self,
         conn: &mut ConnectionManager,
+        session_id: &SessionId,
         lease_key: &str,
         identity: LeaseIdentity<'_>,
     ) -> Result<(), StoreError> {
@@ -302,7 +306,7 @@ impl Scripts {
             .arg(identity.fencing_token)
             .invoke_async(conn)
             .await
-            .map_err(super::backend)?;
+            .map_err(super::one_session(session_id))?;
         Ok(())
     }
 

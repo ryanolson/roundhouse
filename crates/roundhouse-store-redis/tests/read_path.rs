@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{assert_covers_every_variant, every_event_kind, log_key, rig};
+use common::{assert_covers_every_variant, every_event_kind, lease_key, log_key, rig};
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::store::{SessionStore, StoreError};
@@ -126,6 +126,69 @@ async fn a_corrupted_log_fails_loudly_rather_than_dropping_events() {
         rig.store.read_events(&sid, 0, 16).await,
         Err(StoreError::CorruptLog { ref session_id, .. }) if *session_id == sid
     ));
+}
+
+/// **A wrong-typed key of one session is that session's fault** (M9
+/// round-2, item 1). A foreign writer replaced the session's log with a
+/// string, or its lease with a string, so Redis answers `WRONGTYPE`. The
+/// store answered, and the fault is in one session's keys: `CorruptLog`,
+/// never `Backend`, which the recovery task reads as an outage for every
+/// project.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_wrong_typed_session_key_is_corrupt_not_a_backend_failure() {
+    fn is_corrupt<T>(result: &Result<T, StoreError>, sid: &SessionId) -> bool {
+        matches!(result, Err(StoreError::CorruptLog { session_id, .. }) if session_id == sid)
+    }
+    let mut rig = rig().await;
+
+    // The log: every read path of one session's log.
+    let sid = rig.fresh_session().await;
+    rig.raw_append(
+        &sid,
+        1,
+        vec![SessionEventKind::Error {
+            message: "x".into(),
+        }],
+    )
+    .await;
+    let _: () = redis::cmd("DEL")
+        .arg(log_key(&sid))
+        .query_async(&mut rig.raw)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg(log_key(&sid))
+        .arg("x")
+        .query_async(&mut rig.raw)
+        .await
+        .unwrap();
+    let read = rig.store.read_events(&sid, 0, 16).await;
+    assert!(is_corrupt(&read, &sid), "read_events: {read:?}");
+    let last = rig.store.last_seq(&sid).await;
+    assert!(is_corrupt(&last, &sid), "last_seq: {last:?}");
+
+    // The lease: acquire, renew and release read only this session's meta
+    // and lease keys.
+    let sid = rig.fresh_session().await;
+    let lease = rig
+        .store
+        .acquire_lease(&sid, "node-a", 60_000)
+        .await
+        .unwrap()
+        .expect("a fresh session's lease is free");
+    let _: () = redis::cmd("SET")
+        .arg(lease_key(&sid))
+        .arg("x")
+        .query_async(&mut rig.raw)
+        .await
+        .unwrap();
+    let acquired = rig.store.acquire_lease(&sid, "node-b", 60_000).await;
+    assert!(is_corrupt(&acquired, &sid), "acquire_lease: {acquired:?}");
+    let renewed = rig.store.renew_lease(&lease, 60_000).await;
+    assert!(is_corrupt(&renewed, &sid), "renew_lease: {renewed:?}");
+    let released = rig.store.release_lease(&lease).await;
+    assert!(is_corrupt(&released, &sid), "release_lease: {released:?}");
 }
 
 /// **F12 (M14.0 review).** The finding: `create_session`'s Redis-side

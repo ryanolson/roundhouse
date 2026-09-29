@@ -28,10 +28,10 @@ use crate::recovery::{cadence, idle, pending, recovery, refuse_applies, shadow};
 use crate::rig::{CountingStore, ReplayFault, Rig, RigConfig, admission, residuals};
 
 /// Longer than every timeout in [`cadence`]: a stall the task must bound.
-const HANG: Duration = Duration::from_secs(3_600);
+pub(crate) const HANG: Duration = Duration::from_secs(3_600);
 
 /// Each session owes one entry, in the project named beside it.
-async fn owed(rig: &Rig, sessions: &[(&SessionId, &str)]) {
+pub(crate) async fn owed(rig: &Rig, sessions: &[(&SessionId, &str)]) {
     refuse_applies(rig, sessions.len());
     for (session, project) in sessions {
         rig.turn(session, "t1", &admission(project, Some(shadow())))
@@ -41,7 +41,7 @@ async fn owed(rig: &Rig, sessions: &[(&SessionId, &str)]) {
 }
 
 /// One sweep, bounded by [`HANG`].
-async fn bounded_sweep(task: &mut LearnerRecovery<CountingStore>) -> SweepReport {
+pub(crate) async fn bounded_sweep(task: &mut LearnerRecovery<CountingStore>) -> SweepReport {
     tokio::time::timeout(HANG, task.sweep())
         .await
         .expect("the sweep is bounded: no call it waits on may hang it")
@@ -49,7 +49,7 @@ async fn bounded_sweep(task: &mut LearnerRecovery<CountingStore>) -> SweepReport
 
 /// `bad` is held, and the sweep delivered `good`'s project behind it with no
 /// outage and no backoff.
-async fn assert_held_and_the_sweep_went_on(
+pub(crate) async fn assert_held_and_the_sweep_went_on(
     rig: &Rig,
     task: &LearnerRecovery<CountingStore>,
     report: SweepReport,
@@ -69,7 +69,7 @@ async fn assert_held_and_the_sweep_went_on(
 }
 
 /// The bad session first in byte order, a good one behind it, both owed.
-async fn bad_then_good(rig: &Rig, bad: &str) -> SessionId {
+pub(crate) async fn bad_then_good(rig: &Rig, bad: &str) -> SessionId {
     let bad = SessionId::new(format!("{bad}/ada/s"));
     let good = SessionId::new("good/ada/s");
     owed(rig, &[(&bad, "abad"), (&good, "good")]).await;
@@ -296,12 +296,15 @@ fn a_replay_that_times_out_on_every_sweep_warns_once() {
         .fault_replays(&bad, ReplayFault::Hangs { after: 0 });
     let warned = captured_warnings(|| {
         rt.block_on(async {
+            let mut last = None;
             for sweep in 0..2 {
                 idle().await;
                 let report = bounded_sweep(&mut task).await;
                 assert!(!report.outage, "sweep {sweep}: a slow log is not an outage");
+                last = Some(report);
             }
-            assert_held_and_the_sweep_went_on(&rig, &task, SweepReport::default(), &bad).await;
+            let report = last.expect("two sweeps ran");
+            assert_held_and_the_sweep_went_on(&rig, &task, report, &bad).await;
         });
     });
     assert_eq!(
