@@ -703,10 +703,9 @@ mod tests {
     /// Same rig as the retryability test above: a real Redis fronted by a
     /// relay this test can sever without touching the shared server. A plain
     /// `#[test]` driving its own runtime, for the reason given on the sibling
-    /// draw-side test below — `captured_warnings` installs a thread-local
-    /// subscriber around a synchronous closure, and `block_on` inside it is
-    /// what puts the ledger's I/O on the thread the subscriber is installed
-    /// on.
+    /// draw-side test below — `captured_warnings` captures only what the
+    /// calling thread emits during a synchronous closure, and `block_on`
+    /// inside it is what puts the ledger's I/O on that thread.
     #[test]
     #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
     fn a_ceiling_that_cannot_be_checked_warns_server_side_too() {
@@ -766,10 +765,10 @@ mod tests {
     /// the assertion is on the warning rather than only on the call returning.
     ///
     /// A plain `#[test]` driving its own runtime rather than `#[tokio::test]`,
-    /// because `captured_warnings` installs a *thread-local* subscriber around
-    /// a synchronous closure — see its own doc for why that serialization is
-    /// not tidiness — and `block_on` inside the closure is what puts the
-    /// ledger's I/O on the thread the subscriber is installed on.
+    /// because `captured_warnings` captures only what the *calling thread*
+    /// emits during a synchronous closure — see its own doc for why — and
+    /// `block_on` inside the closure is what puts the ledger's I/O on that
+    /// thread.
     #[test]
     #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
     fn a_draw_that_cannot_be_recorded_is_logged_and_the_turn_still_stands() {

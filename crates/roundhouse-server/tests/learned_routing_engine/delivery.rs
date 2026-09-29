@@ -714,9 +714,9 @@ async fn a_refuse_project_fails_the_turn_on_a_store_outage_and_a_serve_rules_pro
 /// reasoning `fair_use_unreachable_warned` already uses for the fair-use
 /// ledger.
 ///
-/// `captured_warnings` installs a thread-local subscriber, so this drives its
-/// own current-thread runtime rather than `#[tokio::test]`'s, which is free to
-/// resume the future on a thread the subscriber was never installed on.
+/// `captured_warnings` captures only the calling thread's events, so this
+/// drives its own current-thread runtime rather than `#[tokio::test]`'s, which
+/// is free to resume the future on another thread.
 #[test]
 fn store_read_failures_during_an_outage_warn_once() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -784,14 +784,6 @@ fn apply_failures_during_an_outage_warn_once() {
 /// again. Without it the flag stays set from the first outage forever, and a
 /// second, unrelated outage would warn zero times instead of once: fail,
 /// succeed, fail should warn twice, not once.
-///
-/// Shares `store_read_failures_during_an_outage_warn_once`'s callsite and its
-/// pre-existing hazard: `captured_warnings`' interest-cache rebuild is
-/// process-global, so a concurrently scheduled test that also flips
-/// `fail_reads(true)` outside of a capture (there are several in this file)
-/// can occasionally steal a warn from this one under `cargo test`'s
-/// in-process thread pool. `cargo nextest`, which this repo's suites also
-/// run under, gives every test its own process and is not exposed to it.
 #[test]
 fn a_read_success_between_two_outages_resets_the_warn_flag() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -827,9 +819,7 @@ fn a_read_success_between_two_outages_resets_the_warn_flag() {
 
 /// The apply side's `store(false, ...)` reset on a successful apply
 /// (`learning.rs`, in `deliver_learning`), the same guard as the read side
-/// above but for `apply_unreachable_warned`, and the same shared hazard with
-/// `apply_failures_during_an_outage_warn_once`'s callsite (see the read
-/// side's doc comment above).
+/// above but for `apply_unreachable_warned`.
 #[test]
 fn an_apply_success_between_two_outages_resets_the_warn_flag() {
     let rt = tokio::runtime::Builder::new_current_thread()

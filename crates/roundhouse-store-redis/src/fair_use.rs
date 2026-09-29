@@ -712,10 +712,8 @@ mod tests {
     }
 
     /// Serializes every test in this module that talks to a real Redis
-    /// server, the way `roundhouse-server`'s `captured_warnings` serializes
-    /// tests that share tracing's global interest cache — same shape of
-    /// hazard, a process-wide resource two tests can each disturb without
-    /// touching the other's state directly.
+    /// server: the server is a process-wide resource that two tests can each
+    /// disturb without touching the other's state directly.
     ///
     /// `would_exceed_worst_case_seven_day_decay_reads_six_bucket_chunks`
     /// below counts `HMGET` calls off `INFO commandstats`, which is
