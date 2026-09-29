@@ -779,6 +779,90 @@ fn apply_failures_during_an_outage_warn_once() {
     );
 }
 
+/// The read side's `store(false, ...)` reset on a successful read
+/// (`learning.rs`, in `choose_learned`) is what lets a later outage warn
+/// again. Without it the flag stays set from the first outage forever, and a
+/// second, unrelated outage would warn zero times instead of once: fail,
+/// succeed, fail should warn twice, not once.
+///
+/// Shares `store_read_failures_during_an_outage_warn_once`'s callsite and its
+/// pre-existing hazard: `captured_warnings`' interest-cache rebuild is
+/// process-global, so a concurrently scheduled test that also flips
+/// `fail_reads(true)` outside of a capture (there are several in this file)
+/// can occasionally steal a warn from this one under `cargo test`'s
+/// in-process thread pool. `cargo nextest`, which this repo's suites also
+/// run under, gives every test its own process and is not exposed to it.
+#[test]
+fn a_read_success_between_two_outages_resets_the_warn_flag() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let rig = Rig::new(RigConfig::default());
+    let admission = admission("readwarn2", Some(shadow()));
+    let warned = captured_warnings(|| {
+        rt.block_on(async {
+            rig.learner.fail_reads(true);
+            rig.turn(&SessionId::new("readwarn2/ada/a"), "t1", &admission)
+                .await
+                .expect("serve_rules serves through the outage");
+            rig.learner.fail_reads(false);
+            rig.turn(&SessionId::new("readwarn2/ada/b"), "t2", &admission)
+                .await
+                .expect("served");
+            rig.learner.fail_reads(true);
+            rig.turn(&SessionId::new("readwarn2/ada/c"), "t3", &admission)
+                .await
+                .expect("serve_rules serves through the outage");
+        });
+    });
+    let warns = warned
+        .matches("the learner store read failed; the turn takes the infeasible path")
+        .count();
+    assert_eq!(
+        warns, 2,
+        "a successful read between two outages must reset the warn flag, so each outage warns once on its own: {warned}"
+    );
+}
+
+/// The apply side's `store(false, ...)` reset on a successful apply
+/// (`learning.rs`, in `deliver_learning`), the same guard as the read side
+/// above but for `apply_unreachable_warned`, and the same shared hazard with
+/// `apply_failures_during_an_outage_warn_once`'s callsite (see the read
+/// side's doc comment above).
+#[test]
+fn an_apply_success_between_two_outages_resets_the_warn_flag() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let rig = Rig::new(RigConfig::default());
+    let session = SessionId::new("applywarn2/ada/s");
+    let admission = admission("applywarn2", Some(shadow()));
+    let warned = captured_warnings(|| {
+        rt.block_on(async {
+            rig.learner
+                .script(ApplyScript::Refuse(LearnerError::Unavailable(
+                    "down".into(),
+                )));
+            rig.turn(&session, "t1", &admission).await.expect("served");
+            rig.turn(&session, "t2", &admission).await.expect("served");
+            rig.learner
+                .script(ApplyScript::Refuse(LearnerError::Unavailable(
+                    "down".into(),
+                )));
+            rig.turn(&session, "t3", &admission).await.expect("served");
+        });
+    });
+    let warns = warned
+        .matches("the learner store did not take this session's entries; they stay pending")
+        .count();
+    assert_eq!(
+        warns, 2,
+        "a successful apply between two outages must reset the warn flag, so each outage warns once on its own: {warned}"
+    );
+}
+
 /// Mutation survivor 8a: no test drove a store that reports more entries
 /// applied than the batch it was sent. `duplicates` is
 /// `entries.len().saturating_sub(applied.applied)`, not a bare subtraction,

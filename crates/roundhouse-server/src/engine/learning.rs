@@ -90,10 +90,13 @@ pub(crate) struct RoutingLearner {
     /// keys.
     stopped_sessions: Mutex<HashMap<ProjectId, HashSet<SessionId>>>,
     /// Set on the first learner-store read failure since the last success,
-    /// cleared on the next one. Same pattern as
-    /// [`fair_use_unreachable_warned`](super::Engine::fair_use_refusal): a
-    /// `tracing::warn` on every turn of an outage is the line an operator
-    /// learns to filter, so only the transition into the outage warns.
+    /// cleared on the next one. Same pattern as `Engine`'s
+    /// `fair_use_unreachable_warned` field: a `tracing::warn` on every turn of
+    /// an outage is the line an operator learns to filter, so only the
+    /// transition into the outage warns. Unlike that field, the transition
+    /// back out logs no recovery line here -- the reset is silent, and the
+    /// next outage simply gets its own warning rather than inheriting this
+    /// one's.
     read_unreachable_warned: AtomicBool,
     /// The same pattern for deliveries the store answered `Unavailable` or
     /// `WrongType`.
@@ -265,8 +268,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                     .swap(true, Ordering::Relaxed)
                 {
                     tracing::warn!(%project, %error, "the learner store read failed; the turn takes the infeasible path");
+                } else {
+                    tracing::debug!(%project, %error, "the learner store read failed; the turn takes the infeasible path");
                 }
-                tracing::debug!(%project, %error, "the learner store read failed; the turn takes the infeasible path");
                 StoreRead::Unavailable {
                     reason: ReadFailure::StoreUnavailable,
                 }
@@ -425,11 +429,12 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                             %project, session = %session_id, %error,
                             "the learner store did not take this session's entries; they stay pending"
                         );
+                    } else {
+                        tracing::debug!(
+                            %project, session = %session_id, %error,
+                            "the learner store did not take this session's entries; they stay pending"
+                        );
                     }
-                    tracing::debug!(
-                        %project, session = %session_id, %error,
-                        "the learner store did not take this session's entries; they stay pending"
-                    );
                     delivery.record(&project, DeliveryOutcome::Unavailable);
                     return;
                 }
@@ -442,14 +447,21 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             }
         };
 
-        // Acknowledge, then clear. A failed append must not be followed by a
-        // clear: the mark is this session's only durable record that entries
-        // are still owed, and clearing it ahead of the append that confirms
-        // delivery would let a crash between the two drop the mark while the
-        // log still shows nothing applied -- the recovery task would then
-        // never revisit a session it has no reason to think finished. Either
-        // step failing leaves the mark, and the next turn or the recovery
-        // task confirms it: the store skips every entry it already holds.
+        // Acknowledge, then clear. The store already holds these entries
+        // durably once it has answered `Applied` above; the mark does not
+        // guard against losing them, it only tracks whether this session's
+        // own log has recorded that delivery -- the fact the recovery task
+        // reads to decide whom to revisit (it never appends the log entry
+        // itself, only re-applies and clears, see the module doc). Ordering
+        // the append first is a choice, not a fix: keeping the mark set on
+        // every failure branch (a failed append, a failed clear, or a crash
+        // between the two) costs at most one redundant recovery apply -- the
+        // store answers the resent entries as duplicates by watermark -- plus
+        // a redundant clear. The other order would instead risk a crash
+        // landing between the clear and the append, which drops the mark
+        // while the log never records the delivery; that loses no data, but
+        // it is a piece of bookkeeping a session that never turns again would
+        // carry as drift forever.
         let appended = session
             .record_learning_applied(watermark)
             .await
