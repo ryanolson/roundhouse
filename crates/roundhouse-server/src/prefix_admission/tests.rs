@@ -1415,3 +1415,120 @@ async fn rewrite_signal_distinguishes_divergence_from_busy_and_resumed_generatio
         assert_eq!(session, rig.generation(u32::from(scenario != "fresh")));
     }
 }
+
+/// Session and sequence identity, M1: wherever admission calls two items the
+/// same, the chain must too.
+///
+/// The chain (`roundhouse_core::item::chain`) is what placement will look a
+/// conversation up by, and admission is what decides the conversation is one.
+/// If the two disagreed — admission agreeing on a pair whose links differ — a
+/// continuation admission keeps on its generation would be looked up under a
+/// tip nobody stored and placed as a new sequence, on a cold deployment, with
+/// every turn still answering. `same_item` is private here, which is why this
+/// lives beside it and not in core.
+///
+/// The two rules that make agreement looser than equality are exactly the
+/// ones the render must not see: the response stamp (never compared) and the
+/// namespace (a stored `None` agrees with any claim). The universe below
+/// crosses every role with stamps and namespaces on every content shape, and
+/// the counts at the end prove both rules were actually exercised rather than
+/// vacuously true.
+#[test]
+fn same_item_agreement_implies_equal_item_digests() {
+    use roundhouse_core::item::chain::{Chain, item_digest};
+
+    let call = |call_id: &str, name: &str, arguments: &str, namespace: Option<&str>| {
+        ItemContent::ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            arguments: arguments.into(),
+            namespace: namespace.map(str::to_owned),
+        }
+    };
+    let contents = [
+        ItemContent::Text { text: "a".into() },
+        ItemContent::Text { text: "b".into() },
+        call("c1", "ls", r#"{"path":"."}"#, None),
+        call("c1", "ls", r#"{"path":"."}"#, Some("mcp__roundhouse")),
+        call("c1", "ls", r#"{"path":"."}"#, Some("mcp__other")),
+        call("c2", "ls", r#"{"path":"."}"#, None),
+        call("c1", "cat", r#"{"path":"."}"#, None),
+        call("c1", "ls", r#"{"path":"src"}"#, None),
+        ItemContent::ToolResult {
+            call_id: "c1".into(),
+            output: "a.rs".into(),
+        },
+        ItemContent::Thinking {
+            thinking: "hmm".into(),
+            signature: "sig".into(),
+        },
+        ItemContent::RedactedThinking {
+            data: "opaque".into(),
+        },
+        ItemContent::Opaque {
+            block_type: "image".into(),
+            block: serde_json::json!({"type": "image", "source": {"data": "AAAA"}}),
+        },
+    ];
+    let roles = [
+        Role::System,
+        Role::Developer,
+        Role::User,
+        Role::Assistant,
+        Role::Tool,
+    ];
+    let stamps = [
+        None,
+        Some(ResponseId::new("resp_1")),
+        Some(ResponseId::new("resp_2")),
+    ];
+    let mut universe = Vec::new();
+    for role in roles {
+        for content in &contents {
+            for stamp in &stamps {
+                universe.push(Item {
+                    role,
+                    content: content.clone(),
+                    response_id: stamp.clone(),
+                });
+            }
+        }
+    }
+
+    // A shared earlier item, so the comparison is of a link that extends a
+    // predecessor and not only of a first link.
+    let before = Item::user_text("before");
+    let chain_of = |item: &Item| Chain::over(&[before.clone(), item.clone()]);
+    let (mut agreed, mut across_stamps, mut across_namespaces) = (0, 0, 0);
+    for stored in &universe {
+        for claimed in &universe {
+            if !same_item(stored, claimed) {
+                continue;
+            }
+            agreed += 1;
+            across_stamps += usize::from(stored.response_id != claimed.response_id);
+            across_namespaces += usize::from(stored.content != claimed.content);
+            assert_eq!(
+                item_digest(&stored.render()),
+                item_digest(&claimed.render()),
+                "admission agrees on {stored:?} and {claimed:?}, their item digests do not"
+            );
+            assert!(
+                chain_of(stored).links() == chain_of(claimed).links(),
+                "admission agrees on {stored:?} and {claimed:?}, their chain links do not"
+            );
+        }
+    }
+    assert!(
+        agreed > universe.len(),
+        "only reflexive agreement was exercised"
+    );
+    assert!(
+        across_stamps > 0,
+        "no agreeing pair differed in its response stamp"
+    );
+    assert!(
+        across_namespaces > 0,
+        "no agreeing pair differed in its namespace"
+    );
+}

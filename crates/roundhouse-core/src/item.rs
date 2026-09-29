@@ -14,6 +14,8 @@ use sha2::{Digest, Sha256};
 
 use crate::ids::ResponseId;
 
+pub mod chain;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {

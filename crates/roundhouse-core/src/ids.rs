@@ -85,6 +85,24 @@ string_id!(
     "Identifies one consultation of the validate/steer loop.\n\nSeparate from [`SideCallId`] because a validation may run *without* a side\ncall — a spent budget, an arm that consults nobody — and a side call may\nexist whose verdict was unusable. One id per question asked, one per model\ncall made, and the join between them is a field rather than an assumption."
 );
 
+/// The namespace every session key the Anthropic Messages surface derives
+/// lives in: `anthropic_messages/{session}[/agent/{agent}]`.
+///
+/// **One spelling, because two readers must agree on it byte for byte.** The
+/// surface stamps it when it scopes a client's name, and
+/// `validate::ControlCallDialect::of_session_key` reads it back to learn which
+/// dialect wrote a log, since the key is the only place a client's dialect
+/// survives into core. Spelled twice — once in the server, once in core, held
+/// together only by a test in the server's suite — a rename of either would
+/// fold every Messages session under the Codex recogniser, which reads a flat
+/// `mcp__roundhouse__status` as task work and a client's own bare `status` as
+/// ours, and nothing would fail but the steers.
+///
+/// It lives here rather than beside either reader because both, and the
+/// `roundhouse-sequence-id` crate that scopes labels, already depend on core
+/// and on nothing else they share.
+pub const MESSAGES_DIALECT_NAMESPACE: &str = "anthropic_messages";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +121,32 @@ mod tests {
         let encoded = serde_json::to_string(&id).unwrap();
         assert_eq!(encoded, "\"resp_abc\"");
         assert_eq!(serde_json::from_str::<ResponseId>(&encoded).unwrap(), id);
+    }
+
+    #[test]
+    fn the_dialect_namespace_has_one_spelling() {
+        use crate::validate::ControlCallDialect;
+        // The literal both old spellings carried (`DIALECT_NAMESPACE` in the
+        // server's `messages_api::wire`, `MESSAGES_SESSION_SEGMENT` in
+        // `validate::control_call`), so every key already stored reads back
+        // under the same dialect after the move.
+        assert_eq!(MESSAGES_DIALECT_NAMESPACE, "anthropic_messages");
+        // The reader agrees with it as a whole segment, which is how it
+        // compares: a key scoped by this constant folds as Messages, and one
+        // whose segment merely starts with it does not.
+        for key in [
+            format!("{MESSAGES_DIALECT_NAMESPACE}/s"),
+            format!("tenant/{MESSAGES_DIALECT_NAMESPACE}/s/agent/a"),
+        ] {
+            assert_eq!(
+                ControlCallDialect::of_session_key(&key),
+                ControlCallDialect::ClaudeMessages,
+                "{key}"
+            );
+        }
+        assert_eq!(
+            ControlCallDialect::of_session_key(&format!("{MESSAGES_DIALECT_NAMESPACE}x/s")),
+            ControlCallDialect::CodexResponses
+        );
     }
 }
