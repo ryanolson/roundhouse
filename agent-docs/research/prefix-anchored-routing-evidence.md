@@ -668,3 +668,23 @@ the pin's actual `.rs`/`.py` source tree — the working code instead has `sessi
 it does not change the ruling that nothing at the pin reads `evict_session` today. It's flagged
 here only so a later reader who greps for "trajectory" and finds nothing doesn't mistakenly
 conclude the changelog entry is fabricated — the code exists, under a different name.
+
+## Note, 2026-09-29: the Roundhouse revision this evidence was read at
+
+[Every `[rh path:line]` claim above was read at `2dd40dd`. That commit is an ancestor of `ai/learner-m8-engine` (remote tip `b32b51e`), the tip of the open stack #18 → #21 → #22 → #23 → #24–#31. It is not on `main` `e521855`, which this document's PR targets. A re-derivation against `main` found:
+
+- **Missing on `main`, present on the stack:**
+  - `CacheReadSource` and `Usage.cache_read_source`
+  - `metrics/cache_evidence.rs` and `cache_reuse_evidence`
+  - the marker-aware, seedable `CacheLedger`
+  - `ContextAssembler::tokens_through`
+  - `routing/learn/*`, `min_sessions` and `LevelKey`
+  - four `SessionEventKind` variants
+- **Moved, but behaving as claimed:** for example, `Engine::admitted_input_tokens` is at `engine.rs:1766` on `main`, and `CacheLedger::invalidate` is at `ledger.rs:400`.
+- **PR #17, already on `main`, adds code this document does not mention:**
+  - `bind_prefix`'s `history_rewritten` flag
+  - `Conversations::observe_context` and the `x-roundhouse-context-signal` header
+  - `RequestContext.session_id` and `thread_id`, which are forwarded to frontier Responses
+- **Precision:** the proposal's §21.9 says the ledger's compare runs "in one Redis script, as the correlation maps already do". That holds only for tool-call bindings (`BIND_CALL` in `crates/roundhouse-store-redis/src/correlation/scripts.rs`). The generation map is a plain write by design, and `roundhouse-core/src/control/correlation.rs:38-49` explains why it rejects a compare-and-set.
+
+The snapshot above is unchanged. The rebaselined table is §1 of `../PLAN-session-sequence-identity.md`. Its citations are derived again when the stack merges.]

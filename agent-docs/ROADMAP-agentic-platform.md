@@ -690,3 +690,22 @@ The next bounded sequence is:
 This sequence produces useful evidence early, preserves the current product
 invariants, and reaches the user's desired quiet-session archive/wake behavior
 without making either Codex integration or G3 storage a blocking dependency.
+
+## Addendum, 2026-09-29: session and sequence identity in Track KV
+
+The owner placed the "session and sequence identity" workstream on this roadmap. Its effective spec is `PLAN-session-sequence-identity.md`. Its design record is `synergies/prefix-anchored-routing-proposal.md`, and its upstream ask is `synergies/dynamo-sequence-lifecycle-upstream.md`. This addendum says where it sits. It does not change the gates of any track.
+
+| Track KV gate | What the workstream contributes | Plan milestone |
+|---|---|---|
+| K0: trace corpus | The shadow supersession log (class, signal, predecessor and successor per generation change) and the per-deployment placement log. These are corpus inputs. K0 still owns the corpus schema and the baseline. | M2, M3 |
+| K1: activity ledger | Nothing new. The design's close and disconnect semantics (its questions 24 and 25) defer to K1's lifecycle state machine. | None |
+| K2: session-to-cache identity | The concrete identity piece. One Roundhouse `SessionId` is one sequence, `label#g{n}`. Its keyed digest is what Roundhouse sends as `x-dynamo-session-id`. A supersession (compaction, rewrite, close) is the first lifecycle hint, and its meaning is "not reused", close to `Cancel`. The plan maps the digest onto `SessionCacheKey` plus generation. `model_layout` and `reuse_scope` are K2 open items. | M1, M2, M4 |
+| K7: fleet-scale placement, embedded Dynamo first | Deployment targets. A continuation is sticky to its bound deployment. A new sequence goes to the deployment with the fewest in-flight tokens. No hash selects a deployment. The gain is measured with ground-truth hits from the in-process mocker harness. | M3, M5 |
+| K8: calibration and return-time models | The dispatch ledger (return curves, virtual LRU, learned effective capacity, adaptive rail) is deferred here. It is unlocked when K0's corpus exists. | Deferred |
+
+Two rules from this roadmap bind the workstream:
+
+- **No default timeouts before K0.** Every time constant in the plan is a named, provisional configuration value that is used only in shadow until K0 calibrates it.
+- **Dynamo is the cache authority.** Roundhouse states only that a sequence will not be reused. Release is Dynamo's. The in-band `x-dynamo-session-final` transport stays in shadow until Dynamo consumes `kv_hints.evict_session`.
+
+Order: the open stack #18–#31 lands first. The plan's M1 (a pure crate) may proceed before it.

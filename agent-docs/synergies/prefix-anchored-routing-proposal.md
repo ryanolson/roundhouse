@@ -1638,3 +1638,36 @@ H_d = C_d - W_d - z · sqrt(V_d)          z = 1 by default (question 31)
 The owner accepted every recommendation of questions 21 to 32 as written above.
 
 For question 26 the owner added a reason. Roundhouse guides users on how to launch their agents (Claude Code, Codex, and others) through NeMo Relay. That launch guidance can therefore set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. The exact compaction header then arrives without an Anthropic remote flag. The content marker stays as the fallback for a client that was launched some other way.
+
+## Addendum, 2026-09-29: readiness review and owner ruling on the remaining questions
+
+A readiness review ran on this document today. Its findings:
+
+- The layered addenda contradict each other. For example, `SequenceKey` has no `surface` field, but §18.6 hashes one. §7.3 says it is "unchanged", but that text places by the load gauge, which a later addendum removed. §7.4 takes a `min()` that biases the price.
+- State is read before the milestone that creates it. M2 and M3 need the window, `last_delta_marker` and `touched`, which live in the M4 reservation. M3 binds anchors before M4 writes tips.
+- Every `[rh path:line]` citation was read at `2dd40dd`. That commit is on the unmerged stack #18 → #21 → #22 → #23 → #24–#31, not on `main` `e521855`.
+- The §19.2 classifier has four defects, listed in item 5 below.
+- The M5 gain metric is circular and probably shows no difference on two equal mockers.
+- The invalidation endpoint does not exist in Dynamo.
+- This workstream was not on the roadmap.
+
+The owner ruled on every point today. **`../PLAN-session-sequence-identity.md` is now the single effective spec.** Milestone briefs are cut from it. Where it and this document disagree, the plan wins. This document and its addenda stay as the record.
+
+1. **Sequencing.** The open stack #18–#31 lands first. M1 may start now on `main`, kept free of conflicts with the stack. Later milestones are briefed after the stack merges, and their citations are derived again then.
+2. **A smaller first slice.** The first measured gain is deployment stickiness with least-in-flight placement for new sequences. The §21 dispatch ledger (return curves, virtual LRU, AIMD capacity, adaptive rail, Q31, Q32) is deferred to roadmap K8. It is unlocked when K0's trace corpus exists.
+3. **Roadmap.** This work is the concrete K2 identity piece and the K7 "embedded Dynamo first" slice, and it feeds K0's corpus. `ROADMAP-agentic-platform.md` carries the placement as a dated addendum.
+4. **Invalidation: in-band now, endpoint later.** The first transport is Dynamo's documented `x-dynamo-session-final: true` on a dedicated minimal request. It is off by default and runs in shadow, because nothing at the Dynamo pin reads `kv_hints.evict_session` (evidence §15.8, §15.12 claim 8a). `POST /v1/sequences/invalidate` becomes an upstream proposal, `dynamo-sequence-lifecycle-upstream.md`. Roundhouse drafts it and the owner files it.
+5. **The §19.2 classifier: all four fixes are adopted, each test-first.**
+   - The hold on an inferred supersession depends on the predecessor's end kind, not a fixed 120 s.
+   - A marker counts only when it is new relative to the predecessor.
+   - A label with more than `MAX_PREFIX_PROBES` live lineages, or with `Busy` generations, is ambiguous and never sends.
+   - `T = 0` is ambiguous.
+6. **PR #17.** The classifier extends `Conversations::observe_context` and `bind_prefix`'s `history_rewritten`, and `x-roundhouse-context-signal` gains the supersession classes. Nothing is replaced.
+7. **Measurement.** The gain is measured with ground-truth hits from the in-process mocker KV-event harness. The baseline is load-only placement per turn, and the runs include unequal cases. A hit derived from TTFT is a secondary signal only.
+8. **Pricing stays unbiased.** The `min()` of §7.4 is removed. Only the rail uses the certain hit.
+9. **Defaults are provisional and wait for the corpus.** Every time constant is a named configuration value, used in shadow until K0 calibrates it. This follows the roadmap's K0 rule.
+10. **Owner questions.**
+    - Q6, Q7, Q8, Q10, Q11, Q12, Q13, Q18 and Q20 are accepted as recommended. Q18's band applies to least-in-flight placement.
+    - Q14, Q17 and Q19 were delegated to the orchestrator, which accepted the recommendations. Q19's values are provisional under item 9.
+    - Q28 and Q29 stand for the out-of-band endpoint.
+    - No owner question is left open.
