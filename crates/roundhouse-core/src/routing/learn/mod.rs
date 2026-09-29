@@ -389,6 +389,11 @@ impl PriorUnits {
 /// builds and validates it from a project's `learner` block and its
 /// [`Artifact`]; [`StrategySet`] already refuses the one shape no policy could
 /// serve.
+///
+/// **No apply timeout here.** Delivery follows the log, so a session of a
+/// project now `off` still delivers, and an `off` block resolves to no terms.
+/// The server carries the block's written apply timeout beside these terms,
+/// in every mode, so delivery has one place to read it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearnerTerms {
     pub mode: LearnerMode,
@@ -406,7 +411,4 @@ pub struct LearnerTerms {
     /// How long the engine waits for the store read before the turn takes the
     /// `ReadTimedOut` path. Read by the engine, never by the policy.
     pub read_timeout_ms: u64,
-    /// How long the engine waits for one delivery apply before it leaves the
-    /// entries pending. Read by the engine, never by the policy.
-    pub apply_timeout_ms: u64,
 }

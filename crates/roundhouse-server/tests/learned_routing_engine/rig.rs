@@ -6,7 +6,7 @@
 //! learner store that counts and can be told to fail, and a session store that
 //! counts mark clears and acknowledgements and can refuse the latter.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -141,14 +141,20 @@ pub fn terms(mode: LearnerMode) -> LearnerTerms {
         on_infeasible: OnInfeasible::ServeRules,
         exploration: None,
         read_timeout_ms: 2_000,
-        apply_timeout_ms: 2_000,
     }
 }
 
+/// The apply timeout every rig admission with a learner block writes.
+pub const APPLY_TIMEOUT_MS: u64 = 2_000;
+
+/// `project`'s admission. A block (`terms`, in any mode, `off` included, as a
+/// hand-built admission may carry) writes [`APPLY_TIMEOUT_MS`]; no block
+/// writes none.
 pub fn admission(project: &str, terms: Option<LearnerTerms>) -> Admission {
     Admission {
         principal: roundhouse_core::control::Principal::new(project, "ada"),
         tiers: Some(Arc::new(recipe())),
+        learner_apply_timeout_ms: terms.as_ref().map(|_| APPLY_TIMEOUT_MS),
         learner: terms.map(Arc::new),
         ..Admission::open()
     }
@@ -189,6 +195,7 @@ pub struct ProbeStore {
     read_delay: Mutex<Option<Duration>>,
     fail_reads: AtomicBool,
     script: Mutex<VecDeque<ApplyScript>>,
+    refused: Mutex<HashMap<SessionId, LearnerError>>,
 }
 
 impl ProbeStore {
@@ -211,6 +218,13 @@ impl ProbeStore {
     pub fn script(&self, step: ApplyScript) {
         self.script.lock().unwrap().push_back(step);
     }
+
+    /// Refuse every apply for `session` with `error`, ahead of the script:
+    /// a session whose page holds an entry no store takes, however often it
+    /// is sent (`Malformed` is decided by the batch alone).
+    pub fn refuse_session(&self, session: &SessionId, error: LearnerError) {
+        self.refused.lock().unwrap().insert(session.clone(), error);
+    }
 }
 
 #[async_trait]
@@ -229,6 +243,10 @@ impl LearnerStore for ProbeStore {
 
     async fn apply(&self, batch: &LearningBatch<'_>) -> Result<Applied, LearnerError> {
         self.applies.fetch_add(1, Ordering::SeqCst);
+        let refused = self.refused.lock().unwrap().get(batch.session).cloned();
+        if let Some(error) = refused {
+            return Err(error);
+        }
         let step = self.script.lock().unwrap().pop_front();
         match step {
             None => self.inner.apply(batch).await,
@@ -644,4 +662,35 @@ pub async fn replayed_chain(rig: &Rig, session: &SessionId) -> Vec<LearningEntry
 
 pub fn project(name: &str) -> ProjectId {
     ProjectId::from(name)
+}
+
+// --------------------------------------------------------------- delivery
+
+/// `large`'s residual sample count in `project`: one per turn entry applied.
+pub async fn residuals(rig: &Rig, project_name: &str) -> u64 {
+    let request = ReadRequest::new(
+        project(project_name),
+        epoch(),
+        &fresh_input(),
+        &terms(LearnerMode::Shadow).strategies,
+        [&large(), &small()],
+    );
+    let view = rig
+        .learner
+        .inner
+        .read(&request)
+        .await
+        .expect("a memory read");
+    view.target(&large()).map_or(0, |ops| ops.latency.n)
+}
+
+/// The engine's delivery outcomes, deployment scope.
+pub fn delivery(rig: &Rig) -> roundhouse_core::metrics::LearningDeliveryMetrics {
+    let config = roundhouse_core::metrics::MetricsConfig::new(catalog().shadow_pricing());
+    rig.engine
+        .metrics()
+        .snapshot(&config, 0)
+        .learning
+        .delivery
+        .expect("the deployment scope carries delivery")
 }

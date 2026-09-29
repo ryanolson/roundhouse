@@ -38,7 +38,7 @@ use crate::classify::{AvailableClassification, ClassificationWindow};
 use crate::control::TurnBudget;
 use crate::routing::selection::{RecipeEvidence, SelectorSnapshot};
 use crate::routing::stage::{Pick, RoutedPick, TierRecipe, pick_tier};
-use crate::routing::{Admitted, Decision, RoutingContext, RoutingError, Target};
+use crate::routing::{Admitted, Decision, RoutingContext, RoutingError, Target, TurnSignals};
 use crate::validate::Arm;
 
 /// What a learned decision needs beyond the [`RoutingContext`].
@@ -58,10 +58,11 @@ pub struct LearningTurn<'a> {
     /// The classification window the decision records, and the session's
     /// accepted classifications it names. See [`LearnedInput::encode`].
     ///
-    /// **The input is encoded here, not passed in**, because its `rules_pick`
-    /// is the pick this policy computes. An input built by the caller could
-    /// carry a pick that disagrees with the plan served under it, and the
-    /// turn's evidence would be counted under the wrong key.
+    /// **The input is derived by [`LearnedPolicy::turn_input`], not passed
+    /// in**, because its `rules_pick` is the pick this policy plans under. An
+    /// input built another way could carry a pick that disagrees with the
+    /// plan served under it, and the turn's evidence would be counted under
+    /// the wrong key. The engine keys its store read with the same function.
     pub window: Option<&'a ClassificationWindow>,
     pub available: &'a [AvailableClassification],
 }
@@ -93,6 +94,30 @@ fn labels(unmet: &[Unmet]) -> String {
 pub struct LearnedPolicy;
 
 impl LearnedPolicy {
+    /// The `rules` pick and the [`LearnedInput`] one turn is keyed under.
+    ///
+    /// **The one derivation the store read and the decision share.** The
+    /// engine reads the store at this input's keys before it calls
+    /// [`Self::choose`], and `choose` plans and records under the same call.
+    /// Two derivations would agree until one of them changed, and then the
+    /// read would fetch one key's evidence for a decision recorded under
+    /// another.
+    pub fn turn_input(
+        ctx: &RoutingContext<'_>,
+        tool_turn: bool,
+        window: Option<&ClassificationWindow>,
+        available: &[AvailableClassification],
+    ) -> Result<(Pick, LearnedInput), LearnedError> {
+        let recipe = ctx.tiers.ok_or(LearnedError::NoRecipe)?;
+        let (picker, threshold) = (recipe.picker(), recipe.confidence_threshold());
+        let rules_pick = match ctx.signals {
+            Some(signals) => pick_tier(signals, picker, threshold),
+            None => pick_tier(&TurnSignals::default(), picker, threshold),
+        };
+        let input = LearnedInput::encode(rules_pick.tier, tool_turn, window, available);
+        Ok((rules_pick, input))
+    }
+
     /// The decision for one turn, with its [`LearnedEvidence`] on the
     /// selector.
     ///
@@ -123,11 +148,9 @@ impl LearnedPolicy {
         // Admission once, as `StagePolicy::choose` takes it, so every plan is
         // routed over the pool and budget state `rules` is.
         let admitted = ctx.admissible(None)?;
-        let signals = ctx.signals.cloned().unwrap_or_default();
-        let rules_pick = pick_tier(&signals, recipe.picker(), recipe.confidence_threshold());
+        let (rules_pick, input) =
+            Self::turn_input(ctx, turn.tool_turn, turn.window, turn.available)?;
         let terms = turn.terms;
-        let input =
-            LearnedInput::encode(rules_pick.tier, turn.tool_turn, turn.window, turn.available);
         let empty = ReadView::default();
         let (view, failure) = match turn.view {
             StoreRead::Read(view) => (view, None),

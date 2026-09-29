@@ -51,6 +51,7 @@ struct ArtifactFile {
     schema_revision: u32,
     input_revision: u32,
     selector_revision: u32,
+    stage_revision: u32,
     credit_revision: u32,
     gate: String,
     strategies: Vec<Strategy>,
@@ -75,9 +76,9 @@ pub enum ArtifactError {
     Format(String),
     #[error("schema revision {found} is not {ARTIFACT_SCHEMA_REVISION}, the one this build reads")]
     Schema { found: u32 },
-    /// The artifact was calibrated under another input, selector or credit
-    /// revision, so its prior counts turns this build would key or credit
-    /// differently.
+    /// The artifact was calibrated under another input, learned selector,
+    /// stage selector or credit revision, so its prior counts turns this
+    /// build would key or credit differently.
     #[error("the artifact's {which} revision {found} is not this build's {expected}")]
     Revision {
         which: &'static str,
@@ -120,6 +121,10 @@ impl Artifact {
                 file.selector_revision,
                 LEARNED_SELECTOR_REVISION,
             ),
+            // The `rules` pick every learned key embeds: an artifact
+            // calibrated under another picker counted its prior under keys
+            // that mean something else here.
+            ("stage", file.stage_revision, STAGE_SELECTOR_REVISION),
             ("credit", file.credit_revision, LEARNING_CREDIT_REVISION),
         ] {
             if found != expected {
@@ -206,8 +211,8 @@ impl Artifact {
 }
 
 /// The epoch id: SHA-256 over the SHA-256 of the artifact bytes, the ordered
-/// strategy list and the three learner revisions, truncated to 16 bytes
-/// (draft section 6).
+/// strategy list and the four revisions an artifact names, truncated to 16
+/// bytes (draft section 6).
 ///
 /// `rules` is versioned by [`STAGE_SELECTOR_REVISION`], and a change to the
 /// stage router's pick changes what a `rules` plan is, so that revision is
@@ -239,7 +244,7 @@ mod tests {
 
     fn file(strategies: &str, prior: &str) -> String {
         format!(
-            r#"{{"schema_revision":1,"input_revision":1,"selector_revision":1,"credit_revision":1,
+            r#"{{"schema_revision":1,"input_revision":1,"selector_revision":1,"stage_revision":1,"credit_revision":1,
                "gate":"wilson-v1","strategies":{strategies},"prior":{prior},
                "manifest_digest":"00","source_commit":"abc"}}"#
         )
@@ -332,6 +337,7 @@ mod tests {
         for (which, field) in [
             ("input", "input_revision"),
             ("selector", "selector_revision"),
+            ("stage", "stage_revision"),
         ] {
             let bytes =
                 file(listed, "[]").replace(&format!(r#""{field}":1"#), &format!(r#""{field}":2"#));

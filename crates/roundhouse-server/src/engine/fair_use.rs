@@ -360,6 +360,7 @@ mod tests {
             budget_counts: Default::default(),
             tiers: None,
             learner: None,
+            learner_apply_timeout_ms: None,
         }
     }
 

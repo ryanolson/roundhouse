@@ -54,6 +54,11 @@ pub struct LearnerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strategies: Option<Vec<Strategy>>,
     /// The calibration artifact's path. Its bytes decide the epoch.
+    ///
+    /// `std::fs::read` takes it as written, so a relative path resolves
+    /// against the process's working directory, not the configuration
+    /// file's. Write an absolute one: a service manager that starts the
+    /// process elsewhere would otherwise read another file, or none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -117,6 +122,8 @@ pub enum LearnerConfigError {
     Z(f64),
     #[error("`{0}` is 0, which would time out every call before it is sent")]
     ZeroTimeout(&'static str),
+    #[error("`latency_limit_ms` is 0, which no first output can meet")]
+    ZeroLatencyLimit,
     #[error("the strategy list is refused: {0}")]
     Strategies(String),
     /// Refused rather than left inert: exploration is live-only by ruling 8,
@@ -133,7 +140,11 @@ pub enum LearnerConfigError {
     /// The epoch hashes the artifact's list, and the policy plans the
     /// configured one: two lists would count evidence under one and serve
     /// another.
-    #[error("the artifact `{path}` lists {artifact:?}, and the block lists {configured:?}")]
+    #[error(
+        "the artifact `{path}` lists [{}], and the block lists [{}]",
+        labels(.artifact),
+        labels(.configured)
+    )]
     ArtifactStrategies {
         path: String,
         artifact: Vec<Strategy>,
@@ -141,8 +152,25 @@ pub enum LearnerConfigError {
     },
 }
 
+/// What one project's `learner` block puts on its keys' admissions: the
+/// terms (`None` when `off` or absent) and the written apply timeout, which an
+/// `off` project still delivers under. See `Admission::learner_apply_timeout_ms`.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ResolvedLearner {
+    pub(super) terms: Option<Arc<LearnerTerms>>,
+    pub(super) apply_timeout_ms: Option<u64>,
+}
+
+fn labels(strategies: &[Strategy]) -> String {
+    strategies
+        .iter()
+        .map(|strategy| strategy.label())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl LearnerConfig {
-    /// The project's resolved learner, or `None` for an `off` block.
+    /// The project's resolved learner.
     ///
     /// `has_tiers` is whether the project configured a `tiers` recipe.
     pub(super) fn to_terms(
@@ -150,13 +178,20 @@ impl LearnerConfig {
         path: &str,
         entry: &str,
         has_tiers: bool,
-    ) -> Result<Option<Arc<LearnerTerms>>, ControlPlaneError> {
-        self.resolve(has_tiers)
-            .map_err(|source| ControlPlaneError::LearnerRejected {
-                path: path.to_string(),
-                entry: entry.to_string(),
-                source,
-            })
+    ) -> Result<ResolvedLearner, ControlPlaneError> {
+        let terms =
+            self.resolve(has_tiers)
+                .map_err(|source| ControlPlaneError::LearnerRejected {
+                    path: path.to_string(),
+                    entry: entry.to_string(),
+                    source,
+                })?;
+        // Whatever the mode: an `off` project still delivers what its
+        // sessions owe, and it delivers under the number written here.
+        Ok(ResolvedLearner {
+            terms,
+            apply_timeout_ms: self.apply_timeout_ms,
+        })
     }
 
     fn resolve(&self, has_tiers: bool) -> Result<Option<Arc<LearnerTerms>>, LearnerConfigError> {
@@ -180,6 +215,9 @@ impl LearnerConfig {
             if value == Some(0) {
                 return Err(LearnerConfigError::ZeroTimeout(field));
             }
+        }
+        if self.latency_limit_ms == Some(0) {
+            return Err(LearnerConfigError::ZeroLatencyLimit);
         }
         let strategies = self
             .strategies
@@ -216,8 +254,8 @@ impl LearnerConfig {
         let read_timeout_ms = self
             .read_timeout_ms
             .ok_or_else(|| required("read_timeout_ms"))?;
-        let apply_timeout_ms = self
-            .apply_timeout_ms
+        // Required here, and carried beside the terms rather than in them.
+        self.apply_timeout_ms
             .ok_or_else(|| required("apply_timeout_ms"))?;
 
         let bytes =
@@ -256,7 +294,6 @@ impl LearnerConfig {
                 rate: exploration.rate,
             }),
             read_timeout_ms,
-            apply_timeout_ms,
         })))
     }
 }

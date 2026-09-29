@@ -24,17 +24,26 @@
 //! | `Applied { watermark }` | clear the source mark through it, then append `LearningApplied` |
 //! | `ChainGap { watermark }` | one backfill from it, applied in the same tail |
 //! | `ChainDiverged` | stop this session's delivery and report it, never backfill |
-//! | `CounterRange`, `Malformed` | stop the project epoch's delivery and report it |
+//! | `CounterRange`, `Malformed` | stop this session's delivery and report it |
 //! | `Unavailable`, `WrongType`, a timeout | leave the entries pending |
 //!
 //! Pending entries keep their source mark, so the next turn or the recovery
-//! task (milestone M9) finishes the work. The stops are process memory: a
-//! restart tries once more, meets the same refusal, and stops again, and a new
-//! epoch (a new artifact) resumes a stopped project.
+//! task (milestone M9) finishes the work.
+//!
+//! **Every stop is a session's, never a project's.** The refused entry stays
+//! in its session's page under the epoch it was written in, so a new artifact
+//! does not take it out of the page: the same page is resent under the new
+//! epoch and refused again. A stop keyed by the project and the admission's
+//! epoch was therefore met again under every later epoch, and each time it
+//! stopped every other session of the project with it. The stops are process
+//! memory: a restart tries each stopped session once more, meets the same
+//! refusal, and stops it again.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use roundhouse_core::classify::{AvailableClassification, ClassificationWindow};
 use roundhouse_core::context::Tokenizer;
@@ -43,25 +52,25 @@ use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_core::learn_store::{LearnerError, LearnerStore, LearningBatch, ReadRequest};
 use roundhouse_core::metrics::DeliveryOutcome;
 use roundhouse_core::routing::learn::{
-    ActiveMode, Draw, EpochId, LearnedError, LearnedInput, LearnedPolicy, LearnerTerms,
-    LearningTurn, ReadFailure, StoreRead,
+    ActiveMode, Draw, EpochId, LearnedError, LearnedPolicy, LearnerTerms, LearningTurn,
+    ReadFailure, StoreRead,
 };
-use roundhouse_core::routing::stage::pick_tier;
-use roundhouse_core::routing::{Decision, RoutingContext, RoutingError, TurnSignals};
-use roundhouse_core::session::{Session, SessionState};
+use roundhouse_core::routing::{Decision, RoutingContext, RoutingError};
+use roundhouse_core::session::{LearningEntry, Session, SessionState};
 use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::Arm;
 
 use crate::control_config::Admission;
-use crate::engine::{Engine, EngineError};
+use crate::engine::{ClientDeclarations, Engine, EngineError};
 
-/// How long delivery waits for an apply on a session whose project no longer
-/// configures a learner, in milliseconds.
+/// How long delivery waits for an apply on a session whose project writes no
+/// `apply_timeout_ms` any more, in milliseconds.
 ///
-/// Such a session still has entries owed (draft section 23), and its project
-/// has no `apply_timeout_ms` any more. The plan's starting value (section 4),
-/// named here so it is not a literal in the tail. A project that configures a
-/// learner always runs under its own value.
+/// Such a session still has entries owed (draft section 23): its project has
+/// no learner block, or an `off` block that writes no timeout. The plan's
+/// starting value (section 4), named here so it is not a literal in the tail.
+/// A block that writes the timeout, in any mode, runs under its own value
+/// (`Admission::learner_apply_timeout_ms`).
 pub const UNCONFIGURED_APPLY_TIMEOUT_MS: u64 = 250;
 
 /// The learner store and the delivery state one engine keeps.
@@ -70,34 +79,32 @@ pub(crate) struct RoutingLearner {
     /// The deployment's `arm_salt`: the draw's salt, so an exploring turn is
     /// reproducible from the log and the configuration alone.
     salt: String,
-    /// Sessions whose delivery stopped on a diverged chain.
-    diverged: Mutex<HashSet<(ProjectId, SessionId)>>,
-    /// Project epochs whose delivery stopped on a counter out of range or a
-    /// malformed batch. `None` is a project that no longer configures a
-    /// learner.
-    stopped: Mutex<HashSet<(ProjectId, Option<EpochId>)>>,
+    /// Sessions whose delivery stopped on a refusal no retry fixes: a
+    /// diverged chain, a counter out of range, or a malformed batch. See the
+    /// module doc for why no stop is a project's.
+    stopped_sessions: Mutex<HashSet<(ProjectId, SessionId)>>,
 }
 
 impl RoutingLearner {
-    fn is_stopped(&self, project: &ProjectId, session: &SessionId, epoch: Option<EpochId>) -> bool {
-        let diverged = self
-            .diverged
+    fn stopped(&self) -> std::sync::MutexGuard<'_, HashSet<(ProjectId, SessionId)>> {
+        self.stopped_sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&(project.clone(), session.clone()));
-        diverged
-            || self
-                .stopped
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .contains(&(project.clone(), epoch))
+    }
+
+    fn is_stopped(&self, project: &ProjectId, session: &SessionId) -> bool {
+        self.stopped().contains(&(project.clone(), session.clone()))
+    }
+
+    fn stop(&self, project: &ProjectId, session: &SessionId) {
+        self.stopped().insert((project.clone(), session.clone()));
     }
 }
 
 /// What the learned choice reads beyond the routing context: the same window,
 /// accepted classifications and tool flag the policy encodes its input from,
 /// so the store read and the decision name one key.
-pub(super) struct LearnedTurnInputs<'a> {
+struct LearnedTurnInputs<'a> {
     pub terms: &'a LearnerTerms,
     pub mode: ActiveMode,
     pub project: &'a ProjectId,
@@ -135,15 +142,45 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         self.learner = Some(Arc::new(RoutingLearner {
             store,
             salt: self.config.arm_salt.clone(),
-            diverged: Mutex::new(HashSet::new()),
-            stopped: Mutex::new(HashSet::new()),
+            stopped_sessions: Mutex::new(HashSet::new()),
         }));
         self
     }
 
+    /// The decision for one turn: the learned policy for a `shadow` or `live`
+    /// project on an engine with a learner, today's policy for everything
+    /// else, both bounded by the turn deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn choose_route(
+        &self,
+        ctx: &RoutingContext<'_>,
+        admission: &Admission,
+        session: &Session<S>,
+        response_id: &ResponseId,
+        declarations: &ClientDeclarations,
+        window: Option<&ClassificationWindow>,
+        deadline_at: Instant,
+    ) -> Result<Decision, EngineError> {
+        let Some((learner, terms, mode)) = self.learning_for(admission) else {
+            return self.bounded(deadline_at, self.policy.choose(ctx)).await;
+        };
+        let inputs = LearnedTurnInputs {
+            terms,
+            mode,
+            project: &admission.principal.project,
+            response_id,
+            arm: session.state().arm(),
+            tool_turn: declarations.declares_tools(),
+            window,
+            available: session.state().classifications(),
+        };
+        self.bounded(deadline_at, self.choose_learned(learner, ctx, inputs))
+            .await
+    }
+
     /// The learner and mode a turn of this admission runs under, or `None`
     /// for today's path: no learner attached, no learner block, or `off`.
-    pub(super) fn learning_for<'a>(
+    fn learning_for<'a>(
         &'a self,
         admission: &'a Admission,
     ) -> Option<(&'a RoutingLearner, &'a LearnerTerms, ActiveMode)> {
@@ -159,7 +196,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// **A failed or late read is not a failed turn.** It becomes the view's
     /// `Unavailable` reason, and the policy takes the infeasible path with it:
     /// `serve_rules` serves the `rules` decision, `refuse` fails the turn.
-    pub(super) async fn choose_learned(
+    async fn choose_learned(
         &self,
         learner: &RoutingLearner,
         ctx: &RoutingContext<'_>,
@@ -175,18 +212,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             window,
             available,
         } = inputs;
-        let recipe = ctx.tiers.ok_or(LearnedError::NoRecipe)?;
-        // The pick `choose` computes from the same signals, so the keys read
+        // The derivation `choose` plans and records under, so the keys read
         // here are the keys the decision records.
-        let rules_pick = match ctx.signals {
-            Some(signals) => pick_tier(signals, recipe.picker(), recipe.confidence_threshold()),
-            None => pick_tier(
-                &TurnSignals::default(),
-                recipe.picker(),
-                recipe.confidence_threshold(),
-            ),
-        };
-        let input = LearnedInput::encode(rules_pick.tier, tool_turn, window, available);
+        let (_, input) = LearnedPolicy::turn_input(ctx, tool_turn, window, available)?;
         let request = ReadRequest::new(
             project.clone(),
             terms.epoch,
@@ -235,9 +263,12 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// alike: a review can land on any of them. It cannot fail the turn. Every
     /// failure leaves the entries pending under their source mark.
     ///
-    /// **At most one backfill per tail.** A backfill is a full read-only
-    /// replay of the log, run only when the page ran dry or the store reported
-    /// a gap.
+    /// **At most one refill and one gap backfill per tail.** Each is a full
+    /// read-only replay of the log: the refill when the page ran dry, the gap
+    /// backfill when the store reported a gap. They are separate budgets
+    /// because a refilled page can meet a gap (the store lost what it
+    /// acknowledged), and a refill that spent the gap's backfill would leave
+    /// every later tail to refill, meet the same gap, and stop there.
     ///
     /// **A gap's backfill is applied in the same tail**, not on the next turn
     /// as draft 11.5 step 6 has it. The live fold's page still starts above
@@ -255,15 +286,14 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             return;
         };
         let session_id = session.session_id().clone();
-        let terms = admission.learner.as_deref();
-        let epoch = terms.map(|terms| terms.epoch);
-        if learner.is_stopped(&project, &session_id, epoch) {
+        if learner.is_stopped(&project, &session_id) {
             return;
         }
-        let apply_timeout =
-            Duration::from_millis(terms.map_or(UNCONFIGURED_APPLY_TIMEOUT_MS, |terms| {
-                terms.apply_timeout_ms
-            }));
+        let apply_timeout = Duration::from_millis(
+            admission
+                .learner_apply_timeout_ms
+                .unwrap_or(UNCONFIGURED_APPLY_TIMEOUT_MS),
+        );
         let delivery = self.metrics.learning_delivery();
 
         // The page ran dry with entries still owed: refill it from the hint.
@@ -276,7 +306,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             }
             delivery.record(&project, DeliveryOutcome::Backfill);
         }
-        let mut backfilled = replay.is_some();
+        let mut gap_backfilled = false;
 
         let watermark = loop {
             let entries = match &replay {
@@ -297,17 +327,17 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                         &project,
                         DeliveryOutcome::Applied {
                             applied: applied.applied as u64,
-                            duplicates: (entries.len() - applied.applied) as u64,
+                            duplicates: entries.len().saturating_sub(applied.applied) as u64,
                         },
                     );
                     break applied.watermark;
                 }
                 Ok(Err(LearnerError::ChainGap { store_watermark })) => {
                     delivery.record(&project, DeliveryOutcome::Gap);
-                    if backfilled {
+                    if gap_backfilled {
                         return;
                     }
-                    backfilled = true;
+                    gap_backfilled = true;
                     match self.backfill(&session_id, store_watermark).await {
                         Some(refilled) => replay = Some(refilled),
                         None => return,
@@ -323,29 +353,23 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                         "the learner store refused a diverged chain; this session's delivery \
                          stops until the process restarts, and its entries stay pending"
                     );
-                    learner
-                        .diverged
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert((project.clone(), session_id.clone()));
+                    learner.stop(&project, &session_id);
                     delivery.record(&project, DeliveryOutcome::Diverged);
                     return;
                 }
                 Ok(Err(
                     error @ (LearnerError::CounterRange { .. } | LearnerError::Malformed { .. }),
                 )) => {
-                    // Neither goes away on a retry; a new epoch is the recovery
-                    // (draft section 11.3).
+                    // Neither goes away on a retry, and a new epoch does not
+                    // either: the refused entry stays in this session's page
+                    // under its own epoch. See the module doc.
+                    let epochs = page_epochs(entries);
                     tracing::error!(
-                        %project, session = %session_id, %error,
-                        "the learner store refused a batch that no retry can fix; delivery for \
-                         this project epoch stops, and a new artifact starts a new one"
+                        %project, session = %session_id, epochs, %error,
+                        "the learner store refused a batch that no retry can fix; this session's \
+                         delivery stops until the process restarts, and its entries stay pending"
                     );
-                    learner
-                        .stopped
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert((project.clone(), epoch));
+                    learner.stop(&project, &session_id);
                     delivery.record(&project, DeliveryOutcome::Stopped);
                     return;
                 }
@@ -403,4 +427,23 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             }
         }
     }
+}
+
+/// The epochs a refused page's entries were written under, in page order and
+/// without repeats, for the stop's log line.
+fn page_epochs(entries: &[LearningEntry]) -> String {
+    let mut epochs: Vec<EpochId> = Vec::new();
+    for epoch in entries
+        .iter()
+        .filter_map(|entry| entry.deltas.as_ref().map(|deltas| deltas.epoch))
+    {
+        if !epochs.contains(&epoch) {
+            epochs.push(epoch);
+        }
+    }
+    epochs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }

@@ -20,7 +20,7 @@ fn artifact(strategies: &[&str]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     let bytes = format!(
-        r#"{{"schema_revision":1,"input_revision":1,"selector_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":[{list}],"prior":[],"manifest_digest":"00","source_commit":"test"}}"#
+        r#"{{"schema_revision":1,"input_revision":1,"selector_revision":1,"stage_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":[{list}],"prior":[],"manifest_digest":"00","source_commit":"test"}}"#
     );
     let path = std::env::temp_dir().join(format!(
         "roundhouse-learner-config-{}.json",
@@ -89,6 +89,17 @@ fn resolved(
         .expect("the key resolved")
         .learner
         .clone()
+}
+
+/// The apply timeout the block wrote, as a key's admission carries it.
+fn apply_timeout(learner: serde_json::Value) -> Option<u64> {
+    let config = ControlPlaneConfig::from_json(&document(learner, true), "test")
+        .expect("a well-formed learner block loads");
+    config
+        .turn_keys
+        .get(TURN_HASH)
+        .expect("the key resolved")
+        .learner_apply_timeout_ms
 }
 
 #[test]
@@ -279,6 +290,49 @@ fn every_numeric_refusal_names_its_field() {
         ),
         LearnerConfigError::ZeroTimeout("apply_timeout_ms")
     );
+    // A limit no first output can meet: every plan would fail latency.
+    assert_eq!(
+        refusal(
+            block("shadow", serde_json::json!({ "latency_limit_ms": 0 })),
+            true
+        ),
+        LearnerConfigError::ZeroLatencyLimit
+    );
+    // Checked in `off` too, like every present field.
+    assert_eq!(
+        refusal(
+            serde_json::json!({ "mode": "off", "latency_limit_ms": 0 }),
+            true
+        ),
+        LearnerConfigError::ZeroLatencyLimit
+    );
+}
+
+/// An `off` block keeps the apply timeout it wrote: a session of a project
+/// now `off` still delivers its pending entries (draft section 23), and it
+/// delivers them under the number the operator wrote, not a built-in one.
+#[test]
+fn an_off_block_keeps_its_written_apply_timeout() {
+    let off = serde_json::json!({ "mode": "off", "apply_timeout_ms": 1500 });
+    assert!(
+        resolved(off.clone()).is_none(),
+        "an off block is still no learner"
+    );
+    assert_eq!(apply_timeout(off), Some(1500));
+    assert_eq!(
+        apply_timeout(block("off", serde_json::json!({ "apply_timeout_ms": 900 }))),
+        Some(900)
+    );
+    // Control: a shadow block carries its value, and an off block that wrote
+    // none carries none.
+    assert_eq!(
+        apply_timeout(block(
+            "shadow",
+            serde_json::json!({ "apply_timeout_ms": 400 })
+        )),
+        Some(400)
+    );
+    assert_eq!(apply_timeout(serde_json::json!({ "mode": "off" })), None);
 }
 
 #[test]
@@ -323,6 +377,13 @@ fn an_artifact_whose_strategy_list_differs_is_refused() {
         matches!(source, LearnerConfigError::ArtifactStrategies { .. }),
         "{source}"
     );
+    // By label, the way every other refusal names a strategy.
+    assert!(
+        source
+            .to_string()
+            .ends_with("lists [rules, capable], and the block lists [rules, efficient, capable]"),
+        "{source}"
+    );
     // The order is part of the list: the epoch hashes it.
     let path = artifact(&["rules", "capable", "efficient"]);
     assert!(matches!(
@@ -361,5 +422,8 @@ fn the_resolved_terms_carry_the_artifacts_epoch_and_every_configured_number() {
     assert_eq!(terms.latency_limit_ms, 9000);
     assert_eq!(terms.quality.min_sessions, 20);
     assert_eq!(terms.read_timeout_ms, 25);
-    assert_eq!(terms.apply_timeout_ms, 250);
+    assert_eq!(
+        apply_timeout(block("shadow", serde_json::json!({}))),
+        Some(250)
+    );
 }

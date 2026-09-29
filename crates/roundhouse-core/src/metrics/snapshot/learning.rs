@@ -82,7 +82,7 @@ pub struct LearningDeliveryMetrics {
     pub gaps: u64,
     /// Sessions whose delivery stopped on a diverged chain.
     pub diverged: u64,
-    /// Project epochs whose delivery stopped on a counter out of range or a
+    /// Sessions whose delivery stopped on a counter out of range or a
     /// malformed batch.
     pub stopped: u64,
     /// Applies the store did not answer, or refused for a key of the wrong

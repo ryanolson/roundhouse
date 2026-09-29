@@ -518,11 +518,12 @@ A project with a `"tiers"` recipe can also add a `"learner"` block. The learner 
 - Every other field is required in `shadow` and `live`. The values above are the ruled starting numbers. Code supplies none of them.
 - The loader refuses these blocks:
   - a block on a project without `tiers`,
-  - a floor outside `0.0..=1.0`, a `z` that is not positive, or a zero timeout,
+  - a floor outside `0.0..=1.0`, a `z` that is not positive, a zero timeout, or a zero `latency_limit_ms`,
   - fewer than 2 strategies, a repeated or unknown strategy, or a list without `rules`,
   - an artifact that the loader cannot read, that is not in the artifact format, or that lists other strategies,
   - an `exploration` block on a project that is not `live`, or a rate outside `(0, 1]`.
-- The artifact is the calibration file (draft section 14.5). Its bytes and the strategy list decide the epoch id, so a new artifact starts new counters.
+- The artifact is the calibration file (draft section 14.5). Its bytes and the strategy list decide the epoch id, so a new artifact starts new counters. A relative `artifact` path resolves against the process's working directory, not the configuration file's, so write an absolute path.
+- An `off` block keeps its `apply_timeout_ms`. A session of a project that is now `off` still delivers its pending entries, and it waits that long for each apply. With no block, or no value in an `off` block, it waits 250 ms (`UNCONFIGURED_APPLY_TIMEOUT_MS`).
 - `exploration` is accepted only on `live` projects. A turn explores only on a session whose validation arm consults the judge, and only to a strategy that is cheaper than the served one and meets every hard constraint.
 
 The engine reads the learner store once per learned turn, bounded by `read_timeout_ms`. After the turn's terminal event and the settle, it delivers the session's pending learning entries in one apply, bounded by `apply_timeout_ms`, then clears the session's source mark and appends `LearningApplied`. A failed delivery leaves the entries marked for the next turn. A session whose project is later set to `off` still has its pending entries delivered, and its turns make no store read.
@@ -1122,7 +1123,7 @@ The `learning` object counts what the online learner decided, in the same scopes
 
 - entries applied, and entries that the store skipped as duplicates,
 - backfill replays and gaps,
-- sessions stopped on a diverged chain, and project epochs stopped on a counter out of range or a malformed batch,
+- sessions stopped on a diverged chain, and sessions stopped on a counter out of range or a malformed batch (every stop is one session's; the other sessions of the project carry on),
 - applies that were unavailable or timed out,
 - acknowledgements that failed after an apply.
 

@@ -54,12 +54,11 @@ use super::Admission;
 use super::budget::{AllocationConfig, BudgetConfig, budget_terms};
 use super::credentials::CredentialsConfig;
 use super::fair_use::{FairUseConfig, fair_use_terms};
-use roundhouse_core::routing::learn::LearnerTerms;
 use roundhouse_core::routing::stage::DEFAULT_CONFIDENCE_THRESHOLD;
 use roundhouse_core::routing::{PickerMode, TierRecipe, TierRecipeError};
 use roundhouse_core::validate::ValidationTerms;
 
-use super::learner::{LearnerConfig, LearnerConfigError};
+use super::learner::{LearnerConfig, LearnerConfigError, ResolvedLearner};
 use super::validate::ValidateConfig;
 
 /// One entry of the config's `"projects"` array.
@@ -969,7 +968,7 @@ impl ControlPlaneConfig {
         // same sharper one: an artifact that does not match its strategy list
         // has to stop the boot on the day it is written, not on the first turn
         // that reads it.
-        let mut project_learners: HashMap<&str, Option<Arc<LearnerTerms>>> = HashMap::new();
+        let mut project_learners: HashMap<&str, ResolvedLearner> = HashMap::new();
         // The deployment's own keys, resolved once: every project's resolution
         // reads them, and reading the environment per project would let one
         // variable be judged twice and -- if it changed underneath us -- judged
@@ -1049,7 +1048,7 @@ impl ControlPlaneConfig {
                 Some(learner_config) => {
                     learner_config.to_terms(path, &entry, project.tiers.is_some())?
                 }
-                None => None,
+                None => ResolvedLearner::default(),
             };
             project_learners.insert(project.id.as_str(), learner);
             project_tiers.insert(project.id.as_str(), tiers);
@@ -1231,6 +1230,9 @@ impl ControlPlaneConfig {
                     source,
                 })?,
             };
+            let learner = project_learners
+                .get(key.project.as_str())
+                .expect("a project checked present above was resolved to a learner above");
 
             turn_keys.insert(
                 key.key_sha256.clone(),
@@ -1251,10 +1253,8 @@ impl ControlPlaneConfig {
                         .expect("a project checked present above was resolved to tiers above")
                         .clone(),
                     // The project's, for the reason `tiers` is.
-                    learner: project_learners
-                        .get(key.project.as_str())
-                        .expect("a project checked present above was resolved to a learner above")
-                        .clone(),
+                    learner: learner.terms.clone(),
+                    learner_apply_timeout_ms: learner.apply_timeout_ms,
                 },
             );
         }

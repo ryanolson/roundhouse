@@ -15,13 +15,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::event::{ControlRecord, Usage, ValidationOutcome};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::learn_store::contract::LearnerStoreControl;
-use roundhouse_core::learn_store::{LearnerError, LearnerStore, LearningBatch, ReadRequest};
+use roundhouse_core::learn_store::{LearnerError, LearnerStore, LearningBatch};
 use roundhouse_core::routing::learn::{LearnerMode, LearnerTerms, Strategy};
+use roundhouse_core::session::LEARNING_PAGE;
 use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{
     ArmShares, IntervalLabel, ValidationTerms, Validator, ValidatorConfig,
@@ -30,8 +32,8 @@ use roundhouse_server::Admission;
 
 use crate::common::validate::{AlwaysFires, ON_TRACK, ScriptedJudge, open_trigger};
 use crate::rig::{
-    ApplyScript, Rig, RigConfig, SALT, admission, epoch, fresh_input, large, project,
-    replayed_chain, small, terms, units_over_keys,
+    ApplyScript, Rig, RigConfig, SALT, admission, delivery, fresh_input, large, project,
+    replayed_chain, residuals, terms, units_over_keys,
 };
 
 fn shadow() -> LearnerTerms {
@@ -40,35 +42,6 @@ fn shadow() -> LearnerTerms {
 
 fn admission_with_default_timeouts(project: &str) -> Admission {
     admission(project, Some(shadow()))
-}
-
-/// `large`'s residual sample count in `project`: one per turn entry applied.
-async fn residuals(rig: &Rig, project_name: &str) -> u64 {
-    let request = ReadRequest::new(
-        project(project_name),
-        epoch(),
-        &fresh_input(),
-        &shadow().strategies,
-        [&large(), &small()],
-    );
-    let view = rig
-        .learner
-        .inner
-        .read(&request)
-        .await
-        .expect("a memory read");
-    view.target(&large()).map_or(0, |ops| ops.latency.n)
-}
-
-fn delivery(rig: &Rig) -> roundhouse_core::metrics::LearningDeliveryMetrics {
-    let config =
-        roundhouse_core::metrics::MetricsConfig::new(crate::rig::catalog().shadow_pricing());
-    rig.engine
-        .metrics()
-        .snapshot(&config, 0)
-        .learning
-        .delivery
-        .expect("the deployment scope carries delivery")
 }
 
 /// One read in `plan`, and in the tail one apply, one mark clear and one
@@ -256,13 +229,10 @@ async fn a_refused_ack_then_a_new_entry_applies_only_the_new_entry() {
 async fn an_apply_timeout_then_retry_applies_each_entry_once() {
     let rig = Rig::new(RigConfig::default());
     let session = SessionId::new("stall/ada/s");
-    let admission = admission(
-        "stall",
-        Some(LearnerTerms {
-            apply_timeout_ms: 50,
-            ..shadow()
-        }),
-    );
+    let admission = Admission {
+        learner_apply_timeout_ms: Some(50),
+        ..admission("stall", Some(shadow()))
+    };
     rig.learner
         .script(ApplyScript::LandThenStall(Duration::from_millis(600)));
     rig.turn(&session, "t1", &admission).await.expect("served");
@@ -423,7 +393,10 @@ async fn a_chain_diverged_apply_leaves_the_entries_pending_records_the_stop_and_
         }));
     rig.turn(&session, "t1", &admission).await.expect("served");
     assert_eq!(rig.learner.applies(), 1);
+    // Two more turns: a stop that is spent by the first check after it would
+    // let the third call the store again.
     rig.turn(&session, "t2", &admission).await.expect("served");
+    rig.turn(&session, "t3", &admission).await.expect("served");
     assert_eq!(
         rig.learner.applies(),
         1,
@@ -484,6 +457,172 @@ async fn a_gap_is_backfilled_once_and_applied_in_the_same_tail() {
         "t1, then t2's gap, then the backfilled page"
     );
     assert_eq!(rig.acknowledged(&session).await.len(), 2);
+}
+
+/// A page that ran dry is refilled from the hint, and the refilled page can
+/// still meet a gap when the store lost what it acknowledged. The refill does
+/// not spend the gap's backfill: each tail refills once and backfills the
+/// gap once, so the gap closes in the same tail.
+#[tokio::test]
+async fn a_gap_after_a_dry_page_refill_is_backfilled_in_the_same_tail() {
+    let rig = Rig::new(RigConfig::default());
+    let session = SessionId::new("dry/ada/s");
+    let admission = admission("dry", Some(shadow()));
+    // `LEARNING_PAGE + 1` turns whose deliveries all fail: the page holds
+    // `LEARNING_PAGE` entries, and one more is owed beyond it.
+    let backlog = LEARNING_PAGE + 1;
+    for _ in 0..backlog {
+        rig.learner
+            .script(ApplyScript::Refuse(LearnerError::Unavailable(
+                "down".into(),
+            )));
+    }
+    for turn in 0..backlog {
+        rig.turn(&session, &format!("b{turn}"), &admission)
+            .await
+            .expect("served");
+    }
+    assert_eq!(residuals(&rig, "dry").await, 0);
+    // One tail delivers the full page and acknowledges it. The live page is
+    // now dry, with this turn's entry and the one beyond it still owed.
+    rig.turn(&session, "fill", &admission)
+        .await
+        .expect("served");
+    assert_eq!(residuals(&rig, "dry").await, LEARNING_PAGE as u64);
+    // The learner store loses the project.
+    rig.learner.inner.restore(&project("dry"), None).await;
+
+    rig.turn(&session, "a", &admission).await.expect("served");
+    rig.turn(&session, "b", &admission).await.expect("served");
+    let entries = (backlog + 3) as u64;
+    assert_eq!(
+        residuals(&rig, "dry").await,
+        entries,
+        "every entry, once each"
+    );
+    let delivery = delivery(&rig);
+    assert_eq!(
+        (delivery.gaps, delivery.backfills),
+        (1, 3),
+        "a: a refill, the gap and its backfill; b: a refill"
+    );
+}
+
+/// At most one gap backfill per tail: a store that answers the backfilled
+/// page with another gap is not asked again in that tail, and the entries
+/// wait for the next one.
+#[tokio::test]
+async fn a_second_gap_in_one_tail_is_not_backfilled_again() {
+    let rig = Rig::new(RigConfig::default());
+    let session = SessionId::new("gaps/ada/s");
+    let admission = admission("gaps", Some(shadow()));
+    for _ in 0..2 {
+        rig.learner
+            .script(ApplyScript::Refuse(LearnerError::ChainGap {
+                store_watermark: 0,
+            }));
+    }
+    rig.turn(&session, "t1", &admission).await.expect("served");
+    assert_eq!(
+        rig.learner.applies(),
+        2,
+        "the page, then the backfilled page, and no third"
+    );
+    let delivery = delivery(&rig);
+    assert_eq!((delivery.gaps, delivery.backfills), (2, 1));
+    assert_eq!(residuals(&rig, "gaps").await, 0);
+    assert!(rig.acknowledged(&session).await.is_empty());
+    // Control: the next tail delivers both entries.
+    rig.turn(&session, "t2", &admission).await.expect("served");
+    assert_eq!(residuals(&rig, "gaps").await, 2);
+}
+
+/// A session with learned history whose delivery failed, left owing one
+/// entry.
+async fn owing(rig: &Rig, session: &SessionId, project_name: &str) {
+    rig.learner
+        .script(ApplyScript::Refuse(LearnerError::Unavailable(
+            "down".into(),
+        )));
+    rig.turn(session, "t1", &admission(project_name, Some(shadow())))
+        .await
+        .expect("served");
+    assert!(rig.acknowledged(session).await.is_empty());
+}
+
+/// A session whose project writes no learner block any more still delivers,
+/// under `UNCONFIGURED_APPLY_TIMEOUT_MS`: long enough for an apply that
+/// answers in tens of milliseconds, and not forever. The stalls are literals,
+/// so a change to the constant cannot move both sides of the test.
+#[tokio::test]
+async fn a_session_without_a_learner_block_delivers_under_the_unconfigured_timeout() {
+    let rig = Rig::new(RigConfig::default());
+    let quick = SessionId::new("bare/ada/quick");
+    let slow = SessionId::new("bare/ada/slow");
+    owing(&rig, &quick, "bare").await;
+    owing(&rig, &slow, "bare").await;
+    let bare = admission("bare", None);
+    assert_eq!(bare.learner_apply_timeout_ms, None);
+
+    rig.learner
+        .script(ApplyScript::LandThenStall(Duration::from_millis(40)));
+    rig.turn(&quick, "t2", &bare).await.expect("served");
+    assert_eq!(
+        rig.acknowledged(&quick).await.len(),
+        1,
+        "an apply that answers in 40 ms is acknowledged"
+    );
+    assert_eq!(delivery(&rig).timed_out, 0);
+
+    rig.learner
+        .script(ApplyScript::LandThenStall(Duration::from_millis(1_500)));
+    rig.turn(&slow, "t2", &bare).await.expect("served");
+    assert!(
+        rig.acknowledged(&slow).await.is_empty(),
+        "an apply that answers after 1.5 s is left pending"
+    );
+    assert_eq!(delivery(&rig).timed_out, 1);
+}
+
+/// An `off` block's written apply timeout is the one its sessions deliver
+/// under: an apply that answers in 600 ms lands under a written 2 s, where
+/// the unconfigured timeout would have given up.
+#[tokio::test]
+async fn an_off_block_delivers_under_its_written_apply_timeout() {
+    let rig = Rig::new(RigConfig::default());
+    let session = SessionId::new("quiet/ada/s");
+    owing(&rig, &session, "quiet").await;
+    // What an `off` block that writes `apply_timeout_ms` resolves to.
+    let off = Admission {
+        learner_apply_timeout_ms: Some(2_000),
+        ..admission("quiet", None)
+    };
+    rig.learner
+        .script(ApplyScript::LandThenStall(Duration::from_millis(600)));
+    rig.turn(&session, "t2", &off).await.expect("served");
+    assert_eq!(rig.acknowledged(&session).await.len(), 1);
+    assert_eq!(delivery(&rig).timed_out, 0);
+}
+
+/// `TurnResult.last_seq` is the session's sequence after the tail's
+/// `LearningApplied` append: the cursor a client resumes from covers the
+/// whole turn.
+#[tokio::test]
+async fn a_learner_turns_last_seq_includes_its_acknowledgement() {
+    let rig = Rig::new(RigConfig::default());
+    let session = SessionId::new("cursor/ada/s");
+    let result = rig
+        .turn(&session, "t1", &admission("cursor", Some(shadow())))
+        .await
+        .expect("served");
+    let events = rig.events(&session).await;
+    let last = events.last().expect("a log");
+    assert!(
+        matches!(last.kind, SessionEventKind::LearningApplied { .. }),
+        "the acknowledgement is the turn's last event: {:?}",
+        last.kind
+    );
+    assert_eq!(result.last_seq, last.seq);
 }
 
 /// `refuse` fails a live turn on a store outage; `serve_rules` serves it.

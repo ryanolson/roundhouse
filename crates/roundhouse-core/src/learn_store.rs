@@ -283,8 +283,10 @@ pub struct Applied {
 /// `ChainGap` asks for a backfill. `ChainDiverged` does not go away on a
 /// retry or a backfill: the engine stops delivery for that one session and
 /// reports it, and the project's other sessions carry on. `CounterRange` and
-/// `Malformed` do not go away on a retry either: the engine stops updates for
-/// the project epoch and a new epoch is the recovery (draft section 11.3).
+/// `Malformed` do not go away on a retry either, nor under a new epoch: the
+/// refused entry stays in its session's page under the epoch it was written
+/// in, so the engine stops that session's delivery the same way (M8 review
+/// ruling, which supersedes the draft's project-epoch stop, section 11.3).
 /// `Unavailable` leaves the result unknown, and a resend is safe under the
 /// identity rule. `WrongType` leaves the entries pending, like `Unavailable`:
 /// the foreign key is an operator's to remove, and the source marks keep the

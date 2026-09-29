@@ -21,11 +21,10 @@
 //! Counting causes here would need a second spelling of that rule, and two
 //! spellings drift.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use crate::control::{PrincipalKey, ProjectId};
-use crate::ids::{ResponseId, SessionId};
 use crate::metrics::fold::Scope;
 use crate::routing::learn::{
     ActiveMode, LearnedChoice, LearnedEvidence, ReadFailure, StoreRead, Strategy, Unmet,
@@ -111,21 +110,26 @@ impl LearningCounts {
 #[derive(Default)]
 pub(super) struct LearningFold {
     by_principal: BTreeMap<PrincipalKey, LearningCounts>,
-    /// Each learned session's latest counted response. A failover writes one
-    /// `Routed` per dispatch with the same selection, and the decision was
-    /// taken once, so only the first `Routed` of a response counts. Holds only
-    /// sessions that ever had a learned decision.
-    counted: HashMap<SessionId, ResponseId>,
 }
 
 impl LearningFold {
+    /// Count a learned decision off its `Routed`.
+    ///
+    /// `failover` is whether this `Routed` is a later dispatch of a response
+    /// the fold already saw routed. A failover writes one `Routed` per
+    /// dispatch with the same selection, and the decision was taken once, so
+    /// only the first counts. The caller already holds that answer (its
+    /// pending response table), so the fold keeps no map of its own that
+    /// would grow with every learned session.
     pub(super) fn routed(
         &mut self,
-        session: &SessionId,
         payer: &PrincipalKey,
-        response_id: &ResponseId,
+        failover: bool,
         decision: &DecisionRecord,
     ) {
+        if failover {
+            return;
+        }
         let Some(SelectorBranch::Learned(evidence)) = decision
             .selection
             .as_deref()
@@ -134,13 +138,6 @@ impl LearningFold {
         else {
             return;
         };
-        match self.counted.get_mut(session) {
-            Some(latest) if latest == response_id => return,
-            Some(latest) => latest.clone_from(response_id),
-            None => {
-                self.counted.insert(session.clone(), response_id.clone());
-            }
-        }
         self.by_principal
             .entry(payer.clone())
             .or_default()
@@ -179,7 +176,7 @@ pub enum DeliveryOutcome {
     /// delivery stopped.
     Diverged,
     /// The store refused the batch with `CounterRange` or `Malformed`; the
-    /// project epoch's delivery stopped.
+    /// session's delivery stopped.
     Stopped,
     /// The store did not answer, or answered `WrongType`; the entries stay
     /// pending.

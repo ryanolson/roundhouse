@@ -736,8 +736,10 @@ impl MetricsFold {
                 }
                 self.agreement
                     .routed(&event.session_id, response_id, decision);
+                // A response already pending is a failover's later dispatch:
+                // the learned decision was taken once.
                 self.learning
-                    .routed(&event.session_id, &payer, response_id, decision);
+                    .routed(&payer, self.pending.contains_key(response_id), decision);
                 self.pending.insert(
                     response_id.clone(),
                     Pending {

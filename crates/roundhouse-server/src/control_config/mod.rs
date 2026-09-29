@@ -1299,6 +1299,15 @@ pub struct Admission {
     ///
     /// Behind an `Arc` for the reason `policy` is.
     pub learner: Option<Arc<LearnerTerms>>,
+    /// The `apply_timeout_ms` this project's learner block wrote, in any
+    /// mode, or `None` where it wrote none.
+    ///
+    /// **Beside `learner`, not inside it**, because delivery follows the log:
+    /// a session of a project now `off` still owes the store its entries,
+    /// and an `off` block resolves `learner` to `None`. Required in `shadow`
+    /// and `live`, so there it is always `Some`. Where it is `None`, delivery
+    /// waits `UNCONFIGURED_APPLY_TIMEOUT_MS` (`engine::learning`).
+    pub learner_apply_timeout_ms: Option<u64>,
 }
 
 impl Admission {
@@ -1342,6 +1351,7 @@ impl Admission {
             tiers: None,
             // No recipe, so no learner: a strategy is a tier pick.
             learner: None,
+            learner_apply_timeout_ms: None,
         }
     }
 
@@ -1397,6 +1407,7 @@ impl Admission {
             tiers: self.tiers.clone(),
             // Nor the learner, for the recipe's reason.
             learner: self.learner.clone(),
+            learner_apply_timeout_ms: self.learner_apply_timeout_ms,
         }
     }
 }

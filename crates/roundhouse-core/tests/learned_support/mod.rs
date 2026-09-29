@@ -167,7 +167,6 @@ pub fn terms(mode: LearnerMode) -> LearnerTerms {
         on_infeasible: OnInfeasible::default(),
         exploration: None,
         read_timeout_ms: 25,
-        apply_timeout_ms: 250,
     }
 }
 

@@ -2474,29 +2474,17 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // The learner, for a project whose learner is `shadow` or `live` on an
         // engine that has one; today's policy for everything else. See
         // `engine::learning` for why an `off` project never reads the store.
-        let chosen = match self.learning_for(admission) {
-            Some((learner, terms, mode)) => {
-                self.bounded(
-                    deadline_at,
-                    self.choose_learned(
-                        learner,
-                        &ctx,
-                        learning::LearnedTurnInputs {
-                            terms,
-                            mode,
-                            project: &admission.principal.project,
-                            response_id,
-                            arm: session.state().arm(),
-                            tool_turn: declarations.declares_tools(),
-                            window: classifications.as_ref(),
-                            available: session.state().classifications(),
-                        },
-                    ),
-                )
-                .await
-            }
-            None => self.bounded(deadline_at, self.policy.choose(&ctx)).await,
-        };
+        let chosen = self
+            .choose_route(
+                &ctx,
+                admission,
+                session,
+                response_id,
+                declarations,
+                classifications.as_ref(),
+                deadline_at,
+            )
+            .await;
         let decision = chosen
             // **The other half of F2, and the one that reads wrong without
             // this.** With local excluded above, an exhausted budget leaves a

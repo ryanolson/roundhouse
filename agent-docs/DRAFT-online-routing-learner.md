@@ -423,6 +423,8 @@ An atomic operation and an unchanged state after a failure are two different cla
 
 A `CounterRange`, `Malformed`, or `WrongType` error does not go away with a retry. The engine stops updates for that project epoch, logs an error, and counts it in metrics. The recovery is a new epoch.
 
+**Addendum, 2026-09-29.** Superseded by the plan's M8 review fixes (`PLAN-online-routing-learner.md` section 9). `CounterRange` and `Malformed` stop the delivery of the one session whose page holds the refused entry. A new epoch does not help, because the entry stays in its session's page under the epoch it was written in. `WrongType` leaves the entries pending.
+
 ### 11.4 Redis layout
 
 A new `KeyFamily::Learn` with name `learn` and version `v1` joins `KeyFamily::ALL`. All keys go through `build_key`, and the key-convention test covers them:
@@ -479,7 +481,7 @@ A learner turn makes one learner-store read in `plan`. When entries are pending,
 | Overlapping requests from two nodes, or from the recovery task | Each entry applies once, in any order |
 | A successor opens the session | It replays the log. A stale hint only causes skipped resends. |
 | The store lost recent writes | `ChainGap` returns the store watermark. Backfill from it restores counters from the durable source events. |
-| A batch puts a counter out of range | Refused with no change. Updates for the epoch stop and are reported. |
+| A batch puts a counter out of range | Refused with no change. Updates for the epoch stop and are reported. (2026-09-29: that session's delivery stops instead; see the addendum in section 11.3.) |
 | A key has the wrong type | Refused before any write |
 | Failure before the first apply | The append of the first entry-producing event marked the session in the source store. The recovery task finds it after it goes idle. |
 | Every learner-store call of a session failed, and it never runs again | The source marks stay. The recovery task finds the session from the source index and delivers its entries when the learner store returns. |
@@ -668,6 +670,8 @@ The artifact is JSON with these fields:
 - the ordered strategy list,
 - prior units for each level key and strategy,
 - the manifest digest and the source commit.
+
+**Addendum, 2026-09-29.** The artifact also names `stage_revision`, and the parser refuses a value other than this build's `STAGE_SELECTOR_REVISION`. That revision versions the `rules` pick that every learned key embeds, and the epoch id already hashes it (plan section 9, M8 review fixes).
 
 The artifact contains no wall-clock time. The same manifest, the same configuration, and the same source commit give byte-identical artifact bytes. A sidecar file `<artifact>.meta.json` holds the creation time and the host. The epoch id hashes the artifact bytes and never the sidecar. The calibrator can also write an artifact with zero prior units, which a new project uses to start.
 
