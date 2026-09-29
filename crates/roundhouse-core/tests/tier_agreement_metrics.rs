@@ -24,6 +24,10 @@ use roundhouse_core::metrics::{
     MetricsConfig, MetricsFold, MetricsRecorder, MetricsSnapshot, Scope, ShadowPricing,
     TierAgreement, TierDisagreements,
 };
+use roundhouse_core::routing::learn::{
+    ActiveMode, Band, EpochId, LEARNING_CREDIT_REVISION, LEARNING_INPUT_REVISION, LearnedChoice,
+    LearnedEvidence, LearnedInput, PriorBand, ReadFailure, RecipeEvidence, StoreRead, Unmet,
+};
 use roundhouse_core::routing::{
     DecisionRecord, DecisionSource, LocalFeatures, Pick, PickerMode, ProviderPricing,
     SelectionSnapshot, SelectorSnapshot, StageEvidence, StageOutcome, Target, Tier, TurnSignals,
@@ -493,6 +497,63 @@ fn a_cost_guarded_turn_compares_the_served_tier_not_the_pick() {
     assert_eq!(agreement.disagree, 1, "{agreement:?}");
     assert_eq!(
         agreement.disagreements.jev_capable_served_efficient, 1,
+        "{agreement:?}"
+    );
+    assert_partitions(&agreement);
+}
+
+/// A learned decision that served `chosen`, under the same recipe as
+/// [`evidence`]. Only the recipe decides the served tier; the rest is the
+/// smallest record a learned turn can write.
+fn learned(chosen: Target) -> DecisionRecord {
+    let evidence = LearnedEvidence {
+        mode: ActiveMode::Live,
+        epoch: EpochId::new([7; 16]),
+        input_revision: LEARNING_INPUT_REVISION,
+        credit_revision: LEARNING_CREDIT_REVISION,
+        input: LearnedInput {
+            rules_pick: Tier::Capable,
+            newest: Band::None,
+            prior: PriorBand::Absent,
+            tool_turn: false,
+        },
+        view: StoreRead::Unavailable {
+            reason: ReadFailure::ReadTimedOut,
+        },
+        recipe: RecipeEvidence {
+            capable: vec!["anthropic/opus".into()],
+            efficient: vec!["anthropic/haiku".into(), "local/qwen".into()],
+            picker: PickerMode::EfficientFirst,
+            confidence_threshold: 0.5,
+        },
+        plans: Vec::new(),
+        choice: LearnedChoice::ConstraintUnmet {
+            unmet: vec![Unmet::ReadTimedOut],
+        },
+        exploration: None,
+        propensity: 1.0,
+    };
+    decision(chosen, Some(SelectorSnapshot::learned(evidence)))
+}
+
+/// **A learned turn is compared by the tier its recipe names for the served
+/// target**, the same rule as a stage turn. Read as "no tier recipe made
+/// this", every learned turn would drop out as not comparable, and the
+/// agreement report would go blind the day a project enables the learner.
+#[test]
+fn a_learned_turn_compares_the_recipe_tier_of_the_served_target() {
+    let mut log = Log::new("s-learned", Principal::new("acme", "ada"));
+    let agree = log.turn(vec![learned(frontier(EFFICIENT))]);
+    log.classified(&agree, TierChoice::Efficient);
+    let disagree = log.turn(vec![learned(frontier(CAPABLE))]);
+    log.classified(&disagree, TierChoice::Efficient);
+
+    let agreement = deployment(&recorder(&[&log]));
+    assert_eq!(agreement.answered, 2, "{agreement:?}");
+    assert_eq!(agreement.not_comparable, 0, "{agreement:?}");
+    assert_eq!(agreement.agree, 1, "{agreement:?}");
+    assert_eq!(
+        agreement.disagreements.jev_efficient_served_capable, 1,
         "{agreement:?}"
     );
     assert_partitions(&agreement);

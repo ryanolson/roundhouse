@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::learn::LearnedEvidence;
 use super::stage::{DecisionSource, Pick, PickerMode, Tier, TierRecipe, TurnSignals};
 use super::{Decision, Target};
 use crate::classify::ClassificationWindow;
@@ -38,6 +39,13 @@ pub const ESCALATION_AUDIT_SELECTOR_REVISION: u32 = 1;
 
 /// The revision of [`StagePolicy`](super::StagePolicy)'s tier selection.
 pub const STAGE_SELECTOR_REVISION: u32 = 1;
+
+/// The revision of the learned selector: the gate, the constraints, the
+/// exploration rule and the choice among passing strategies.
+///
+/// Part of the epoch id, like the input and credit revisions in
+/// [`learn`](super::learn).
+pub const LEARNED_SELECTOR_REVISION: u32 = 1;
 
 /// What the extractor computed for this turn, and where in the log it read to.
 ///
@@ -118,6 +126,54 @@ pub enum StageOutcome {
     DegradedPastRecipe { degraded_to: String },
 }
 
+impl StageOutcome {
+    /// The [`DecisionSource`] this outcome implies for `pick`.
+    ///
+    /// The one home for the rule, shared by [`StageEvidence::source`] and by a
+    /// learned decision's served plan, so the two cannot come to disagree about
+    /// which turns narrate. A cost guard moved the decision off the pick, so it
+    /// names itself; a recipe degrade served no tier at all, so it names none;
+    /// a signal that picked the cheap tier and found it empty did not pick the
+    /// capable tier that served, so it is the fall-open
+    /// [`DecisionSource::Ambiguous`] names; every other arm is exactly what the
+    /// pick said.
+    ///
+    /// The fallthrough arm matters because the handoff note gates on this
+    /// value. Carried through, a `Dimensions` de-escalation would have the
+    /// note tell the capable model the previous steps were in trouble when
+    /// the signals said the opposite — the same reason `CostGuard` is not
+    /// signal-driven.
+    pub fn source(&self, pick: &Pick) -> Option<DecisionSource> {
+        match self {
+            StageOutcome::CostGuard { .. } => Some(DecisionSource::CostGuard),
+            StageOutcome::DegradedPastRecipe { .. } => None,
+            StageOutcome::PickedTierEmpty {
+                served: Tier::Capable,
+            } if pick.source.is_signal_driven() => Some(DecisionSource::Ambiguous),
+            StageOutcome::Served { .. } | StageOutcome::PickedTierEmpty { .. } => Some(pick.source),
+        }
+    }
+}
+
+/// The recipe tier whose list names `target`, or `None` when neither does.
+///
+/// Shared by [`StageEvidence::tier_of`] and the learned evidence's recipe, so
+/// both read a dispatched target's tier by one rule.
+pub(crate) fn tier_named_by(
+    capable: &[String],
+    efficient: &[String],
+    target: &Target,
+) -> Option<Tier> {
+    let identity = target.policy_identity();
+    if capable.contains(&identity) {
+        Some(Tier::Capable)
+    } else if efficient.contains(&identity) {
+        Some(Tier::Efficient)
+    } else {
+        None
+    }
+}
+
 /// The recipe a staged decision ran under, and what the scorer answered.
 ///
 /// **Full typed configuration rather than a digest.** A digest tells a reader
@@ -146,7 +202,7 @@ impl StageEvidence {
     /// actually did.
     ///
     /// One constructor rather than the two hand-written literals it replaces
-    /// (`StagePolicy::choose` and `StagePolicy::degrade_past_the_recipe` each
+    /// (`StagePolicy::route_pick` and `StagePolicy::degrade_past_the_recipe` each
     /// wrote out all four recipe-derived fields by hand): a field added to
     /// that half needs one edit instead of two that have to agree.
     pub fn new(recipe: &TierRecipe, pick: Pick, outcome: StageOutcome) -> Self {
@@ -162,32 +218,12 @@ impl StageEvidence {
 
     /// The [`DecisionSource`] this evidence implies.
     ///
-    /// The one home for the rule, so a [`Decision`](super::Decision)'s own
-    /// `source` is *derived* from the evidence recorded beside it rather than
+    /// **Derived, never stored.** A [`Decision`](super::Decision)'s own
+    /// `source` is read from the evidence recorded beside it rather than
     /// computed a second time by the caller and carried next to it hoping the
-    /// two agree. A cost guard moved the decision off the scorer's own
-    /// answer, so it names itself; a recipe degrade served no tier at all, so
-    /// it names none; a signal that picked the cheap tier and found it empty
-    /// did not pick the capable tier that served, so it is the fall-open
-    /// [`DecisionSource::Ambiguous`] names; every other arm is exactly what
-    /// the scorer picked.
-    ///
-    /// The fallthrough arm matters because the handoff note gates on this
-    /// value. Carried through, a `Dimensions` de-escalation would have the
-    /// note tell the capable model the previous steps were in trouble when
-    /// the signals said the opposite — the same reason `CostGuard` is not
-    /// signal-driven.
+    /// two agree. The rule itself is [`StageOutcome::source`].
     pub fn source(&self) -> Option<DecisionSource> {
-        match self.outcome {
-            StageOutcome::CostGuard { .. } => Some(DecisionSource::CostGuard),
-            StageOutcome::DegradedPastRecipe { .. } => None,
-            StageOutcome::PickedTierEmpty {
-                served: Tier::Capable,
-            } if self.pick.source.is_signal_driven() => Some(DecisionSource::Ambiguous),
-            StageOutcome::Served { .. } | StageOutcome::PickedTierEmpty { .. } => {
-                Some(self.pick.source)
-            }
-        }
+        self.outcome.source(&self.pick)
     }
 
     /// The recipe tier that names `target`, or `None` when neither list does.
@@ -200,14 +236,7 @@ impl StageEvidence {
     /// says which tier served. `None` is a recipe degrade to a local worker the
     /// recipe does not name.
     pub fn tier_of(&self, target: &Target) -> Option<Tier> {
-        let identity = target.policy_identity();
-        if self.capable.contains(&identity) {
-            Some(Tier::Capable)
-        } else if self.efficient.contains(&identity) {
-            Some(Tier::Efficient)
-        } else {
-            None
-        }
+        tier_named_by(&self.capable, &self.efficient, target)
     }
 }
 
@@ -248,6 +277,14 @@ pub enum SelectorBranch {
         audit_every: u64,
     },
     Stage(StageEvidence),
+    /// A learned decision: every strategy's plan, the counts it read, and what
+    /// it chose. Written only by a project whose learner is not `off`.
+    ///
+    /// **Boxed**, because the evidence carries every plan and the store view,
+    /// and the branch is moved with every selection snapshot: inline it would
+    /// widen the other three arms by its own size. The box keeps
+    /// `SelectorBranch` exactly as wide as it was without this arm.
+    Learned(Box<LearnedEvidence>),
 }
 
 impl SelectorSnapshot {
@@ -270,6 +307,13 @@ impl SelectorSnapshot {
         Self {
             algorithm_revision: STAGE_SELECTOR_REVISION,
             branch: SelectorBranch::Stage(evidence),
+        }
+    }
+
+    pub fn learned(evidence: LearnedEvidence) -> Self {
+        Self {
+            algorithm_revision: LEARNED_SELECTOR_REVISION,
+            branch: SelectorBranch::Learned(Box::new(evidence)),
         }
     }
 }
@@ -360,13 +404,19 @@ impl SelectionSnapshot {
 
     /// The [`DecisionSource`] the selection ran under, read off the same
     /// evidence [`Self::selector`] already carries rather than kept as a
-    /// second copy: a stage decision's source is [`StageEvidence::source`],
-    /// and every other branch -- affinity, the escalation audit, and an
-    /// unknown policy's `None` -- has no source to state.
+    /// second copy: a stage decision's source is [`StageEvidence::source`], a
+    /// learned decision's is its served plan's
+    /// ([`LearnedEvidence::source`]), and every other branch -- affinity, the
+    /// escalation audit, and an unknown policy's `None` -- has no source to
+    /// state.
     pub fn source(&self) -> Option<DecisionSource> {
         match &self.selector {
             Some(SelectorSnapshot {
                 branch: SelectorBranch::Stage(evidence),
+                ..
+            }) => evidence.source(),
+            Some(SelectorSnapshot {
+                branch: SelectorBranch::Learned(evidence),
                 ..
             }) => evidence.source(),
             _ => None,

@@ -336,6 +336,9 @@ fn served_tier(decision: &DecisionRecord) -> Option<Tier> {
     let selector = decision.selection.as_ref()?.selector.as_ref()?;
     match &selector.branch {
         SelectorBranch::Stage(evidence) => evidence.tier_of(&decision.chosen),
+        // The same recipe lists, held once for every plan: a learned turn
+        // served a target the recipe names, and its tier is read the same way.
+        SelectorBranch::Learned(evidence) => evidence.tier_of(&decision.chosen),
         SelectorBranch::Affinity(_) | SelectorBranch::EscalationAudit { .. } => None,
     }
 }

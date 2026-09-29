@@ -17,7 +17,7 @@
 //! the expensive failure of this surface is a note riding a turn that did not
 //! earn one.
 //!
-//! Seven ways a turn can *look* like a tier escalation without being one, one
+//! Eight ways a turn can *look* like a tier escalation without being one, one
 //! test each:
 //!
 //! | Case | What blocks the note | The check doing the blocking |
@@ -29,6 +29,7 @@
 //! | no note configured | this deployment did not opt in | the config read |
 //! | no recipe on the project | there is no tier to have moved between | the `ctx.tiers` read |
 //! | cost-guarded de-escalation | a price is not a signal | `DecisionSource::is_signal_driven`'s exclusion of `CostGuard` |
+//! | a learned strategy forced the capable tier | a strategy is not a signal | `DecisionSource::is_signal_driven`'s exclusion of `Strategy` |
 //!
 //! And one way it can look like *not* one while being one: a failover inside
 //! the escalating turn, which is the case the gate's placement above the
@@ -44,8 +45,11 @@ use roundhouse_core::control::{TargetFilter, TurnPolicy};
 use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent, Role};
+use roundhouse_core::routing::learn::Strategy;
+use roundhouse_core::routing::stage::pick_tier;
 use roundhouse_core::routing::{
-    AffinityPolicy, DecisionSource, ProviderPricing, StagePolicy, Target, TierRecipe,
+    AffinityPolicy, Decision, DecisionSource, Pick, ProviderPricing, RoutingContext, RoutingError,
+    RoutingPolicy, StagePolicy, Target, Tier, TierRecipe,
 };
 use roundhouse_core::routing::{PickerMode, stage::DEFAULT_CONFIDENCE_THRESHOLD};
 use roundhouse_core::store::{MemoryStore, SessionStore};
@@ -249,6 +253,20 @@ struct Rig {
 /// [`rig_of`]'s engine wiring, parameterized on the catalog so the cost-guard
 /// case can price its providers for real without a second copy of it.
 fn rig_over(catalog: StaticFrontierCatalog, clients: Vec<(&str, Arc<dyn FrontierClient>)>) -> Rig {
+    rig_routed_by(
+        catalog,
+        Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new()))),
+        clients,
+    )
+}
+
+/// [`rig_over`] with the routing policy as a parameter, for the one case that
+/// routes a forced pick rather than the scorer's.
+fn rig_routed_by(
+    catalog: StaticFrontierCatalog,
+    policy: Arc<dyn RoutingPolicy>,
+    clients: Vec<(&str, Arc<dyn FrontierClient>)>,
+) -> Rig {
     let store = Arc::new(MemoryStore::new());
     let registry = FrontierClients::keyed(
         clients
@@ -262,7 +280,7 @@ fn rig_over(catalog: StaticFrontierCatalog, clients: Vec<(&str, Arc<dyn Frontier
         Arc::new(EchoLocalExecutor::new("local")) as Arc<dyn LocalExecutor>,
         catalog,
         Arc::new(registry),
-        Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new()))),
+        policy,
         EngineConfig {
             turn_deadline_ms: 5_000,
             ..EngineConfig::default()
@@ -873,5 +891,93 @@ async fn a_cost_guarded_turn_narrates_nothing() {
         "a price is not a signal: the guarded turn must carry no handoff note \
          either, the same promise `DecisionSource::is_signal_driven` makes by \
          excluding `CostGuard` from its set"
+    );
+}
+
+/// Routes every turn to the capable tier through `StagePolicy::route_pick`, the
+/// way a learned `capable` strategy does, stamping the pick with `source`.
+struct ForcedCapable {
+    /// `None` is the learned strategy's own pick; `Some` stamps the forced pick
+    /// with that source instead, for the control.
+    stamp: Option<DecisionSource>,
+}
+
+#[async_trait]
+impl RoutingPolicy for ForcedCapable {
+    fn name(&self) -> &str {
+        "forced_capable"
+    }
+
+    fn reads_tier_recipes(&self) -> bool {
+        true
+    }
+
+    async fn choose(&self, ctx: &RoutingContext<'_>) -> Result<Decision, RoutingError> {
+        let recipe = ctx.tiers.expect("the narrating admission carries a recipe");
+        let admitted = ctx.admissible(None)?;
+        let rules = pick_tier(
+            &ctx.signals.cloned().unwrap_or_default(),
+            recipe.picker(),
+            recipe.confidence_threshold(),
+        );
+        match self.stamp {
+            None => Strategy::Capable.plan(recipe, rules, &admitted),
+            Some(source) => StagePolicy::route_pick(
+                recipe,
+                Pick {
+                    tier: Tier::Capable,
+                    source,
+                    score: 0.0,
+                    confidence: None,
+                },
+                &admitted,
+            ),
+        }
+    }
+}
+
+/// **A learned strategy that forces the capable tier is not a signal.** On a
+/// turn where nothing said the cheap tier was in trouble, the `capable`
+/// strategy serves alpha and the request alpha receives carries no note.
+///
+/// The control routes the identical forced pick through the identical code,
+/// stamped `Override`, and the note rides: the rig can narrate a forced pick,
+/// so its silence under the strategy's own source is the source's doing.
+#[tokio::test]
+async fn a_forced_capable_pick_does_not_open_a_handoff_note() {
+    async fn run(stamp: Option<DecisionSource>) -> (String, Option<DecisionSource>) {
+        let alpha = Recording::answering();
+        let rig = rig_routed_by(
+            catalog(),
+            Arc::new(ForcedCapable { stamp }),
+            vec![
+                (ALPHA, Arc::clone(&alpha) as Arc<dyn FrontierClient>),
+                (BETA, Recording::answering() as Arc<dyn FrontierClient>),
+                (GAMMA, Recording::answering() as Arc<dyn FrontierClient>),
+            ],
+        );
+        // `efficient_first` and a plain question: the scorer would have served
+        // gamma, so reaching alpha is the forced pick's doing alone.
+        let (_, result) = rig
+            .turn(ask(), &narrating(PickerMode::EfficientFirst))
+            .await;
+        let decision = result.decision.expect("a dispatched turn records one");
+        assert_eq!(decision.target, target(ALPHA), "{}", decision.rationale);
+        (alpha.only_prompt("alpha"), decision.source)
+    }
+
+    let (prompt, source) = run(None).await;
+    assert!(
+        !prompt.contains(HANDOFF_MARKER),
+        "a forced capable pick must not tell the capable model the previous \
+         steps were in trouble: {prompt}"
+    );
+    assert_eq!(source, Some(DecisionSource::Strategy));
+
+    let (control, control_source) = run(Some(DecisionSource::Override)).await;
+    assert_eq!(control_source, Some(DecisionSource::Override));
+    assert!(
+        control.ends_with(&note_block()),
+        "the control must narrate, or the silence above proves nothing: {control}"
     );
 }
