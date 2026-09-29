@@ -17,7 +17,9 @@
 //! acknowledgement therefore skips what landed and applies what did not, and a
 //! batch that starts after a missing entry is refused with
 //! [`LearnerError::ChainGap`] rather than moving the watermark past the entry
-//! it never saw. A batch-level comparison fails both ways: it drops the new
+//! it never saw. An entry whose predecessor is below the watermark is refused
+//! with [`LearnerError::ChainDiverged`]: its chain lacks the store's entry, and
+//! no backfill can supply it. A batch-level comparison fails both ways: it drops the new
 //! entries of a resend, or it skips the missing one for good (draft section
 //! 15). The rule does not depend on the session lease, because every node
 //! folds the same entries from the same log.
@@ -49,12 +51,9 @@ pub use memory::MemoryLearnerStore;
 
 /// The largest integer a Lua number holds exactly, `2^53 - 1`.
 ///
-/// The bound on every sequence and every nonnegative counter. The signed sums
-/// are bounded by its negation below.
+/// The bound on every sequence and every nonnegative counter, and on the
+/// magnitude of every signed sum.
 pub const MAX_EXACT: u64 = (1 << 53) - 1;
-
-/// [`MAX_EXACT`] as the bound of a signed sum, `±(2^53 - 1)`.
-pub const MAX_EXACT_SIGNED: i64 = MAX_EXACT as i64;
 
 /// The shared counters of the online routing learner.
 ///
@@ -69,6 +68,10 @@ pub trait LearnerStore: Send + Sync + 'static {
     /// order, with zeros where the store holds nothing. The view is recorded
     /// on every learned `Routed`, so two backends that shaped it differently
     /// would write different logs for the same state.
+    ///
+    /// Fails only with [`LearnerError::Unavailable`] (M7 adds the wrong-type
+    /// refusal, which a read can meet too). The other variants judge a batch,
+    /// and a read carries none.
     async fn read(&self, request: &ReadRequest) -> Result<ReadView, LearnerError>;
 
     /// Apply the entries above the `(project, session)` watermark, all or
@@ -78,7 +81,15 @@ pub trait LearnerStore: Send + Sync + 'static {
     /// them, which is the store's watermark even when nothing applied: a
     /// batch wholly at or below it returns the larger value, and that is what
     /// the caller may confirm to the source index.
-    async fn apply(&self, batch: &LearningBatch) -> Result<Applied, LearnerError>;
+    ///
+    /// The two chain refusals ask for different recoveries.
+    /// [`LearnerError::ChainGap`] means "backfill from this watermark": an
+    /// entry names a predecessor above it, which the store has not seen.
+    /// [`LearnerError::ChainDiverged`] means "stop this session's delivery and
+    /// report; do not backfill": an entry names a predecessor below it, so the
+    /// store holds an entry the sender's chain does not have, and a backfill
+    /// from the watermark would resend the same entry forever.
+    async fn apply(&self, batch: &LearningBatch<'_>) -> Result<Applied, LearnerError>;
 
     /// The `(project, session)` watermark, 0 for a session with no entry
     /// applied. Makes no write.
@@ -157,14 +168,18 @@ impl ReadRequest {
 }
 
 /// The entries of one session for one project, in ascending `seq`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LearningBatch {
-    pub project: ProjectId,
-    pub session: SessionId,
-    pub entries: Vec<LearningEntry>,
+///
+/// **Borrows its entries.** The engine sends the fold's page on every turn
+/// tail that has one; owning the entries would clone that page each time only
+/// for the store to read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LearningBatch<'a> {
+    pub project: &'a ProjectId,
+    pub session: &'a SessionId,
+    pub entries: &'a [LearningEntry],
 }
 
-impl LearningBatch {
+impl LearningBatch<'_> {
     /// The checks that do not depend on stored state, which every backend runs
     /// before it reads anything.
     ///
@@ -174,22 +189,23 @@ impl LearningBatch {
     /// split tells an operator whether the build or the data is at fault.
     ///
     /// Refused: a sequence above [`MAX_EXACT`], sequences that do not ascend
-    /// strictly from 1, a `prev_seq` not below its `seq`, a delta a Lua number
-    /// cannot carry exactly, and a signed sum beyond `±(2^53 - 1)`. A negative
-    /// delta for a nonnegative counter reaches these `u64` fields only by a
-    /// wrapping cast, which puts it far above [`MAX_EXACT`], so it is refused
-    /// by the same check.
+    /// strictly from 1, a `prev_seq` not below its `seq`, a nonnegative delta
+    /// above [`MAX_EXACT`], and a signed delta beyond `±(2^53 - 1)`. A
+    /// negative delta for a nonnegative counter reaches these `u64` fields
+    /// only by a wrapping cast, which puts it far above [`MAX_EXACT`], so it is
+    /// refused by the same check. Each rule is held by a contract case that
+    /// the chain rule alone would answer differently.
     pub fn check(&self) -> Result<(), LearnerError> {
         let mut last = 0;
-        for entry in &self.entries {
+        for entry in self.entries {
             let malformed = |reason: String| LearnerError::Malformed {
                 reason: format!("entry {}: {reason}", entry.seq),
             };
-            if entry.seq > MAX_EXACT || entry.prev_seq > MAX_EXACT {
-                return Err(malformed(format!(
-                    "a sequence above 2^53 - 1 (prev_seq {})",
-                    entry.prev_seq
-                )));
+            // `prev_seq` needs no bound of its own: it must be below `seq`,
+            // which is within the bound, and a second clause here could never
+            // be the one that refuses.
+            if entry.seq > MAX_EXACT {
+                return Err(malformed("a sequence above 2^53 - 1".to_owned()));
             }
             if entry.seq <= last {
                 return Err(malformed(format!(
@@ -260,10 +276,13 @@ pub struct Applied {
 
 /// Why a learner-store call did not succeed.
 ///
-/// `ChainGap` asks for a backfill. `CounterRange` and `Malformed` do not go
-/// away on a retry: the engine stops updates for the project epoch and a new
-/// epoch is the recovery (draft section 11.3). `Unavailable` leaves the
-/// result unknown, and a resend is safe under the identity rule.
+/// `ChainGap` asks for a backfill. `ChainDiverged` does not go away on a
+/// retry or a backfill: the engine stops delivery for that one session and
+/// reports it, and the project's other sessions carry on. `CounterRange` and
+/// `Malformed` do not go away on a retry either: the engine stops updates for
+/// the project epoch and a new epoch is the recovery (draft section 11.3).
+/// `Unavailable` leaves the result unknown, and a resend is safe under the
+/// identity rule.
 ///
 /// A wrong-type refusal joins with the Redis backend (M7), the only backend
 /// that can hold a key of the wrong type.
@@ -274,6 +293,12 @@ pub enum LearnerError {
     /// it to.
     #[error("the batch skips an entry: the store watermark is {store_watermark}")]
     ChainGap { store_watermark: u64 },
+    /// The sender's chain has no entry at the store watermark: an entry above
+    /// it names a predecessor below it. Stop this session's delivery and
+    /// report it; a backfill from `store_watermark` would reproduce the same
+    /// entry. Nothing was written.
+    #[error("the batch's chain diverges from the store at watermark {store_watermark}")]
+    ChainDiverged { store_watermark: u64 },
     /// A counter would leave its range. Nothing was written.
     #[error("counter `{counter}` would leave its range")]
     CounterRange { counter: String },

@@ -14,6 +14,11 @@
 //! | `{project}:{epoch}:ops` | `ProjectState::ops` |
 //! | `{project}:{epoch}:seen:{session}` | `ProjectState::seen` |
 //!
+//! [`key_name`] spells the quality and operations keys after `{project}:`, and
+//! both the test-support visit recorder and the counter a
+//! [`LearnerError::CounterRange`] names use it, so an operator reading a
+//! refusal and a test reading the visits see the key M7 will store.
+//!
 //! **The check phase borrows the state immutably.** `stage` takes
 //! `&ProjectState` and returns every new value; only `Staged::commit` takes
 //! `&mut`. That the check writes nothing is then the borrow checker's claim,
@@ -89,7 +94,11 @@ pub struct MemoryLearnerStore {
 #[derive(Default)]
 struct Probe {
     fail_between_phases: std::sync::atomic::AtomicBool,
-    visited: std::sync::Mutex<Vec<String>>,
+    /// `None` until a test calls
+    /// [`record_visits`](MemoryLearnerStore::record_visits). A dependent that
+    /// enables test support for other reasons reads on every turn, and an
+    /// always-on list would grow with every read for the life of its store.
+    visited: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 impl MemoryLearnerStore {
@@ -97,36 +106,55 @@ impl MemoryLearnerStore {
         Self::default()
     }
 
-    /// Records a key a read visits, spelled as the Redis key parts after the
-    /// project. A no-op outside test support.
-    fn visit(&self, _key: impl FnOnce() -> String) {
+    /// Records a key a read visits, spelled by [`key_name`], when a test has
+    /// armed the recorder. A no-op otherwise, and outside test support.
+    fn visit(&self, _epoch: EpochId, _key: StoreKey) {
         #[cfg(any(test, feature = "test-support"))]
-        self.probe
+        if let Some(visited) = self
+            .probe
             .visited
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(_key());
+            .as_mut()
+        {
+            visited.push(key_name(_epoch, _key));
+        }
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl MemoryLearnerStore {
-    /// Fail the next `apply` after its check phase and before its write phase.
+    /// Fail the next `apply` that reaches its write phase, after the check
+    /// phase passed and before anything is stored.
+    ///
+    /// An apply the check refuses, or one that skips every entry and so has
+    /// nothing to write, leaves the fault armed for the next one.
     pub fn fail_next_apply_between_phases(&self) {
         self.probe
             .fail_between_phases
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// The keys reads visited since the last call, in visit order.
+    /// Start recording the keys reads visit. Until this is called nothing is
+    /// recorded.
+    pub fn record_visits(&self) {
+        *self
+            .probe
+            .visited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Vec::new());
+    }
+
+    /// The keys reads visited since the recorder was armed or last taken, in
+    /// visit order; empty when it was never armed.
     pub fn take_visited(&self) -> Vec<String> {
-        std::mem::take(
-            &mut *self
-                .probe
-                .visited
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        self.probe
+            .visited
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     fn fault_between_phases(&self) -> bool {
@@ -146,7 +174,7 @@ impl LearnerStore for MemoryLearnerStore {
             .keys()
             .iter()
             .map(|key| {
-                self.visit(|| format!("q:{epoch}:{}:{}", key.level().label(), key.part()));
+                self.visit(epoch, StoreKey::Quality(*key));
                 let hash = project.and_then(|project| project.quality.get(&(epoch, *key)));
                 LevelView {
                     key: *key,
@@ -170,7 +198,7 @@ impl LearnerStore for MemoryLearnerStore {
                 }
             })
             .collect();
-        self.visit(|| format!("ops:{epoch}"));
+        self.visit(epoch, StoreKey::Ops);
         let ops = project.and_then(|project| project.ops.get(&epoch));
         let targets = request
             .targets()
@@ -195,24 +223,24 @@ impl LearnerStore for MemoryLearnerStore {
         })
     }
 
-    async fn apply(&self, batch: &LearningBatch) -> Result<Applied, LearnerError> {
+    async fn apply(&self, batch: &LearningBatch<'_>) -> Result<Applied, LearnerError> {
         batch.check()?;
         let mut state = self.state.write().await;
-        let staged = stage(state.get(&batch.project), batch)?;
-        #[cfg(any(test, feature = "test-support"))]
-        if self.fault_between_phases() {
-            return Err(LearnerError::Unavailable(
-                "injected fault between the check and the write".to_owned(),
-            ));
-        }
+        let staged = stage(state.get(batch.project), batch)?;
         let applied = Applied {
             applied: staged.applied,
             watermark: staged.watermark,
         };
         if staged.applied > 0 {
+            #[cfg(any(test, feature = "test-support"))]
+            if self.fault_between_phases() {
+                return Err(LearnerError::Unavailable(
+                    "injected fault between the check and the write".to_owned(),
+                ));
+            }
             staged.commit(
                 state.entry(batch.project.clone()).or_default(),
-                &batch.session,
+                batch.session,
             );
         }
         Ok(applied)
@@ -229,6 +257,22 @@ impl LearnerStore for MemoryLearnerStore {
             .and_then(|project| project.watermarks.get(session))
             .copied()
             .unwrap_or(0))
+    }
+}
+
+/// A quality or operations key of one epoch.
+#[derive(Debug, Clone, Copy)]
+enum StoreKey {
+    Quality(LevelKey),
+    Ops,
+}
+
+/// The Redis spelling of a key after `{project}:`, as the module doc's table
+/// has it: `{epoch}:q:{level}:{key}` or `{epoch}:ops`.
+fn key_name(epoch: EpochId, key: StoreKey) -> String {
+    match key {
+        StoreKey::Quality(key) => format!("{epoch}:q:{}:{}", key.level().label(), key.part()),
+        StoreKey::Ops => format!("{epoch}:ops"),
     }
 }
 
@@ -250,25 +294,35 @@ struct Staged {
 ///
 /// Each entry is compared with the watermark as the entries before it moved
 /// it: at or below, skipped by its identity; above, applied only if its
-/// `prev_seq` is that watermark. A gap refuses the whole batch and reports the
-/// watermark the store holds.
-fn stage(current: Option<&ProjectState>, batch: &LearningBatch) -> Result<Staged, LearnerError> {
+/// `prev_seq` is that watermark. A gap or a divergence refuses the whole batch
+/// and reports the watermark the store holds.
+fn stage(
+    current: Option<&ProjectState>,
+    batch: &LearningBatch<'_>,
+) -> Result<Staged, LearnerError> {
     let empty = ProjectState::default();
     let current = current.unwrap_or(&empty);
-    let store_watermark = current.watermarks.get(&batch.session).copied().unwrap_or(0);
+    let store_watermark = current.watermarks.get(batch.session).copied().unwrap_or(0);
     let mut staged = Staged {
         watermark: store_watermark,
         ..Staged::default()
     };
-    for entry in &batch.entries {
+    for entry in batch.entries {
         if entry.seq <= staged.watermark {
             continue;
         }
-        if entry.prev_seq != staged.watermark {
+        // Above the watermark, the predecessor decides: equal applies, above
+        // is an entry the store has not seen (a backfill supplies it), below
+        // is a chain without the store's entry at the watermark (a backfill
+        // would resend the same entry forever).
+        if entry.prev_seq > staged.watermark {
             return Err(LearnerError::ChainGap { store_watermark });
         }
+        if entry.prev_seq < staged.watermark {
+            return Err(LearnerError::ChainDiverged { store_watermark });
+        }
         if let Some(deltas) = &entry.deltas {
-            staged.add(current, &batch.session, deltas)?;
+            staged.add(current, batch.session, deltas)?;
         }
         staged.watermark = entry.seq;
         staged.applied += 1;
@@ -289,20 +343,16 @@ impl Staged {
             let member = (quality.key, quality.strategy);
             let new_session = !seen.is_some_and(|seen| seen.contains(&member))
                 && self.seen.entry(epoch).or_default().insert(member);
-            let hash = self.quality.entry((epoch, quality.key)).or_insert_with(|| {
-                current
-                    .quality
-                    .get(&(epoch, quality.key))
-                    .cloned()
-                    .unwrap_or_default()
-            });
-            let cell = hash.strategies.entry(quality.strategy).or_default();
+            let cell = self
+                .quality_hash(current, epoch, quality.key)
+                .strategies
+                .entry(quality.strategy)
+                .or_default();
             let name = |field: &str| {
                 format!(
-                    "{epoch}:q:{}:{}:{}",
-                    quality.key.level().label(),
-                    quality.key.part(),
-                    format_args!("{}:{field}", quality.strategy)
+                    "{}:{}:{field}",
+                    key_name(epoch, StoreKey::Quality(quality.key)),
+                    quality.strategy
                 )
             };
             cell.pos = add(cell.pos, quality.units.pos, || name("pos"))?;
@@ -312,18 +362,11 @@ impl Staged {
             }
         }
         for jev in &deltas.jev {
-            let hash = self.quality.entry((epoch, jev.key)).or_insert_with(|| {
-                current
-                    .quality
-                    .get(&(epoch, jev.key))
-                    .cloned()
-                    .unwrap_or_default()
-            });
+            let hash = self.quality_hash(current, epoch, jev.key);
             let name = |field: &str| {
                 format!(
-                    "{epoch}:q:{}:{}:jev_{field}",
-                    jev.key.level().label(),
-                    jev.key.part()
+                    "{}:jev_{field}",
+                    key_name(epoch, StoreKey::Quality(jev.key))
                 )
             };
             hash.jev.capable = add(hash.jev.capable, jev.counts.capable, || name("capable"))?;
@@ -340,7 +383,13 @@ impl Staged {
             .or_insert_with(|| current.ops.get(&epoch).cloned().unwrap_or_default());
         for target in &deltas.targets {
             let cell = ops.targets.entry(target.target.clone()).or_default();
-            let name = |field: &str| format!("{epoch}:ops:{}:{field}", target.target);
+            let name = |field: &str| {
+                format!(
+                    "{}:{}:{field}",
+                    key_name(epoch, StoreKey::Ops),
+                    target.target
+                )
+            };
             cell.latency.sum_ms = add_signed(cell.latency.sum_ms, target.latency.sum_ms, || {
                 name("lat_sum")
             })?;
@@ -359,12 +408,29 @@ impl Staged {
             cell.cache.n = add(cell.cache.n, target.cache.n, || name("cache_n"))?;
         }
         ops.overhead.sum_ms = add_signed(ops.overhead.sum_ms, deltas.overhead.sum_ms, || {
-            format!("{epoch}:ops:turn:pre_sum")
+            format!("{}:turn:pre_sum", key_name(epoch, StoreKey::Ops))
         })?;
         ops.overhead.n = add(ops.overhead.n, deltas.overhead.n, || {
-            format!("{epoch}:ops:turn:pre_n")
+            format!("{}:turn:pre_n", key_name(epoch, StoreKey::Ops))
         })?;
         Ok(())
+    }
+
+    /// The staged whole value of one quality key, seeded from the stored one
+    /// the first time the batch touches it.
+    fn quality_hash(
+        &mut self,
+        current: &ProjectState,
+        epoch: EpochId,
+        key: LevelKey,
+    ) -> &mut QualityHash {
+        self.quality.entry((epoch, key)).or_insert_with(|| {
+            current
+                .quality
+                .get(&(epoch, key))
+                .cloned()
+                .unwrap_or_default()
+        })
     }
 
     /// The write phase: store every staged value, the `seen` members and the
@@ -411,19 +477,20 @@ fn add_signed(
 #[cfg(any(test, feature = "test-support"))]
 #[async_trait]
 impl super::contract::LearnerStoreControl for MemoryLearnerStore {
-    type Snapshot = ProjectState;
+    /// `None` for a project the map has no entry for, so a call that created
+    /// an empty entry does not compare equal to one that created nothing.
+    type Snapshot = Option<ProjectState>;
 
-    async fn snapshot(&self, project: &ProjectId) -> ProjectState {
-        self.state
-            .read()
-            .await
-            .get(project)
-            .cloned()
-            .unwrap_or_default()
+    async fn snapshot(&self, project: &ProjectId) -> Option<ProjectState> {
+        self.state.read().await.get(project).cloned()
     }
 
-    async fn restore(&self, project: &ProjectId, snapshot: ProjectState) {
-        self.state.write().await.insert(project.clone(), snapshot);
+    async fn restore(&self, project: &ProjectId, snapshot: Option<ProjectState>) {
+        let mut state = self.state.write().await;
+        match snapshot {
+            Some(snapshot) => state.insert(project.clone(), snapshot),
+            None => state.remove(project),
+        };
     }
 }
 

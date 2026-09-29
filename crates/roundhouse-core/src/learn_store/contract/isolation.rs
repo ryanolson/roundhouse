@@ -38,7 +38,7 @@ pub async fn concurrent_batches_from_many_sessions_sum_exactly<S: LearnerStoreCo
             let session = SessionId::generate();
             for entry in chain(e, &turn, ENTRIES) {
                 store
-                    .apply(&batch(&project, &session, vec![entry]))
+                    .apply(&batch(&project, &session, &[entry]))
                     .await
                     .expect("each session's chain applies in order");
             }
@@ -92,14 +92,14 @@ pub async fn overlapping_windows_in_any_order_credit_each_entry_once<S: LearnerS
             windows.swap(index, rng.below(index + 1));
         }
         for (start, end) in windows {
-            let sent = batch(&project, &session, entries[start..end].to_vec());
+            let sent = batch(&project, &session, &entries[start..end]);
             match store.apply(&sent).await {
                 Ok(_) | Err(LearnerError::ChainGap { .. }) => {}
                 Err(error) => panic!("trial {trial}: window {start}..{end}: {error}"),
             }
         }
         store
-            .apply(&batch(&project, &session, entries.clone()))
+            .apply(&batch(&project, &session, &entries))
             .await
             .unwrap_or_else(|error| panic!("trial {trial}: the full pass applies: {error}"));
 
@@ -134,17 +134,20 @@ pub async fn a_session_counts_once_for_each_level_key_and_strategy<S: LearnerSto
         entry(40, 30, Some(credit(e, l0, Strategy::Capable, 1, 1))),
     ];
     store
-        .apply(&batch(&project, &first, one_batch.clone()))
+        .apply(&batch(&project, &first, &one_batch))
         .await
         .unwrap();
     let later = entry(50, 40, Some(credit(e, l0, Strategy::Rules, 1, 1)));
     store
-        .apply(&batch(&project, &first, vec![later.clone()]))
+        .apply(&batch(&project, &first, std::slice::from_ref(&later)))
         .await
         .unwrap();
     let mut resend = one_batch;
     resend.push(later);
-    store.apply(&batch(&project, &first, resend)).await.unwrap();
+    store
+        .apply(&batch(&project, &first, &resend))
+        .await
+        .unwrap();
 
     let sessions = |counts: StrategyCounts| (counts.n_units, counts.sessions);
     assert_eq!(
@@ -168,7 +171,7 @@ pub async fn a_session_counts_once_for_each_level_key_and_strategy<S: LearnerSto
         .apply(&batch(
             &project,
             &second,
-            vec![entry(10, 0, Some(credit(e, l0, Strategy::Rules, 1, 1)))],
+            &[entry(10, 0, Some(credit(e, l0, Strategy::Rules, 1, 1)))],
         ))
         .await
         .unwrap();
@@ -186,7 +189,7 @@ pub async fn projects_share_no_state<S: LearnerStoreControl>(store: &S) {
     let session = SessionId::generate();
     let turn = input(Tier::Capable, false);
     store
-        .apply(&batch(&acme, &session, chain(e, &turn, 3)))
+        .apply(&batch(&acme, &session, &chain(e, &turn, 3)))
         .await
         .unwrap();
 
@@ -196,7 +199,7 @@ pub async fn projects_share_no_state<S: LearnerStoreControl>(store: &S) {
 
     let first = chain(e, &turn, 1);
     let applied = store
-        .apply(&batch(&globex, &session, first))
+        .apply(&batch(&globex, &session, &first))
         .await
         .expect("another project's watermark does not skip this entry");
     assert_eq!(applied.applied, 1);
@@ -234,11 +237,11 @@ pub async fn epochs_share_no_state<S: LearnerStoreControl>(store: &S) {
         ),
     ];
     store
-        .apply(&batch(&project, &session, entries[..1].to_vec()))
+        .apply(&batch(&project, &session, &entries[..1]))
         .await
         .unwrap();
     store
-        .apply(&batch(&project, &session, entries))
+        .apply(&batch(&project, &session, &entries))
         .await
         .unwrap();
 
@@ -278,7 +281,7 @@ pub async fn read_makes_no_write<S: LearnerStoreControl>(store: &S) {
     let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
     let turn = input(Tier::Capable, false);
     store
-        .apply(&batch(&project, &session, chain(e, &turn, 2)))
+        .apply(&batch(&project, &session, &chain(e, &turn, 2)))
         .await
         .unwrap();
     let before = store.snapshot(&project).await;
@@ -294,6 +297,54 @@ pub async fn read_makes_no_write<S: LearnerStoreControl>(store: &S) {
     assert_eq!(store.snapshot(&project).await, before);
 }
 
+/// A call with nothing to write leaves no trace, even of the project: a read
+/// and a watermark query of a project the store holds nothing for, and an
+/// empty batch, leave it absent. On a project that exists, an empty batch for
+/// a session the store has never seen writes no watermark for it, and a batch
+/// wholly at or below the watermark changes nothing (that last case is a
+/// control: its write phase, if it ran, would rewrite the values it read).
+pub async fn a_call_with_nothing_to_write_leaves_no_trace<S: LearnerStoreControl>(store: &S) {
+    let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
+    let turn = input(Tier::Capable, false);
+    let absent = store.snapshot(&project).await;
+
+    read_view(store, &project, e, &turn).await;
+    assert_eq!(store.watermark(&project, &session).await.unwrap(), 0);
+    assert_eq!(
+        store.snapshot(&project).await,
+        absent,
+        "a read of an absent project creates it"
+    );
+    let empty = store.apply(&batch(&project, &session, &[])).await.unwrap();
+    assert_eq!((empty.applied, empty.watermark), (0, 0));
+    assert_eq!(
+        store.snapshot(&project).await,
+        absent,
+        "an empty batch creates the project"
+    );
+
+    let entries = chain(e, &turn, 2);
+    store
+        .apply(&batch(&project, &session, &entries))
+        .await
+        .unwrap();
+    let before = store.snapshot(&project).await;
+    let newcomer = SessionId::generate();
+    let empty = store.apply(&batch(&project, &newcomer, &[])).await.unwrap();
+    assert_eq!((empty.applied, empty.watermark), (0, 0));
+    assert_eq!(
+        store.snapshot(&project).await,
+        before,
+        "an empty batch writes a watermark for a new session"
+    );
+    let skipped = store
+        .apply(&batch(&project, &session, &entries))
+        .await
+        .unwrap();
+    assert_eq!((skipped.applied, skipped.watermark), (0, 20));
+    assert_eq!(store.snapshot(&project).await, before);
+}
+
 /// The Jev counts of each key of the turn, and the project's overhead sum,
 /// come back on the read. Answers on a key of another turn do not.
 pub async fn read_returns_the_jev_counts_and_overhead_sums_of_the_turn<S: LearnerStoreControl>(
@@ -306,7 +357,7 @@ pub async fn read_returns_the_jev_counts_and_overhead_sums_of_the_turn<S: Learne
         .apply(&batch(
             &project,
             &session,
-            vec![
+            &[
                 entry(
                     10,
                     0,
@@ -399,7 +450,7 @@ pub async fn read_returns_every_requested_key_strategy_and_target_zero_filled_in
         ..credit(e, l1, Strategy::Capable, 3, 5)
     };
     store
-        .apply(&batch(&project, &session, vec![entry(10, 0, Some(ops))]))
+        .apply(&batch(&project, &session, &[entry(10, 0, Some(ops))]))
         .await
         .unwrap();
 

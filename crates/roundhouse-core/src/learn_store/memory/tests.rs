@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The memory learner store's conformance run, plus the two cases only an
-//! instrumented memory store can observe.
+//! The memory learner store's conformance run, plus the cases of its
+//! test-support instruments: the fault between the phases, the keys a read
+//! visits, and when each instrument is armed.
 
 use super::MemoryLearnerStore;
 use crate::ids::SessionId;
@@ -24,12 +25,13 @@ async fn a_fault_between_check_and_write_changes_nothing() {
     let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
     let turn = input(Tier::Capable, false);
     store
-        .apply(&batch(&project, &session, chain(e, &turn, 2)))
+        .apply(&batch(&project, &session, &chain(e, &turn, 2)))
         .await
         .unwrap();
     let before = store.snapshot(&project).await;
 
-    let next = batch(&project, &session, chain(e, &turn, 4));
+    let entries = chain(e, &turn, 4);
+    let next = batch(&project, &session, &entries);
     store.fail_next_apply_between_phases();
     assert!(matches!(
         store.apply(&next).await,
@@ -40,6 +42,48 @@ async fn a_fault_between_check_and_write_changes_nothing() {
 
     let retried = store.apply(&next).await.expect("the hook fails one call");
     assert_eq!((retried.applied, retried.watermark), (2, 40));
+}
+
+/// The armed fault fires on the next apply that has something to write. An
+/// apply the check refuses, or one that skips every entry, passes it by, so a
+/// test that arms it cannot have it spent by a call that never reaches the
+/// point it guards.
+#[tokio::test]
+async fn the_fault_hook_fires_on_the_next_apply_that_would_write() {
+    let store = MemoryLearnerStore::new();
+    let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
+    let turn = input(Tier::Capable, false);
+    let entries = chain(e, &turn, 3);
+    store
+        .apply(&batch(&project, &session, &entries[..2]))
+        .await
+        .unwrap();
+    store.fail_next_apply_between_phases();
+
+    let skipped = store
+        .apply(&batch(&project, &session, &entries[..2]))
+        .await
+        .expect("a wholly skipped batch writes nothing, so the fault waits");
+    assert_eq!((skipped.applied, skipped.watermark), (0, 20));
+    let gapped = [entry(40, 30, None)];
+    assert_eq!(
+        store.apply(&batch(&project, &session, &gapped)).await,
+        Err(LearnerError::ChainGap {
+            store_watermark: 20
+        }),
+        "a refused batch never reaches the fault"
+    );
+    assert_eq!(
+        store
+            .apply(&batch(&project, &session, &entries[2..]))
+            .await
+            .map(|applied| applied.applied),
+        Err(LearnerError::Unavailable(
+            "injected fault between the check and the write".to_owned()
+        )),
+        "the first apply with an entry to write meets the fault"
+    );
+    assert_eq!(store.watermark(&project, &session).await.unwrap(), 20);
 }
 
 /// Every level key the fields can spell, reachable or not: the store does not
@@ -77,7 +121,7 @@ async fn read_visits_only_the_keys_of_the_turn() {
     let store = MemoryLearnerStore::new();
     let (project, session) = (fresh_project(), SessionId::generate());
     let keys = every_key();
-    let entries = (0..KEYS)
+    let entries: Vec<_> = (0..KEYS)
         .map(|index| {
             let seq = index as u64 + 1;
             let e = epoch((index / keys.len()) as u8);
@@ -89,11 +133,11 @@ async fn read_visits_only_the_keys_of_the_turn() {
         })
         .collect();
     let applied = store
-        .apply(&batch(&project, &session, entries))
+        .apply(&batch(&project, &session, &entries))
         .await
         .unwrap();
     assert_eq!(applied.applied, KEYS);
-    store.take_visited();
+    store.record_visits();
 
     let e = epoch(3);
     let turn = input(Tier::Efficient, true);
@@ -108,8 +152,20 @@ async fn read_visits_only_the_keys_of_the_turn() {
     let expected: Vec<String> = turn
         .keys()
         .iter()
-        .map(|key| format!("q:{e}:{}:{}", KeyLevel::label(key.level()), key.part()))
-        .chain([format!("ops:{e}")])
+        .map(|key| format!("{e}:q:{}:{}", KeyLevel::label(key.level()), key.part()))
+        .chain([format!("{e}:ops")])
         .collect();
     assert_eq!(store.take_visited(), expected);
+}
+
+/// The visit recorder is off until a test arms it. A store built with test
+/// support and used by a test that never reads its visits must not grow a
+/// list on every read.
+#[tokio::test]
+async fn an_unarmed_store_records_no_visits() {
+    let store = MemoryLearnerStore::new();
+    let (project, e) = (fresh_project(), epoch(1));
+    read_view(&store, &project, e, &input(Tier::Capable, false)).await;
+    read_view(&store, &project, e, &input(Tier::Efficient, true)).await;
+    assert_eq!(store.take_visited(), Vec::<String>::new());
 }

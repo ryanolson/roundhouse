@@ -9,17 +9,18 @@
 //! the same list, which is what makes "a Lua script and a `HashMap` keep the
 //! same counters" a checked property. The cases carry the model check of
 //! draft section 15 into Rust: the lost acknowledgement, the chain gap, the
-//! overflow with no change, and store loss repaired by a backfill.
+//! overflow with no change, and store loss repaired by a backfill. The
+//! diverged chain, which no backfill repairs, is a case of its own.
 //!
 //! Every test mints a fresh [`ProjectId`], and every key and watermark is
 //! scoped by project, so one shared backend (one real Redis) hosts the whole
 //! suite without one test reading another's counters.
 //!
 //! The [`learner_store_contract_suite!`](crate::learner_store_contract_suite)
-//! macro is the single list. Two cases are not in it, because only an
-//! instrumented memory store can observe them: the fault between the check and
-//! the write, and which keys a read visits. They are in
-//! [`memory`](super::memory)'s own tests.
+//! macro is the single list. The cases of the memory store's test-support
+//! instrumentation are not in it, because only that store has it: the fault
+//! between the check and the write, which keys a read visits, and when each
+//! instrument is armed. They are in [`memory`](super::memory)'s own tests.
 
 pub mod isolation;
 
@@ -48,9 +49,17 @@ use crate::validate::REVIEW_RULE_REVISION;
 /// backend clones its project state; a Redis backend dumps and restores the
 /// keys under the project's prefix. Test-only by construction, like
 /// [`LeaseControl`](crate::store::contract::LeaseControl).
+///
+/// **A snapshot tells an absent project from an empty one.** A read, a
+/// watermark query, or an apply that applied nothing must leave no record of
+/// a project it found empty, and only a snapshot that sees existence can hold
+/// that. The memory backend returns `None` for a project it has no entry for,
+/// and restoring `None` removes the entry. Redis cannot hold an empty key, so
+/// its snapshot of an absent project is the empty key set, and a restore of
+/// that set deletes every key under the prefix.
 #[async_trait]
 pub trait LearnerStoreControl: LearnerStore {
-    type Snapshot: std::fmt::Debug + PartialEq + Send;
+    type Snapshot: std::fmt::Debug + Clone + PartialEq + Send;
 
     async fn snapshot(&self, project: &ProjectId) -> Self::Snapshot;
 
@@ -153,14 +162,14 @@ pub fn jev_and_overhead(
     }
 }
 
-pub fn batch(
-    project: &ProjectId,
-    session: &SessionId,
-    entries: Vec<LearningEntry>,
-) -> LearningBatch {
+pub fn batch<'a>(
+    project: &'a ProjectId,
+    session: &'a SessionId,
+    entries: &'a [LearningEntry],
+) -> LearningBatch<'a> {
     LearningBatch {
-        project: project.clone(),
-        session: session.clone(),
+        project,
+        session,
         entries,
     }
 }
@@ -209,7 +218,7 @@ pub async fn counts<S: LearnerStore>(
         .unwrap_or_else(|| panic!("the read returns every requested strategy, not {strategy}"))
 }
 
-async fn apply<S: LearnerStore>(store: &S, batch: &LearningBatch) -> Applied {
+async fn apply<S: LearnerStore>(store: &S, batch: &LearningBatch<'_>) -> Applied {
     store
         .apply(batch)
         .await
@@ -244,7 +253,7 @@ pub async fn apply_then_read_returns_the_integer_sums<S: LearnerStoreControl>(st
         entry(50, 40, Some(residual(e, &frontier("large"), 12))),
         entry(60, 50, None),
     ];
-    let applied = apply(store, &batch(&project, &session, entries)).await;
+    let applied = apply(store, &batch(&project, &session, &entries)).await;
     assert_eq!(
         applied,
         Applied {
@@ -283,7 +292,8 @@ pub async fn apply_then_read_returns_the_integer_sums<S: LearnerStoreControl>(st
 pub async fn a_repeated_batch_applies_zero_entries<S: LearnerStoreControl>(store: &S) {
     let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
     let turn = input(Tier::Capable, false);
-    let sent = batch(&project, &session, chain(e, &turn, 3));
+    let entries = chain(e, &turn, 3);
+    let sent = batch(&project, &session, &entries);
     apply(store, &sent).await;
     let before = store.snapshot(&project).await;
 
@@ -314,8 +324,12 @@ pub async fn a_lost_ack_then_a_new_entry_credits_each_entry_once<S: LearnerStore
     let first = entry(10, 0, Some(credit(e, key, Strategy::Rules, 1, 1)));
     let second = entry(20, 10, Some(credit(e, key, Strategy::Rules, 1, 1)));
 
-    apply(store, &batch(&project, &session, vec![first.clone()])).await;
-    let resent = apply(store, &batch(&project, &session, vec![first, second])).await;
+    apply(
+        store,
+        &batch(&project, &session, std::slice::from_ref(&first)),
+    )
+    .await;
+    let resent = apply(store, &batch(&project, &session, &[first, second])).await;
 
     assert_eq!(
         resent,
@@ -335,8 +349,8 @@ pub async fn a_late_original_after_a_larger_retry_applies_zero_entries<S: Learne
     let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
     let turn = input(Tier::Capable, false);
     let entries = chain(e, &turn, 3);
-    let original = batch(&project, &session, entries[..2].to_vec());
-    let retry = batch(&project, &session, entries);
+    let original = batch(&project, &session, &entries[..2]);
+    let retry = batch(&project, &session, &entries);
 
     apply(store, &retry).await;
     let before = store.snapshot(&project).await;
@@ -362,9 +376,9 @@ pub async fn a_stale_request_with_a_newer_entry_applies_only_that_entry<S: Learn
     let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
     let turn = input(Tier::Capable, false);
     let entries = chain(e, &turn, 4);
-    apply(store, &batch(&project, &session, entries[..3].to_vec())).await;
+    apply(store, &batch(&project, &session, &entries[..3])).await;
 
-    let stale = apply(store, &batch(&project, &session, entries[1..].to_vec())).await;
+    let stale = apply(store, &batch(&project, &session, &entries[1..])).await;
 
     assert_eq!(
         stale,
@@ -393,14 +407,11 @@ pub async fn a_batch_that_skips_an_entry_returns_chain_gap_and_changes_nothing<
     let key = l0(&turn);
     let before = store.snapshot(&project).await;
 
-    let gapped = batch(
-        &project,
-        &session,
-        vec![
-            entry(10, 0, Some(credit(e, key, Strategy::Rules, 1, 1))),
-            entry(30, 20, Some(credit(e, key, Strategy::Rules, 1, 1))),
-        ],
-    );
+    let gapped_entries = [
+        entry(10, 0, Some(credit(e, key, Strategy::Rules, 1, 1))),
+        entry(30, 20, Some(credit(e, key, Strategy::Rules, 1, 1))),
+    ];
+    let gapped = batch(&project, &session, &gapped_entries);
     assert_eq!(
         store.apply(&gapped).await,
         Err(LearnerError::ChainGap { store_watermark: 0 })
@@ -413,29 +424,84 @@ pub async fn a_batch_that_skips_an_entry_returns_chain_gap_and_changes_nothing<
     assert_eq!(store.watermark(&project, &session).await.unwrap(), 0);
 }
 
+/// An entry above the watermark whose predecessor is below it is not a gap.
+/// The store holds an entry at its watermark that the sender's chain does not
+/// have, so a backfill from the watermark would send the same entry forever.
+/// It is refused as `ChainDiverged`, which the engine reports and never
+/// backfills. The rule compares with the watermark as the batch's earlier
+/// entries moved it, so a batch that diverges from its own staged entry is
+/// refused the same way, and still reports the watermark the store holds.
+pub async fn a_diverged_chain_is_refused_and_is_not_a_gap<S: LearnerStoreControl>(store: &S) {
+    let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
+    let turn = input(Tier::Capable, false);
+    let key = l0(&turn);
+    apply(store, &batch(&project, &session, &chain(e, &turn, 2))).await;
+    let before = store.snapshot(&project).await;
+    let next = |seq, prev_seq| entry(seq, prev_seq, Some(credit(e, key, Strategy::Rules, 1, 1)));
+    let refused = |entries: Vec<LearningEntry>| {
+        let (project, session) = (project.clone(), session.clone());
+        async move { store.apply(&batch(&project, &session, &entries)).await }
+    };
+
+    assert_eq!(
+        refused(vec![next(30, 10)]).await,
+        Err(LearnerError::ChainDiverged {
+            store_watermark: 20
+        }),
+        "entry 30 skips over the store's entry 20"
+    );
+    assert_eq!(
+        refused(vec![next(30, 20), next(40, 25)]).await,
+        Err(LearnerError::ChainDiverged {
+            store_watermark: 20
+        }),
+        "entry 40 skips over the batch's own entry 30"
+    );
+    assert_eq!(
+        refused(vec![next(30, 25)]).await,
+        Err(LearnerError::ChainGap {
+            store_watermark: 20
+        }),
+        "control: a predecessor above the watermark is a gap a backfill fills"
+    );
+    assert_eq!(store.snapshot(&project).await, before);
+    assert_eq!(store.watermark(&project, &session).await.unwrap(), 20);
+}
+
 /// Draft section 11.6: the store applied 10 and 20, then 30, then lost the
 /// write of 30. A page above the log's hint of 30 gaps at 20, and the backfill
 /// from 20 restores what a rebuild from the log gives.
+///
+/// Entries 10 and 20 credit `rules` and the lost 30 and the later 40 credit
+/// `capable`, so the loss takes a `seen` member with it. A restore that kept
+/// the live `seen` set would let the backfill find `capable` already seen and
+/// leave its `sessions` at 0, which no rebuild from the log could produce.
 pub async fn after_store_loss_a_gap_backfill_restores_the_rebuilt_totals<S: LearnerStoreControl>(
     store: &S,
 ) {
     let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
     let turn = input(Tier::Capable, false);
-    let entries = chain(e, &turn, 4);
-    apply(store, &batch(&project, &session, entries[..2].to_vec())).await;
+    let key = l0(&turn);
+    let entries = [
+        entry(10, 0, Some(credit(e, key, Strategy::Rules, 0, 1))),
+        entry(20, 10, Some(credit(e, key, Strategy::Rules, 0, 2))),
+        entry(30, 20, Some(credit(e, key, Strategy::Capable, 0, 4))),
+        entry(40, 30, Some(credit(e, key, Strategy::Capable, 0, 8))),
+    ];
+    apply(store, &batch(&project, &session, &entries[..2])).await;
     let after_twenty = store.snapshot(&project).await;
-    apply(store, &batch(&project, &session, entries[2..3].to_vec())).await;
+    apply(store, &batch(&project, &session, &entries[2..3])).await;
     store.restore(&project, after_twenty).await;
     assert_eq!(store.watermark(&project, &session).await.unwrap(), 20);
 
-    let page = batch(&project, &session, entries[3..].to_vec());
+    let page = batch(&project, &session, &entries[3..]);
     assert_eq!(
         store.apply(&page).await,
         Err(LearnerError::ChainGap {
             store_watermark: 20
         })
     );
-    let backfill = apply(store, &batch(&project, &session, entries[2..].to_vec())).await;
+    let backfill = apply(store, &batch(&project, &session, &entries[2..])).await;
 
     assert_eq!(
         backfill,
@@ -444,8 +510,17 @@ pub async fn after_store_loss_a_gap_backfill_restores_the_rebuilt_totals<S: Lear
             watermark: 40
         }
     );
-    let counts = counts(store, &project, e, &turn, l0(&turn), Strategy::Rules).await;
-    assert_eq!(counts.n_units, 0b1111, "the rebuild of all four entries");
+    let totals = |counts: StrategyCounts| (counts.n_units, counts.sessions);
+    assert_eq!(
+        totals(counts(store, &project, e, &turn, key, Strategy::Rules).await),
+        (0b0011, 1),
+        "the entries before the loss"
+    );
+    assert_eq!(
+        totals(counts(store, &project, e, &turn, key, Strategy::Capable).await),
+        (0b1100, 1),
+        "the lost entry and the next, rebuilt with their session"
+    );
 }
 
 /// A batch whose second entry would carry a counter past `2^53 - 1` is
@@ -462,7 +537,7 @@ pub async fn an_out_of_range_result_is_refused_and_changes_nothing<S: LearnerSto
         &batch(
             &project,
             &session,
-            vec![entry(
+            &[entry(
                 10,
                 0,
                 Some(credit(e, key, Strategy::Rules, 0, MAX_EXACT - 1)),
@@ -472,14 +547,11 @@ pub async fn an_out_of_range_result_is_refused_and_changes_nothing<S: LearnerSto
     .await;
     let before = store.snapshot(&project).await;
 
-    let over = batch(
-        &project,
-        &session,
-        vec![
-            entry(20, 10, Some(credit(e, key, Strategy::Capable, 1, 1))),
-            entry(30, 20, Some(credit(e, key, Strategy::Rules, 0, 2))),
-        ],
-    );
+    let over_entries = [
+        entry(20, 10, Some(credit(e, key, Strategy::Capable, 1, 1))),
+        entry(30, 20, Some(credit(e, key, Strategy::Rules, 0, 2))),
+    ];
+    let over = batch(&project, &session, &over_entries);
     assert!(
         matches!(
             store.apply(&over).await,
@@ -491,11 +563,8 @@ pub async fn an_out_of_range_result_is_refused_and_changes_nothing<S: LearnerSto
     assert_eq!(store.watermark(&project, &session).await.unwrap(), 10);
 
     // One below the limit is still a counter.
-    let at_limit = batch(
-        &project,
-        &session,
-        vec![entry(20, 10, Some(credit(e, key, Strategy::Rules, 0, 1)))],
-    );
+    let at_limit_entries = [entry(20, 10, Some(credit(e, key, Strategy::Rules, 0, 1)))];
+    let at_limit = batch(&project, &session, &at_limit_entries);
     assert_eq!(apply(store, &at_limit).await.applied, 1);
     let counts = counts(store, &project, e, &turn, key, Strategy::Rules).await;
     assert_eq!(counts.n_units, MAX_EXACT);
@@ -512,15 +581,12 @@ pub async fn a_negative_delta_for_a_nonnegative_counter_is_refused<S: LearnerSto
     let turn = input(Tier::Capable, false);
     let before = store.snapshot(&project).await;
 
-    let negative = batch(
-        &project,
-        &session,
-        vec![entry(
-            10,
-            0,
-            Some(credit(e, l0(&turn), Strategy::Rules, 0, -1i64 as u64)),
-        )],
-    );
+    let negative_entries = [entry(
+        10,
+        0,
+        Some(credit(e, l0(&turn), Strategy::Rules, 0, -1i64 as u64)),
+    )];
+    let negative = batch(&project, &session, &negative_entries);
     assert!(
         matches!(
             store.apply(&negative).await,
@@ -536,36 +602,83 @@ pub async fn a_sequence_above_the_exact_lua_range_is_refused<S: LearnerStoreCont
     let turn = input(Tier::Capable, false);
     let before = store.snapshot(&project).await;
 
-    let beyond = batch(
-        &project,
-        &session,
-        vec![entry(
-            MAX_EXACT + 1,
-            0,
-            Some(credit(e, l0(&turn), Strategy::Rules, 1, 1)),
-        )],
-    );
+    let beyond_entries = [entry(
+        MAX_EXACT + 1,
+        0,
+        Some(credit(e, l0(&turn), Strategy::Rules, 1, 1)),
+    )];
+    let beyond = batch(&project, &session, &beyond_entries);
     assert!(matches!(
         store.apply(&beyond).await,
         Err(LearnerError::Malformed { .. })
     ));
     assert_eq!(store.snapshot(&project).await, before);
 
-    let at_limit = batch(
-        &project,
-        &session,
-        vec![entry(
-            MAX_EXACT,
-            0,
-            Some(credit(e, l0(&turn), Strategy::Rules, 1, 1)),
-        )],
-    );
+    let at_limit_entries = [entry(
+        MAX_EXACT,
+        0,
+        Some(credit(e, l0(&turn), Strategy::Rules, 1, 1)),
+    )];
+    let at_limit = batch(&project, &session, &at_limit_entries);
     assert_eq!(
         apply(store, &at_limit).await,
         Applied {
             applied: 1,
             watermark: MAX_EXACT
         }
+    );
+}
+
+/// Every input rule of [`LearningBatch::check`] refuses its batch as
+/// `Malformed`. Each case is one that the chain rule alone answers
+/// differently, so the case holds its rule: without the ascending rule the
+/// out-of-order entry is skipped and the batch succeeds, without the
+/// predecessor rule a `prev_seq` at or above `seq` is a gap that a backfill
+/// can never close, and without the delta bound `i64::MIN` is reported as a
+/// range failure of the stored counter rather than as bad input.
+pub async fn every_input_rule_refuses_its_batch_as_malformed<S: LearnerStoreControl>(store: &S) {
+    let (project, session, e) = (fresh_project(), SessionId::generate(), epoch(1));
+    let turn = input(Tier::Capable, false);
+    let rules = |seq, prev_seq| {
+        entry(
+            seq,
+            prev_seq,
+            Some(credit(e, l0(&turn), Strategy::Rules, 1, 1)),
+        )
+    };
+    let cases = [
+        (
+            "sequences that do not ascend",
+            vec![rules(10, 0), rules(20, 10), rules(15, 10)],
+        ),
+        ("a prev_seq equal to its seq", vec![rules(10, 10)]),
+        ("a prev_seq above 2^53 - 1", vec![rules(10, MAX_EXACT + 1)]),
+        (
+            "a signed delta beyond -(2^53 - 1)",
+            vec![entry(
+                10,
+                0,
+                Some(residual(e, &frontier("large"), i64::MIN)),
+            )],
+        ),
+    ];
+    let before = store.snapshot(&project).await;
+    // Every case runs before the verdict, so a failure names each rule a
+    // backend misses rather than only the first.
+    let mut missed = Vec::new();
+    for (rule, entries) in cases {
+        let refused = store.apply(&batch(&project, &session, &entries)).await;
+        if !matches!(refused, Err(LearnerError::Malformed { .. })) {
+            missed.push(format!("{rule}: {refused:?}"));
+        }
+        if store.snapshot(&project).await != before {
+            missed.push(format!("{rule}: the store changed"));
+            store.restore(&project, before.clone()).await;
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "rules not refused as malformed: {missed:#?}"
     );
 }
 
@@ -581,20 +694,17 @@ pub async fn a_signed_sum_is_range_checked_after_every_entry<S: LearnerStoreCont
         &batch(
             &project,
             &session,
-            vec![entry(10, 0, Some(residual(e, &target, near)))],
+            &[entry(10, 0, Some(residual(e, &target, near)))],
         ),
     )
     .await;
     let before = store.snapshot(&project).await;
 
-    let through = batch(
-        &project,
-        &session,
-        vec![
-            entry(20, 10, Some(residual(e, &target, 10))),
-            entry(30, 20, Some(residual(e, &target, -10))),
-        ],
-    );
+    let through_entries = [
+        entry(20, 10, Some(residual(e, &target, 10))),
+        entry(30, 20, Some(residual(e, &target, -10))),
+    ];
+    let through = batch(&project, &session, &through_entries);
     assert!(
         matches!(
             store.apply(&through).await,
@@ -604,14 +714,11 @@ pub async fn a_signed_sum_is_range_checked_after_every_entry<S: LearnerStoreCont
     );
     assert_eq!(store.snapshot(&project).await, before);
 
-    let negative = batch(
-        &project,
-        &session,
-        vec![
-            entry(20, 10, Some(residual(e, &target, -near))),
-            entry(30, 20, Some(residual(e, &target, -near))),
-        ],
-    );
+    let negative_entries = [
+        entry(20, 10, Some(residual(e, &target, -near))),
+        entry(30, 20, Some(residual(e, &target, -near))),
+    ];
+    let negative = batch(&project, &session, &negative_entries);
     assert_eq!(
         apply(store, &negative).await.applied,
         2,
@@ -639,13 +746,13 @@ pub async fn jev_counts_and_overhead_sums_apply_under_the_same_identity_rule<
     let first = entry(10, 0, Some(jev_and_overhead(e, &turn, capable, 40)));
     let second = entry(20, 10, Some(jev_and_overhead(e, &turn, efficient, 60)));
 
-    apply(store, &batch(&project, &session, vec![first.clone()])).await;
     apply(
         store,
-        &batch(&project, &session, vec![first.clone(), second]),
+        &batch(&project, &session, std::slice::from_ref(&first)),
     )
     .await;
-    apply(store, &batch(&project, &session, vec![first])).await;
+    apply(store, &batch(&project, &session, &[first.clone(), second])).await;
+    apply(store, &batch(&project, &session, &[first])).await;
 
     let view = read_view(store, &project, e, &turn).await;
     for level in &view.levels {
@@ -700,10 +807,12 @@ macro_rules! learner_store_contract_suite {
             a_late_original_after_a_larger_retry_applies_zero_entries,
             a_stale_request_with_a_newer_entry_applies_only_that_entry,
             a_batch_that_skips_an_entry_returns_chain_gap_and_changes_nothing,
+            a_diverged_chain_is_refused_and_is_not_a_gap,
             after_store_loss_a_gap_backfill_restores_the_rebuilt_totals,
             an_out_of_range_result_is_refused_and_changes_nothing,
             a_negative_delta_for_a_nonnegative_counter_is_refused,
             a_sequence_above_the_exact_lua_range_is_refused,
+            every_input_rule_refuses_its_batch_as_malformed,
             a_signed_sum_is_range_checked_after_every_entry,
             jev_counts_and_overhead_sums_apply_under_the_same_identity_rule,
         );
@@ -714,6 +823,7 @@ macro_rules! learner_store_contract_suite {
             projects_share_no_state,
             epochs_share_no_state,
             read_makes_no_write,
+            a_call_with_nothing_to_write_leaves_no_trace,
             read_returns_the_jev_counts_and_overhead_sums_of_the_turn,
             read_returns_every_requested_key_strategy_and_target_zero_filled_in_order,
         );
