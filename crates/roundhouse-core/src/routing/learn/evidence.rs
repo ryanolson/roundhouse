@@ -306,7 +306,9 @@ pub enum CostCorrection {
     Applied,
     /// The target's measured pairs predicted no reuse, so there is no ratio.
     NoPredictedReuse,
-    /// Fewer measured pairs than `cache_min_samples`.
+    /// Fewer measured pairs than `cache_min_samples`. Also recorded for a
+    /// target the store view holds nothing for, and for zero pairs under a
+    /// configured minimum of zero: no samples is never a measurement.
     TooFewSamples,
     /// A local target. Its quote is the residency answer, at the configured
     /// capacity price when there is one, and it has no ledger model to
@@ -331,7 +333,9 @@ pub enum LatencyTerm {
     /// The mean was added, in whole milliseconds.
     Applied { mean_ms: i64 },
     /// Fewer samples than `latency_min_samples`, so nothing was added and the
-    /// record says so rather than showing a zero that looks measured.
+    /// record says so rather than showing a zero that looks measured. Also
+    /// recorded for a target the store view holds nothing for, and for zero
+    /// samples under a configured minimum of zero.
     TooFewSamples,
 }
 

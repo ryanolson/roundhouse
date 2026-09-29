@@ -281,9 +281,131 @@ fn a_reuse_surplus_never_prices_a_route_below_its_quote() {
     );
 }
 
+/// A rate card whose cached read rate (5) is above its effective write rate
+/// (the input rate 1, since the write rate is zero). No catalog entry today is
+/// shaped like this, but nothing refuses one.
+const INVERTED: ProviderPricing = ProviderPricing {
+    input_per_mtok_usd: 1.0,
+    cached_input_per_mtok_usd: 5.0,
+    cache_write_per_mtok_usd: 0.0,
+    output_per_mtok_usd: 0.0,
+};
+
+fn inverted_ledger() -> CacheLedger {
+    let mut ledger = CacheLedger::new();
+    ledger.register(
+        &sol(),
+        CacheModel::Deterministic { ttl_ms: 300_000 },
+        INVERTED,
+    );
+    ledger
+}
+
+/// A `sol` candidate quoted with [`INVERTED`] rather than [`PARENT`].
+fn inverted(isl: usize, uncached: f64, cached: f64) -> Candidate {
+    Candidate {
+        expected_prefill_tokens: uncached,
+        matched_prefix_tokens: cached.max(0.0) as u64,
+        expected_cost_usd: INVERTED.price_tokens(uncached, cached.max(0.0), 0.0),
+        ..frontier(sol(), isl, 0.0, 800.0)
+    }
+}
+
+/// **The owner's rule is held by the correction, not by the rate card.**
+/// Moving a token from cached to uncached raises the price only while the read
+/// rate is below the effective write rate. Under a card where it is not, a
+/// shortfall would lower the quote, so the re-pricing term stops at zero.
+#[test]
+fn a_shortfall_never_lowers_the_quote_under_any_rate_card() {
+    let isl = 1_000;
+    let candidate = inverted(isl, 500.0, 500.0);
+    let view = view(
+        vec![ops(&sol(), LatencySum::default(), reuse(500, 100, MIN))],
+        LatencySum::default(),
+    );
+    let ledger = inverted_ledger();
+
+    let cost = Corrections::new(&view, &ledger, isl, MIN, MIN).cost(&candidate);
+
+    assert_eq!(cost.correction, CostCorrection::Applied);
+    assert!(
+        cost.adjusted_usd >= cost.quoted_usd,
+        "a shortfall lowered the quote from {} to {}",
+        cost.quoted_usd,
+        cost.adjusted_usd
+    );
+}
+
+/// A quote whose prefill exceeds the input claims a negative cached count. The
+/// count is taken as zero, so there is nothing to move and the corrected cost
+/// is the quote exactly. Priced under [`INVERTED`], where a negative count
+/// would show: re-pricing it as zero would raise the cost above the quote, and
+/// the clamp on the re-priced term does not hide a rise.
+#[test]
+fn a_prefill_above_the_input_quotes_no_cached_tokens() {
+    let isl = 1_000;
+    let candidate = inverted(isl, 1_500.0, 0.0);
+    let shortfall = reuse(500, 100, MIN);
+    let view = view(
+        vec![ops(&sol(), LatencySum::default(), shortfall)],
+        LatencySum::default(),
+    );
+    let ledger = inverted_ledger();
+
+    let cost = Corrections::new(&view, &ledger, isl, MIN, MIN).cost(&candidate);
+
+    assert_eq!(cost.correction, CostCorrection::Applied);
+    assert_eq!(
+        cost.adjusted_usd, cost.quoted_usd,
+        "no cached tokens were quoted, so nothing may be re-priced"
+    );
+    assert_eq!(adjusted_cached_tokens(&candidate, isl, &shortfall), 0.0);
+}
+
+/// The cost correction reads `cache_min_samples`, not the latency minimum:
+/// ten pairs meet a latency minimum of 5 but not a cache minimum of 20.
+#[test]
+fn the_cost_correction_uses_the_cache_sample_minimum() {
+    let isl = 1_000;
+    let candidate = frontier(sol(), isl, 800.0, 800.0);
+    let view = view(
+        vec![ops(
+            &sol(),
+            LatencySum::default(),
+            reuse(1_000 * 10, 500 * 10, 10),
+        )],
+        LatencySum::default(),
+    );
+    let ledger = ledger();
+
+    let cost = Corrections::new(&view, &ledger, isl, 5, 20).cost(&candidate);
+
+    assert_eq!(cost.correction, CostCorrection::TooFewSamples);
+    assert_eq!(cost.adjusted_usd, cost.quoted_usd);
+}
+
+/// Too few pairs is checked before zero predicted reuse: a zero from a thin
+/// sample is not yet a measured zero, and the record must not call it one.
+#[test]
+fn too_few_samples_is_recorded_before_no_predicted_reuse() {
+    let isl = 1_000;
+    let candidate = frontier(sol(), isl, 800.0, 800.0);
+    let view = view(
+        vec![ops(&sol(), LatencySum::default(), reuse(0, 0, MIN - 1))],
+        LatencySum::default(),
+    );
+    let ledger = ledger();
+
+    let cost = Corrections::new(&view, &ledger, isl, MIN, MIN).cost(&candidate);
+
+    assert_eq!(cost.correction, CostCorrection::TooFewSamples);
+}
+
 /// The shortfall's cost appears once, inside the re-priced tokens: a full miss
 /// costs exactly the write-rate price of the moved tokens less their read
-/// price, and a calibrated target (observed equals predicted) costs its quote.
+/// price, and a calibrated target (observed equals predicted) costs its quote
+/// when its cached count is whole. A fractional count floors, which can make a
+/// calibrated target slightly dearer than its quote, the allowed direction.
 #[test]
 fn a_cache_miss_adds_no_separate_penalty() {
     let isl = 10 * MTOK;
@@ -494,6 +616,40 @@ fn latency_without_overhead_samples_uses_the_quote_plus_residual_and_is_recorded
     assert_eq!(unknown.adjusted_ms, 400.0);
 }
 
+/// Two workers of one local model are one recipe target, so both read the
+/// model's single residual. A lookup by worker would find neither.
+#[test]
+fn every_worker_of_one_local_model_reads_the_same_residual() {
+    let ledger = ledger();
+    let view = view(
+        vec![ops(
+            &worker(),
+            samples(120 * MIN as i64, MIN),
+            CacheReuse::default(),
+        )],
+        LatencySum::default(),
+    );
+    let corrections = Corrections::new(&view, &ledger, MTOK, MIN, MIN);
+    let local = |worker_id| Candidate {
+        target: Target::Local {
+            worker_id,
+            dp_rank: 0,
+            model: "llama".into(),
+        },
+        ..frontier(sol(), MTOK, 0.0, 50.0)
+    };
+
+    for worker_id in [7, 8] {
+        let estimate = corrections.first_output(&local(worker_id));
+        assert_eq!(
+            estimate.residual,
+            LatencyTerm::Applied { mean_ms: 120 },
+            "worker {worker_id} did not read the model's residual"
+        );
+        assert_eq!(estimate.adjusted_ms, 50.0 + 120.0);
+    }
+}
+
 fn granted(ceiling_usd: f64, state: BudgetState, overflow: bool) -> TurnBudget {
     TurnBudget::Granted {
         ceiling_usd,
@@ -511,8 +667,20 @@ fn quoted(target: Target, usd: f64) -> Candidate {
     }
 }
 
+/// The cost the grant sees: the candidate's own quote, corrected to
+/// `adjusted_usd`. The two differ, so a grant that read the quote would not
+/// pass for one that read the correction.
+fn corrected(candidate: &Candidate, adjusted_usd: f64) -> CostEvidence {
+    CostEvidence {
+        quoted_usd: candidate.expected_cost_usd,
+        adjusted_usd,
+        correction: CostCorrection::Applied,
+    }
+}
+
 /// A correction can lift a cost above the grant, and then the candidate fails
-/// the grant constraint although admission accepted its quote.
+/// the grant constraint although admission accepted its quote. `grant` takes
+/// the whole [`CostEvidence`], so a bare quote does not compile as its input.
 #[test]
 fn an_adjusted_cost_above_the_grant_fails_the_grant_constraint() {
     let budget = granted(0.010, BudgetState::Warned, false);
@@ -520,17 +688,21 @@ fn an_adjusted_cost_above_the_grant_fails_the_grant_constraint() {
     assert!(budget.admits(&candidate), "admission accepted the quote");
 
     assert_eq!(
-        grant(&budget, BudgetState::Warned, &candidate, 0.012),
+        grant(
+            &budget,
+            BudgetState::Warned,
+            &candidate,
+            &corrected(&candidate, 0.012)
+        ),
         GrantCheck::Exceeds
     );
     assert_eq!(
-        grant(&budget, BudgetState::Warned, &candidate, 0.009),
-        GrantCheck::Admits
-    );
-    // The check is on the corrected cost, not the quote: a quote over the
-    // grant that the correction does not reach is not re-judged by its quote.
-    assert_eq!(
-        grant(&budget, BudgetState::Warned, &quoted(sol(), 0.011), 0.009),
+        grant(
+            &budget,
+            BudgetState::Warned,
+            &candidate,
+            &corrected(&candidate, 0.009)
+        ),
         GrantCheck::Admits
     );
     // A local candidate is the budget's to exempt, whatever its capacity price.
@@ -540,7 +712,12 @@ fn an_adjusted_cost_above_the_grant_fails_the_grant_constraint() {
         ..quoted(sol(), 0.05)
     };
     assert_eq!(
-        grant(&budget, BudgetState::Warned, &local, 0.05),
+        grant(
+            &budget,
+            BudgetState::Warned,
+            &local,
+            &corrected(&local, 0.05)
+        ),
         GrantCheck::Admits
     );
 }
@@ -555,11 +732,21 @@ fn an_overflow_admitted_candidate_keeps_its_status() {
     let candidate = quoted(sol(), 0.40);
 
     assert_eq!(
-        grant(&budget, BudgetState::ExhaustedOverflow, &candidate, 0.55),
+        grant(
+            &budget,
+            BudgetState::ExhaustedOverflow,
+            &candidate,
+            &corrected(&candidate, 0.55)
+        ),
         GrantCheck::Overflow
     );
     assert_eq!(
-        grant(&budget, BudgetState::Exhausted, &candidate, 0.55),
+        grant(
+            &budget,
+            BudgetState::Exhausted,
+            &candidate,
+            &corrected(&candidate, 0.55)
+        ),
         GrantCheck::Exceeds
     );
 }

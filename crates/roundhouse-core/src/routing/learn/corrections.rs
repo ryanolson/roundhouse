@@ -15,7 +15,9 @@
 //! the direction that makes a route look cheaper than it is. The reuse
 //! correction therefore only ever moves predicted-cached tokens back to
 //! uncached: a target that reused more than predicted keeps the ledger's own
-//! quote. See [`adjusted_cached_tokens`].
+//! quote. See [`adjusted_cached_tokens`]. The re-priced difference is also
+//! clamped at zero, so the rule holds whatever the rate card says; see
+//! [`Corrections::cost`].
 //!
 //! **Predictions, not measurements.** A corrected quote does not establish a
 //! measured cost reduction; the offline report measures serving cost from the
@@ -76,6 +78,12 @@ impl<'a> Corrections<'a> {
     /// of the draft used the plain input rate less the read rate, which
     /// dropped the premium and priced a one-hour cache at half its cost.
     ///
+    /// **The re-priced term stops at zero.** Moving a token to uncached raises
+    /// the price only while the card's cached read rate is below its effective
+    /// write rate. Nothing refuses a card where it is not, and under one a
+    /// shortfall would make the route look cheaper, which the owner's rule
+    /// forbids. The clamp holds the rule for any card.
+    ///
     /// **The shortfall's cost appears once, here.** No separate cache-miss
     /// penalty is added on top, and a local target is not corrected: its quote
     /// is the residency answer, priced at the configured capacity rate when
@@ -101,9 +109,9 @@ impl<'a> Corrections<'a> {
         let quoted_cached = quoted_cached_tokens(candidate, self.isl_tokens);
         let adjusted_cached = adjusted_cached_tokens(candidate, self.isl_tokens, &reuse);
         let (_, pricing) = self.ledger.model_for(&candidate.target);
-        let adjusted_usd = quoted_usd
-            + pricing.price_tokens(isl - adjusted_cached, adjusted_cached, 0.0)
+        let repriced = pricing.price_tokens(isl - adjusted_cached, adjusted_cached, 0.0)
             - pricing.price_tokens(isl - quoted_cached, quoted_cached, 0.0);
+        let adjusted_usd = quoted_usd + repriced.max(0.0);
         CostEvidence {
             quoted_usd,
             adjusted_usd,
@@ -216,6 +224,21 @@ pub fn adjusted_cached_tokens(candidate: &Candidate, isl_tokens: usize, reuse: &
 
 /// The grant constraint on a corrected cost (draft section 7.2, constraint 2).
 ///
+/// **Takes the [`CostEvidence`], not a number**, and reads its `adjusted_usd`.
+/// A bare `f64` parameter would accept the quote as readily as the correction,
+/// and a grant checked on the quote passes exactly the candidates the
+/// correction exists to catch. With the evidence as the input, that mistake
+/// does not compile:
+///
+/// ```compile_fail
+/// # use roundhouse_core::control::{BudgetState, TurnBudget};
+/// # use roundhouse_core::routing::Candidate;
+/// # use roundhouse_core::routing::learn::grant;
+/// fn check(budget: &TurnBudget, candidate: &Candidate) {
+///     grant(budget, BudgetState::Unconstrained, candidate, candidate.expected_cost_usd);
+/// }
+/// ```
+///
 /// `admitted_as` is the budget state of the plan's decision, which is where
 /// admission recorded whether the overflow valve opened. **A candidate the
 /// valve re-admitted keeps [`GrantCheck::Overflow`]**: it is past the grant by
@@ -228,13 +251,13 @@ pub fn grant(
     budget: &TurnBudget,
     admitted_as: BudgetState,
     candidate: &Candidate,
-    adjusted_usd: f64,
+    cost: &CostEvidence,
 ) -> GrantCheck {
     if admitted_as.overflowed() {
         return GrantCheck::Overflow;
     }
     let corrected = Candidate {
-        expected_cost_usd: adjusted_usd,
+        expected_cost_usd: cost.adjusted_usd,
         ..candidate.clone()
     };
     if budget.admits(&corrected) {
