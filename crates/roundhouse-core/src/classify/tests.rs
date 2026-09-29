@@ -50,45 +50,71 @@ fn available(turn: u64, seq: u64, intent: TurnIntent) -> AvailableClassification
                 value: ContextDependence::Recent,
                 confidence: 0.5,
             },
+            tier: Some(Graded {
+                value: TierChoice::Capable,
+                confidence: 0.7,
+            }),
         },
     }
 }
 
 // ------------------------------------------------------------------ taxonomy
 
-/// **Every axis must be able to say it does not know.**
+/// Every offered label parses back to itself and carries a rubric.
+fn round_trips<T: ClassificationAxis + std::fmt::Debug + PartialEq>() {
+    for &(_, label, rubric) in T::OPTIONS {
+        let parsed = T::from_label(label)
+            .unwrap_or_else(|| panic!("{}: `{label}` is offered and does not parse", T::KEY));
+        assert_eq!(parsed.label(), label, "{}: `{label}` round trips", T::KEY);
+        assert!(!rubric.is_empty(), "{}: `{label}` has a rubric", T::KEY);
+    }
+    assert!(T::from_label("a label nothing offers").is_none());
+}
+
+/// **Every taxonomy axis must be able to say it does not know.**
 ///
 /// Not decoration: a classifier with no `unknown` option answers *something*
 /// for a turn it cannot read, and a feature built from that is a guess wearing a
 /// label. The `unknown` option is how "there was too little here" reaches the
 /// record as itself.
+///
+/// The tier question is the exception, and on purpose: it is a choice between
+/// the two tiers a recipe has, so it offers exactly those two. See
+/// [`TierChoice`].
 #[test]
 fn every_axis_offers_unknown_and_round_trips_every_label() {
     fn check<T: ClassificationAxis + std::fmt::Debug + PartialEq>() {
-        let options = T::OPTIONS;
         assert!(
-            options.iter().any(|(_, label, _)| *label == "unknown"),
+            T::OPTIONS.iter().any(|(_, label, _)| *label == "unknown"),
             "{} offers no `unknown` option",
             T::KEY
         );
-        for &(_, label, rubric) in options {
-            let parsed = T::from_label(label)
-                .unwrap_or_else(|| panic!("{}: `{label}` is offered and does not parse", T::KEY));
-            assert_eq!(parsed.label(), label, "{}: `{label}` round trips", T::KEY);
-            assert!(!rubric.is_empty(), "{}: `{label}` has a rubric", T::KEY);
-        }
-        assert!(T::from_label("a label nothing offers").is_none());
+        round_trips::<T>();
     }
     check::<TurnIntent>();
     check::<TurnComplexity>();
     check::<ContextDependence>();
+
+    round_trips::<TierChoice>();
+    let labels: Vec<&str> = TierChoice::OPTIONS.iter().map(|(_, l, _)| *l).collect();
+    assert_eq!(labels, ["capable", "efficient"]);
+    assert_eq!(TierChoice::Capable.tier(), crate::routing::Tier::Capable);
+    assert_eq!(
+        TierChoice::Efficient.tier(),
+        crate::routing::Tier::Efficient
+    );
 }
 
-/// The three axes are asked under three distinct keys, or two answers would
-/// collide in one map.
+/// Every question is asked under its own key, or two answers would collide
+/// in one map.
 #[test]
 fn the_three_axes_have_distinct_keys() {
-    let keys = [TurnIntent::KEY, TurnComplexity::KEY, ContextDependence::KEY];
+    let keys = [
+        TurnIntent::KEY,
+        TurnComplexity::KEY,
+        ContextDependence::KEY,
+        TierChoice::KEY,
+    ];
     let mut sorted = keys.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
@@ -674,4 +700,29 @@ fn an_unusable_answer_is_not_a_classification() {
     // And its accounting survives, which is the whole reason usage sits outside
     // the answers.
     assert_eq!(unusable.committed_usd(), Some(0.1));
+}
+
+// ------------------------------------------------------------------ taxonomy 2
+
+/// **A record written under taxonomy 1 still decodes, with no tier.**
+///
+/// Taxonomy 2 added the tier answer. A log written before it carries three axes
+/// and no `tier` key, and a replay must read it rather than fail on it. A
+/// taxonomy-1 record written back keeps its bytes: no `tier` key appears.
+#[test]
+fn a_taxonomy_1_record_decodes_with_no_tier() {
+    let written = serde_json::json!({
+        "taxonomy_version": 1,
+        "intent": {"value": "implement", "confidence": 0.82},
+        "complexity": {"value": "involved", "confidence": 0.61},
+        "context_dependence": {"value": "recent", "confidence": 0.55},
+    });
+
+    let decoded: TurnClassification =
+        serde_json::from_value(written.clone()).expect("a taxonomy-1 record decodes");
+
+    assert_eq!(decoded.taxonomy_version, 1);
+    assert_eq!(decoded.intent.value, TurnIntent::Implement);
+    assert_eq!(decoded.tier, None);
+    assert_eq!(serde_json::to_value(decoded).unwrap(), written);
 }

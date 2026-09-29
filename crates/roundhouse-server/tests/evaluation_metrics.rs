@@ -31,15 +31,20 @@ use tower::ServiceExt;
 
 use roundhouse_core::classify::{
     ClassificationIntent, ClassificationOutcome, ClassificationRecord, ClassifierIdentity,
-    EvaluationSpend, EvaluationUsage, SettlementAck,
+    ContextDependence, EvaluationSpend, EvaluationUsage, Graded, SettlementAck, TierChoice,
+    TurnClassification, TurnComplexity, TurnIntent,
 };
 use roundhouse_core::control::{BudgetWindow, Principal, PrincipalKey, ProjectId};
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
-use roundhouse_core::ids::{ResponseId, SessionId};
+use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::metrics::{
     MetricsConfig, MetricsRecorder, MetricsSnapshot, ReferenceModel, ShadowPricing,
 };
-use roundhouse_core::routing::ProviderPricing;
+use roundhouse_core::routing::{
+    DecisionRecord, DecisionSource, LocalFeatures, Pick, PickerMode, ProviderPricing,
+    SelectionSnapshot, SelectorSnapshot, StageEvidence, StageOutcome, Target, Tier, TurnSignals,
+};
+use roundhouse_core::validate::ControlCallDialect;
 use roundhouse_server::{ControlPlane, metrics_api};
 
 mod common;
@@ -174,6 +179,120 @@ fn classified(session: &str, who: Principal, call: &str, usd: f64) -> Vec<Sessio
             },
         ),
     ]
+}
+
+/// One session whose single turn was served on the capable tier and which the
+/// classifier said was efficient work: one disagreement, not yet reviewed.
+fn tiered(session: &str, who: Principal) -> Vec<SessionEvent> {
+    let mut events = classified(session, who, "c-tier", 0.1);
+    let session_id = SessionId::new(session);
+    let source = ResponseId::new("r1");
+    let capable = Target::Frontier {
+        provider: "anthropic".into(),
+        model: "claude".into(),
+    };
+    let evidence = StageEvidence {
+        capable: vec!["anthropic/claude".into()],
+        efficient: vec!["local/qwen".into()],
+        picker: PickerMode::EfficientFirst,
+        confidence_threshold: 0.5,
+        pick: Pick {
+            tier: Tier::Capable,
+            source: DecisionSource::Dimensions,
+            score: 0.8,
+            confidence: Some(0.9),
+        },
+        outcome: StageOutcome::Served {
+            tier: Tier::Capable,
+        },
+    };
+    let decision = DecisionRecord {
+        block_marker: None,
+        selection: Some(Box::new(SelectionSnapshot {
+            features: LocalFeatures {
+                extractor_revision: 1,
+                dialect: ControlCallDialect::ClaudeMessages,
+                signals: TurnSignals::default(),
+                turn_index: 1,
+                observed_through_seq: 1,
+            },
+            selected: capable.clone(),
+            fallbacks: Vec::new(),
+            admitted: None,
+            selector: Some(SelectorSnapshot::stage(evidence)),
+            classifications: None,
+            objective: None,
+        })),
+        local_quote_skipped: None,
+        chosen: capable,
+        rationale: "test".into(),
+        policy: "stage".into(),
+        isl_tokens: 100,
+        expected_prefill_tokens: 0.0,
+        expected_cost_usd: 0.0,
+        considered: Vec::new(),
+        turn_policy_digest: String::new(),
+        budget_state: Default::default(),
+        rate_card: None,
+        payer: Default::default(),
+        billing: Default::default(),
+        budget_draw: None,
+        withheld_providers: Vec::new(),
+        declared_baseline: None,
+        attempts: Vec::new(),
+    };
+    // The route goes in ahead of the intent, as the engine writes it: the
+    // intent follows the turn's terminal.
+    let created = events.remove(0);
+    let (intent, mut result) = (events.remove(0), events.remove(0));
+    if let SessionEventKind::ClassificationRecorded { record } = &mut result.kind {
+        record.outcome = ClassificationOutcome::Classified {
+            classification: TurnClassification {
+                taxonomy_version: 2,
+                intent: Graded {
+                    value: TurnIntent::Implement,
+                    confidence: 0.8,
+                },
+                complexity: Graded {
+                    value: TurnComplexity::Routine,
+                    confidence: 0.7,
+                },
+                context_dependence: Graded {
+                    value: ContextDependence::Recent,
+                    confidence: 0.6,
+                },
+                tier: Some(Graded {
+                    value: TierChoice::Efficient,
+                    confidence: 0.7,
+                }),
+            },
+            spend: record.outcome.spend().copied().expect("the fixture spent"),
+            reported_model: Some("claude-haiku-4.5".into()),
+        };
+    }
+    let kinds = vec![
+        created.kind,
+        SessionEventKind::TurnStarted {
+            turn_id: TurnId::new("t1"),
+            response_id: source.clone(),
+        },
+        SessionEventKind::Routed {
+            response_id: source,
+            decision,
+        },
+        intent.kind,
+        result.kind,
+    ];
+    kinds
+        .into_iter()
+        .enumerate()
+        .map(|(at, kind)| SessionEvent {
+            seq: at as u64 + 1,
+            session_id: session_id.clone(),
+            at_ms: 1_000 + at as u64,
+            kind,
+        })
+        .collect()
 }
 
 struct Rig {
@@ -377,4 +496,37 @@ async fn the_served_document_is_the_scoped_snapshot_verbatim() {
         serde_json::to_value(&built).expect("encodes"),
         "the surface encodes the scoped snapshot and computes nothing"
     );
+}
+
+/// **The agreement block is scoped like the money beside it.**
+///
+/// `ada` has one tier disagreement in a session of her own. The admin document
+/// and her own carry it; `bob`, in the same project, and `zoe`, in another,
+/// carry an empty block. The block is present on every document, so a page can
+/// read it without asking whether it exists.
+#[tokio::test]
+async fn the_agreement_block_is_scoped_like_the_evaluation_spend() {
+    let rig = rig();
+    rig.metrics
+        .record(&tiered("acme/ada/tiered", principal("acme", "ada")));
+
+    let (_, admin) = metrics(&rig.app, &admin_key("root")).await;
+    let agreement = &admin["evaluation"]["agreement"];
+    assert_eq!(agreement["answered"], 1, "{agreement}");
+    assert_eq!(agreement["disagree"], 1, "{agreement}");
+    assert_eq!(
+        agreement["disagreements"]["jev_efficient_served_capable"], 1,
+        "{agreement}"
+    );
+    assert_eq!(agreement["disagreements"]["unlabeled"], 1, "{agreement}");
+
+    let (_, ada) = metrics(&rig.app, &key("ada")).await;
+    assert_eq!(ada["evaluation"]["agreement"], *agreement);
+
+    for who in ["bob", "zoe"] {
+        let (_, document) = metrics(&rig.app, &key(who)).await;
+        let theirs = &document["evaluation"]["agreement"];
+        assert_eq!(theirs["answered"], 0, "{who}: {theirs}");
+        assert_eq!(theirs["disagreements"]["unlabeled"], 0, "{who}: {theirs}");
+    }
 }

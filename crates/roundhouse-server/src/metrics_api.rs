@@ -606,6 +606,41 @@ mod tests {
             assert!(row.get(field).is_some(), "the row lost `{field}`: {row}");
         }
 
+        // The agreement tile reads its block off bound locals as well, so its
+        // fields are named here: every count the document publishes is one
+        // the tile prints, or a disagreement's review label goes unseen.
+        let agreement = &json["evaluation"]["agreement"];
+        let tile = function_body(DASHBOARD_HTML, "renderAgreement");
+        assert!(
+            evaluation_table.contains("renderAgreement(data.evaluation.agreement)"),
+            "the evaluation panel must render the agreement block"
+        );
+        for field in ["answered", "agree", "disagree", "not_comparable"] {
+            assert!(agreement.get(field).is_some(), "no `{field}`: {agreement}");
+            assert!(
+                tile.contains(&format!("a.{field}")),
+                "the tile drops `{field}`"
+            );
+        }
+        for field in [
+            "jev_capable_served_efficient",
+            "jev_efficient_served_capable",
+            "positive",
+            "negative",
+            "unknown",
+            "unlabeled",
+            "evicted",
+        ] {
+            assert!(
+                agreement["disagreements"].get(field).is_some(),
+                "no `disagreements.{field}`: {agreement}"
+            );
+            assert!(
+                tile.contains(&format!("d.{field}")),
+                "the tile drops `{field}`"
+            );
+        }
+
         // A serving row states whether the catalog priced it, and the page
         // reads that rather than inferring it from a zero. Both halves are
         // needed: a renamed field leaves `m.priced_by_catalog === false`

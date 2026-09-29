@@ -29,7 +29,7 @@ use roundhouse_core::classify::projection::PROJECTION_REVISION;
 use roundhouse_core::classify::{
     ClassificationIntent, ClassificationOutcome, ClassificationRecord, ClassificationWindow,
     ClassifierIdentity, ContextDependence, EvaluationSpend, Graded, ReservationRecord,
-    SettlementAck, TAXONOMY_VERSION, TurnClassification, TurnComplexity, TurnIntent,
+    SettlementAck, TAXONOMY_VERSION, TierChoice, TurnClassification, TurnComplexity, TurnIntent,
 };
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{BudgetWindow, MemorySpendLedger};
@@ -324,6 +324,10 @@ fn result(turn: u64) -> ClassificationRecord {
                     value: ContextDependence::Recent,
                     confidence: 0.5,
                 },
+                tier: Some(Graded {
+                    value: TierChoice::Capable,
+                    confidence: 0.7,
+                }),
             },
             spend: EvaluationSpend::Unknown {
                 granted_usd: 0.0,

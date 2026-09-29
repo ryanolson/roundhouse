@@ -504,7 +504,7 @@ Owner approval is also required for: the merge of PR #18, which every milestone 
 
 | Milestone | Draft slice | Status | PR |
 |---|---|---|---|
-| M1 Jev tier question and agreement report | new | not started | |
+| M1 Jev tier question and agreement report | new | implemented on `ai/learner-m1-jev-tier`, awaiting review | |
 | M2 strategies, learned input, keys, record types | L1 part 1 | not started | |
 | M3 cost, latency, and cache corrections | L6 | not started | |
 | M4 gate, constraints, exploration, policy | L1 part 2 | not started | |
@@ -517,3 +517,13 @@ Owner approval is also required for: the merge of PR #18, which every milestone 
 | M11 live enablement | L8 | owner procedure | |
 
 L3b, the source-side index, is done at `6a9eb07` and ships in PR #18. M5 connects `Session::commit` to it.
+
+**M1 status, 2026-09-28.** M1 is implemented test-first on `ai/learner-m1-jev-tier`, from `485a093`. The seams agree with section 5. `TAXONOMY_VERSION` is 2. `TierChoice` is the fourth question in the same request. `evaluation.agreement` is on `/v1/metrics` for every scope and on the dashboard. The milestone did not settle these points, so the implementation made these decisions:
+
+- The fold opens a slot at the classification intent. Thus a review that arrives before the answer still labels the disagreement.
+- Agreement counts only the results that the evaluation join accepted.
+- An answer with no served tier counts as `not_comparable`.
+- The metrics fold uses the label of a review as written. Only the review tracker of the session can verify membership.
+- The projection does not show the tier answer, so `PROJECTION_REVISION` does not change.
+
+Independent mutations of these parts each failed their tests: the question map, the rubric, the served-tier source (pick and first dispatch), the label join, the bound, the acceptance join, the early label, the scope, and the dashboard tile. No live TypeSafe call occurred.

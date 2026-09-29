@@ -381,7 +381,7 @@ pub(super) struct EvaluationFold {
 }
 
 impl EvaluationFold {
-    /// A call this deployment committed to.
+    /// A call this deployment committed to. Answers whether it was new.
     ///
     /// Idempotent by identity: a re-appended intent for a call already known is
     /// not a second call. The fold's sequence watermark already refuses the
@@ -391,10 +391,10 @@ impl EvaluationFold {
         session: &SessionId,
         payer: &PrincipalKey,
         record: &ClassificationIntent,
-    ) {
+    ) -> bool {
         let key = (session.clone(), record.call_id.clone());
         if self.calls.contains_key(&key) {
-            return;
+            return false;
         }
         self.calls.insert(
             key,
@@ -405,15 +405,17 @@ impl EvaluationFold {
             }),
         );
         self.row(payer).counters.intents += 1;
+        true
     }
 
-    /// What a call produced, booked once or not at all.
+    /// What a call produced, booked once or not at all. Answers whether it was
+    /// booked, which is the join every other reader of the result follows.
     pub(super) fn recorded(
         &mut self,
         session: &SessionId,
         payer: &PrincipalKey,
         record: &ClassificationRecord,
-    ) {
+    ) -> bool {
         let key = (session.clone(), record.call_id.clone());
         // The join is resolved before anything is booked, because the counters
         // are a second borrow of this struct. Taking the entry out also frees
@@ -431,19 +433,19 @@ impl EvaluationFold {
             Some(state @ CallState::Intended(_)) => {
                 self.calls.insert(key, state);
                 self.row(payer).counters.unattributed_results += 1;
-                return;
+                return false;
             }
             // Already settled. One answer, one cost, however often it is
             // delivered.
             Some(state) => {
                 self.calls.insert(key, state);
                 self.row(payer).counters.duplicate_results += 1;
-                return;
+                return false;
             }
             // No intent of this session names this call.
             None => {
                 self.row(payer).counters.unattributed_results += 1;
-                return;
+                return false;
             }
         };
 
@@ -490,6 +492,7 @@ impl EvaluationFold {
             }
         };
         self.calls.insert(key, state);
+        true
     }
 
     /// One unconfirmed settlement, resolved.

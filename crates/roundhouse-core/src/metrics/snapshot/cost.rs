@@ -14,8 +14,9 @@
 use serde::Serialize;
 
 use crate::metrics::ServingMode;
+use crate::metrics::agreement::AgreementCounts;
 use crate::metrics::evaluation::{EvaluationCallTally, EvaluationView};
-use crate::metrics::snapshot::{Coverage, ModelAccounting, ModelMetrics};
+use crate::metrics::snapshot::{Coverage, ModelAccounting, ModelMetrics, TierAgreement};
 
 /// What every serving dollar on this document was priced by.
 ///
@@ -203,10 +204,14 @@ pub struct EvaluationMetrics {
     pub unbooked: EvaluationUnbooked,
     /// One row per identity pair, ordered by requested then reported name.
     pub models: Vec<EvaluationModelMetrics>,
+    /// How often the served tier matched the classifier's tier pick, and what
+    /// the covering review said where it did not. Counts, not money, and in
+    /// this section because the classifier's answers are what it compares.
+    pub agreement: TierAgreement,
 }
 
 impl EvaluationMetrics {
-    pub(super) fn build(view: &EvaluationView) -> Self {
+    pub(super) fn build(view: &EvaluationView, agreement: &AgreementCounts) -> Self {
         let counters = &view.counters;
         Self {
             intents: counters.intents,
@@ -247,6 +252,7 @@ impl EvaluationMetrics {
                     tokens: EvaluationTokens::from(row),
                 })
                 .collect(),
+            agreement: TierAgreement::build(agreement),
         }
     }
 }

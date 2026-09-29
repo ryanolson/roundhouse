@@ -29,12 +29,14 @@ use super::*;
 const ANSWER_INTENT_A: &str = r#"{"model":"jev-1.12","answers":{
   "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
   "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
-  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55},
+  "tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.7,"efficient":0.3},"confidence":0.7}
 },"usage":{"input_tokens":200,"output_tokens":40}}"#;
 const ANSWER_INTENT_B: &str = r#"{"model":"jev-1.12","answers":{
   "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
   "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
-  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55},
+  "tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.7,"efficient":0.3},"confidence":0.7}
 },"usage":{"input_tokens":300,"output_tokens":60}}"#;
 
 /// One classification intent: its hold identity and the upstream usage it

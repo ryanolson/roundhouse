@@ -189,6 +189,26 @@ impl StageEvidence {
             }
         }
     }
+
+    /// The recipe tier that names `target`, or `None` when neither list does.
+    ///
+    /// **The tier of a dispatched target, read off the recipe, never off
+    /// [`Self::pick`] or [`Self::outcome`].** A cost guard serves a capable
+    /// target on a turn the scorer picked efficient, and a guarded turn's
+    /// failover can then dispatch an efficient member under the same record
+    /// (see [`StageOutcome::CostGuard`]). Only the target that was dispatched
+    /// says which tier served. `None` is a recipe degrade to a local worker the
+    /// recipe does not name.
+    pub fn tier_of(&self, target: &Target) -> Option<Tier> {
+        let identity = target.policy_identity();
+        if self.capable.contains(&identity) {
+            Some(Tier::Capable)
+        } else if self.efficient.contains(&identity) {
+            Some(Tier::Efficient)
+        } else {
+            None
+        }
+    }
 }
 
 /// Which builtin selector ran, and the configuration it ran under.

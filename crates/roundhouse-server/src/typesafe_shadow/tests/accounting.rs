@@ -246,6 +246,13 @@ async fn a_missing_axis_supplies_no_classification_at_all() {
         "two axes out of three is not a classification: {:?}",
         record.outcome
     );
+    // The fixture carries the tier answer, so the refusal is about the missing
+    // axis and not about the tier question.
+    assert!(
+        matches!(&record.outcome, ClassificationOutcome::Unusable { reason, .. } if reason == "missing_answer"),
+        "{:?}",
+        record.outcome
+    );
     assert_eq!(
         record.outcome.committed_usd(),
         Some(REPORTED_USD),

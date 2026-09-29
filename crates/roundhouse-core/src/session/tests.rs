@@ -2264,8 +2264,8 @@ fn a_turns_leading_configuration_run_replaces_the_sessions_at_the_head() {
 
 use crate::classify::{
     ClassificationOutcome, ClassifierIdentity, ContextDependence, EvaluationSpend, EvaluationUsage,
-    Graded, ReservationRecord, SettlementAck, TAXONOMY_VERSION, TurnClassification, TurnComplexity,
-    TurnIntent,
+    Graded, ReservationRecord, SettlementAck, TAXONOMY_VERSION, TierChoice, TurnClassification,
+    TurnComplexity, TurnIntent,
 };
 use crate::control::BudgetWindow;
 
@@ -2345,6 +2345,10 @@ fn classify_result(
                     value: ContextDependence::Recent,
                     confidence: 0.5,
                 },
+                tier: Some(Graded {
+                    value: TierChoice::Capable,
+                    confidence: 0.7,
+                }),
             },
             spend: EvaluationSpend::Unknown {
                 granted_usd: 0.0,

@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use roundhouse_core::classify::{
     ClassificationIntent, ClassificationOutcome, ClassificationRecord, ClassifierIdentity,
     ContextDependence, EvaluationSpend, EvaluationUsage, Graded, ReservationRecord, SettlementAck,
-    TAXONOMY_VERSION, TurnClassification, TurnComplexity, TurnIntent,
+    TAXONOMY_VERSION, TierChoice, TurnClassification, TurnComplexity, TurnIntent,
 };
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{
@@ -523,6 +523,10 @@ async fn seed_unconfirmed_settlement(
                     value: ContextDependence::SelfContained,
                     confidence: 0.5,
                 },
+                tier: Some(Graded {
+                    value: TierChoice::Capable,
+                    confidence: 0.7,
+                }),
             },
             spend: EvaluationSpend::Measured {
                 granted_usd: usd,

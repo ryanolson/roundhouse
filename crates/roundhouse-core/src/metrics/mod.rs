@@ -64,6 +64,10 @@
 //! [`Savings`] would put a number no serving rate card produced into the column
 //! the savings claim is computed from.
 //!
+//! Beside that spend, [`EvaluationMetrics::agreement`] counts how often the
+//! served tier matched the classifier's tier answer, with the covering review's
+//! label for each disagreement. Counts, not money, folded in `agreement`.
+//!
 //! [`MetricsSnapshot::observed_cost`] is the one field that adds the two, and it
 //! publishes both bases beside the sum rather than quietly merging them. It is
 //! a spend figure and never a saving: [`Savings::total_usd`] remains cache plus
@@ -100,6 +104,7 @@
 //! module keeps only the vocabulary all three share and the live recorder that
 //! drives them, and re-exports the rest so callers see one surface.
 
+pub(crate) mod agreement;
 pub(crate) mod cache_evidence;
 pub(crate) mod evaluation;
 pub mod fold;
@@ -135,7 +140,7 @@ pub use snapshot::{
     ModelMetrics, OBSERVED_CACHE_BASIS, OBSERVED_COST_SCOPE,
     OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY, ObservedCost, PREDICTED_CACHE_BASIS, ProviderMetrics,
     Rollup, SERVING_PRICE_BASIS, Savings, ServingCostGaps, ServingModeMetrics, TURN_ELAPSED_BASIS,
-    TokenBreakdown,
+    TierAgreement, TierDisagreements, TokenBreakdown,
 };
 
 /// The provider name local targets are grouped under.

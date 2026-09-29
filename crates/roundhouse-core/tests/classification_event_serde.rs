@@ -17,7 +17,7 @@
 use roundhouse_core::classify::{
     ClassificationIntent, ClassificationOutcome, ClassificationRecord,
     ClassificationSettlementRepair, ClassifierIdentity, ContextDependence, EvaluationSpend,
-    EvaluationUsage, Graded, ReservationRecord, SettlementAck, TAXONOMY_VERSION,
+    EvaluationUsage, Graded, ReservationRecord, SettlementAck, TAXONOMY_VERSION, TierChoice,
     TurnClassification, TurnComplexity, TurnIntent,
 };
 use roundhouse_core::control::BudgetWindow;
@@ -75,6 +75,10 @@ fn classification() -> TurnClassification {
             value: ContextDependence::Unknown,
             confidence: 0.4,
         },
+        tier: Some(Graded {
+            value: TierChoice::Capable,
+            confidence: 0.7,
+        }),
     }
 }
 
