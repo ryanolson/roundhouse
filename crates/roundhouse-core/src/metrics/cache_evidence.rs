@@ -112,6 +112,24 @@ impl CacheEvidence {
     }
 }
 
+/// The predicted and observed ratios of one settled dispatch, when both are
+/// usable: the pair [`CacheEvidence::observe`] books.
+///
+/// **The one rule for a measured pair.** The learner's cache reuse rows
+/// (`session::learning`) read it too, so the dashboard and the learner cannot
+/// come to disagree about which terminals measured the cache.
+pub(crate) fn measured_pair(
+    isl_tokens: u64,
+    expected_prefill_tokens: f64,
+    usage: &Usage,
+) -> Option<(f64, f64)> {
+    let predicted = predicted_ratio(isl_tokens, expected_prefill_tokens)?;
+    match observed_ratio(usage) {
+        Evidence::Measured(observed) => Some((predicted, observed)),
+        Evidence::Unverifiable | Evidence::Invalid | Evidence::Unusable => None,
+    }
+}
+
 /// What a terminal's usage says about the provider's cache.
 enum Evidence {
     /// The provider stated its read, and it is consistent with its own input.

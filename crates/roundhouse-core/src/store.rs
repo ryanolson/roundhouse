@@ -24,11 +24,12 @@
 //!
 //! The store also keeps the source half of learning discovery (`learning`):
 //! an append may carry a [`LearningMark`], and the same atomic, fenced step
-//! that writes the events records it. That index is deliberately unwired —
-//! `Session::commit` passes no mark until a later slice projects learner
-//! entries from the log (`agent-docs/DRAFT-online-routing-learner.md` §11.7;
-//! of that draft only this mechanism, L3b, is accepted, per §21). The contract
-//! suite pins its guarantees now so the learner can be built on them.
+//! that writes the events records it. `Session::commit` computes the mark
+//! from the session fold (`session::learning_mark`), so only a session that
+//! has learned evidence is ever marked; every other append is unmarked and
+//! unchanged (`agent-docs/DRAFT-online-routing-learner.md` §11.7, and
+//! milestone M5 of `agent-docs/PLAN-online-routing-learner.md`). The contract
+//! suite pins the index's guarantees.
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod contract;

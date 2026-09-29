@@ -34,6 +34,8 @@ use crate::validate::{
     ReviewedDecision, Verdict, label_for,
 };
 
+use super::learning::{CoveredRow, LearningRow, Reviewed};
+
 /// How many turns one open interval tracks before it overflows.
 pub const MAX_REVIEW_TURNS: usize = 64;
 
@@ -81,6 +83,8 @@ struct TrackedDecision {
     /// The instruction generation the decision ran under.
     generation: u64,
     objective: Option<ObjectiveVersion>,
+    /// What credit needs from a learned decision; `None` for any other.
+    learning: Option<LearningRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +253,7 @@ impl ReviewTracker {
         response_id: &ResponseId,
         objective: Option<&ObjectiveVersion>,
         configuration: &[Item],
+        learning: Option<LearningRow>,
     ) {
         if !self.enabled {
             return;
@@ -268,6 +273,7 @@ impl ReviewTracker {
                     seq,
                     generation,
                     objective: objective.cloned(),
+                    learning,
                 });
                 self.decisions += 1;
             }
@@ -294,43 +300,63 @@ impl ReviewTracker {
     }
 
     /// A judged validation was folded in at `event_seq`.
+    ///
+    /// Returns the review as credit reads it when the fold accepted it, and
+    /// `None` when it rejected it, recorded no coverage, or this session tracks
+    /// no interval.
+    ///
+    /// **The covered rows are taken here, before [`Self::advance`] drops
+    /// them**, and only for a label this build verified: an unverified review
+    /// is kept as a checkpoint without its label, and credit reads it as
+    /// `Unknown` with no rows at all.
     pub(crate) fn judged(
         &mut self,
         event_seq: u64,
         verdict: &Verdict,
         review: Option<&IntervalReview>,
-    ) {
+    ) -> Option<Reviewed> {
         if !self.enabled {
-            return;
+            return None;
         }
         let Some(review) = review else {
             // Written before coverage existed: a real review of everything
             // before it, whose coverage nobody recorded. It closes the interval
             // and labels nothing.
             self.advance(event_seq);
-            return;
+            return None;
         };
-        match self.verify(event_seq, verdict, review) {
-            Some(verified) => {
-                self.accepted += 1;
-                self.outcomes.push(ReviewOutcome {
-                    validation_seq: event_seq,
-                    rule_revision: review.rule_revision,
-                    after_seq: review.after_seq,
-                    through_seq: review.through_seq,
-                    decisions: review.decisions.iter().map(|d| d.routed_seq).collect(),
-                    label: match verified {
-                        true => review.label,
-                        false => IntervalLabel::Unknown,
-                    },
-                });
-                if self.outcomes.len() > REVIEW_OUTCOME_WINDOW {
-                    self.outcomes.remove(0);
-                }
-                self.advance(review.through_seq);
-            }
-            None => self.rejected += 1,
+        let Some(verified) = self.verify(event_seq, verdict, review) else {
+            self.rejected += 1;
+            return None;
+        };
+        self.accepted += 1;
+        let label = match verified {
+            true => review.label,
+            false => IntervalLabel::Unknown,
+        };
+        self.outcomes.push(ReviewOutcome {
+            validation_seq: event_seq,
+            rule_revision: review.rule_revision,
+            after_seq: review.after_seq,
+            through_seq: review.through_seq,
+            decisions: review.decisions.iter().map(|d| d.routed_seq).collect(),
+            label,
+        });
+        if self.outcomes.len() > REVIEW_OUTCOME_WINDOW {
+            self.outcomes.remove(0);
         }
+        let rows = match label {
+            IntervalLabel::Unknown => Vec::new(),
+            IntervalLabel::Positive | IntervalLabel::Negative => self
+                .covered_spans(review.after_seq, review.through_seq)
+                .map(|(span, decision)| CoveredRow {
+                    turn_index: span.turn_index,
+                    row: decision.learning,
+                })
+                .collect(),
+        };
+        self.advance(review.through_seq);
+        Some(Reviewed { label, rows })
     }
 
     /// Whether `review` may close the open interval: `Some(true)` when its
@@ -641,12 +667,12 @@ mod tests {
 
         let r0 = ResponseId::new("r0");
         tracker.turn_started(1, 0, &r0, 0);
-        tracker.routed(2, &r0, Some(&objective), &config_a);
+        tracker.routed(2, &r0, Some(&objective), &config_a, None);
         tracker.ended(3, &r0, TurnEnd::Completed);
 
         let r1 = ResponseId::new("r1");
         tracker.turn_started(4, 1, &r1, 0);
-        tracker.routed(5, &r1, Some(&objective), &config_a);
+        tracker.routed(5, &r1, Some(&objective), &config_a, None);
         tracker.ended(6, &r1, TurnEnd::Completed);
 
         // The configuration changed, but nothing has routed under it yet --
@@ -657,7 +683,7 @@ mod tests {
         // the new generation before the span lookup fails, so the tip moves
         // to generation 2 while both covered decisions above still name 1.
         let ghost = ResponseId::new("ghost");
-        tracker.routed(7, &ghost, Some(&objective), &config_b);
+        tracker.routed(7, &ghost, Some(&objective), &config_b, None);
 
         let facts = tracker.facts(&[], 7);
         assert!(

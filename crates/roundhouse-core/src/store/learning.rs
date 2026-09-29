@@ -3,10 +3,9 @@
 
 //! Source-side learning discovery: the index a marked append writes.
 //!
-//! A learner (not built yet — see `agent-docs/DRAFT-online-routing-learner.md`
-//! §11.7; only this source-discovery mechanism, L3b, is accepted there, per its
-//! §21 ruling and §22 addendum) folds some session events into shared counters
-//! in a separate store. Every call to that store can fail, so the record of
+//! The online routing learner (`agent-docs/DRAFT-online-routing-learner.md`
+//! §11.7, and `agent-docs/PLAN-online-routing-learner.md`) folds some session
+//! events into shared counters in a separate store. Every call to that store can fail, so the record of
 //! *which sessions still owe it entries* cannot live there: a session whose
 //! every learner-store call failed would never be registered, and nothing
 //! would find it once the session went idle. The index lives here instead,
@@ -51,11 +50,13 @@
 //! every member it examined, so a consumer that never manages to finish a
 //! session still reaches the ones after it.
 //!
-//! **Not wired yet.** `Session::commit` passes no mark, so ordinary session
-//! appends stay unmarked until a later slice projects learner entries from the
-//! event log and decides which events produce one. Nothing here reads the
-//! learner store, and nothing here is runtime recovery: this is the source
-//! half of the mechanism and its contract, not a working learner.
+//! **Marked by the session layer.** `Session::commit` passes the mark that
+//! `session::learning_mark` computes: the newest entry-producing event of the
+//! batch, once the session has a `Routed` with learned evidence. A session
+//! whose project never enables the learner has no such `Routed`, so its
+//! appends stay unmarked. Nothing here reads the learner store, and nothing
+//! here is runtime recovery: this is the source half of the mechanism and its
+//! contract.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;

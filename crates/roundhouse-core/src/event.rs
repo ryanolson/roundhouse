@@ -545,6 +545,25 @@ pub enum SessionEventKind {
     ClassificationSettlementRepaired {
         record: ClassificationSettlementRepair,
     },
+    /// The learner store confirmed this session's learning entries through
+    /// `through_seq`.
+    ///
+    /// **A hint, never the authority.** The store's watermark decides which
+    /// entries apply; this only lets the session fold stop holding entries the
+    /// store already has, so a successor that replays the log resends less.
+    /// A stale value costs a resend the store skips by identity (draft section
+    /// 11.5 of `agent-docs/DRAFT-online-routing-learner.md`).
+    ///
+    /// No response id and not terminal: it is this deployment's delivery
+    /// bookkeeping, about entries rather than about any turn, so no surface
+    /// streams it and no dispatch pairs with it.
+    ///
+    /// Part of the one-way door of draft section 13: a build older than this
+    /// variant cannot decode a log that holds one. Only a project whose learner
+    /// is not `off` produces entries, so only such a project writes it.
+    LearningApplied {
+        through_seq: u64,
+    },
     Error {
         message: String,
     },
@@ -847,6 +866,8 @@ impl SessionEvent {
             | SessionEventKind::ClassificationRequested { .. }
             | SessionEventKind::ClassificationRecorded { .. }
             | SessionEventKind::ClassificationSettlementRepaired { .. }
+            // Delivery bookkeeping for learner entries, about no turn.
+            | SessionEventKind::LearningApplied { .. }
             | SessionEventKind::Error { .. } => None,
         }
     }

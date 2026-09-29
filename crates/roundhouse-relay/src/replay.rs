@@ -317,7 +317,10 @@ impl SessionReplay {
                 // A settlement repair is further out again: it is about this
                 // deployment's own accounting for a call that is already over,
                 // and it changes no answer any consumer of these formats reads.
+                // A learning acknowledgement is this deployment's delivery
+                // bookkeeping for learner entries, and reaches no client either.
                 SessionEventKind::ClassificationRequested { .. }
+                | SessionEventKind::LearningApplied { .. }
                 | SessionEventKind::ClassificationRecorded { .. }
                 | SessionEventKind::ClassificationSettlementRepaired { .. }
                 | SessionEventKind::SideCallCompleted { .. }

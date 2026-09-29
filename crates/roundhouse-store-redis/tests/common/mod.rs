@@ -385,6 +385,11 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                 repaired_at_ms: 9_000,
             },
         },
+        // Above the 2^32 boundary, so a round trip that narrowed the
+        // watermark would not come back equal.
+        SessionEventKind::LearningApplied {
+            through_seq: 5_000_000_000,
+        },
         SessionEventKind::Error {
             message: "boom".into(),
         },
@@ -397,7 +402,7 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
 /// rather than a hopeful one.
 pub fn assert_covers_every_variant(kinds: &[SessionEventKind]) {
     use SessionEventKind as K;
-    let mut covered = [false; 15];
+    let mut covered = [false; 16];
     for kind in kinds {
         covered[match kind {
             K::SessionCreated { .. } => 0,
@@ -415,6 +420,7 @@ pub fn assert_covers_every_variant(kinds: &[SessionEventKind]) {
             K::ClassificationRequested { .. } => 12,
             K::ClassificationRecorded { .. } => 13,
             K::ClassificationSettlementRepaired { .. } => 14,
+            K::LearningApplied { .. } => 15,
         }] = true;
     }
     assert!(

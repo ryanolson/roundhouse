@@ -684,6 +684,8 @@ impl MessageEmission {
             | SessionEventKind::ClassificationRequested { .. }
             | SessionEventKind::ClassificationRecorded { .. }
             | SessionEventKind::ClassificationSettlementRepaired { .. }
+            // Learner delivery bookkeeping, about no turn at all.
+            | SessionEventKind::LearningApplied { .. }
             | SessionEventKind::Error { .. } => (Vec::new(), Step::Continue),
         }
     }

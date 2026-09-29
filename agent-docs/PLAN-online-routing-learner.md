@@ -509,7 +509,7 @@ Owner approval is also required for: the merge of PR #18, which every milestone 
 | M2 strategies, learned input, keys, record types | L1 part 1 | implemented on `ai/learner-m2-strategies`, awaiting review | |
 | M3 cost, latency, and cache corrections | L6 | implemented on `ai/learner-m3-corrections`, awaiting review | |
 | M4 gate, constraints, exploration, policy | L1 part 2 | implemented on `ai/learner-m4-gate`, awaiting review | |
-| M5 entries, credit, ops rows, Jev counts, cursor, marks | L2 | not started | |
+| M5 entries, credit, ops rows, Jev counts, cursor, marks | L2 | implemented on `ai/learner-m5-credit`, awaiting review | |
 | M6 learner store contract and memory store | L3 | not started | |
 | M7 Redis learner store | L4 | not started | |
 | M8 configuration, engine path, delivery, metrics | L5 part 1 | not started | |
@@ -613,3 +613,44 @@ The milestone did not settle these points, so the implementation made these deci
 - **`StagePolicy::route_pick` returns a `RoutedPick`**: the decision, with the pick and outcome that its stage evidence records. This supersedes the M2 settled signature `-> Result<Decision, RoutingError>`. The learner no longer reads them back from the selector snapshot, so `stage_parts` and its impossible-branch error are gone. The struct holds the pick and the outcome, not the whole `StageEvidence`, because the recipe lists are the caller's own recipe, and cloning them on every stage turn would cost `StagePolicy::choose`, which drops them. `route_pick_with_the_rules_pick_equals_stage_policy_choose` still passes, and the strategies fixture now asserts that the returned pick and outcome equal the recorded ones on every branch.
 - New tests for two mutations that survived. `the_draw_matches_a_golden_digest` holds a digest computed outside the crate, so a change to `LEARNER_DRAW_VERSION`, the domain string, or the encoding fails. `an_upper_bound_exactly_at_the_floor_is_unproven` sets the floor to the bound itself, so `<=` for `<` gives `BelowFloor` and fails.
 
+**M5 status, 2026-09-28.** M5 is implemented test-first on `ai/learner-m5-credit`, from `4079d5b`. The fold is in `crates/roundhouse-core/src/session/learning.rs`, with credit in `learning/credit.rs` and the public entry types in `learning/entry.rs`. `SessionState` exposes `learning_page`, `learning_beyond`, `learning_hint`, `learning_causes`, and `project_learning`. `learning_mark` is public, and `Session::commit` calls it. `Session::record_learning_applied` writes the new event; no engine path calls it until M8. The tests are in `crates/roundhouse-core/tests/learning_entries.rs` and `learning_cursor.rs`, with fixtures in `learning_support/`. Draft section 23 records the automatic marks as a dated addendum to sections 21 and 22.
+
+Two rows of the section 5 seam map are out of date: `commit` now passes the computed mark, and `SessionEventKind` has `LearningApplied`. The Redis fixture `every_event_kind` includes the new variant, but its Redis-gated round trip, and marked appends through `commit` on the Redis store, were not run in this milestone; only `MemoryStore` exercised the automatic marks.
+
+What changes for an existing deployment: nothing while every project is `off`. No `Routed` carries learned evidence, so no entry exists, no append is marked, and the append bytes are unchanged. `LearningApplied` joins the one-way door of draft section 13.
+
+The milestone did not settle these points, so the implementation made these decisions:
+
+- **The row holds agreement, not indices.** Draft 8.1 lists the served target and each plan's first target as recipe indices. `LearningRow` holds the one fact credit reads from them: a bit for each strategy whose plan's first target is the target this dispatch went to. The comparison is structural (provider and model, or local model), so a recipe degrade to a local worker that the recipe does not name is still comparable.
+- **A foreign credit revision suppresses every delta of that decision**, not only credit (draft 11.1: "contributes no deltas"). Its turn adds no operational rows, and a classification of it adds no Jev counts. The entry still exists.
+- **Cache reuse per-mille rounds to nearest.** The rule for a measured pair is shared with the metrics fold (`metrics::cache_evidence::measured_pair`).
+- **Jev retention.** The row of a learned turn is kept from its intent until the accepted result. It is dropped when a later intent is requested at or after its `expires_at_ms`. A result is delivered at the start of the next turn, possibly long after its call's deadline, and the next intent is written after that delivery. Pruning on the log clock of any event would drop late-delivered answers.
+- **The residual quote** is the `expected_ttft_ms` of the candidate in `considered` that equals the served target. A served dispatch with no such candidate supplies neither the residual nor the overhead, so the two samples still come from the same turns.
+- **`beyond` is never an undercount.** When a `LearningApplied` reaches past the page but not the newest entry, the count is kept as an upper bound, and the backfill finds the exact set.
+- **Causes.** `LearningCauses` counts `unknown_label`, `failover_in_interval`, `missing_row`, `mixed_epoch`, and `other_credit_revision`, in the draft's check order.
+
+**Finding: with per-decision agreement, the failover rule decides the cause and not the deltas.** A failover turn writes two `Routed` to two targets. A strategy's plan has one first target, so no strategy agrees with both dispatches, and consistency alone already credits nothing. Rule 1 of draft 8.2 still runs first. It is observable through `failover_in_interval`, which is how its test holds it.
+
+The tests were run first against a skeleton that produced no entries, and then against one that produced entries with no deltas. At the first stage every test failed except `learning_applied_has_no_response_id_and_is_not_terminal` and `learning_mark_marks_nothing_before_learned_evidence`. At the second stage every credit, operational-row and Jev test failed on its own claim. Two tests passed there, `a_classification_without_a_tier_answer_yields_an_entry_with_no_deltas` and `a_classification_for_a_turn_without_a_learned_row_yields_an_entry_with_no_deltas`, so they count as controls. They and the other two controls are held by named mutations. These mutations each failed their tests:
+
+- `ClassificationRecorded` dropped from the entry list;
+- a strategy credited when any turn agreed;
+- the failover rule removed;
+- the epoch check removed;
+- a negative interval counted as positive;
+- no remainder;
+- the Jev count on only one key;
+- a mark that ignores learned evidence;
+- a mark that names the first event instead of the newest;
+- a mark that ignores the session state;
+- `commit` passing no mark;
+- `LearningApplied` made terminal;
+- a missing tier answer counted;
+- a row kept for any turn;
+- the residual measured from turn start;
+- latency sampled on an incomplete turn;
+- a cache sample for a local target;
+- `beyond` reset on every acknowledgement;
+- no expiry prune;
+- operational rows under a foreign credit revision;
+- a backfill that ignores its floor.
