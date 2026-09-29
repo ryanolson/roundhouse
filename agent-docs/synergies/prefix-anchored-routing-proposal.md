@@ -1632,3 +1632,9 @@ H_d = C_d - W_d - z · sqrt(V_d)          z = 1 by default (question 31)
 - **A new-sequence placement:** one read of each eligible deployment's partials, which a node memo answers for up to one publish interval.
 - **Each second, per node:** one partial write per deployment. The curve increments are batched in the same pipeline.
 - **Memory:** about 120 B per reservation. At 10,000 live sequences per deployment that is about 1.2 MB per deployment (estimate, not measured).
+
+## Addendum, 2026-09-29: owner ruling on questions 21 to 32
+
+The owner accepted every recommendation of questions 21 to 32 as written above.
+
+For question 26 the owner added a reason. Roundhouse guides users on how to launch their agents (Claude Code, Codex, and others) through NeMo Relay. That launch guidance can therefore set `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. The exact compaction header then arrives without an Anthropic remote flag. The content marker stays as the fallback for a client that was launched some other way.
