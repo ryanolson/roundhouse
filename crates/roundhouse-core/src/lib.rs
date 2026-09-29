@@ -21,6 +21,7 @@ pub mod event;
 pub mod ids;
 pub mod interject;
 pub mod item;
+pub mod learn_store;
 pub mod metrics;
 pub mod routing;
 pub mod session;

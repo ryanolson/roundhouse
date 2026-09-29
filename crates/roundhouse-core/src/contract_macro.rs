@@ -17,14 +17,18 @@
 //! call and what the local binding is named. Before this rung each family
 //! carried its own copy (M14.1 review, F6); now each carries only its own
 //! name, its own module path, its own binding name and its own list of test
-//! names, and delegates the rest here.
+//! names, and delegates the rest here. Two families written since delegate
+//! the same way:
+//! [`document_store_contract_suite!`](crate::document_store_contract_suite)
+//! and
+//! [`learner_store_contract_suite!`](crate::learner_store_contract_suite).
 //!
 //! `#[doc(hidden)]` because this is plumbing a family macro reaches for, not
-//! a suite an implementation calls directly — the four public macros above
-//! are the contract.
+//! a suite an implementation calls directly — the family macros above are
+//! the contract.
 
-/// See the module doc: the recursion the four family `..._contract_suite!`
-/// macros delegate to.
+/// See the module doc: the recursion the family `..._contract_suite!` macros
+/// delegate to.
 ///
 /// `$binding` becomes the local variable name each generated test binds
 /// `$make` to (`maps`, `ledger`, `store`, one per family, kept distinct so a
