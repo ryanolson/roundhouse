@@ -396,6 +396,49 @@ async fn a_seq_that_overflows_u64_is_named_and_the_page_goes_on() {
     assert!(page.sessions.is_empty());
 }
 
+/// `LearningPage::unreadable` is documented in byte order. The Lua page
+/// names a member with no mark, and `decode_page` names one whose mark it
+/// cannot decode; the two lists are merged, so the order is only right if
+/// the merge sorts (M9 round-5).
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn unreadable_members_from_the_script_and_the_decoder_come_back_in_byte_order() {
+    let rig = rig().await;
+    let [marks, _, pending] = learning_index_keys(&rig.namespace);
+    for member in ["sess_a", "sess_b", "sess_c"] {
+        let _: i64 = redis::cmd("ZADD")
+            .arg(&pending)
+            .arg(0)
+            .arg(member)
+            .query_async(&mut rig.raw.clone())
+            .await
+            .unwrap();
+    }
+    // `sess_a` and `sess_c` have no mark (the script names them);
+    // `sess_b` has one the script accepts and Rust cannot decode.
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg("sess_b")
+        .arg("18446744073709551616:1:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let page = rig
+        .store
+        .pending_learning(None, 0, NonZeroUsize::new(8).unwrap())
+        .await
+        .expect("unreadable members must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![
+            SessionId::new("sess_a"),
+            SessionId::new("sess_b"),
+            SessionId::new("sess_c"),
+        ],
+        "unreadable is in byte order, whichever side named each member"
+    );
+}
+
 /// The same overflow, in the marked-at field, against the permanent
 /// enumeration rather than pending (M9 round-4, item 1).
 #[tokio::test]

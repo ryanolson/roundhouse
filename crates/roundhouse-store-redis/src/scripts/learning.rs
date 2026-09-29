@@ -355,6 +355,10 @@ fn decode_page(reply: &[Value], limit: NonZeroUsize) -> Result<LearningPage, Sto
             None => unreadable.push(SessionId::new(session_id)),
         }
     }
+    // The script names members with no mark and this loop names marks it
+    // cannot decode; `LearningPage::unreadable` is documented in byte order,
+    // so the merged list is sorted rather than left script-first.
+    unreadable.sort();
     // A full page may have more behind it; a short one reached the end.
     let next = (usize::try_from(examined).ok() == Some(limit.get()))
         .then(|| LearningCursor::after(SessionId::new(last)));
