@@ -202,6 +202,21 @@ mod tests {
         }
     }
 
+    /// M1 refute, mutation 3c: an empty `prompt_cache_key` is no hint, so the
+    /// cache key falls back to the fingerprint even when a header named the
+    /// request; a whitespace key was a hint before the move and stays one.
+    #[test]
+    fn an_empty_cache_key_is_no_hint_and_a_blank_one_is() {
+        let items = [Item::system_text("system"), Item::user_text("first")];
+        let mut headers = HeaderMap::new();
+        headers.insert("session-id", "a".parse().unwrap());
+        let empty = RequestContext::from_request(&headers, Some(""), &items).unwrap();
+        assert!(!empty.prompt_cache_key.is_empty());
+        assert_eq!(empty.prompt_cache_key, empty.prefix_fingerprint);
+        let blank = RequestContext::from_request(&headers, Some(" "), &items).unwrap();
+        assert_eq!(blank.prompt_cache_key, " ");
+    }
+
     #[test]
     fn explicit_cache_hint_is_independent_of_the_fingerprint() {
         let context = RequestContext::from_request(
