@@ -198,7 +198,10 @@ impl LearnedInput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyLevel {
-    /// `rules_pick`, `newest`, `prior`, `tool_turn`: 48 keys.
+    /// `rules_pick`, `newest`, `prior`, `tool_turn`: 40 reachable keys of the
+    /// 48 the fields could spell. `newest == None` means the sequence is empty,
+    /// which forces `prior == Absent`, so `None` pairs with one prior band
+    /// rather than three: 10 band pairs, times 2 picks, times 2 tool flags.
     L2,
     /// `rules_pick`, `newest`: 8 keys.
     L1,

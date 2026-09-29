@@ -453,15 +453,15 @@ async fn a_staged_turn_records_the_recipe_it_ran_under() {
 
     let decision = choose(&policy, &fixture, &candidates).await;
     let evidence = stage_evidence(&decision);
-    assert_eq!(evidence.capable, vec!["openai/sol".to_string()]);
+    assert_eq!(evidence.recipe.capable, vec!["openai/sol".to_string()]);
     assert_eq!(
-        evidence.efficient,
+        evidence.recipe.efficient,
         vec!["openai/terra".to_string(), "openai/luna".to_string()],
         "the operator's order, not the quoter's -- `luna` is cheaper and still \
          second"
     );
-    assert_eq!(evidence.picker, PickerMode::EfficientFirst);
-    assert_eq!(evidence.confidence_threshold, 0.75);
+    assert_eq!(evidence.recipe.picker, PickerMode::EfficientFirst);
+    assert_eq!(evidence.recipe.confidence_threshold, 0.75);
     assert_eq!(
         decision.target,
         hosted_target("terra"),
@@ -600,7 +600,7 @@ async fn degrading_past_the_recipe_is_recorded_as_its_own_branch() {
         }
     );
     assert_eq!(
-        evidence.capable,
+        evidence.recipe.capable,
         vec!["openai/sol".to_string()],
         "the recipe that was bypassed is still the recipe this turn ran under"
     );

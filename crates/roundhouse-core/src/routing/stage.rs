@@ -994,7 +994,7 @@ impl StagePolicy {
             } => (served, outcome, ordered, guarded),
         };
         // The evidence is built once and read from, rather than a `source`
-        // recomputed here beside it: `StageEvidence::source` is the rule's one
+        // recomputed here beside it: `StageOutcome::source` is the rule's one
         // home, so `Decision.source` (set inside `decide_staged`, below) and
         // the rationale's own `by {}` cannot come to name two different
         // things. `None` is unreachable on this path in practice --

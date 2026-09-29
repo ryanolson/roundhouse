@@ -16,8 +16,8 @@ use roundhouse_core::control::{Billing, BudgetState, Payer};
 use roundhouse_core::ids::ResponseId;
 use roundhouse_core::routing::{
     AffinityEvidence, Candidate, Decision, DecisionRecord, DecisionSource, LocalFeatures, Pick,
-    PickerMode, SelectionSnapshot, SelectorBranch, SelectorSnapshot, StageEvidence, StageOutcome,
-    Target, Tier, TurnSignals,
+    PickerMode, RecipeEvidence, SelectionSnapshot, SelectorBranch, SelectorSnapshot, StageEvidence,
+    StageOutcome, Target, Tier, TurnSignals,
 };
 use roundhouse_core::validate::{ControlCallDialect, ToolSignals};
 
@@ -48,10 +48,12 @@ fn features() -> LocalFeatures {
 
 fn stage_snapshot() -> SelectorSnapshot {
     SelectorSnapshot::stage(StageEvidence {
-        capable: vec!["openai/sol".into()],
-        efficient: vec!["openai/luna".into(), "openai/terra".into()],
-        picker: PickerMode::EfficientFirst,
-        confidence_threshold: 0.5,
+        recipe: RecipeEvidence {
+            capable: vec!["openai/sol".into()],
+            efficient: vec!["openai/luna".into(), "openai/terra".into()],
+            picker: PickerMode::EfficientFirst,
+            confidence_threshold: 0.5,
+        },
         pick: Pick {
             tier: Tier::Efficient,
             source: DecisionSource::Ambiguous,
@@ -255,18 +257,44 @@ fn a_selection_snapshot_survives_a_round_trip_whole() {
     assert_eq!(selection.admitted.as_ref().map(Vec::len), Some(3));
 }
 
+/// **The claim.** A stage selector's wire bytes are exactly these, in this
+/// order.
+///
+/// Every stage `Routed` already in a log was written in this shape, and the
+/// recipe half of the evidence is a nested struct in the code but flat on the
+/// wire. A round trip alone would pass on a shape that nested it, because both
+/// directions would move together, and every log written before would then
+/// stop reading. The exact string is what pins it.
+#[test]
+fn a_stage_selector_keeps_its_exact_wire_shape() {
+    assert_eq!(
+        serde_json::to_string(&stage_snapshot()).expect("serializes"),
+        concat!(
+            r#"{"algorithm_revision":1,"branch":{"kind":"stage","#,
+            r#""capable":["openai/sol"],"efficient":["openai/luna","openai/terra"],"#,
+            r#""picker":"efficient_first","confidence_threshold":0.5,"#,
+            r#""pick":{"tier":"efficient","source":"ambiguous","score":-0.125,"confidence":0.125},"#,
+            r#""outcome":{"kind":"cost_guard","displaced":"openai/luna"}}}"#,
+        )
+    );
+}
+
 /// **The claim.** The recipe's order is preserved, not its membership: two
 /// recipes over the same names are different evidence.
 #[test]
 fn the_recipe_order_and_the_thresholds_survive_distinctly() {
+    let fixture = match stage_snapshot().branch {
+        SelectorBranch::Stage(evidence) => evidence,
+        other => panic!("the fixture is a stage snapshot, got {other:?}"),
+    };
     let reordered = SelectorSnapshot::stage(StageEvidence {
-        efficient: vec!["openai/terra".into(), "openai/luna".into()],
-        confidence_threshold: 0.75,
-        picker: PickerMode::CapableFirst,
-        ..match stage_snapshot().branch {
-            SelectorBranch::Stage(evidence) => evidence,
-            other => panic!("the fixture is a stage snapshot, got {other:?}"),
-        }
+        recipe: RecipeEvidence {
+            efficient: vec!["openai/terra".into(), "openai/luna".into()],
+            confidence_threshold: 0.75,
+            picker: PickerMode::CapableFirst,
+            ..fixture.recipe.clone()
+        },
+        ..fixture
     });
     let shipped = stage_snapshot();
 

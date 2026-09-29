@@ -111,8 +111,8 @@ pub enum StageOutcome {
     /// run through the efficient tier before the rest of the capable one
     /// (2026-09-28 ruling 4), so a failover can dispatch an efficient member
     /// under a record that still carries this arm. A reader that needs the
-    /// tier of a dispatched target reads it off the recipe lists in
-    /// [`StageEvidence`] by the `Routed` record's own target, the way
+    /// tier of a dispatched target reads it off the recipe lists by the
+    /// `Routed` record's own target ([`RecipeEvidence::tier_of`]), the way
     /// `engine::opened_a_tier_escalation` does, never off this arm.
     ///
     /// `displaced` is the head it dominated, by
@@ -155,39 +155,66 @@ impl StageOutcome {
     }
 }
 
-/// The recipe tier whose list names `target`, or `None` when neither does.
-///
-/// Shared by [`StageEvidence::tier_of`] and the learned evidence's recipe, so
-/// both read a dispatched target's tier by one rule.
-pub(crate) fn tier_named_by(
-    capable: &[String],
-    efficient: &[String],
-    target: &Target,
-) -> Option<Tier> {
-    let identity = target.policy_identity();
-    if capable.contains(&identity) {
-        Some(Tier::Capable)
-    } else if efficient.contains(&identity) {
-        Some(Tier::Efficient)
-    } else {
-        None
-    }
-}
-
-/// The recipe a staged decision ran under, and what the scorer answered.
+/// The recipe a tier decision ran under.
 ///
 /// **Full typed configuration rather than a digest.** A digest tells a reader
 /// that two turns ran under different settings and never which settings; these
 /// are the operator's own lists, in the operator's own order, which is what a
 /// reader needs to explain why a turn went where it did.
+///
+/// One struct for both readers: [`StageEvidence`] carries it flattened, so a
+/// stage record's wire shape is the four fields side by side, and a learned
+/// decision holds it once for every plan. Two copies of these fields would be
+/// two tier lookups that could come to disagree about which tier a dispatched
+/// target was served on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StageEvidence {
+pub struct RecipeEvidence {
     /// The recipe's capable tier, in the operator's order.
     pub capable: Vec<String>,
     /// The recipe's efficient tier, in the operator's order.
     pub efficient: Vec<String>,
     pub picker: PickerMode,
     pub confidence_threshold: f64,
+}
+
+impl RecipeEvidence {
+    pub fn of(recipe: &TierRecipe) -> Self {
+        Self {
+            capable: recipe.list(Tier::Capable).to_vec(),
+            efficient: recipe.list(Tier::Efficient).to_vec(),
+            picker: recipe.picker(),
+            confidence_threshold: recipe.confidence_threshold(),
+        }
+    }
+
+    /// The recipe tier that names `target`, or `None` when neither list does.
+    ///
+    /// **The tier of a dispatched target, read off the recipe, never off the
+    /// pick or the outcome.** A cost guard serves a capable target on a turn
+    /// the scorer picked efficient, and a guarded turn's failover can then
+    /// dispatch an efficient member under the same record (see
+    /// [`StageOutcome::CostGuard`]). Only the target that was dispatched says
+    /// which tier served. `None` is a recipe degrade to a local worker the
+    /// recipe does not name.
+    pub fn tier_of(&self, target: &Target) -> Option<Tier> {
+        let identity = target.policy_identity();
+        if self.capable.contains(&identity) {
+            Some(Tier::Capable)
+        } else if self.efficient.contains(&identity) {
+            Some(Tier::Efficient)
+        } else {
+            None
+        }
+    }
+}
+
+/// The recipe a staged decision ran under, and what the scorer answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageEvidence {
+    /// Flattened, so the four recipe fields sit beside `pick` and `outcome` on
+    /// the wire exactly as they did before the struct existed.
+    #[serde(flatten)]
+    pub recipe: RecipeEvidence,
     /// What `pick_tier` answered, carried verbatim rather than recomputed.
     ///
     /// The scorer is pure, so a reader *could* re-run it — on the extractor and
@@ -201,16 +228,13 @@ impl StageEvidence {
     /// The recipe and the scorer's answer, paired with what the resolution
     /// actually did.
     ///
-    /// One constructor rather than the two hand-written literals it replaces
-    /// (`StagePolicy::route_pick` and `StagePolicy::degrade_past_the_recipe` each
-    /// wrote out all four recipe-derived fields by hand): a field added to
-    /// that half needs one edit instead of two that have to agree.
+    /// One constructor for the two paths that record a stage decision
+    /// (`StagePolicy::route_pick` and `StagePolicy::degrade_past_the_recipe`),
+    /// with the recipe half read by [`RecipeEvidence::of`]: a field added to the
+    /// recipe needs one edit, and the learned record picks it up too.
     pub fn new(recipe: &TierRecipe, pick: Pick, outcome: StageOutcome) -> Self {
         Self {
-            capable: recipe.list(Tier::Capable).to_vec(),
-            efficient: recipe.list(Tier::Efficient).to_vec(),
-            picker: recipe.picker(),
-            confidence_threshold: recipe.confidence_threshold(),
+            recipe: RecipeEvidence::of(recipe),
             pick,
             outcome,
         }
@@ -224,19 +248,6 @@ impl StageEvidence {
     /// two agree. The rule itself is [`StageOutcome::source`].
     pub fn source(&self) -> Option<DecisionSource> {
         self.outcome.source(&self.pick)
-    }
-
-    /// The recipe tier that names `target`, or `None` when neither list does.
-    ///
-    /// **The tier of a dispatched target, read off the recipe, never off
-    /// [`Self::pick`] or [`Self::outcome`].** A cost guard serves a capable
-    /// target on a turn the scorer picked efficient, and a guarded turn's
-    /// failover can then dispatch an efficient member under the same record
-    /// (see [`StageOutcome::CostGuard`]). Only the target that was dispatched
-    /// says which tier served. `None` is a recipe degrade to a local worker the
-    /// recipe does not name.
-    pub fn tier_of(&self, target: &Target) -> Option<Tier> {
-        tier_named_by(&self.capable, &self.efficient, target)
     }
 }
 
@@ -285,6 +296,40 @@ pub enum SelectorBranch {
     /// widen the other three arms by its own size. The box keeps
     /// `SelectorBranch` exactly as wide as it was without this arm.
     Learned(Box<LearnedEvidence>),
+}
+
+impl SelectorBranch {
+    /// The [`DecisionSource`] this branch's evidence implies.
+    ///
+    /// **The one home for which branches state a source**, read by
+    /// [`SelectionSnapshot::source`] and so by the handoff gate. A stage
+    /// decision's is [`StageEvidence::source`], a learned decision's is its
+    /// served plan's ([`LearnedEvidence::source`]); affinity and the
+    /// escalation audit pick a candidate, not a tier, and have none. No
+    /// wildcard arm: a new branch has to say which it is.
+    pub fn source(&self) -> Option<DecisionSource> {
+        match self {
+            SelectorBranch::Stage(evidence) => evidence.source(),
+            SelectorBranch::Learned(evidence) => evidence.source(),
+            SelectorBranch::Affinity(_) | SelectorBranch::EscalationAudit { .. } => None,
+        }
+    }
+
+    /// The recipe tier that names `target`, or `None` for a branch no tier
+    /// recipe made or a target the recipe does not name.
+    ///
+    /// **The one home for which branches carry a recipe**, read by the tier
+    /// agreement report. A learned turn served a target its recipe names and is
+    /// read by the same lists a stage turn is ([`RecipeEvidence::tier_of`]);
+    /// read as "no recipe", every learned turn would drop out of the report.
+    /// No wildcard arm, for the same reason as [`Self::source`].
+    pub fn tier_of(&self, target: &Target) -> Option<Tier> {
+        match self {
+            SelectorBranch::Stage(evidence) => evidence.recipe.tier_of(target),
+            SelectorBranch::Learned(evidence) => evidence.recipe.tier_of(target),
+            SelectorBranch::Affinity(_) | SelectorBranch::EscalationAudit { .. } => None,
+        }
+    }
 }
 
 impl SelectorSnapshot {
@@ -404,23 +449,12 @@ impl SelectionSnapshot {
 
     /// The [`DecisionSource`] the selection ran under, read off the same
     /// evidence [`Self::selector`] already carries rather than kept as a
-    /// second copy: a stage decision's source is [`StageEvidence::source`], a
-    /// learned decision's is its served plan's
-    /// ([`LearnedEvidence::source`]), and every other branch -- affinity, the
-    /// escalation audit, and an unknown policy's `None` -- has no source to
-    /// state.
+    /// second copy ([`SelectorBranch::source`]). An unknown policy's `None`
+    /// selector has no source to state.
     pub fn source(&self) -> Option<DecisionSource> {
-        match &self.selector {
-            Some(SelectorSnapshot {
-                branch: SelectorBranch::Stage(evidence),
-                ..
-            }) => evidence.source(),
-            Some(SelectorSnapshot {
-                branch: SelectorBranch::Learned(evidence),
-                ..
-            }) => evidence.source(),
-            _ => None,
-        }
+        self.selector
+            .as_ref()
+            .and_then(|selector| selector.branch.source())
     }
 }
 
@@ -430,10 +464,12 @@ mod tests {
 
     fn evidence(pick: Tier, outcome: StageOutcome) -> StageEvidence {
         StageEvidence {
-            capable: vec!["anthropic/opus".into()],
-            efficient: vec!["anthropic/haiku".into(), "local/qwen".into()],
-            picker: PickerMode::EfficientFirst,
-            confidence_threshold: 0.5,
+            recipe: RecipeEvidence {
+                capable: vec!["anthropic/opus".into()],
+                efficient: vec!["anthropic/haiku".into(), "local/qwen".into()],
+                picker: PickerMode::EfficientFirst,
+                confidence_threshold: 0.5,
+            },
             pick: Pick {
                 tier: pick,
                 source: DecisionSource::Dimensions,
@@ -473,26 +509,30 @@ mod tests {
                     degraded_to: "local/llama".into(),
                 },
             );
-            assert_eq!(evidence.tier_of(&local("llama")), None, "pick {pick:?}");
             assert_eq!(
-                evidence.tier_of(&frontier("openai", "gpt")),
+                evidence.recipe.tier_of(&local("llama")),
+                None,
+                "pick {pick:?}"
+            );
+            assert_eq!(
+                evidence.recipe.tier_of(&frontier("openai", "gpt")),
                 None,
                 "pick {pick:?}"
             );
             // Controls: a named target reads its own list, not the pick, and a
             // local worker is named by model whatever its worker and rank.
             assert_eq!(
-                evidence.tier_of(&frontier("anthropic", "opus")),
+                evidence.recipe.tier_of(&frontier("anthropic", "opus")),
                 Some(Tier::Capable),
                 "pick {pick:?}"
             );
             assert_eq!(
-                evidence.tier_of(&frontier("anthropic", "haiku")),
+                evidence.recipe.tier_of(&frontier("anthropic", "haiku")),
                 Some(Tier::Efficient),
                 "pick {pick:?}"
             );
             assert_eq!(
-                evidence.tier_of(&local("qwen")),
+                evidence.recipe.tier_of(&local("qwen")),
                 Some(Tier::Efficient),
                 "pick {pick:?}"
             );

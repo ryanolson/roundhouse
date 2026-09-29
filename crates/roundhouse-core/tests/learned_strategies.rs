@@ -14,7 +14,9 @@
 
 use roundhouse_core::control::{FrontierHistory, TurnBudget, TurnPolicy};
 use roundhouse_core::ids::SessionId;
-use roundhouse_core::routing::learn::{Strategy, StrategySet, StrategySetError};
+use roundhouse_core::routing::learn::{
+    ActiveMode, LearnerMode, Strategy, StrategySet, StrategySetError,
+};
 use roundhouse_core::routing::stage::{DEFAULT_CONFIDENCE_THRESHOLD, pick_tier};
 use roundhouse_core::routing::{
     AffinityPolicy, CacheLedger, Candidate, Decision, DecisionSource, PickerMode, RoutingContext,
@@ -331,4 +333,28 @@ fn a_strategy_list_without_rules_or_with_a_repeat_is_refused() {
         serde_json::from_str::<StrategySet>(r#"["efficient","capable"]"#).is_err(),
         "the wire refuses what the constructor refuses"
     );
+}
+
+/// **The count is checked before the repeats**, so a list longer than three
+/// is refused for its length. Four distinct strategies do not exist, so a
+/// four-entry list always repeats one; checked the other way round, the count
+/// bound would be unreachable and nothing would hold it at three.
+#[test]
+fn a_four_entry_strategy_list_is_refused_for_its_count() {
+    use Strategy::{Capable, Efficient, Rules};
+    assert_eq!(
+        StrategySet::new(vec![Rules, Efficient, Capable, Rules]),
+        Err(StrategySetError::Count { count: 4 })
+    );
+    // Control: the same list without its repeat is accepted.
+    assert!(StrategySet::new(vec![Rules, Efficient, Capable]).is_ok());
+}
+
+/// **`off` writes no learned evidence**, so it has no active mode, and each
+/// other mode records itself rather than its neighbour.
+#[test]
+fn only_shadow_and_live_have_an_active_mode() {
+    assert_eq!(LearnerMode::Off.active(), None);
+    assert_eq!(LearnerMode::Shadow.active(), Some(ActiveMode::Shadow));
+    assert_eq!(LearnerMode::Live.active(), Some(ActiveMode::Live));
 }

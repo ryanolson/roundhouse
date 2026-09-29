@@ -42,7 +42,8 @@ use roundhouse_core::metrics::{
 };
 use roundhouse_core::routing::{
     DecisionRecord, DecisionSource, LocalFeatures, Pick, PickerMode, ProviderPricing,
-    SelectionSnapshot, SelectorSnapshot, StageEvidence, StageOutcome, Target, Tier, TurnSignals,
+    RecipeEvidence, SelectionSnapshot, SelectorSnapshot, StageEvidence, StageOutcome, Target, Tier,
+    TurnSignals,
 };
 use roundhouse_core::validate::ControlCallDialect;
 use roundhouse_server::{ControlPlane, metrics_api};
@@ -192,10 +193,12 @@ fn tiered(session: &str, who: Principal) -> Vec<SessionEvent> {
         model: "claude".into(),
     };
     let evidence = StageEvidence {
-        capable: vec!["anthropic/claude".into()],
-        efficient: vec!["local/qwen".into()],
-        picker: PickerMode::EfficientFirst,
-        confidence_threshold: 0.5,
+        recipe: RecipeEvidence {
+            capable: vec!["anthropic/claude".into()],
+            efficient: vec!["local/qwen".into()],
+            picker: PickerMode::EfficientFirst,
+            confidence_threshold: 0.5,
+        },
         pick: Pick {
             tier: Tier::Capable,
             source: DecisionSource::Dimensions,

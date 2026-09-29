@@ -18,19 +18,25 @@ use roundhouse_core::ids::ResponseId;
 use roundhouse_core::routing::learn::{
     ActiveMode, Band, CacheReuse, CostCorrection, CostEvidence, Draw, EpochId, ExplorationEvidence,
     GateEvidence, GateResult, GrantCheck, JevCounts, KeyLevel, LatencySum, LatencyTerm,
-    LearnedChoice, LearnedEvidence, LearnedInput, LevelView, PlanEvidence, PriorBand, ReadFailure,
-    ReadView, RecipeEvidence, StoreRead, Strategy, StrategyCounts, TargetOps, TtftEvidence, Unmet,
+    LearnedChoice, LearnedEvidence, LearnedEvidenceError, LearnedEvidenceParts, LearnedInput,
+    LevelView, PlanEvidence, PriorBand, ReadFailure, ReadView, StoreRead, Strategy, StrategyCounts,
+    StrategySetError, TargetOps, TtftEvidence, Unmet,
 };
 use roundhouse_core::routing::{
     AffinityEvidence, Candidate, DecisionRecord, DecisionSource, LocalFeatures, Pick, PickerMode,
-    SelectionSnapshot, SelectorBranch, SelectorSnapshot, StageEvidence, StageOutcome, Target, Tier,
-    TurnSignals,
+    RecipeEvidence, SelectionSnapshot, SelectorBranch, SelectorSnapshot, StageEvidence,
+    StageOutcome, Target, Tier, TurnSignals,
 };
 use roundhouse_core::validate::ControlCallDialect;
 
 /// `SessionEventKind`'s size at `75ccf2c`, the commit before the learned
 /// branch, on the pinned toolchain (`rust-toolchain.toml`, 1.96.1).
-const SESSION_EVENT_KIND_BYTES: usize = 344;
+///
+/// A ceiling, not an exact pin: another toolchain may lay the enum out
+/// smaller, and that is no regression. The claim that the learned arm costs
+/// nothing is the `BranchBeforeLearned` comparison, which holds on any
+/// toolchain; this bound only catches growth from elsewhere.
+const SESSION_EVENT_KIND_MAX_BYTES: usize = 344;
 
 fn hosted(model: &str) -> Target {
     Target::Frontier {
@@ -95,8 +101,12 @@ fn forced(tier: Tier) -> Pick {
 }
 
 fn evidence(mode: ActiveMode, choice: LearnedChoice) -> LearnedEvidence {
+    LearnedEvidence::new(parts(mode, choice)).expect("the fixture holds every configured plan")
+}
+
+fn parts(mode: ActiveMode, choice: LearnedChoice) -> LearnedEvidenceParts {
     let input = input();
-    LearnedEvidence {
+    LearnedEvidenceParts {
         mode,
         epoch: EpochId::new([
             0xab, 0xcd, 0xef, 0x01, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
@@ -249,15 +259,19 @@ fn learned_evidence_round_trips_and_session_event_size_is_unchanged() {
     // A served forced pick reports its own source, so the handoff gate that
     // reads it does not narrate.
     assert_eq!(selection.source(), Some(DecisionSource::Strategy));
-    assert_eq!(learned.tier_of(&hosted("luna")), Some(Tier::Efficient));
+    assert_eq!(
+        learned.recipe.tier_of(&hosted("luna")),
+        Some(Tier::Efficient)
+    );
 
     // An unavailable store is recorded as such, not as an empty view.
-    let unavailable = LearnedEvidence {
+    let unavailable = LearnedEvidence::new(LearnedEvidenceParts {
         view: StoreRead::Unavailable {
             reason: ReadFailure::ReadTimedOut,
         },
-        ..learned.clone()
-    };
+        ..learned.clone().into_parts()
+    })
+    .expect("the same plans");
     let json = serde_json::to_string(&unavailable).expect("serializes");
     assert_eq!(
         serde_json::from_str::<LearnedEvidence>(&json).expect("reads"),
@@ -277,10 +291,10 @@ fn learned_evidence_round_trips_and_session_event_size_is_unchanged() {
         size_of::<BranchBeforeLearned>(),
         "the learned arm widened SelectorBranch"
     );
-    assert_eq!(
-        size_of::<SessionEventKind>(),
-        SESSION_EVENT_KIND_BYTES,
-        "SessionEventKind moved from its size before the learned branch"
+    assert!(
+        size_of::<SessionEventKind>() <= SESSION_EVENT_KIND_MAX_BYTES,
+        "SessionEventKind grew past its size before the learned branch: {} bytes",
+        size_of::<SessionEventKind>()
     );
 }
 
@@ -406,4 +420,95 @@ fn the_rationale_carries_no_price() {
             }
         }
     }
+}
+
+/// **The claim.** A learned record whose served strategy has no plan is not a
+/// value anyone can hold: the constructor refuses it and so does the wire.
+///
+/// Without the check, `source()` answers `None` and the rationale drops its
+/// served clause, so a bad durable record reads as a turn that served nothing
+/// rather than failing where it was read.
+#[test]
+fn a_learned_record_whose_served_strategy_has_no_plan_is_refused() {
+    let whole = evidence(
+        ActiveMode::Live,
+        LearnedChoice::Exploit {
+            strategy: Strategy::Capable,
+        },
+    );
+    let without = |strategy: Strategy| {
+        let mut parts = whole.clone().into_parts();
+        parts.plans.retain(|plan| plan.strategy != strategy);
+        parts
+    };
+    // The wire half writes the unchecked parts, which is exactly what a bad
+    // durable record looks like to the reader.
+    let decode = |parts: &LearnedEvidenceParts| {
+        serde_json::from_value::<LearnedEvidence>(serde_json::to_value(parts).expect("serializes"))
+    };
+
+    // The served strategy's plan is missing.
+    assert_eq!(
+        LearnedEvidence::new(without(Strategy::Capable)),
+        Err(LearnedEvidenceError::MissingPlan {
+            strategy: Strategy::Capable
+        })
+    );
+    assert!(
+        decode(&without(Strategy::Capable)).is_err(),
+        "a live record that served `capable` with no `capable` plan must not read"
+    );
+    // The `rules` plan is missing, which shadow mode and an infeasible turn serve.
+    assert_eq!(
+        LearnedEvidence::new(without(Strategy::Rules)),
+        Err(LearnedEvidenceError::Plans(StrategySetError::NoRules))
+    );
+    assert!(
+        decode(&without(Strategy::Rules)).is_err(),
+        "a record with no `rules` plan must not read"
+    );
+    // Shadow mode serves `rules`, and the rationale still reads the chosen
+    // strategy's gate: a chosen strategy with no plan is refused too.
+    let mut shadow = without(Strategy::Capable);
+    shadow.mode = ActiveMode::Shadow;
+    assert_eq!(
+        LearnedEvidence::new(shadow.clone()),
+        Err(LearnedEvidenceError::MissingPlan {
+            strategy: Strategy::Capable
+        })
+    );
+    assert!(decode(&shadow).is_err());
+
+    // Control: the same record with every plan present reads, and states the
+    // served plan's source.
+    let read: LearnedEvidence =
+        serde_json::from_value(serde_json::to_value(&whole).expect("serializes"))
+            .expect("the whole record reads");
+    assert_eq!(read.source(), Some(DecisionSource::Strategy));
+}
+
+/// **`rules_stage()` is the `rules` plan, whichever strategy served.** A reader
+/// that wants what the stage router alone would have recorded gets the `rules`
+/// pick and outcome, never the served plan's.
+#[test]
+fn rules_stage_reads_the_rules_plan_when_another_strategy_served() {
+    let learned = evidence(
+        ActiveMode::Live,
+        LearnedChoice::Exploit {
+            strategy: Strategy::Efficient,
+        },
+    );
+    let rules = learned.plan(Strategy::Rules).expect("configured");
+    let served = learned.served_plan();
+    // Control: the two plans differ in both fields, so the assertions below
+    // can tell them apart.
+    assert_eq!(served.strategy, Strategy::Efficient);
+    assert_ne!(served.pick, rules.pick);
+    assert_ne!(served.outcome, rules.outcome);
+
+    let stage = learned.rules_stage();
+    assert_eq!(stage.pick, rules.pick);
+    assert_eq!(stage.outcome, rules.outcome);
+    assert_eq!(stage.recipe, learned.recipe);
+    assert_eq!(stage.source(), Some(DecisionSource::Override));
 }

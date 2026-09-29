@@ -32,9 +32,9 @@ use super::{Admitted, Decision, RoutingError};
 
 pub use evidence::{
     CacheReuse, CostCorrection, CostEvidence, Draw, ExplorationEvidence, GateEvidence, GateResult,
-    GrantCheck, JevCounts, LatencySum, LatencyTerm, LearnedChoice, LearnedEvidence, LevelView,
-    PlanEvidence, ReadFailure, ReadView, RecipeEvidence, StoreRead, StrategyCounts, TargetOps,
-    TtftEvidence, Unmet,
+    GrantCheck, JevCounts, LatencySum, LatencyTerm, LearnedChoice, LearnedEvidence,
+    LearnedEvidenceError, LearnedEvidenceParts, LevelView, PlanEvidence, ReadFailure, ReadView,
+    StoreRead, StrategyCounts, TargetOps, TtftEvidence, Unmet,
 };
 pub use input::{Band, KeyLevel, LearnedInput, LevelKey, PriorBand, SEQUENCE_LEN};
 

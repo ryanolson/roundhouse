@@ -15,20 +15,24 @@
 //! turn. The branch holds them behind a `Box`, so a session event is the same
 //! size whether or not the learner ran.
 
-use serde::{Deserialize, Serialize};
+use std::ops::Deref;
+
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::input::{KeyLevel, LearnedInput, LevelKey};
-use super::{ActiveMode, EpochId, Strategy};
+use super::{ActiveMode, EpochId, Strategy, StrategySet, StrategySetError};
 use crate::routing::Target;
-use crate::routing::selection::{StageEvidence, StageOutcome, tier_named_by};
-use crate::routing::stage::{DecisionSource, Pick, PickerMode, Tier, TierRecipe};
+use crate::routing::selection::{RecipeEvidence, StageEvidence, StageOutcome};
+use crate::routing::stage::{DecisionSource, Pick, Tier};
 
-/// One learned decision's evidence.
+/// The fields of one learned decision's evidence, before they are checked.
 ///
-/// No field is named `kind`: `SelectorBranch` is internally tagged on it, and
-/// this struct is that branch's payload.
+/// The wire shape of [`LearnedEvidence`], and the only way to build one: pass
+/// it to [`LearnedEvidence::new`]. No field is named `kind`:
+/// `SelectorBranch` is internally tagged on it, and this struct is that
+/// branch's payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LearnedEvidence {
+pub struct LearnedEvidenceParts {
     pub mode: ActiveMode,
     pub epoch: EpochId,
     /// [`LEARNING_INPUT_REVISION`](super::LEARNING_INPUT_REVISION) as of the
@@ -62,15 +66,14 @@ pub struct LearnedEvidence {
     pub propensity: f64,
 }
 
-impl LearnedEvidence {
+impl LearnedEvidenceParts {
     /// The strategy whose plan served the turn.
     ///
     /// `rules` in `shadow` mode and on an infeasible turn; the chosen strategy
     /// on a `live` turn that chose one.
     pub fn served_strategy(&self) -> Strategy {
-        match (self.mode, &self.choice) {
-            (ActiveMode::Live, LearnedChoice::Exploit { strategy })
-            | (ActiveMode::Live, LearnedChoice::Explore { strategy, .. }) => *strategy,
+        match (self.mode, self.choice.strategy()) {
+            (ActiveMode::Live, Some(chosen)) => chosen,
             _ => Strategy::Rules,
         }
     }
@@ -79,32 +82,92 @@ impl LearnedEvidence {
     pub fn plan(&self, strategy: Strategy) -> Option<&PlanEvidence> {
         self.plans.iter().find(|plan| plan.strategy == strategy)
     }
+}
+
+/// Why a learned record was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LearnedEvidenceError {
+    /// The plans' strategies are not a list a learner could be configured
+    /// with: a repeat, a missing `rules`, or the wrong count.
+    #[error("the plans are not a strategy list: {0}")]
+    Plans(StrategySetError),
+    /// The record served or chose a strategy it holds no plan for.
+    #[error("the record names the `{strategy}` strategy and holds no plan for it")]
+    MissingPlan { strategy: Strategy },
+}
+
+/// One learned decision's evidence, checked.
+///
+/// **Every plan the record names is present.** The plans are one per
+/// configured strategy with `rules` among them, and the served and chosen
+/// strategies each have one. Without that, [`Self::source`] would answer
+/// `None` and [`Self::rationale`] would drop its served clause, so a record
+/// missing its served plan would read as a turn that served nothing rather than
+/// failing where it was built or read. [`LearnedEvidence::new`] is the only
+/// constructor and deserialization goes through it, so a bad durable record
+/// fails loudly at decode.
+///
+/// The plans' strategies are checked as a [`StrategySet`], not against the
+/// configured one: a record is read without the configuration that wrote it,
+/// so the configured order cannot be checked here.
+///
+/// Read-only: the fields are reached through [`Deref`] to
+/// [`LearnedEvidenceParts`], and there is no `DerefMut`, so the checked shape
+/// cannot be edited after construction. [`Self::into_parts`] gives the fields
+/// back to rebuild from.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(try_from = "LearnedEvidenceParts")]
+pub struct LearnedEvidence(LearnedEvidenceParts);
+
+impl LearnedEvidence {
+    pub fn new(parts: LearnedEvidenceParts) -> Result<Self, LearnedEvidenceError> {
+        StrategySet::new(parts.plans.iter().map(|plan| plan.strategy).collect())
+            .map_err(LearnedEvidenceError::Plans)?;
+        for strategy in [Some(parts.served_strategy()), parts.choice.strategy()]
+            .into_iter()
+            .flatten()
+        {
+            if parts.plan(strategy).is_none() {
+                return Err(LearnedEvidenceError::MissingPlan { strategy });
+            }
+        }
+        Ok(Self(parts))
+    }
+
+    pub fn into_parts(self) -> LearnedEvidenceParts {
+        self.0
+    }
+
+    /// The plan of a strategy [`Self::new`] checked is present.
+    fn named(&self, strategy: Strategy) -> &PlanEvidence {
+        self.plan(strategy)
+            .expect("LearnedEvidence::new refuses a record missing a plan it names")
+    }
+
+    /// The plan that served the turn.
+    pub fn served_plan(&self) -> &PlanEvidence {
+        self.named(self.served_strategy())
+    }
 
     /// The [`DecisionSource`] of the served plan.
     ///
     /// Read off the served plan's own pick and outcome by the same rule a
     /// stage decision uses, so a served forced pick reports
-    /// [`DecisionSource::Strategy`] and never narrates a handoff.
+    /// [`DecisionSource::Strategy`] and never narrates a handoff. `None` only
+    /// for a served plan that degraded past the recipe.
     pub fn source(&self) -> Option<DecisionSource> {
-        self.plan(self.served_strategy())
-            .and_then(|plan| plan.outcome.source(&plan.pick))
-    }
-
-    /// The recipe tier that names `target`, or `None` when neither list does.
-    pub fn tier_of(&self, target: &Target) -> Option<Tier> {
-        self.recipe.tier_of(target)
+        let plan = self.served_plan();
+        plan.outcome.source(&plan.pick)
     }
 
     /// The `rules` plan as the stage router itself would have recorded it.
-    pub fn rules_stage(&self) -> Option<StageEvidence> {
-        self.plan(Strategy::Rules).map(|plan| StageEvidence {
-            capable: self.recipe.capable.clone(),
-            efficient: self.recipe.efficient.clone(),
-            picker: self.recipe.picker,
-            confidence_threshold: self.recipe.confidence_threshold,
+    pub fn rules_stage(&self) -> StageEvidence {
+        let plan = self.named(Strategy::Rules);
+        StageEvidence {
+            recipe: self.recipe.clone(),
             pick: plan.pick,
             outcome: plan.outcome.clone(),
-        })
+        }
     }
 
     /// The account of this decision that reaches the audit trail and the
@@ -122,11 +185,11 @@ impl LearnedEvidence {
         let (choice, level) = match &self.choice {
             LearnedChoice::Exploit { strategy } => (
                 format!("the {strategy} strategy passed"),
-                self.plan(*strategy).and_then(|plan| plan.gate.level),
+                self.named(*strategy).gate.level,
             ),
             LearnedChoice::Explore { strategy, .. } => (
                 format!("the {strategy} strategy explored"),
-                self.plan(*strategy).and_then(|plan| plan.gate.level),
+                self.named(*strategy).gate.level,
             ),
             LearnedChoice::ConstraintUnmet { unmet } => (
                 format!(
@@ -151,45 +214,41 @@ impl LearnedEvidence {
         {
             rationale.push_str("; shadow mode, so the learned choice was not applied");
         }
-        let served = self.served_strategy();
-        if let Some(plan) = self.plan(served) {
-            rationale.push_str(&format!(
-                "; served the {served} strategy, {} tier ({})",
-                self.tier_of(&plan.first)
-                    .map(Tier::label)
-                    .unwrap_or("no recipe"),
-                plan.first.policy_identity(),
-            ));
-        }
+        let served = self.served_plan();
+        rationale.push_str(&format!(
+            "; served the {} strategy, {} tier ({})",
+            served.strategy,
+            self.recipe
+                .tier_of(&served.first)
+                .map(Tier::label)
+                .unwrap_or("no recipe"),
+            served.first.policy_identity(),
+        ));
         rationale
     }
 }
 
-/// The recipe a learned decision's plans were routed under.
-///
-/// The same four fields [`StageEvidence`] carries, held once for all plans
-/// rather than copied into each.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RecipeEvidence {
-    pub capable: Vec<String>,
-    pub efficient: Vec<String>,
-    pub picker: PickerMode,
-    pub confidence_threshold: f64,
+impl TryFrom<LearnedEvidenceParts> for LearnedEvidence {
+    type Error = LearnedEvidenceError;
+
+    fn try_from(parts: LearnedEvidenceParts) -> Result<Self, Self::Error> {
+        Self::new(parts)
+    }
 }
 
-impl RecipeEvidence {
-    pub fn of(recipe: &TierRecipe) -> Self {
-        Self {
-            capable: recipe.list(Tier::Capable).to_vec(),
-            efficient: recipe.list(Tier::Efficient).to_vec(),
-            picker: recipe.picker(),
-            confidence_threshold: recipe.confidence_threshold(),
-        }
-    }
+impl Deref for LearnedEvidence {
+    type Target = LearnedEvidenceParts;
 
-    /// The recipe tier that names `target`. See [`StageEvidence::tier_of`].
-    pub fn tier_of(&self, target: &Target) -> Option<Tier> {
-        tier_named_by(&self.capable, &self.efficient, target)
+    fn deref(&self) -> &LearnedEvidenceParts {
+        &self.0
+    }
+}
+
+/// Written as its parts, and by hand rather than with `serde(into)`, which
+/// would clone the whole record on every learned `Routed` write.
+impl Serialize for LearnedEvidence {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
     }
 }
 
@@ -294,12 +353,28 @@ pub enum LearnedChoice {
     Exploit { strategy: Strategy },
     /// An exploring turn served `strategy`, which is `member` of the
     /// exploration set.
-    Explore { strategy: Strategy, member: u32 },
+    ///
+    /// `member` is [`Draw::member`] modulo the set size, and has the draw's
+    /// width so the index is the remainder itself rather than a narrowing cast
+    /// of it.
+    Explore { strategy: Strategy, member: u64 },
     /// No strategy satisfied the constraints, and the turn served `rules`.
     ///
     /// The learner did not validate the route. It does not say the review of
     /// the turn is void: the served trajectory still earns credit.
     ConstraintUnmet { unmet: Vec<Unmet> },
+}
+
+impl LearnedChoice {
+    /// The strategy chosen, or `None` when no strategy met the constraints.
+    pub fn strategy(&self) -> Option<Strategy> {
+        match self {
+            LearnedChoice::Exploit { strategy } | LearnedChoice::Explore { strategy, .. } => {
+                Some(*strategy)
+            }
+            LearnedChoice::ConstraintUnmet { .. } => None,
+        }
+    }
 }
 
 /// One reason a turn was infeasible.

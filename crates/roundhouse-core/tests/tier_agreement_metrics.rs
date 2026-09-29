@@ -25,12 +25,15 @@ use roundhouse_core::metrics::{
     TierAgreement, TierDisagreements,
 };
 use roundhouse_core::routing::learn::{
-    ActiveMode, Band, EpochId, LEARNING_CREDIT_REVISION, LEARNING_INPUT_REVISION, LearnedChoice,
-    LearnedEvidence, LearnedInput, PriorBand, ReadFailure, RecipeEvidence, StoreRead, Unmet,
+    ActiveMode, Band, CostCorrection, CostEvidence, EpochId, GateEvidence, GateResult, GrantCheck,
+    LEARNING_CREDIT_REVISION, LEARNING_INPUT_REVISION, LatencyTerm, LearnedChoice, LearnedEvidence,
+    LearnedEvidenceParts, LearnedInput, PlanEvidence, PriorBand, ReadFailure, StoreRead, Strategy,
+    TtftEvidence, Unmet,
 };
 use roundhouse_core::routing::{
     DecisionRecord, DecisionSource, LocalFeatures, Pick, PickerMode, ProviderPricing,
-    SelectionSnapshot, SelectorSnapshot, StageEvidence, StageOutcome, Target, Tier, TurnSignals,
+    RecipeEvidence, SelectionSnapshot, SelectorSnapshot, StageEvidence, StageOutcome, Target, Tier,
+    TurnSignals,
 };
 use roundhouse_core::session::MAX_REVIEW_DECISIONS;
 use roundhouse_core::validate::{
@@ -60,10 +63,12 @@ fn local(model: &str) -> Target {
 /// a local worker at the tail of the efficient tier.
 fn evidence(pick: Tier, outcome: StageOutcome) -> StageEvidence {
     StageEvidence {
-        capable: vec!["anthropic/opus".into()],
-        efficient: vec!["anthropic/haiku".into(), "local/qwen".into()],
-        picker: PickerMode::EfficientFirst,
-        confidence_threshold: 0.5,
+        recipe: RecipeEvidence {
+            capable: vec!["anthropic/opus".into()],
+            efficient: vec!["anthropic/haiku".into(), "local/qwen".into()],
+            picker: PickerMode::EfficientFirst,
+            confidence_threshold: 0.5,
+        },
         pick: Pick {
             tier: pick,
             source: DecisionSource::Dimensions,
@@ -502,11 +507,68 @@ fn a_cost_guarded_turn_compares_the_served_tier_not_the_pick() {
     assert_partitions(&agreement);
 }
 
+/// One strategy's plan with first target `first`, served on `tier`. Nothing
+/// here reads the plan's prices, latency or gate.
+fn plan(strategy: Strategy, source: DecisionSource, tier: Tier, first: Target) -> PlanEvidence {
+    PlanEvidence {
+        strategy,
+        pick: Pick {
+            tier,
+            source,
+            score: 0.0,
+            confidence: None,
+        },
+        outcome: StageOutcome::Served { tier },
+        first,
+        cost: CostEvidence {
+            quoted_usd: 0.0,
+            adjusted_usd: 0.0,
+            correction: CostCorrection::TooFewSamples,
+        },
+        ttft: TtftEvidence {
+            quoted_ms: 0.0,
+            adjusted_ms: 0.0,
+            residual: LatencyTerm::TooFewSamples,
+            overhead: LatencyTerm::TooFewSamples,
+        },
+        grant: GrantCheck::Admits,
+        latency_met: true,
+        gate: GateEvidence {
+            level: None,
+            result: GateResult::Unproven,
+        },
+    }
+}
+
 /// A learned decision that served `chosen`, under the same recipe as
 /// [`evidence`]. Only the recipe decides the served tier; the rest is the
-/// smallest record a learned turn can write.
+/// smallest record a learned turn can write: an infeasible turn, so `rules`
+/// served `chosen`, beside the one other plan a strategy list needs.
 fn learned(chosen: Target) -> DecisionRecord {
-    let evidence = LearnedEvidence {
+    let recipe = RecipeEvidence {
+        capable: vec!["anthropic/opus".into()],
+        efficient: vec!["anthropic/haiku".into(), "local/qwen".into()],
+        picker: PickerMode::EfficientFirst,
+        confidence_threshold: 0.5,
+    };
+    let served = recipe
+        .tier_of(&chosen)
+        .expect("the recipe names the target");
+    let plans = vec![
+        plan(
+            Strategy::Rules,
+            DecisionSource::Dimensions,
+            served,
+            chosen.clone(),
+        ),
+        plan(
+            Strategy::Efficient,
+            DecisionSource::Strategy,
+            Tier::Efficient,
+            frontier(EFFICIENT),
+        ),
+    ];
+    let evidence = LearnedEvidence::new(LearnedEvidenceParts {
         mode: ActiveMode::Live,
         epoch: EpochId::new([7; 16]),
         input_revision: LEARNING_INPUT_REVISION,
@@ -520,19 +582,15 @@ fn learned(chosen: Target) -> DecisionRecord {
         view: StoreRead::Unavailable {
             reason: ReadFailure::ReadTimedOut,
         },
-        recipe: RecipeEvidence {
-            capable: vec!["anthropic/opus".into()],
-            efficient: vec!["anthropic/haiku".into(), "local/qwen".into()],
-            picker: PickerMode::EfficientFirst,
-            confidence_threshold: 0.5,
-        },
-        plans: Vec::new(),
+        recipe,
+        plans,
         choice: LearnedChoice::ConstraintUnmet {
             unmet: vec![Unmet::ReadTimedOut],
         },
         exploration: None,
         propensity: 1.0,
-    };
+    })
+    .expect("a rules plan that served, beside one other");
     decision(chosen, Some(SelectorSnapshot::learned(evidence)))
 }
 

@@ -533,7 +533,7 @@ Independent mutations of these parts each failed their tests: the question map, 
 - The catalog local price (ruling 6) landed in `82446c9` as `LocalCapacityPrice`. Local quotes are $0 only when the catalog sets no price. The M11 precondition therefore depends on code that exists now.
 - The fallback order of ruling 4 (`f7ddc32`) is inside `StagePolicy::resolve`, and C3 fail-open (`ad5888c`) is in the engine. `route_pick` inherits ruling 4 as planned.
 - M1 added a second reader of `SelectorBranch`, `metrics/agreement.rs`. The `Learned` arm reads the served tier from the recipe lists, which is the same rule as the `Stage` arm.
-- `stage.rs` has 2490 lines and `routing/mod.rs` has 1393. The extraction stays in `stage.rs`. The new code is in `routing/learn/`, and the new tests are in `crates/roundhouse-core/tests/learned_*.rs`.
+- `stage.rs` and `routing/mod.rs` are already large files. The extraction stays in `stage.rs`. The new code is in `routing/learn/`, and the new tests are in `crates/roundhouse-core/tests/learned_*.rs`.
 
 Two points differ from draft section 7.7, which the M2 settled points name. Each record holds the same information. The orchestrator accepted both on 2026-09-28:
 
@@ -542,7 +542,7 @@ Two points differ from draft section 7.7, which the M2 settled points name. Each
 
 The milestone did not settle these points, so the implementation made these decisions:
 
-- The source rule moved to `StageOutcome::source(pick)`, and the recipe-tier lookup moved to `tier_named_by`. `StageEvidence` and `LearnedEvidence` use the same rule. `SelectionSnapshot::source` reads the source of the served plan.
+- The source rule moved to `StageOutcome::source(pick)`, and the recipe-tier lookup moved to `tier_named_by`. `StageEvidence` and `LearnedEvidence` use the same rule. `SelectionSnapshot::source` reads the source of the served plan. (The review fixes below replaced `tier_named_by`.)
 - The learned input comes from the recorded `ClassificationWindow`. It resolves the named references against the accepted classifications of the session, and it checks the window cutoff again.
 - A key part is spelled with dots and has no colon, for example `capable.low.no_high.tools`, because the store joins key parts with `:`. The tier words are `capable` and `efficient`, not the rationale labels `strong` and `weak`.
 - `StrategySet` refuses a list that does not contain `rules`, a list with a repeated strategy, and a list with fewer than 2 or more than 3 entries, on the wire as well. `LearnerMode` (`off`, `shadow`, `live`) is separate from `ActiveMode` (`shadow`, `live`), so a record cannot say `off`.
@@ -550,3 +550,10 @@ The milestone did not settle these points, so the implementation made these deci
 - `Tier` now derives `Ord`, because `LevelKey` is a map key in `PriorUnits`.
 
 Each new test failed first, except three controls that passed before and after the change: `route_pick_with_the_rules_pick_equals_stage_policy_choose`, `a_record_without_learned_evidence_still_decodes`, and the `Override` control in the handoff test. These mutations each failed their tests: `prior` removed from L2, `rules_pick` removed from L1, sort by arrival, no cutoff check, no `K` truncation, a forced pick that copies the `rules` source, a forced pick that is stamped `Override`, `route_pick` refusing instead of degrading, the guard skipping a forced pick, a price in the rationale, the `Learned` arm without its box, `StrategySet` without the `rules` check, and the agreement arm returning no tier for a learned turn.
+
+**M2 review fixes, 2026-09-28.** The PR 25 review and mutation pass found two design defects and three untested lines. All are fixed on the same branch. The wire shape of every existing record is unchanged.
+
+- `LearnedEvidence` is now checked. `LearnedEvidence::new(LearnedEvidenceParts)` is the only constructor, and deserialization goes through it. It refuses a record whose plans are not a valid strategy list (so `rules` must be present), and a record with no plan for the served strategy or the chosen strategy. `served_plan()` and `rules_stage()` cannot fail now. Before this fix, `source()` returned `None` and the rationale dropped its served clause when the plan was missing. The configured order cannot be checked at decode, because a record is read without the configuration that wrote it.
+- There is one recipe struct. `RecipeEvidence` moved to `selection.rs`, and `StageEvidence` holds it as a flattened `recipe` field. `RecipeEvidence::tier_of` replaces `tier_named_by`, `StageEvidence::tier_of`, and `LearnedEvidence::tier_of`. `SelectorBranch::source` and `SelectorBranch::tier_of` are the one place that decides which branches have a source or a recipe. `SelectionSnapshot::source` and the agreement report call them. An exact-JSON test pins the stage record's wire bytes.
+- New tests for three mutations that survived: `StrategySet` accepting 4 entries, `LearnerMode::Off` mapping to a mode, and `rules_stage()` reading the served plan. Each test failed under its mutation.
+- `LearnedChoice::Explore.member` is `u64`, the same width as `Draw.member`. The L2 doc says 40 keys are reachable (not 48), because `newest == None` forces `prior == Absent`. The size check on `SessionEventKind` is now a ceiling. The `handoff_escalation` rig moved to `tests/handoff_escalation/rig.rs`.
