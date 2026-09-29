@@ -8,7 +8,7 @@ use roundhouse_core::classify::{
     ClassificationAxis, ContextDependence, TierChoice, TurnComplexity, TurnIntent,
 };
 
-/// **Three questions about the turn, and none about the models.**
+/// **Four questions about the turn, and none about the models.**
 ///
 /// The tier-only question the taxonomy replaced named the *decision* rather
 /// than the turn, so a later selector that wanted a different mapping had
@@ -18,7 +18,7 @@ use roundhouse_core::classify::{
 /// `validate::brief` rules that the routing decision is taken by code, and a
 /// criteria list of model names would ask a third party to route.
 #[test]
-fn the_adapter_asks_the_three_taxonomy_questions_and_names_no_model() {
+fn the_adapter_asks_the_four_questions_and_names_no_model() {
     let questions = TypeSafeShadow::<ByteTokenizer>::questions();
 
     assert_eq!(questions.len(), 4, "three axes and the tier: {questions:?}");
@@ -244,4 +244,47 @@ async fn a_reply_without_the_tier_answer_is_unusable_under_taxonomy_2() {
         other => panic!("three answers to four questions is unusable: {other:?}"),
     }
     assert_eq!(roundhouse_core::classify::TAXONOMY_VERSION, 2);
+}
+
+/// One valid answer to `A`'s question: its first offered option.
+fn first_option<A: ClassificationAxis>() -> (String, ChoiceAnswer) {
+    let (_, label, _) = A::OPTIONS[0];
+    (
+        A::KEY.to_string(),
+        ChoiceAnswer {
+            choice: label.to_string(),
+            probabilities: BTreeMap::from([(label.to_string(), 1.0)]),
+            confidence: 0.9,
+        },
+    )
+}
+
+/// **The shadow's own read is all or nothing, tier included.**
+///
+/// The fleet transport already refuses a batch that is missing an answer, so
+/// the end-to-end test above passes even if this read quietly made the tier
+/// optional. This one reads the answers directly: three taxonomy answers and
+/// no tier answer are no classification, whatever the transport lets through.
+/// The control adds the tier answer to the same map and gets one back, which
+/// proves the three taxonomy answers are ones the read accepts.
+#[test]
+fn the_read_without_a_tier_answer_is_no_classification() {
+    let mut answers: BTreeMap<String, ChoiceAnswer> = [
+        first_option::<TurnIntent>(),
+        first_option::<TurnComplexity>(),
+        first_option::<ContextDependence>(),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        TypeSafeShadow::<ByteTokenizer>::read(&answers),
+        None,
+        "three answers to four questions must not read as a classification"
+    );
+
+    let (key, tier) = first_option::<TierChoice>();
+    answers.insert(key, tier);
+    let classification =
+        TypeSafeShadow::<ByteTokenizer>::read(&answers).expect("all four answers read");
+    assert!(classification.tier.is_some(), "{classification:?}");
 }

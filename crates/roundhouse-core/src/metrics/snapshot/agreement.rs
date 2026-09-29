@@ -27,9 +27,10 @@ pub struct TierAgreement {
     pub agree: u64,
     /// Answers that named the other tier.
     pub disagree: u64,
-    /// Answers with no served tier to compare against: the turn was not routed
-    /// by a tier recipe, its target is in neither recipe list, or its route is
-    /// not in the log this process folded.
+    /// Answers with no served tier to compare against: no tier recipe routed
+    /// the turn, its target is in neither recipe list, its route is not the
+    /// session's latest route in the log this process folded, or the fold had
+    /// stopped waiting for the answer at the per-session bound.
     pub not_comparable: u64,
     pub disagreements: TierDisagreements,
 }

@@ -163,7 +163,7 @@ Dependency order: M1 is independent and ships first. M2 to M4 build the pure pol
 - `a_local_only_session_reports_no_agreement_row`
 - `replay_rebuilds_the_same_agreement_counts`
 - `retained_disagreements_are_bounded_and_an_eviction_is_counted`
-- The dashboard DOM-stub smoke script gains the agreement row.
+- `the_dashboard_reads_the_fields_the_document_publishes` in `crates/roundhouse-server/src/metrics_api.rs` reads the body of `renderAgreement` with `function_body` and checks that the tile prints every agreement field the document publishes.
 
 **Done means.** The loopback classifier receives one request with four questions. Old classification records replay. The agreement block appears in `/v1/metrics` for each scope and on the dashboard. Independent mutations of the question map, the served-tier source, the label join, and the bound fail their tests. No live TypeSafe call.
 

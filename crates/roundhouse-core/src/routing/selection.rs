@@ -373,3 +373,79 @@ impl SelectionSnapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn evidence(pick: Tier, outcome: StageOutcome) -> StageEvidence {
+        StageEvidence {
+            capable: vec!["anthropic/opus".into()],
+            efficient: vec!["anthropic/haiku".into(), "local/qwen".into()],
+            picker: PickerMode::EfficientFirst,
+            confidence_threshold: 0.5,
+            pick: Pick {
+                tier: pick,
+                source: DecisionSource::Dimensions,
+                score: 0.0,
+                confidence: Some(0.9),
+            },
+            outcome,
+        }
+    }
+
+    fn local(model: &str) -> Target {
+        Target::Local {
+            worker_id: 7,
+            dp_rank: 1,
+            model: model.into(),
+        }
+    }
+
+    fn frontier(provider: &str, model: &str) -> Target {
+        Target::Frontier {
+            provider: provider.into(),
+            model: model.into(),
+        }
+    }
+
+    /// **A target neither list names has no recipe tier**, whatever the pick
+    /// was. A recipe degrade to a local worker the recipe does not name is the
+    /// case this exists for: reporting the pick there would book a tier the
+    /// turn was never served on, and the agreement report would compare the
+    /// classifier against the scorer rather than against what served.
+    #[test]
+    fn a_target_outside_both_recipe_lists_has_no_tier() {
+        for pick in [Tier::Capable, Tier::Efficient] {
+            let evidence = evidence(
+                pick,
+                StageOutcome::DegradedPastRecipe {
+                    degraded_to: "local/llama".into(),
+                },
+            );
+            assert_eq!(evidence.tier_of(&local("llama")), None, "pick {pick:?}");
+            assert_eq!(
+                evidence.tier_of(&frontier("openai", "gpt")),
+                None,
+                "pick {pick:?}"
+            );
+            // Controls: a named target reads its own list, not the pick, and a
+            // local worker is named by model whatever its worker and rank.
+            assert_eq!(
+                evidence.tier_of(&frontier("anthropic", "opus")),
+                Some(Tier::Capable),
+                "pick {pick:?}"
+            );
+            assert_eq!(
+                evidence.tier_of(&frontier("anthropic", "haiku")),
+                Some(Tier::Efficient),
+                "pick {pick:?}"
+            );
+            assert_eq!(
+                evidence.tier_of(&local("qwen")),
+                Some(Tier::Efficient),
+                "pick {pick:?}"
+            );
+        }
+    }
+}

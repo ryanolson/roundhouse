@@ -108,7 +108,7 @@ fn every_axis_offers_unknown_and_round_trips_every_label() {
 /// Every question is asked under its own key, or two answers would collide
 /// in one map.
 #[test]
-fn the_three_axes_have_distinct_keys() {
+fn the_four_questions_have_distinct_keys() {
     let keys = [
         TurnIntent::KEY,
         TurnComplexity::KEY,
@@ -216,6 +216,35 @@ fn prior_classifications_are_bounded_and_the_remainder_is_counted() {
             .rendered
             .contains("2 earlier classifications omitted")
     );
+}
+
+/// **The tier answer never rides back out in a later projection.** A prior
+/// classification carries it, and the projection renders only the three
+/// taxonomy axes: sending the classifier its own earlier tier pick would ask
+/// it to agree with itself, and would change what the projection revision
+/// promises without bumping it.
+#[test]
+fn a_prior_tier_answer_is_not_rendered_in_the_projection() {
+    let prior = [available(1, 10, TurnIntent::Implement)];
+    assert!(
+        prior[0].classification.tier.is_some(),
+        "the fixture must carry a tier answer, or this test proves nothing"
+    );
+    let capture = PromptCapture::of(&[Item::user_text("carry on")], &caps());
+    let projection = project(&capture, &prior, &[], &caps()).expect("it fits");
+
+    assert!(
+        projection.rendered.contains("turn 1: intent=implement"),
+        "the prior classification is rendered:\n{}",
+        projection.rendered
+    );
+    for leak in ["tier=", "capable", "efficient"] {
+        assert!(
+            !projection.rendered.contains(leak),
+            "`{leak}` leaked into the projection:\n{}",
+            projection.rendered
+        );
+    }
 }
 
 /// Over the total bound the call does not happen. Rejected, never cut: a sliced

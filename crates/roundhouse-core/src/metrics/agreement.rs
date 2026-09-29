@@ -30,12 +30,16 @@
 //! ## Retention
 //!
 //! Per session, at most [`MAX_REVIEW_DECISIONS`] open slots: intents whose
-//! answer has not landed, and disagreements whose label has not. Past the bound
-//! the oldest slot is dropped, and a dropped disagreement is counted as evicted
-//! so the report says how many it stopped waiting for. The bound is the review
-//! tracker's own: no review can cover a decision older than that, so a slot
-//! beyond it could never be labelled. A dropped intent whose answer lands later
-//! is counted as not comparable.
+//! answer has not landed, and disagreements whose label has not. The bound caps
+//! what one session holds in this fold, which otherwise grows with every
+//! classified turn that is never answered or never reviewed. It borrows the
+//! value of the review tracker's per-interval decision bound because one review
+//! covers at most that many decisions, but it is not the tracker's guarantee: a
+//! review that arrives late can still name a dropped turn. So nothing assumes
+//! eviction is harmless. Past the bound the oldest slot is dropped, a dropped
+//! disagreement is counted as evicted so the report says how many it stopped
+//! waiting for, and a dropped intent whose answer lands later is counted as
+//! not comparable.
 //!
 //! [`AgreementFold::served`] holds one entry per session, the latest route, and
 //! grows with the fold's watermarks for the same reason they do.
@@ -103,10 +107,21 @@ struct Slot {
     response_id: ResponseId,
     /// The recipe tier the turn was served on, or `None` when it has none.
     served: Option<Tier>,
-    /// The covering review's label, when a review landed first.
-    label: Option<IntervalLabel>,
-    /// The answer has landed and disagreed, and the slot now waits on a label.
-    disagreed: bool,
+    state: SlotState,
+}
+
+/// What a slot waits for.
+///
+/// An enum rather than a label and a flag, because a disagreement waiting on a
+/// label cannot also hold one: the review that labels it books the label and
+/// frees the slot in the same step.
+#[derive(Debug, Clone, Copy)]
+enum SlotState {
+    /// No answer yet. `label` is the covering review's, when a review landed
+    /// first.
+    AwaitingAnswer { label: Option<IntervalLabel> },
+    /// The answer landed and disagreed, and no review has covered the turn.
+    AwaitingLabel,
 }
 
 #[derive(Default)]
@@ -130,10 +145,19 @@ impl AgreementFold {
         response_id: &ResponseId,
         decision: &DecisionRecord,
     ) {
-        self.served.insert(
-            session.clone(),
-            (response_id.clone(), served_tier(decision)),
-        );
+        let tier = served_tier(decision);
+        // In place when the session already has an entry: every turn after the
+        // first, and every failover of a turn, which re-clones nothing but a
+        // response id that actually changed.
+        if let Some((latest, served)) = self.served.get_mut(session) {
+            if latest != response_id {
+                latest.clone_from(response_id);
+            }
+            *served = tier;
+        } else {
+            self.served
+                .insert(session.clone(), (response_id.clone(), tier));
+        }
     }
 
     /// A classification the evaluation join accepted as a new call.
@@ -151,12 +175,11 @@ impl AgreementFold {
         slots.push_back(Slot {
             response_id: record.source_response_id.clone(),
             served,
-            label: None,
-            disagreed: false,
+            state: SlotState::AwaitingAnswer { label: None },
         });
         if slots.len() > MAX_REVIEW_DECISIONS
             && let Some(dropped) = slots.pop_front()
-            && dropped.disagreed
+            && matches!(dropped.state, SlotState::AwaitingLabel)
         {
             self.row(payer).evicted += 1;
         }
@@ -178,42 +201,38 @@ impl AgreementFold {
             .classification()
             .and_then(|classification| classification.tier)
             .map(|graded| graded.value);
+        // The slot comes out once, here. Only the arm that keeps waiting puts
+        // it back, and at the index it came from, so the bound still evicts in
+        // the order the turns were classified.
         let found = self.open.get_mut(session).and_then(|slots| {
             let at = slots
                 .iter()
                 .rposition(|slot| slot.response_id == record.source_response_id)?;
-            Some((slots, at))
+            let slot = slots.remove(at)?;
+            Some((slots, at, slot))
         });
         let booking = match (answer, found) {
             // No tier answer: a taxonomy-1 record, or no usable answer at all.
             // The slot has nothing left to wait for.
-            (None, found) => {
-                if let Some((slots, at)) = found {
-                    slots.remove(at);
-                }
-                None
-            }
+            (None, _) => None,
             // The slot was evicted, or no intent opened one.
             (Some(_), None) => Some(Booking::NotComparable),
-            (Some(answer), Some((slots, at))) => Some(match slots[at].served {
-                None => {
-                    slots.remove(at);
-                    Booking::NotComparable
+            (Some(answer), Some((slots, at, slot))) => Some(match (slot.served, slot.state) {
+                (None, _) => Booking::NotComparable,
+                (Some(served), _) if served == answer.tier() => Booking::Agree,
+                (Some(_), SlotState::AwaitingAnswer { label: Some(label) }) => {
+                    Booking::Disagree(answer, Some(label))
                 }
-                Some(served) if served == answer.tier() => {
-                    slots.remove(at);
-                    Booking::Agree
+                (Some(_), SlotState::AwaitingAnswer { label: None } | SlotState::AwaitingLabel) => {
+                    slots.insert(
+                        at,
+                        Slot {
+                            state: SlotState::AwaitingLabel,
+                            ..slot
+                        },
+                    );
+                    Booking::Disagree(answer, None)
                 }
-                Some(_) => match slots[at].label {
-                    Some(label) => {
-                        slots.remove(at);
-                        Booking::Disagree(answer, Some(label))
-                    }
-                    None => {
-                        slots[at].disagreed = true;
-                        Booking::Disagree(answer, None)
-                    }
-                },
             }),
         };
         self.prune(session);
@@ -253,15 +272,24 @@ impl AgreementFold {
         };
         let mut labelled = Vec::new();
         for decision in &review.decisions {
-            if let Some(at) = slots
-                .iter()
-                .position(|slot| slot.response_id == decision.response_id && slot.label.is_none())
-            {
-                if slots[at].disagreed {
-                    slots.remove(at);
-                    labelled.push(review.label);
-                } else {
-                    slots[at].label = Some(review.label);
+            let unlabelled = |slot: &Slot| {
+                slot.response_id == decision.response_id
+                    && matches!(
+                        slot.state,
+                        SlotState::AwaitingAnswer { label: None } | SlotState::AwaitingLabel
+                    )
+            };
+            if let Some(at) = slots.iter().position(unlabelled) {
+                match slots[at].state {
+                    SlotState::AwaitingLabel => {
+                        slots.remove(at);
+                        labelled.push(review.label);
+                    }
+                    SlotState::AwaitingAnswer { .. } => {
+                        slots[at].state = SlotState::AwaitingAnswer {
+                            label: Some(review.label),
+                        };
+                    }
                 }
             }
         }

@@ -695,3 +695,49 @@ fn retained_disagreements_are_bounded_and_an_eviction_is_counted() {
     );
     assert_partitions(&agreement);
 }
+
+/// One more unanswered intent than the bound: the oldest intent's slot is
+/// evicted before its answer lands. Answers the log and the evicted turn.
+fn a_session_past_the_bound_with_every_answer_pending() -> (Log, Turn) {
+    let mut log = Log::new("s-pending", Principal::new("acme", "ada"));
+    let mut turns = Vec::new();
+    for _ in 0..=MAX_REVIEW_DECISIONS {
+        let turn = log.turn(vec![served(Tier::Capable)]);
+        log.intent(&turn);
+        turns.push(turn);
+    }
+    (log, turns.swap_remove(0))
+}
+
+/// **An answer whose slot the bound dropped is not comparable**, even when it
+/// names the tier the turn was served on: the fold no longer knows which tier
+/// that was, and booking it as agreement would count a comparison nobody made.
+#[test]
+fn an_answer_to_an_evicted_intent_is_not_comparable() {
+    let (mut log, evicted) = a_session_past_the_bound_with_every_answer_pending();
+    log.answer(&evicted, Some(TierChoice::Capable));
+
+    let agreement = deployment(&recorder(&[&log]));
+    assert_eq!(
+        agreement,
+        TierAgreement {
+            answered: 1,
+            not_comparable: 1,
+            ..Default::default()
+        }
+    );
+    assert_partitions(&agreement);
+}
+
+/// **Only a dropped disagreement is an eviction.** A dropped intent has no
+/// answer yet, so it is no disagreement the report stopped waiting to label;
+/// counting it would make `evicted` exceed the unlabelled disagreements it is a
+/// part of.
+#[test]
+fn an_evicted_unanswered_intent_is_not_counted_as_evicted() {
+    let (log, _) = a_session_past_the_bound_with_every_answer_pending();
+
+    let agreement = deployment(&recorder(&[&log]));
+    assert_eq!(agreement, TierAgreement::default());
+    assert_eq!(agreement.disagreements.evicted, 0, "{agreement:?}");
+}
