@@ -916,9 +916,9 @@ impl DecisionRecord {
     /// and therefore worth reporting beside that one rather than instead of it.
     ///
     /// On the record rather than in the fold that first needed it, because it is
-    /// a question about a decision with more than one reader: the Relay
-    /// emission publishes it per turn, and [`Self::quoted_routing_saving_usd`]
-    /// nets it for the metrics fold. Two copies of a `min` over the same
+    /// a question about a decision with more than one reader: the Relay route
+    /// facts publish it per turn, and [`Self::quoted_routing_saving_usd`] nets
+    /// it for the metrics fold and the Relay optimization summary. Two copies of a `min` over the same
     /// vector would agree until one of them learned about a new candidate kind.
     ///
     /// `None` for a hosted dispatch, and that is not the same as zero: there is
@@ -938,10 +938,9 @@ impl DecisionRecord {
     /// hosted quote less the local quote this decision served on, or `None`
     /// when it did not choose local or no hosted target was quoted.
     ///
-    /// What the metrics fold sums into `routing_savings_at_decision_usd`. The
-    /// Relay emission still publishes the gross alternative; netting it there
-    /// is a follow-up (see `agent-docs/PLAN-cache-affinity.md`, the
-    /// 2026-09-28 local capacity note). The local quote is zero while the
+    /// What the metrics fold sums into `routing_savings_at_decision_usd`, and
+    /// what the Relay optimization summary publishes under the same name, so
+    /// the two agree on every turn. The local quote is zero while the
     /// catalog sets no `local_capacity_price`, so every log written before
     /// one could be set reads exactly as it did. With a price, the saving is
     /// net of the capacity cost the router itself used, and it can be
