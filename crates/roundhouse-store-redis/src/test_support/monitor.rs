@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 
-use super::{raw_from_env, url_from_env};
+use super::url_from_env;
 
 /// One command the server executed, as `MONITOR` reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,7 +55,7 @@ pub async fn commands_naming<T>(needle: &str, op: impl Future<Output = T>) -> (T
     let output = op.await;
 
     let marker = format!("rhtest-monitor-end-{}", uuid::Uuid::new_v4().simple());
-    let mut raw = raw_from_env().await;
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
     let _: String = redis::cmd("ECHO")
         .arg(&marker)
         .query_async(&mut raw)
@@ -105,7 +105,9 @@ fn parse(line: &str, needle: &str) -> Option<Executed> {
 }
 
 /// Script calls from a client that is not the one under measurement, issued
-/// continuously until [`ForeignTraffic::stop`].
+/// continuously until [`ForeignTraffic::stop`]. Each one is an `EVAL` whose
+/// script issues an `HMGET`, so it adds to a top-level count and to a
+/// script-issued one alike.
 ///
 /// This is what another test in the same binary looks like to the server. A
 /// round-trip test that runs its measurement under this traffic proves its
@@ -120,13 +122,19 @@ impl ForeignTraffic {
     /// so a measurement taken after this is taken under it.
     pub async fn start() -> Self {
         let issued = Arc::new(AtomicU64::new(0));
-        let mut raw = raw_from_env().await;
+        let mut raw = redis::Client::open(url_from_env().as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let key = format!("rhtest-foreign-{}", uuid::Uuid::new_v4().simple());
         let counter = issued.clone();
         let task = tokio::spawn(async move {
             loop {
-                let _: i64 = redis::cmd("EVAL")
-                    .arg("return 1")
-                    .arg(0)
+                let _: Vec<Option<String>> = redis::cmd("EVAL")
+                    .arg("return redis.call('HMGET', KEYS[1], 'f')")
+                    .arg(1)
+                    .arg(&key)
                     .query_async(&mut raw)
                     .await
                     .unwrap();

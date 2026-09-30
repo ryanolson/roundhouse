@@ -20,6 +20,8 @@ use crate::fair_use::{
 use crate::spend::{SpendLeaf, spend_key};
 use crate::{RedisSessionStore, lease_key as store_lease_key, log_key as store_log_key};
 
+pub mod monitor;
+
 /// The namespace every helper in this module builds a key under.
 ///
 /// Every gated test in this crate connects through [`connect_from_env`] or

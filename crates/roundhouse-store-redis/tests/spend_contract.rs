@@ -20,7 +20,6 @@
 
 mod common;
 
-use common::monitor::{ForeignTraffic, commands_naming, round_trips};
 use common::raw_from_env;
 use roundhouse_core::control::spend::contract::{assert_usd, fresh_principal, terms};
 use roundhouse_core::control::{
@@ -29,6 +28,7 @@ use roundhouse_core::control::{
 };
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_store_redis::RedisSpendLedger;
+use roundhouse_store_redis::test_support::monitor::{ForeignTraffic, commands_naming, round_trips};
 use roundhouse_store_redis::test_support::{spend_holds_key, url_from_env};
 
 roundhouse_core::spend_ledger_contract_suite!(
@@ -164,7 +164,7 @@ async fn a_sub_dollar_grant_is_not_truncated_to_zero() {
 ///
 /// Not `INFO commandstats`: its counters are server-wide, and no number of
 /// back-to-back attempts gets one that no neighbour overlapped
-/// (`common::monitor` has the detail). The foreign traffic is here so this
+/// (`test_support::monitor` has the detail). The foreign traffic is here so this
 /// test proves its count is its own on every run, rather than only on the
 /// runs where the scheduler happens to put a busy neighbour beside it.
 ///

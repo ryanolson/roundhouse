@@ -22,7 +22,6 @@
 #![allow(dead_code)]
 
 pub mod fair_use;
-pub mod monitor;
 
 use roundhouse_core::classify::{
     ClassificationIntent, ClassificationOutcome, ClassificationRecord,
