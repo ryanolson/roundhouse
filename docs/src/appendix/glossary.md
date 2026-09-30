@@ -1,163 +1,109 @@
 # Glossary
 
-This glossary defines the terms that the book uses. The terms are in alphabetical order. A term in *italics* in a definition has its own entry.
+This glossary defines the terms that the book uses across chapters, in alphabetical order. A term in *italics* has its own entry.
 
-**Admin key.** A key of the form `rh_admin_<43 base62 characters>`. It administers the *control plane* through the *admin plane*. Every turn route refuses it with `wrong_key_kind`.
+**Admin key.** A key of the form `rh_admin_<43 base62 characters>`. It works only on the *admin plane*. Every turn route refuses it with `wrong_key_kind`.
 
-**Admin plane.** The routes under `/v1/admin`. They are the only routes that write tenancy: projects, users, memberships, and keys. They refuse Open mode.
+**Admin plane.** The routes under `/v1/admin`, the only routes that write tenancy: projects, users, memberships, and keys. They refuse every request in *Open mode*.
 
-**Admission cache.** The cache that each surface uses to resolve a key against the *control directory*. Its default lifetime is 30 seconds, so a revoked key stops working within that time, not at once.
+**Admission cache.** The compiled *control plane* that each node resolves keys against. A node refreshes it only after `admission_cache_ttl_ms` (default 30 seconds) has passed and the stored version has moved. A revocation therefore reaches another node within one TTL, or two after a failed refresh.
 
-**Admission, policy.** The filter that removes the targets that a key's policy, quality floor, or credentials do not allow. A target that admission removes is never added back.
+**Admission, policy.** The filter that removes the targets that a key's policy, quality floor, or credentials do not allow. A removed target is never added back.
 
-**Arm.** One of three modes of the *validate/steer* loop, fixed when a session is created. `Live` takes the action. `Shadow` runs the judge, logs everything, and discards the action. `Placebo` runs no judge and intervenes on a fixed timing, as a control.
+**Arm.** One of three modes of the *validate/steer* loop, fixed when a session is created. `Live` takes the action. `Shadow` runs the *judge*, logs everything, and discards the action. `Placebo` runs no judge and intervenes on a fixed timing, as a control.
 
-**ATIF.** NeMo Relay's format for a finished agent trajectory. Roundhouse emits ATIF v1.7 from the *event log* at `GET /v1/sessions/{id}/trajectory`.
+**Budget.** A dollar ceiling on a project and, optionally, on a member, kept as a ledger of *grants*. When it is spent, the turn *degrades to local* or is refused, as the budget's `on_exhaustion` says.
 
-**ATOF.** NeMo Relay's format for a stream of agent events. Roundhouse emits it as NDJSON at `GET /v1/sessions/{id}/atof`.
+**Cache ledger.** The router's record of what it last sent to each hosted target, when, and under which cache model. No provider exposes its cache, so the ledger predicts whether the cache is warm.
 
-**Budget.** A dollar ceiling on a project and, optionally, on a member. It works as a *grant* ledger, not as a counter. A spent budget *degrades to local* and does not fail the turn.
+**Cadence, frontier.** A limit of `max_frontier` hosted dispatches in the last `per_turns` turns of a session. When it is spent, hosted targets become inadmissible and the turn serves locally.
 
-**Cache ledger.** The router's record of what it last sent to each target, when, and under which cache model. It predicts whether a hosted target's cache is warm.
+**Capability gate.** The check that lets two models be priced against each other only when their *quality priors* are within `capability_band` (default `0.10`). It stops a small local model from being priced against a flagship.
 
-**Cache model.** The rule that predicts how a provider's prompt cache expires. The catalog names one for each entry: `inactivity_decay`, `deterministic`, or `observed`.
+**Catalog.** The JSON file that `ROUNDHOUSE_CATALOG` names: the hosted models the router can choose, their prices, and their *providers*. See [Configure providers and the catalog](../guides/catalog.md).
 
-**Cadence, frontier.** A limit on how many hosted dispatches a project can make in a trailing window of turns. When the window is spent, hosted targets become inadmissible and the turn serves locally. A cadence counts dispatches, not turns.
+**Chained topology.** A launch in which NeMo Relay runs between the agent and Roundhouse. In the direct topology, there is no Relay in between.
 
-**Capability band.** The largest difference between two *quality priors* that still lets the *capability gate* compare the two models. The default is `0.10`.
+**Configured mode.** A deployment that has a *control plane* file. Every surface demands a key.
 
-**Capability gate.** The check that decides whether two models can be priced against each other. It compares their *quality priors* within the *capability band*. It stops a small local model from being priced against a flagship.
+**Control call.** A call that an agent makes to one of the eight tools of the *MCP* control surface, such as `status` or `prefer`.
 
-**Catalog.** The JSON file that `ROUNDHOUSE_CATALOG` names. It lists the hosted models the router can choose, their prices, and the *providers* where they live. See [Configure providers and the catalog](../guides/catalog.md).
+**Control plane.** Who is asking, what they can be routed to, and what it can cost: *projects*, *users*, *memberships*, and keys. `ROUNDHOUSE_CONTROL_PLANE` names the file, and the *admin plane* changes it at runtime.
 
-**Chained topology.** A launch in which NeMo Relay runs between the agent and Roundhouse. The other topology is the *direct topology*.
+**Conversation.** The thread of turns that a client names, for example by `thread-id`, `session-id`, or *prompt cache key*. Roundhouse maps a conversation to a *session*.
 
-**Classification.** An optional background call that labels a turn by intent, complexity, dependence on context, and the tier of work it needs. A label describes the turn. It does not measure answer quality, and the selector does not learn from it.
+**Correlator.** A value on an MCP call that names the *conversation* the call is about, such as a Codex `threadId` or a Claude Code `toolUseId`. With none, Roundhouse guesses the caller's most recent conversation.
 
-**Configured mode.** A deployment that has a *control plane* file. Every surface demands a key. The other mode is *Open mode*.
+**Degrade to local.** Serve a local candidate instead of failing. A turn does this when its *cadence* is spent, or when its *budget* is spent under `on_exhaustion: "degrade_to_local"`.
 
-**Control call.** A call that an agent makes to one of the eight tools of the *MCP* control surface, such as `status` or `prefer`. The *validate/steer* triggers do not count control calls as work on the task.
+**Dialect.** The wire format of a provider endpoint, named `wire_protocol` in the catalog: `openai_responses`, `anthropic_messages`, or `openai_chat_completions`. Only the first two have a client.
 
-**Control directory.** The object that every surface holds in place of a compiled *control plane*. It re-resolves the plane on each request, so an admin write takes effect on the next admission.
+**Dynamo.** NVIDIA's inference serving system. Roundhouse pins Dynamo crates for the *selection service* and token-block hashing and runs them in its own process.
 
-**Control plane.** The configuration of who is asking, what they can be routed to, and what it can cost. It has *projects*, *users*, *memberships*, and keys. The file is `ROUNDHOUSE_CONTROL_PLANE`.
+**Echo stub.** The offline answerer that serves every turn when no upstream is configured. Every price is zero, and no request leaves the process.
 
-**Conversation.** The thread of turns that a client names, for example by `thread-id`, `session-id`, or *prompt cache key* on the Responses surface. Roundhouse maps a conversation to a *session*.
+**Event log.** The append-only list of events of one *session*, ordered by *seq*. Conversation items, routing decisions, and metrics are *projections* of it.
 
-**Correlary.** A declared equivalence between one of your local models and a hosted model. The dashboard uses it to price a saving. Its `note` is shown on the dashboard.
+**Fair-use window.** A limit on the tokens or dollars of a project or member in a rolling `5h`, `24h`, or `7d` window. A turn over it gets HTTP 429 `fair_use_exceeded` with `resets_at`.
 
-**Correlator.** A value that a client attaches to an MCP call so that Roundhouse can find the *conversation* that the call is about. Examples are a Codex `threadId` and a Claude Code `toolUseId`. With no correlator, Roundhouse guesses the most recent conversation.
+**Generation.** A run of a *conversation* over one stored prefix. A history rewrite starts a new generation: a new session with a cold *cache ledger*.
 
-**Decision record.** The event that Roundhouse writes to the log before a dispatch. It holds the winner, the losers, the policy, the rationale, and the budget state.
+**Grant.** A hold on a *budget* for one turn. It reserves the smallest of the requested amount and the project's and member's remaining amounts, and settles once when the turn ends. A hold whose turn died lapses after its TTL.
 
-**Declared baseline.** The `model` that a client wrote in its request. Roundhouse records it and never routes on it. The dashboard prices a counterfactual against it, through the *capability gate*.
+**Judge.** The model that reviews an agent's recent steps in the *validate/steer* loop, on the catalog entry that `ROUNDHOUSE_JUDGE_MODEL` names.
 
-**Degrade to local.** What a turn does when its budget or its *cadence* is spent: it serves the local candidate and does not fail.
+**Learner.** The optional component that chooses a serving strategy per turn from logged reviews. See [The routing learner](../concepts/routing-learner.md).
 
-**Dialect.** The wire format that a provider endpoint speaks. The catalog calls it `wire_protocol`. The values are `openai_responses`, `anthropic_messages`, and `openai_chat_completions`. Only the first two have a client.
+**Lease.** The proof that one node is the single writer for a *session*. Every append needs one.
 
-**Direct topology.** A launch in which the agent talks to Roundhouse without NeMo Relay in between. See *chained topology*.
-
-**Dynamo.** NVIDIA's inference serving system. Roundhouse sits in front of it. Roundhouse pins two Dynamo crates, the *selection service* and token-block hashing, and builds on its own.
-
-**Echo stub.** The offline answerer that serves every turn when no upstream is configured. Every price is zero. It exists so that the demo runs without a provider.
-
-**Effective prefill tokens.** The number that the *selection service* returns for a worker. It is the prefill cost of the prompt after the scheduler credits the cache that the worker already holds.
-
-**Event log.** The append-only list of events of one *session*, ordered by *seq*. The conversation items, the routing ledger, and the metrics are all *projections* of it.
-
-**Fair-use window.** A limit on the tokens or dollars that a project or a member can use in a rolling `5h`, `24h`, or `7d` window. A turn over the limit gets HTTP 429 `fair_use_exceeded` with a `resets_at` time.
-
-**Fencing token.** A unique value that the store mints each time a node acquires a *lease*. It makes the handles of an earlier tenure invalid, so an old owner cannot write behind its successor.
-
-**Fold.** See *projection*.
-
-**Forwarded login.** An authentication mode in which the caller's own subscription token, such as a ChatGPT or Claude login, arrives with each turn and is forwarded to the provider. Roundhouse never stores it.
-
-**Frontier provider.** A hosted model endpoint that Roundhouse dispatches to, such as OpenAI, Anthropic, or OpenRouter. No provider exposes its cache, so the *cache ledger* models it.
-
-**Generation.** A run of a *conversation* that shares one stored prefix. A history rewrite starts a new generation, which is a new session with a cold cache ledger.
-
-**Grant.** A hold on a budget for one turn. It reserves the smaller of the requested amount, the project's remaining amount, and the member's remaining amount. It settles once when the turn ends. A hold whose turn died lapses after its TTL.
-
-**Judge.** The model that reviews an agent's recent steps in the *validate/steer* loop. It runs on the catalog entry that `ROUNDHOUSE_JUDGE_MODEL` names. A judge that cannot be reached releases the turn.
-
-**KV event.** A message that a Dynamo worker publishes when its KV cache changes. The embedded *selection service* uses these messages to know which prefix each worker holds.
-
-**Learner.** The optional online component that chooses a serving strategy for each turn from logged reviews. See [The routing learner](../concepts/routing-learner.md).
-
-**Lease.** The proof that one node is the single writer for a *session*. Every append needs one. A node whose lease expired fails its next append.
-
-**Local fleet.** The set of Dynamo workers that Roundhouse quotes and serves locally. The shipped binary attaches none.
+**Local fleet.** The Dynamo workers that Roundhouse quotes and serves locally. The shipped `roundhouse` binary attaches none.
 
 **MCP.** The Model Context Protocol. Roundhouse mounts a control surface at `/mcp` with eight tools that let an agent read its routing state and narrow it.
 
-**Membership.** The link between a *user* and a *project*. It is the unit that a turn is attributed to, as a *principal*. Keys belong to memberships.
+**Membership.** The link between a *user* and a *project*. Keys belong to memberships, and a turn is attributed to one as a *principal*.
 
-**Namespace, Redis.** The prefix that every shared Redis key is built under. `ROUNDHOUSE_REDIS_NAMESPACE` sets it. The default is `rh`.
+**NeMo Relay.** The agent harness that Roundhouse works with. Roundhouse emits Relay's formats from its log, and a launch can chain the agent through Relay.
 
-**Namespace, session.** The prefix `{project}/{user}/` of every session id. The namespace check is what authorizes the session reads.
+**Open mode.** A deployment with no *control plane* file. Every request is the `default/default` principal, and no key is required.
 
-**NeMo Relay.** The harness that Roundhouse works with. Roundhouse emits Relay's formats from its log, and a launch can chain the agent through Relay.
+**Overlay.** A change that an agent makes to its own routing through an MCP tool, such as `prefer` or `set_quality_floor`. Like every policy change, it can only narrow. A request for more is clamped and reported.
 
-**Open mode.** A deployment that has no *control plane* file. Every request is the `default/default` principal, and no key is required.
+**Pass-through auth.** An agent keeps its own credentials, and Roundhouse uses them. A forwarded login, such as a ChatGPT or Claude subscription token, arrives with each turn, goes to the provider, and is never stored.
 
-**Overlay.** A change that an agent can make to its own routing through an MCP tool, such as `prefer` or `set_quality_floor`. An overlay can only narrow, and a request for more is clamped and reported.
+**Prefix admission.** Comparing the history that a client resends with the stored prefix, and admitting only the new suffix. A rewrite starts a new *generation*.
 
-**Pass-through auth.** The design in which an agent keeps its own credentials and Roundhouse uses or forwards them. It lets an unmodified agent hook up without a change to its stack.
+**Principal.** The pair `project/user` that a turn is attributed to.
 
-**Picker.** The part of a tier recipe that chooses between the capable and the efficient tier. `efficient_first` is the default.
+**Project.** The unit that has a *budget* and a policy. *Users* join it through *memberships*.
 
-**Policy narrowing.** The only way to combine policies. A key's overrides and an overlay can make a project's policy tighter, and never looser. An override that is wider than its project is refused at load.
+**Projection.** A value computed from the *event log* and not stored on its own, also called a fold. A fold of the stored events gives the same numbers as the running process.
 
-**Prefix admission.** The step that compares the history that a client resends with the stored prefix and admits only the new suffix. A history rewrite starts a new *generation*.
+**Prompt cache key.** The `prompt_cache_key` field, which steers a request to a provider cache node. Roundhouse always sends one. On the Responses surface it can also name a *conversation*.
 
-**Principal.** The pair `project/user` that a turn is attributed to. A *membership* names one.
+**Provider.** An entry in the catalog's `providers` section: a base URL, a route per *dialect*, a key variable, and optional headers. Roundhouse builds one client per provider.
 
-**Project.** The entity that has a budget and a policy. *Users* join it through *memberships*.
+**Quality prior.** A number from `0.0` to `1.0` that states a model's relative capability. It is configuration, not measurement.
 
-**Projection.** A value that is computed from the *event log* and not stored on its own. Conversation items, the routing ledger, and the metrics are projections. A fold of the stored events gives the same numbers as the running process.
+**Redis namespace.** The prefix of every shared Redis key, set by `ROUNDHOUSE_REDIS_NAMESPACE`. The default is `rh`.
 
-**Prompt cache key.** A field that steers a request to a provider cache node. Roundhouse always sends one. On the Responses surface it is also one of the names that identify a *conversation*.
+**Residency call.** The realtime call that asks Dynamo how much of a prompt a worker already holds. The router makes it only when the answer can change the decision.
 
-**Provider.** An entry in the catalog's `providers` section: a base URL, a route for each *dialect*, a key variable, and optional headers. Roundhouse builds one client for each provider.
+**Selection service.** Dynamo's `SelectionService`, which answers which worker holds a prefix. Roundhouse embeds it, so a query has no network round trip and sends block hashes, never token ids.
 
-**Quality prior.** A number from `0.0` to `1.0` that states the relative capability of a model. It is configuration, not measurement. You can source it with `import-benchmarks`.
+**seq.** The sequence number of an event in a *session*'s log, increasing by one per event. On Redis, the stream entry id is the seq.
 
-**Rate card.** The prices of a model. Roundhouse keeps them in the *catalog*, never in source code.
+**Session.** The durable state of one *conversation*: an *event log* with one writer at a time. Its id is `{project}/{user}/{name}`, and a session read checks that the prefix is the caller's.
 
-**Re-discovery tax.** The cost of processing a prompt prefix again. Tax A occurs within a session as the resent prefix grows. Tax B occurs across sessions that send the same prefix. See [Measure cache reuse](../guides/cache-reuse.md).
+**Steer.** A correction that Roundhouse gives an agent after a negative review, as text in the answer of the steered turn. The next resend admits it as prefix, which is how Roundhouse knows it arrived.
 
-**Reservation.** A booking of capacity on a local worker. The *select/reserve* split creates it only if the local option wins. A reservation must be released, or it inflates the router's view of the worker.
+**Switchyard.** A routing project that Roundhouse adopts ideas and judge prompts from.
 
-**Residency check.** The realtime call to Dynamo that asks how much of a prompt a worker already holds. The router makes it only when the answer can change the decision.
+**Tier.** One of two ordered target lists in a project recipe, `capable` and `efficient`. The first admitted entry of the chosen tier serves the turn, and the rest are its fallbacks.
 
-**Routing ledger.** The record of routing decisions in the *event log*. It is a *projection*.
+**Topham.** The operator entry point. It mints keys and turns a saved profile, a TOML file under `$XDG_CONFIG_HOME/topham/profiles/` that holds no secret, into a running agent. See [Launch with topham](../guides/topham.md).
 
-**Select/reserve.** The split between pricing a local option without booking it (`select`) and booking it (`reserve`). It lets the router compare a local worker with a hosted model and book only if local wins. An abandoned quote costs nothing.
-
-**Selection service.** Dynamo's `SelectionService`. It answers which worker holds a prefix. Roundhouse embeds it in the process, so a query needs no network round trip and sends block hashes, never token ids.
-
-**seq.** The sequence number of an event in a *session*'s log. It increases by one for each event. On Redis, the stream entry id is the seq.
-
-**Session.** The durable state of one *conversation*: an *event log* with one writer at a time. Its id is `{project}/{user}/{name}`.
-
-**Steer.** A correction that Roundhouse gives to an agent after a negative review. It is delivered as text, in the answer of the steered turn. The next resend of the history admits it as prefix. That is also how Roundhouse knows the steer was fulfilled.
-
-**Switchyard.** A routing project. Roundhouse adopts ideas and judge prompts from it, such as the coding-agent scorer and two of the validate signals.
-
-**Tier.** One of two ordered lists of targets in a project recipe: `capable` and `efficient`. The first admitted entry of the chosen tier serves the turn, and the rest of that tier are its ordered fallbacks.
-
-**Topham.** The operator entry point. It turns a saved *topham profile* into a running agent, and it mints keys. See [Launch with topham](../guides/topham.md).
-
-**Topham profile.** A TOML file under `$XDG_CONFIG_HOME/topham/profiles/` that names an agent, a deployment root, an auth kind, the variable that holds the turn key, and a topology. It never holds a secret.
-
-**Trigger.** The condition that starts a validation. It is a budget gate together with a signal. The gate is a projection of the log. The six signals are `NoProgressRepeat`, `PingPong`, `ToolFailureStreak`, `CostAnomaly`, `ErrorSeverity`, and `PureBashStreak`.
-
-**Turn key.** A key of the form `rh_turn_<43 base62 characters>`. It authorizes turns for one *membership*. The control-plane file holds only its SHA-256 hash.
+**Turn key.** A key of the form `rh_turn_<43 base62 characters>` that authorizes turns for one *membership*. The control-plane file holds only its SHA-256 hash.
 
 **User.** An identity in the *control plane*. A user joins a *project* through a *membership*.
 
-**Validate/steer.** The loop that watches a session and interposes when an agent seems to go the wrong way. A *judge* reviews the recent steps, and a *steer* delivers the correction. It is off unless a project turns it on.
-
-**Wire protocol.** See *dialect*.
+**Validate/steer.** The loop that watches a session and interposes when the agent seems to go the wrong way. A *judge* reviews recent steps, and a *steer* delivers the correction. It is off unless a project enrolls.

@@ -1,12 +1,12 @@
 # Measurements
 
-This chapter records measured numbers with their setup, source, and revision, and what each number does not prove. None of these numbers was measured with Roundhouse in the request path.
+This chapter records measured numbers with their setup, source, and revision, and what each number does not prove. Roundhouse was in the request path for none of them.
 
 ## Local prefix-cache reuse on Dynamo and vLLM
 
-This measurement shows how much of each prompt a local vLLM worker behind Dynamo serves from its prefix cache on a replayed agentic session. Roundhouse was not in the loop. The client called the Dynamo frontend directly.
+This measurement shows how much of each prompt a local vLLM worker behind Dynamo serves from its prefix cache on a replayed agentic session. The client called the Dynamo frontend directly.
 
-Source: the branch `origin/ai/charming-hypatia-vtpz0y` at commit `6756c85`, files `use-cases/cache-aware-routing/README.md` ("Local tier") and `use-cases/cache-aware-routing/DYNAMO_LOCAL_SERVING.md`. That branch is not merged, so the replay script `run_local.py` and the serving script `serve_model.sh` are not in this tree.
+Source: the branch `origin/ai/charming-hypatia-vtpz0y` at commit `6756c85`, files `use-cases/cache-aware-routing/README.md` ("Local tier") and `use-cases/cache-aware-routing/DYNAMO_LOCAL_SERVING.md`. That branch is not merged, so its replay script `run_local.py` and its single-GPU `serve_model.sh` are not on `main`. Read them from that commit to repeat the run.
 
 Setup:
 
@@ -35,7 +35,7 @@ Two effects show:
 - **Reuse within a session.** Turn 1 is cold. From turn 2, each turn reads the prefix that the previous turn wrote.
 - **Reuse across sessions.** Session 2 opens warm, because the corpus prefix is still resident from session 1.
 
-The cached counts (1472, 2752) are multiples of 64, which matches the block size. The source does not state that as the cause.
+The cached counts (1472, 2752) are multiples of 64, the block size. The source does not state that as the cause.
 
 What this does not prove:
 
@@ -56,13 +56,13 @@ Same source, setup, and date as the previous section, with the vLLM default `gpu
 | Weights on disk | about 62 GB of bf16 safetensors |
 | `maturin develop --uv` build of the Dynamo bindings | about 3.5 min |
 
-The 32B model fits without running out of memory, but with almost no headroom. At 1.25x concurrency, the GPU can barely serve two full-length requests of 32K tokens at once. That is enough for one session at a time with a corpus of about 1,000 tokens. For real concurrency on one GPU, `Qwen/Qwen2.5-Coder-14B-Instruct` (about 28 GB of weights) leaves more KV headroom.
+The 32B model fits with almost no headroom. At 1.25x concurrency, the GPU can barely serve two full-length requests of 32K tokens at once. That is enough for one session at a time with a corpus of about 1,000 tokens. For real concurrency on one GPU, `Qwen/Qwen2.5-Coder-14B-Instruct` (about 28 GB of weights) leaves more KV headroom.
 
 ## TypeSafe Jev routing benchmark
 
-This is the only published routing evidence for the TypeSafe Jev classifier. The [routing learner](../concepts/routing-learner.md#cold-start-prior-from-classifier-tier-answers) uses Jev answers only as features and a small cold-start prior. These numbers are part of the reason.
+This is the only published routing evidence for the TypeSafe Jev classifier. It is part of the reason that the [routing learner](../concepts/routing-learner.md#cold-start-prior-from-classifier-tier-answers) uses Jev answers only as features and a small cold-start prior.
 
-Source: `pst2154/Typesafe_Testing` at commit `84facd7`, three commits dated 2026-09-16. This project did not run it, and no call from this project reached the TypeSafe API.
+Source: `pst2154/Typesafe_Testing` at commit `84facd7` (branch `benchmark/typesafe-sol-classification`), three commits dated 2026-09-16. This project did not run it, and no call from this project reached the TypeSafe API.
 
 Setup:
 
@@ -92,7 +92,7 @@ A separate TypeSafe cookbook on skill suggestions (docs.typesafe.ai, read 2026-0
 
 ## Endpoint picker cost at agentic request shapes
 
-The Kubernetes Gateway API Inference Extension routes each request through an out-of-process Endpoint Picker (EPP) over Envoy ext-proc. The EPP buffers the whole request body before it decides. These upstream measurements show where that cost goes. Roundhouse did not measure them.
+The Kubernetes Gateway API Inference Extension routes each request through an out-of-process Endpoint Picker (EPP) over Envoy ext-proc, and the EPP buffers the whole request body before it decides. Upstream projects measured where that cost goes. Roundhouse did not.
 
 Scheduler latency, from `gateway-api-inference-extension` one commit before `a70292c` (`site-src/guides/epp-configuration/resource-tuning.md:22-34`):
 
@@ -117,4 +117,4 @@ EPP sizing, from `llm-d/llm-d-router` at `e051872` (`docs/operations.md`), for b
 | Scheduler P50 | 0.1 to 0.2 ms |
 | Active-Active throughput, 1 to 4 replicas | 1.0x, 2.0x, 2.7x, 3.5x |
 
-Reading: the routing decision is almost free. The cost is buffering, parsing, and prefix-hashing the body, which is the cost that an embedded selection service avoids (see [Routing and the selection service](../concepts/routing.md)). Active-Active replicas keep flow-control and prefix state per replica. Upstream says to avoid Active-Active with approximate prefix routing, because the partitioned state lowers prefix-cache hit rates.
+Reading: the routing decision is almost free. The cost is buffering, parsing, and prefix-hashing the body, which an embedded selection service avoids (see [Routing and the selection service](../concepts/routing.md)). Active-Active replicas keep flow-control and prefix state per replica. Upstream says to avoid Active-Active with approximate prefix routing, because the partitioned state lowers prefix-cache hit rates.

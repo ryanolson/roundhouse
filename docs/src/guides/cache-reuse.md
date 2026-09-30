@@ -1,15 +1,15 @@
 # Measure cache reuse
 
-This chapter shows how to measure how much of each prompt a provider serves from its cache. It covers the two costs to measure, the test commands, a manual experiment against `/v1/responses`, and the numbers measured so far.
+This chapter shows how to measure how much of each prompt a provider serves from its cache. It covers the two costs, the test commands, a manual experiment, and measurements of Claude Code captures.
 
 ## The two costs
 
-A coding agent resends its whole conversation on every turn. Roundhouse admits only the new suffix to its log. But the provider still receives the full prompt. The provider's prompt cache decides how much of it is billed and processed again. The cost of processing a prefix again is the re-discovery tax. It has two forms.
+A coding agent resends its whole conversation on every turn. Roundhouse admits only the new suffix to its log, but the provider receives the full prompt. The provider's cache decides how much of it is processed and billed again. That cost is the re-discovery tax.
 
-| Tax | Where it occurs | What to measure |
+| Tax | Where it occurs | Expected result |
 |---|---|---|
-| A | Within one session. The resent prefix grows each turn. | Expected: the cached share of input tokens climbs toward the whole prefix as the session grows. |
-| B | Across sessions. A second user sends the same prefix. | Expected: the second session opens with a higher cached share than the first. |
+| A | Within one session, as the resent prefix grows each turn. | The cached share of input tokens climbs toward the whole prefix. |
+| B | Across sessions that send the same prefix. | The second session opens with a higher cached share than the first. |
 
 The cached share of a turn is `cached_tokens / input_tokens`.
 
@@ -20,24 +20,24 @@ The cached share of a turn is `cached_tokens / input_tokens`.
 | OpenAI Responses | `input_tokens_details.cached_tokens` on `response.completed` | Not a separate billed event |
 | Anthropic Messages | `cache_read_input_tokens` | `cache_creation_input_tokens` |
 
-Roundhouse stores the provider's numbers in the log as reported. If the provider sends none, Roundhouse books its own token count as estimated. An estimated record carries zero cached tokens. A zero like that is not an observed zero.
+The log stores the provider's numbers as reported. If the provider sends none, Roundhouse books its own count as estimated, with zero cached tokens, which is not an observed zero.
 
-The `/v1/metrics` document adds `cache_reuse_evidence` to each model row. It compares the cache reuse that the router predicted with the reuse that the provider reported, for the same dispatches. The prediction uses the router's token count. The observation uses the provider's token count. A negative mean error means that the router expected more reuse than the provider reported. Only explicit provider counts give observations, and a reported zero counts. Missing counts and locally derived counts give none.
+Each model row of `/v1/metrics` carries `cache_reuse_evidence`: the reuse the router predicted beside the reuse the provider reported, on the same dispatches. A negative `mean_signed_error` means the router expected more reuse than it got. Only a count the provider stated, zero included, is an observation. See [Metrics and the dashboard](../operations/metrics.md#cache-reuse-evidence).
 
 ## How the prefix is marked on Anthropic Messages
 
-Anthropic caches only what an explicit `cache_control` marker names. Without a marker, every turn reads nothing. Roundhouse places the markers like this.
+Anthropic caches only what an explicit `cache_control` marker names, so a request with no marker reads nothing.
 
-- The first marker goes on the penultimate block. It caches the prefix that the previous turn already sent. The last segment is this turn's new input, and it stays unmarked.
-- A second marker goes on the block that the previous request to the same target marked. Anthropic looks back at most 20 block positions from a marker. Without the second marker, a session that appends 20 or more items between two turns puts the old entry out of reach.
-- A request carries at most four markers. If the client's tool definitions already use the allowance, Roundhouse sends fewer markers or none.
-- A target with a one-hour cache model gets `ttl: "1h"` on every marker.
+- The first marker goes on the penultimate block, which ends the prefix that the previous turn sent. This turn's new input stays unmarked.
+- A second marker goes on the block that the previous request to the same target marked. Anthropic looks back at most 20 blocks from a marker, so without it a turn that appends 20 or more items loses the old entry.
+- A request carries at most four markers. If the client's tools already use them, Roundhouse sends fewer or none.
+- A one-hour target gets `ttl: "1h"` on every marker. See [Configure providers and the catalog](catalog.md#cache-lifetime-on-anthropic-messages).
 
-On the Responses wire, the `prompt_cache_key` steers a request to a cache node that caches by itself. Roundhouse always sends one. See [Configure providers and the catalog](catalog.md#cache-lifetime-on-anthropic-messages) for the lifetime rules.
+On the Responses wire, `prompt_cache_key` steers a request to a node that caches by itself, and Roundhouse always sends one.
 
 ## Run the offline suite
 
-The offline suite drives the real engine against a loopback server. It checks the shared driver, the request markers, the configured transport, and the budget refusal. It does not show how a provider behaves.
+The offline suite drives the real engine against a loopback server. It checks the shared driver, the request markers, the configured transport, and the budget refusal, not provider behavior.
 
 ```bash
 timeout 300 cargo test -p roundhouse-server --test cache_probe
@@ -45,11 +45,9 @@ timeout 300 cargo test -p roundhouse-server --test cache_probe
 
 ## Run the live probe
 
-The `e2e-frontier` feature adds a live cache probe. It sends two turns to one configured Messages target. The second turn appends 20 items. The report keeps each turn's cache reads, writes, and usage provenance separate.
+The `e2e-frontier` feature adds a live probe that sends two turns to one Messages target, the second appending 20 items. It reports each turn's cache reads, writes, and usage provenance. If turn one neither read nor wrote the cache, a zero read on turn two is inconclusive, not evidence against the marker placement.
 
-A zero cache read on turn two does not settle anything by itself. If turn one neither read nor wrote the cache, the run is inconclusive. It is not evidence against the marker placement.
-
-To run the live probe, supply a catalog, a pinned `provider/model`, and a USD spend cap. The catalog must contain real prices and a deterministic cache model. Inject the key through `openv` into the variable that the provider's `auth.env` names. Check the minimum cacheable prefix of the pinned model before the run. The fixture contains at least 8,192 words before its marker. That is not a provider token count.
+Supply a catalog with real prices and a deterministic cache model, a pinned `provider/model`, and a USD spend cap. Inject the key through `openv` into the variable that the provider's `auth.env` names. Check the model's minimum cacheable prefix first: the fixture has at least 8,192 words before its marker, which is not a token count.
 
 ```bash
 openv env ROUNDHOUSE_PROBE_CATALOG=/path/to/catalog.json \
@@ -59,22 +57,18 @@ openv env ROUNDHOUSE_PROBE_CATALOG=/path/to/catalog.json \
     --test cache_probe live -- --nocapture
 ```
 
-The live test has no `#[ignore]`. Enabling the feature includes it in an unfiltered test run. Missing configuration fails before any request. The project budget governs both turns, with 16 output tokens and a 30-second deadline per turn. A zero cache read remains a reported observation for investigation.
+The live test has no `#[ignore]`, so the feature adds it to an unfiltered run. Missing configuration fails before any request. The project budget governs both turns, each with 16 output tokens and a 30-second deadline.
 
 ## Measure Tax A and Tax B by hand
 
-This experiment needs only a running Roundhouse and a client that can send `POST /v1/responses`. Use a catalog with a real target and a prefix that is longer than the provider's minimum.
+You need a running Roundhouse, a catalog with a real target, and a client that can send `POST /v1/responses`.
 
-### Design
-
-- Use one fixed reference document of about 4 KB. It must be longer than the `min_prefix_tokens` of the catalog entry, which is 1024 in the example. Providers do not cache a prefix below their minimum.
-- Send the document as `instructions` on every turn of every session. This is what a stateless OpenAI client does.
-- Use a list of about 20 short questions that only the document can answer. Ask for the exact words "not specified" when the document does not say. Closed questions keep the answers short and the outputs comparable.
-- Send the questions one by one as a growing conversation, so the resent prefix grows each turn.
-- Give each session its own `prompt_cache_key`, for example `alice-run1`. A request with no `thread-id`, no `session-id`, and no `prompt_cache_key` is refused with a 422.
-- For Tax B, run a second session with the same document and a different key.
-
-### Request
+1. Write a reference document of about 4 KB, longer than the entry's `min_prefix_tokens` (1024 in the example).
+2. Write about 20 short questions that only the document answers. Ask for "not specified" when it does not, to keep answers short.
+3. Send the document as `instructions` on every turn, as a stateless OpenAI client does.
+4. Send the questions as a growing conversation, with the whole conversation in `input`.
+5. Give each session its own `prompt_cache_key`, such as `alice-run1`. A request with no `thread-id`, `session-id`, or `prompt_cache_key` gets a 422.
+6. For Tax B, run a second session with the same document and another key.
 
 ```bash
 curl -N http://127.0.0.1:8080/v1/responses \
@@ -89,32 +83,21 @@ curl -N http://127.0.0.1:8080/v1/responses \
   }'
 ```
 
-In Open mode, no key is needed. On each later turn, send the whole conversation in `input`, with the previous answers and the new question.
+In Open mode, omit the key header. Compute `input_tokens_details.cached_tokens / input_tokens` from `usage` on each `response.completed` event, then read the model rows of `GET /v1/metrics`.
 
-### Read the result
-
-1. Read `usage` on the `response.completed` event of each turn.
-2. Compute `input_tokens_details.cached_tokens / input_tokens` for each turn.
-3. After the last turn, call `GET /v1/metrics` and read the model rows.
-
-### What to expect
-
-These are indicators. They are not assertions, and no measured frontier run is recorded for this experiment. The exact numbers depend on the provider's cache and on the `inactivity_decay` parameters in the catalog.
-
-| Turns | Expected cached share |
-|---|---|
-| 1 to 3 | Low. The prefix is not cached yet, or it is warming. |
-| 5 and later | Above 50%. |
-| 10 and later | 70% to 85%, depending on the provider TTL and the `half_life_ms`. |
-| First turn of a second session (Tax B) | Higher than the first turn of the first session. |
-
-A cached share above 70% by turn 10 is the target that the experiment was designed around.
+No measured run of this experiment is recorded. Expect the cached share to rise as the session grows, and the second session to open higher than the first.
 
 ## Claude Code and cross-session reuse
 
-Tax B is small for Claude Code. The start of its request differs between sessions, so the shared prefix is short.
+Tax B is small for Claude Code, because the start of its request differs between sessions.
 
-Setup for these numbers: bodies that Claude Code 2.1.251 and 2.1.257 sent to a loopback mock server, with synthetic prompts such as "say hi". The bodies are the fixtures in `crates/roundhouse-server/tests/fixtures/`. A Python script approximated `canonicalize` and `Item::render` at revision `2dd40dd`. It is not kept in the repository. The byte counts are therefore not the counts of the Rust render, but the positions where two requests first differ are not affected. Token counts are bytes divided by 4, with no tokenizer. The shared bytes are given in Roundhouse item order, and then in Anthropic order (tools, system, messages). An independent rerun gave the same numbers.
+Setup: the fixtures in `crates/roundhouse-server/tests/fixtures/` are bodies that Claude Code 2.1.251 and 2.1.257 sent to a loopback mock, with synthetic prompts such as "say hi". `scripts/measure-prefix-divergence.py` approximates `canonicalize` and `Item::render` at revision `2dd40dd`: its byte counts differ from the Rust render, but not the positions of the first difference. Tokens are bytes divided by 4. Reproduce the table with:
+
+```bash
+python3 scripts/measure-prefix-divergence.py crates/roundhouse-server/tests/fixtures
+```
+
+Shared bytes are given in Roundhouse item order, and in Anthropic order (tools, system, messages).
 
 | Comparison | First difference | Shared bytes (Roundhouse order) | Shared bytes (Anthropic order) |
 |---|---|---|---|
@@ -126,15 +109,13 @@ Setup for these numbers: bodies that Claude Code 2.1.251 and 2.1.257 sent to a l
 
 What this shows:
 
-- Inside one process, Claude Code only appends. Tax A reuse works.
-- A new process changes item 2. A new session, a new day, or a new directory changes items 0 to 4. So two sessions share little in Roundhouse item order.
-- In Anthropic order, the tools come first, and two sessions share about 46 KB. Whether Anthropic reuses those bytes depends on its own cache. This measurement does not test it.
-- A client upgrade changes the first tool description, so it starts a new prefix for every session.
+- Inside one process, Claude Code only appends, so Tax A reuse works.
+- A new process changes item 2. A new session, day, or directory changes items 0, 2, 3, and 4.
+- In Anthropic order the tools come first, and two sessions share about 46 KB. Whether Anthropic's cache reuses those bytes is not tested here.
+- A client upgrade changes the first tool description, which starts a new prefix for every session.
 
-The first request of 2.1.257 has these items: two developer items of 87 and 75 bytes, the main system prompt of 9,670 bytes, a date reminder of 314 bytes, the typed prompt of 14 bytes, and a system item of 7,106 bytes. It has 21 tool schemas of 45,991 bytes in compact JSON. The session with MCP tools has 23 schemas of 46,416 bytes.
+The first 2.1.257 request has six items of 87, 75, 9,670, 314, 14, and 7,106 bytes. They are two developer items, the main system prompt, a date reminder, the prompt, and a system item. Its 21 tool schemas are 45,991 bytes of compact JSON. With MCP tools there are 23 schemas of 46,416 bytes.
 
 ## Relation to NeMo Relay
 
-NeMo Relay's Adaptive Cache Governor plans provider cache breakpoints from assumed reuse horizons. The source is Relay at commit `c37b551`, file `crates/adaptive/src/acg/economics.rs`. It places up to `max_cache_breakpoints` markers at semantic boundaries. It rewrites requests, and it works offline.
-
-Roundhouse does the complementary job. It predicts whether a target's cache is warm, and it measures the realized hit ratio for each target. Its judge runs inline, and it changes who serves a turn.
+NeMo Relay's Adaptive Cache Governor (Relay commit `c37b551`, `crates/adaptive/src/acg/economics.rs`) plans provider cache markers offline. It places up to `max_cache_breakpoints` markers at semantic boundaries from assumed reuse horizons, and rewrites requests. Roundhouse does the complementary job. It predicts whether each target's cache is warm, measures the realized hit ratio, and uses the prediction to choose who serves a turn.

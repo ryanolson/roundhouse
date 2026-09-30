@@ -4,22 +4,13 @@ This guide shows how to write a control-plane file, mint keys, and manage tenanc
 
 ## Before you start
 
-You need:
-
-- A roundhouse binary that starts. See [Getting started](getting-started.md).
-- A catalog file in `ROUNDHOUSE_CATALOG`. See [Configure providers and the catalog](catalog.md).
-- `sha256sum` and a shell.
-
-Without a control-plane file, roundhouse runs in Open mode. Every request is then the `default/default` principal, and no key is necessary.
+You need a roundhouse binary that starts (see [Getting started](getting-started.md)), a catalog in `ROUNDHOUSE_CATALOG` (see [Configure providers and the catalog](catalog.md)), and `sha256sum`. Without a control-plane file, roundhouse runs in Open mode and needs no key.
 
 ## Copy the example file
 
-1. Copy `examples/control-plane.example.json` to a path outside the repository.
-2. Keep the `$comment` array or delete it. The loader accepts `$comment` and reads nothing in it.
+Copy `examples/control-plane.example.json` to a path outside the repository. The loader reads nothing in its `$comment` array.
 
-The hashes in the example are placeholders. They parse and validate, but they authenticate nothing. With the example file unchanged, every request gets `401 unknown_key`.
-
-The example's `acme` project names `local/REPLACE-with-your-local-model` and a frontier cadence. Both need a local fleet. The shipped `roundhouse` binary attaches no local fleet, so it refuses to boot with this file unchanged. Remove the local tier and the cadence, or attach a fleet.
+The hashes in the example are placeholders that authenticate nothing, so every request gets `401 unknown_key`. The example's `acme` project names `local/REPLACE-with-your-local-model` and a frontier cadence. Both need a local fleet. The shipped `roundhouse` binary attaches no local fleet, so it refuses to boot with this file unchanged. Remove the local tier and the cadence, or attach a fleet.
 
 ## Know the file structure
 
@@ -29,9 +20,9 @@ The top level has these fields:
 |---|---|---|
 | `projects` | yes | The project entries. |
 | `users` | yes | The user entries. |
-| `keys` | no | The turn keys. Each key makes one membership. |
+| `keys` | no | The turn keys. Each key names one membership. |
 | `admin_keys` | no | SHA-256 hashes of admin secrets. |
-| `credentials` | no | The deployment's own provider keys. |
+| `credentials` | no | The deployment's own provider keys. Each entry names an environment variable. |
 | `admission_cache_ttl_ms` | no | How long a node serves a compiled plane before it re-reads the directory. Default 30000. |
 | `arm_salt` | no | The salt for validation arm assignment. See [Validate and steer](../concepts/validate-steer.md#arms). |
 | `learner_recovery` | no | Required when a project enables the learner. See [The routing learner](../concepts/routing-learner.md). |
@@ -41,17 +32,15 @@ A project entry has these fields:
 
 | Field | Meaning |
 |---|---|
-| `id` | Required. Matches `^[a-z0-9][a-z0-9_-]{0,63}$`. |
+| `id` | Required. Matches `^[a-z0-9][a-z0-9_-]{0,63}$`. A user `id` has the same pattern. |
 | `name` | A label for operators. |
 | `policy` | `min_quality`, `allow`, `frontier_cadence`. Absent means unrestricted. |
 | `budget` | The spend ceiling. Absent means unlimited. |
 | `fair_use` | Rolling windows. Absent means no rolling ceiling. |
-| `credentials` | Whose provider keys the project's turns use. |
-| `validate` | The validate/steer loop. Absent means off. See [Validate and steer](../concepts/validate-steer.md). |
+| `credentials` | Whose provider keys the project's turns use: `mode` and `budget_counts`. |
+| `validate` | The validate/steer loop. Absent means off. See [Validate and steer](../concepts/validate-steer.md#configuration). |
 | `tiers` | Two-tier model selection. See [Choosing a model](../concepts/model-selection.md). |
 | `learner` | The routing learner. See [The routing learner](../concepts/routing-learner.md). |
-
-A user entry has one field, `id`, with the same pattern as a project id.
 
 A key entry has these fields:
 
@@ -69,9 +58,9 @@ Every object refuses unknown fields. A misspelled field stops the boot and names
 
 ## Mint a key for the file
 
-The file holds only the SHA-256 of each secret. Make the secret yourself for the first admin key.
+The file holds only the SHA-256 of each secret. Make the first admin secret yourself.
 
-1. Make an admin secret with 43 random base62 characters:
+1. Make a secret with 43 random base62 characters:
 
    ```sh
    secret="rh_admin_$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 43)"
@@ -86,17 +75,11 @@ The file holds only the SHA-256 of each secret. Make the secret yourself for the
 3. Put the hash in `admin_keys`.
 4. Keep the secret in your secret manager. Roundhouse cannot show it again.
 
-For a turn key in the file, use the prefix `rh_turn_` and put the hash in a `keys` entry. It is easier to mint turn keys through the admin API after the first boot. See [Use the admin API](#use-the-admin-api).
-
-The secret must be `rh_turn_` or `rh_admin_` followed by exactly 43 ASCII letters or digits. Any other shape gets `401 malformed_key`. 43 uniform base62 characters carry 256 bits, the same as the 32 CSPRNG bytes the admin API uses.
+For a turn key in the file, use the prefix `rh_turn_` and put the hash in a `keys` entry. After the first boot, mint turn keys through the [admin API](#use-the-admin-api). Any other secret shape gets `401 malformed_key`.
 
 ## Point roundhouse at the file
 
-1. Set `ROUNDHOUSE_CONTROL_PLANE` to the path of the file.
-2. Start roundhouse.
-3. If the boot fails, read the error. It names the file and the entry.
-
-These are common refusals at load:
+Set `ROUNDHOUSE_CONTROL_PLANE` to the path of the file and start roundhouse. If the boot fails, read the error. It names the file and the entry. These are common refusals:
 
 | Refusal | Cause |
 |---|---|
@@ -108,21 +91,17 @@ These are common refusals at load:
 | Overflow under `refuse` | `overflow_when_local_saturated` is set on a `refuse` budget. |
 | No local capacity | A cadence, a local tier, or a degrade-mode budget with overflow off needs local models, and the deployment has none. |
 | Floor above local quality | A key's floor makes the only local model inadmissible, but its cadence promises local service. |
+| No judge | A project enables `validate`, and `ROUNDHOUSE_JUDGE_MODEL` names no catalog model. |
 | `mcp_namespace` | The field is retired. Remove it. |
 | `channel: "tool_call"` | The steer channel is retired. Use `text` or `auto`. |
 
 ## Present the key
 
-A client sends a turn key in one of two headers:
-
-- `x-roundhouse-key: rh_turn_…`
-- `Authorization: Bearer rh_turn_…`
-
-When both are present, `x-roundhouse-key` wins. Use it when `Authorization` carries a forwarded provider login. [Hook up Codex](codex.md) and [Hook up Claude Code](claude-code.md) show the client settings. [Launch with topham](topham.md) writes them for you.
+A client sends a turn key in `x-roundhouse-key: rh_turn_…` or in `Authorization: Bearer rh_turn_…`. When both are present, `x-roundhouse-key` wins. Use it when `Authorization` carries a forwarded provider login. [Hook up Codex](codex.md) and [Hook up Claude Code](claude-code.md) show the client settings, and [Launch with topham](topham.md) writes them.
 
 ## Narrow a key's policy
 
-Add `overrides` to a key entry. It has the same three axes as a project `policy`:
+Add `overrides` to a key entry, with the same three axes as a project `policy`:
 
 ```json
 {
@@ -136,10 +115,8 @@ Add `overrides` to a key entry. It has the same three axes as a project `policy`
 }
 ```
 
-- An absent axis keeps the project's value.
-- An axis can only narrow. A lower `min_quality` or a looser cadence is refused at load.
-- `min_quality` is in `0.0..=1.0`.
-- `frontier_cadence` needs `per_turns >= 1` and `1 <= max_frontier <= per_turns`.
+- An absent axis keeps the project's value. An axis can only narrow: a lower `min_quality` or a looser cadence is refused at load.
+- `min_quality` is in `0.0..=1.0`. `frontier_cadence` needs `per_turns >= 1` and `1 <= max_frontier <= per_turns`.
 
 ## Set a budget
 
@@ -157,27 +134,21 @@ Add `overrides` to a key entry. It has the same three axes as a project `policy`
 
 2. Optionally, add an `allocation` to a key to give that member a second ceiling.
 
-The budget fields are:
-
 | Field | Values |
 |---|---|
 | `limit_usd` | Required. A positive number. |
 | `window` | Required. `total` (the life of the project) or `monthly` (UTC calendar month). |
 | `on_exhaustion` | Required. `degrade_to_local` or `refuse`. |
-| `overflow_when_local_saturated` | Default `true`. Only valid with `degrade_to_local`. |
-| `warn_at` | Default `0.8`. The fraction of the limit after which a grant is marked `Warned`. |
+| `overflow_when_local_saturated` | Default `true`. Valid only with `degrade_to_local`. |
+| `warn_at` | Default `0.8`, in `(0.0, 1.0]`. After this fraction of the limit, a grant is marked `Warned`. |
 
-The allocation shapes are:
-
-| Shape | Meaning |
+| Allocation | Meaning |
 |---|---|
-| absent | Pooled. No second ceiling. The project limit still applies. |
+| absent or `"pooled"` | No second ceiling. The project limit still applies. |
 | `{ "capped": { "limit_usd": 100.0 } }` | A fixed dollar ceiling for this member. |
-| `{ "share": { "fraction": 0.25 } }` | A fraction of the project limit. It follows a later change to the limit. |
+| `{ "share": { "fraction": 0.25 } }` | A fraction of the project limit in `(0.0, 1.0]`. It follows a later change to the limit. |
 
-Shares can sum past 1.0. The project limit stops all members together. An `allocation` on a key whose project has no budget has no effect.
-
-You cannot change `window` after the project exists. The admin API refuses it with `400 window_change_unsupported`.
+Shares can sum past 1.0, and the project limit stops all members together. An `allocation` on a key whose project has no budget has no effect. The admin API refuses a change of `window` with `400 window_change_unsupported`.
 
 ## Set fair-use windows
 
@@ -192,14 +163,11 @@ Add a `fair_use` block to a project, a key, or both:
 }
 ```
 
-- `window` is `5h`, `24h`, or `7d`.
+- `window` is `5h`, `24h`, or `7d`. Name each window once at each scope.
 - Each window needs `max_tokens`, `max_usd`, or both. Each cap must be positive.
-- Name each window once at each scope.
 - A key's windows are a second ceiling. They do not replace the project's windows.
 
-A turn over a window gets HTTP 429 `fair_use_exceeded`. [Control plane](../concepts/control-plane.md#the-429) describes the body.
-
-For a multi-node deployment, set `ROUNDHOUSE_REDIS_URL`. Without Redis, each node counts in its own memory and logs a warning the first time it enforces a ceiling.
+A turn over a window gets HTTP 429 `fair_use_exceeded`. [Control plane](../concepts/control-plane.md#the-429) describes the body. For more than one node, set `ROUNDHOUSE_REDIS_URL`. Without it, each node counts in its own memory and logs a warning the first time it enforces a ceiling.
 
 ## Use the admin API
 
@@ -237,7 +205,7 @@ The list routes return `{"data": [...]}`. Each row has a `provenance` of `config
      -d '{"id": "dana"}'
    ```
 
-2. Create the membership. `role` is `owner` or `member`. `allocation` and `overrides` use the file's shapes:
+2. Create the membership. `role` is `owner` or `member`:
 
    ```sh
    curl -sS -X PUT http://127.0.0.1:8080/v1/admin/projects/acme/members/dana \
@@ -255,9 +223,9 @@ The list routes return `{"data": [...]}`. Each row has a `provenance` of `config
 
 4. Copy the `secret` field from the response. Roundhouse returns it once.
 
-A `PUT` replaces the membership. If you leave out `allocation`, the member ceiling is removed from all of the member's keys.
+A `PUT` replaces the membership. An absent `allocation` or `overrides` removes that ceiling or narrowing from all of the member's keys. A membership that the file declares gets `409 config_owned`.
 
-`topham mint --profile <p> --project <P> --user <U>` does step 3. It reads the admin key from `ROUNDHOUSE_ADMIN_KEY` and prints an export line. It writes nothing to disk. See [Launch with topham](topham.md).
+`topham mint --profile <p> --project <P> --user <U>` does step 3. It reads the admin key from `ROUNDHOUSE_ADMIN_KEY`, prints an export line, and writes nothing to disk. See [Launch with topham](topham.md).
 
 ### Revoke a key
 
@@ -266,7 +234,7 @@ A `PUT` replaces the membership. If you leave out `allocation`, the member ceili
 
 The key stops on this node at the next request. Other nodes stop it within `admission_cache_ttl_ms`, or two TTLs if a directory refresh failed. A turn that is already streaming finishes.
 
-You cannot revoke an admin key that the file declares. Remove its hash from the file and restart.
+You cannot revoke a key that the file declares, turn or admin. Remove its hash from the file and restart.
 
 ### Change a project
 
@@ -279,16 +247,12 @@ curl -sS -X PATCH http://127.0.0.1:8080/v1/admin/projects/acme \
   -d '{"budget": {"limit_usd": 800.0, "window": "monthly", "on_exhaustion": "degrade_to_local"}}'
 ```
 
-An explicit `null` is refused, and the error names the field. The API has no way to remove a block, because a removal widens a ceiling. To remove a block, edit the file.
+An explicit `null` is refused, and the error names the field. The API cannot remove a block, because a removal widens a ceiling. To remove a block, edit the file.
 
 ### Archive a project
 
-Send `DELETE /v1/admin/projects/{project}`. The project's keys then get `403 project_archived`. No route undoes an archive, and no route deletes a project. Its spend history stays.
+`DELETE /v1/admin/projects/{project}` archives the project, and its keys then get `403 project_archived`. No route undoes an archive or deletes a project.
 
-## Tune revocation speed
+## Tune revocation and durability
 
-Set `admission_cache_ttl_ms` at the top level of the file. A smaller value makes a revocation reach other nodes sooner, and costs a store read more often. `0` re-reads on every request. A node recompiles only when the store's version changed.
-
-## Keep the directory durable
-
-Without `ROUNDHOUSE_REDIS_URL`, rows that the admin API creates are in process memory and are lost at restart. Rows from the file are always there. For admin-created rows that last, set `ROUNDHOUSE_REDIS_URL`. See [Deploy with Redis](../operations/redis.md).
+A smaller `admission_cache_ttl_ms` makes a revocation reach other nodes sooner and costs a store read more often. `0` re-reads on every request. Without `ROUNDHOUSE_REDIS_URL`, rows that the admin API creates are in process memory and are lost at restart, while rows from the file stay. See [Deploy with Redis](../operations/redis.md).
