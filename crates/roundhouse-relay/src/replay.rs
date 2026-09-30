@@ -93,12 +93,15 @@ pub struct TurnRecord {
     pub output: Vec<Item>,
     /// Streamed text, concatenated. The answer as the client received it.
     pub text: String,
-    /// Whether the validate loop interjected on this turn.
+    /// Whether the validate loop interjected on this turn: set when a judged
+    /// verdict's action intervenes under an acting arm. Shadow never sets it,
+    /// and a Placebo arm's timing-selected halt is logged as `NotRun`, so it
+    /// does not set it either.
     ///
     /// Carried so the divergence the crate documentation names is *visible*
-    /// rather than merely admitted: a steered turn publishes as an ordinary tool
-    /// call, and this is the flag a reader of our own log can join on to find
-    /// which ones those were.
+    /// rather than merely admitted: a steered turn publishes as an ordinary
+    /// turn, and this is the flag a reader of our own log can join on to
+    /// find which ones those were.
     pub steered: bool,
 }
 

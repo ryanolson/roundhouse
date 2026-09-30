@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The recovery task (draft section 11.7, milestone M9): idle sessions with
+//! The recovery task: idle sessions with
 //! entries owed are found in the session store's index and delivered without
 //! the engine, through the same delivery the tail runs.
 //!
@@ -83,7 +83,7 @@ pub(crate) async fn pending(rig: &Rig) -> Vec<SessionId> {
     .collect()
 }
 
-/// **Failure before the first apply** (draft 11.6): the append of the first
+/// **Failure before the first apply**: the append of the first
 /// entry-producing event marked the session, the node died before any apply
 /// landed, and a successor's task finds the session once it is idle.
 #[tokio::test]
@@ -115,7 +115,7 @@ async fn a_crash_before_the_first_apply_is_recovered_by_the_recovery_task() {
     );
 }
 
-/// **Every learner-store call of a session failed** (draft 11.6): the reads
+/// **Every learner-store call of a session failed**: the reads
 /// and the applies. The source marks keep the session, and the task delivers
 /// it once the store answers again.
 #[tokio::test]
@@ -189,7 +189,7 @@ async fn a_recovered_session_reaches_the_same_counters_as_an_engine_delivered_on
     assert_eq!(total.duplicate_entries, 0);
 }
 
-/// **A delayed clear cannot remove a newer mark** (draft 11.6). Node A
+/// **A delayed clear cannot remove a newer mark**. Node A
 /// delivers turn 1 and its clear is delayed past a lease turnover; the
 /// successor's turn 2 marks the session and does not deliver. A's clear
 /// arrives with turn 1's watermark and leaves turn 2's mark pending, and the
@@ -236,7 +236,7 @@ async fn a_delayed_engine_clear_after_lease_turnover_keeps_the_new_turn_mark() {
     assert!(pending(&successor).await.is_empty());
 }
 
-/// **A lost acknowledgement** (draft 11.6): the store applied, and the
+/// **A lost acknowledgement**: the store applied, and the
 /// `LearningApplied` append failed, so the mark stays. The task finds nothing
 /// above the store's watermark to send, and the clear with that watermark
 /// covers the mark.
@@ -361,7 +361,7 @@ async fn two_recovery_tasks_on_one_session_apply_each_entry_once() {
     assert!(pending(&rig).await.is_empty());
 }
 
-/// **The audit** (draft 11.7): the learner store lost what an earlier clear
+/// **The audit**: the learner store lost what an earlier clear
 /// confirmed, so its watermark is below the permanent mark. The audit makes
 /// the session pending again through `requeue_learning`, and the next sweep
 /// restores the counters from the log. The audit never clears.

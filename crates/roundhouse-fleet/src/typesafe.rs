@@ -8,9 +8,8 @@
 //! on 2026-09-21: `POST {base}/systemone`, bearer auth, a body of `state`,
 //! `model` and a `questions` map keyed by names the caller chooses, answering
 //! under the same keys with `choice`, `probabilities` and `confidence`, plus a
-//! top-level `usage` of `input_tokens` and `output_tokens`. The evidence is
-//! `agent-docs/research/typesafe-jev-primary-read.md`; the design this serves is
-//! `agent-docs/PLAN-routing-strategy-bandit.md` B4.
+//! top-level `usage` of `input_tokens` and `output_tokens`. The design this serves is in
+//! `docs/src/concepts/routing.md`.
 //!
 //! A question map lets several classifications share one transmitted state and
 //! one HTTP call. This does not guarantee identical answers, cost, or latency
@@ -181,7 +180,7 @@ pub struct ChoiceAnswer {
     /// **An observation about the answer, never a measure of answer quality.**
     /// `confidence.md` calls it a statistic computed from the distribution and
     /// publishes neither the formula nor any calibration evidence
-    /// (`typesafe-jev-primary-read.md` §2), so a caller may gate on it and may
+    /// (read 2026-09-21), so a caller may gate on it and may
     /// not report it as confidence in an outcome.
     pub confidence: f64,
 }

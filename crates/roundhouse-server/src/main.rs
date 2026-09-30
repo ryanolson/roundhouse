@@ -131,7 +131,7 @@ const FRONTIER_UPSTREAM_VAR: &str = "ROUNDHOUSE_FRONTIER_UPSTREAM";
 /// Where a stored key authenticates, overriding the published endpoint.
 ///
 /// Separate from the pass-through base below because the two auth modes address
-/// genuinely different origins — stage 0's ruling, and the reason
+/// genuinely different origins, which is the reason
 /// `OpenAiResponsesClient` takes two. A deployment behind one egress proxy
 /// points both at it.
 const OPENAI_API_BASE_VAR: &str = "ROUNDHOUSE_OPENAI_API_BASE";
@@ -950,10 +950,10 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// **The steer used to be the second half of that sentence and is not any
 /// more.** Until M10.0 the engine deposited a correction's payload here and the
-/// surface served it to `fetch_steer`; the correction is a conversation item now
-/// (`PLAN-frontier-selection.md` R1), so it lives in the session log with
-/// everything else and this store holds only overlays, intents, bindings and the
-/// advisory outcome an agent reports.
+/// surface served it to `fetch_steer`; the correction is a conversation item
+/// now, so it lives in the session log with everything else and this store
+/// holds only overlays, intents, bindings and the advisory outcome an agent
+/// reports.
 #[allow(clippy::too_many_arguments)]
 async fn serve<S: SessionStore>(
     store: Arc<S>,
@@ -1551,15 +1551,15 @@ mod tests {
     }
 
     /// G08 (review finding): the file `examples/catalog.example.json` tells an
-    /// operator to copy it, and its own README calls it the starting point.
+    /// operator to copy it, and the catalog guide calls it the starting point.
     /// `tests/example_catalog.rs` only proves it survives `CatalogConfig::load`
     /// — the config boundary's checks — never this file's third cross-check,
     /// which only runs here because it is a fact about the binary, not the
     /// file. The shipped `anthropic`/`anthropic_messages` entry is exactly the
     /// shape `a_dialect_this_build_cannot_speak_stops_the_boot_and_names_the_entry`
     /// exercises by hand above, so the desired property is that the shipped
-    /// example, loaded for real and pointed at a real upstream the way the
-    /// README instructs, boots the shipped binary rather than being refused
+    /// example, loaded for real and pointed at a real upstream the way
+    /// `docs/src/guides/catalog.md` instructs, boots the shipped binary rather than being refused
     /// by a dialect this build has no client for.
     ///
     /// **M10 closed it by moving the entry; M11.0 closed it by adding the
@@ -1582,7 +1582,7 @@ mod tests {
             .expect("tests/example_catalog.rs already pins that this file parses and validates");
 
         frontier_clients(&config.catalog(), &config.providers, &real_upstream).expect(
-            "an operator who copies the README's own example and names a real upstream must \
+            "an operator who copies the shipped example and names a real upstream must \
              get a booted process, not a boot-time refusal naming a dialect they never chose",
         );
     }

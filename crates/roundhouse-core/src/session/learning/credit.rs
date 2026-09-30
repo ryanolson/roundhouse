@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Consistent-trajectory credit (draft section 8.2, accepted as written by the
-//! 2026-09-28 ruling 9).
+//! Consistent-trajectory credit.
 //!
 //! A strategy is consistent with an accepted interval when, on every covered
 //! turn, its plan had the same first target as the served dispatch. Each
@@ -20,11 +19,10 @@ use crate::validate::IntervalLabel;
 
 use super::entry::{Deltas, LearningCauses, QualityDelta};
 
-/// What credit needs from one covered decision, copied from its `Routed`
-/// (draft section 8.1).
+/// What credit needs from one covered decision, copied from its `Routed`.
 ///
 /// **Fixed-size and `Copy`**, so the review tracker's per-interval decision
-/// bound is also the bound on these rows. The draft names the served target
+/// bound is also the bound on these rows. A `Routed` names the served target
 /// and each plan's first target as recipe indices; this row holds the one fact
 /// credit reads from them, which plans agreed with the served dispatch, as a
 /// bit per strategy. Comparing on the `Routed` keeps a target that no recipe
@@ -72,7 +70,7 @@ impl LearningRow {
     }
 
     /// Recorded under the credit rule this build applies. A row that is not
-    /// contributes no deltas of any kind (draft section 11.1).
+    /// contributes no deltas of any kind.
     pub(crate) fn is_current(&self) -> bool {
         self.credit_revision == LEARNING_CREDIT_REVISION
     }
@@ -131,7 +129,7 @@ pub(crate) struct Reviewed {
     pub(crate) rows: Vec<CoveredRow>,
 }
 
-/// Why an accepted review credits nothing: the draft's checks, in its order.
+/// Why an accepted review credits nothing: the checks, in the order they run.
 ///
 /// **The one spelling of the screen**, read by [`credit`] and by the offline
 /// calibrator (`routing::learn::offline`), which excludes exactly the
@@ -157,7 +155,7 @@ pub enum Exclusion {
 /// Screen one accepted review: `Ok(positive)` when it may be credited, or the
 /// first check it fails.
 ///
-/// The checks run in the draft's order: the label, then a failover anywhere,
+/// The checks run in this order: the label, then a failover anywhere,
 /// then a decision with no row, then more than one epoch, then a foreign
 /// credit revision. Each makes the whole interval credit nothing.
 pub(crate) fn screen<I>(label: IntervalLabel, rows: I) -> Result<bool, Exclusion>

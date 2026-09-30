@@ -366,8 +366,8 @@ pub const MCP_MOUNT_PATH: &str = "/mcp";
 ///
 /// Mounted with [`post_service`] rather than `route_service`, which is a
 /// decision and not a detail. The SDK answers every other method `405` with an
-/// `Allow: POST` of its own — see the plan's §5, where a server offering no
-/// stream is permitted to — and mounting POST-only means axum refuses the same
+/// `Allow: POST` of its own — the Streamable HTTP transport permits a server
+/// that offers no stream to — and mounting POST-only means axum refuses the same
 /// methods with the same status even if the transport underneath is swapped for
 /// the hand-rolled handler. The behavior a test pins is therefore a property of
 /// this deployment rather than of whichever library is behind the route.

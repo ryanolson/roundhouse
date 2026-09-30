@@ -26,10 +26,10 @@
 //! # Stateless, and what that buys
 //!
 //! [`NeverSessionManager`] plus `legacy_session_mode: false` is the
-//! configuration the plan describes: no `Mcp-Session-Id` is issued, no session
+//! stateless configuration: no `Mcp-Session-Id` is issued, no session
 //! state is held, and `GET /mcp` answers 405 — which the specification permits
-//! for a server offering no stream, and which is honest here because §1 of the
-//! plan established that nothing we could push would reach the model anyway.
+//! for a server offering no stream, and which is honest here because
+//! nothing we could push would reach the model anyway.
 //! It is also where the 2026-07-28 revision lands, so the surface is
 //! forward-compatible rather than merely minimal.
 //!
@@ -291,7 +291,7 @@ fn into_result(outcome: ToolOutcome) -> CallToolResult {
 impl ServerHandler for RoundhouseMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            // The version the plan pins the semantics to. `rmcp` negotiates
+            // The protocol version the semantics are pinned to. `rmcp` negotiates
             // upward for a client that asks for a later one, and every later
             // revision so far only removes session state we do not keep.
             .with_protocol_version(ProtocolVersion::V_2025_06_18)

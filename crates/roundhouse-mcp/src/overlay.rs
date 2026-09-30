@@ -16,7 +16,7 @@
 //! silently_going_local` — so an overlay that emptied the set would fail every
 //! remaining turn of the session, at a seam the agent cannot reach to undo it.
 //! An agent asking for frontier on a local-only project must therefore be told
-//! `narrowed: true` and left routable, which is exactly the plan's example.
+//! `narrowed: true` and left routable, which is exactly the case this rule exists for.
 //!
 //! Both halves are one rule stated once, in [`crate::plane`]: *the overlay is
 //! applied only insofar as it leaves at least one admissible target, and any
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn a_mode_with_nothing_on_its_side_of_the_fleet_does_not_resolve() {
-        // The probe: the plan's own example. A local-only key asking for
+        // The probe: the motivating case. A local-only key asking for
         // frontier must not produce a filter that admits nothing, because an
         // empty admissible set fails every remaining turn of the session.
         assert!(

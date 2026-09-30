@@ -18,7 +18,7 @@
 //! sends. A server reading the same shape must do the opposite: Claude Code
 //! 2.1.247 posts the *beta* property set — `context_management`, a `thinking`
 //! object with a `display` field, `output_config` — and the beta schema grows
-//! faster than any pin (evidence doc §5.5 ¶4). Refusing an unknown property
+//! faster than any pin. Refusing an unknown property
 //! would make every roundhouse release a race against the client's next one.
 //! What is refused instead is a *content shape* that cannot be represented at
 //! all, because that is the failure a client can act on and the one that would
@@ -31,19 +31,19 @@
 //! silently, because every turn would still answer. That is why nothing here
 //! reads a header, a clock, or a config, and why the attribution pseudo-header
 //! block Claude Code prepends to `system` is stored as ordinary prefix with no
-//! special case: the block is stable per conversation (§4.4, confirmed at
-//! 2.1.247), so its stability is the client's to keep, and a server that
+//! special case: the block is stable per conversation (read from v2.1.42,
+//! confirmed at 2.1.247), so its stability is the client's to keep, and a server that
 //! stripped it would be guessing at which parts of a system prompt matter.
 //!
-//! **What the client rewrites per request is not a turn of the conversation**
-//! (R-A). One rule, drawn once, with three consequences already visible in this
+//! **What the client rewrites per request is not a turn of the conversation**.
+//! One rule, drawn once, with three consequences already visible in this
 //! module: what the client resends byte-identical is history and is admitted
 //! strictly; what it rebuilds from its own environment *at the front* is turn
 //! configuration and is replaced in place ([`mark_turn_configuration`], F7); and
 //! what it regenerates per request *behind* the conversation is ephemeral and
 //! becomes no item at all ([`is_ephemeral_client_notice`]). The third arm exists
 //! because the current client line appends a remaining-budget notice after every
-//! `--continue`'s new question (§5.7, §5.7.1) — a counter, and the moment it
+//! `--continue`'s new question (2.1.257) — a counter, and the moment it
 //! counts down, a resend that disagreed with the stored copy would fork the
 //! session to a cold generation while every turn still answered. The leading-run
 //! mechanism cannot cover it: a configuration run is leading by construction and
@@ -206,7 +206,7 @@ const BUDGET_NOTICE_CLOSE: &str = "</total_tokens>";
 /// `<total_tokens>N tokens left</total_tokens>` after the new user turn of every
 /// `--continue`, with the cache breakpoint moved onto it; one turn later the
 /// same message is resent flattened to a bare string and a *fresh* one is
-/// appended behind the new question (evidence doc §5.7, §5.7.1, and the pinned
+/// appended behind the new question (the pinned
 /// `claude-2.1.257-turn-3-continue.json` capture).
 ///
 /// **The failure avoided.** `N` is a counter the client recomputes from its own
@@ -343,11 +343,11 @@ pub fn turn_id_for(items: &[Item]) -> TurnId {
 /// `system`, as one item per block.
 ///
 /// A string becomes one item; a list becomes one item per block, in order. The
-/// per-block split is what R5 means by "ordinary stored prefix": Claude Code
-/// sends three blocks, of which block 0 is the attribution pseudo-header and
-/// blocks 1-2 carry the cache breakpoints (§5.5 ¶5), and folding them into one
-/// item would make the whole system prompt a single unit whose hash changes
-/// whenever any part of it does. One item per block is also what lets the
+/// per-block split is what keeps the system prompt ordinary stored prefix:
+/// Claude Code sends three blocks, of which block 0 is the attribution
+/// pseudo-header and blocks 1-2 carry the cache breakpoints (2.1.247 capture),
+/// and folding them into one item would make the whole system prompt a single
+/// unit whose hash changes whenever any part of it does. One item per block is also what lets the
 /// prefix check say *how much* of the system prompt still agrees.
 ///
 /// An empty string is skipped, exactly as `instructions` is on the Responses
@@ -483,15 +483,15 @@ fn block_item(role: Role, block: &Value) -> Result<Item, ApiError> {
             ItemContent::ToolCall {
                 call_id: id,
                 name,
-                // **`None`, and that is the ruling rather than a gap** (M17,
-                // R-N6). This wire has no `namespace` key to read: Claude Code
-                // folds the MCP registration into every tool name it declares,
-                // calls and permits, so what arrives is `mcp__roundhouse__status`
-                // as one flat string — the flat spelling *is* the namespace
-                // here. Splitting it on `__` to manufacture a `Some` would put
-                // this module's guess where the client's word belongs, would
-                // make a second server called `roundhouse_extra` read as ours,
-                // and would change the canonical form of every already-stored
+                // **`None`, and that is deliberate rather than a gap.** This
+                // wire has no `namespace` key to read: Claude Code folds the
+                // MCP registration into every tool name it declares, calls and
+                // permits, so what arrives is `mcp__roundhouse__status` as one
+                // flat string — the flat spelling *is* the namespace here.
+                // Splitting it on `__` to manufacture a `Some` would put this
+                // module's guess where the client's word belongs, would make a
+                // second server called `roundhouse_extra` read as ours, and
+                // would change the canonical form of every already-stored
                 // Messages session. `validate::is_control_call_on`'s Messages
                 // arm reads the flat name and never this field, for the same
                 // reason.
@@ -641,11 +641,11 @@ mod tests {
 
     /// The 2.1.247 body, canonicalized.
     ///
-    /// Modelled on the live capture (§5.5): three system blocks with the
+    /// Modelled on the live capture: three system blocks with the
     /// attribution pseudo-header first, a user turn, the assistant's reply
     /// replayed verbatim with its thinking block, and a second user turn. The
-    /// attribution block is an ordinary `System` item like the other two — R5's
-    /// ruling, asserted here so a future "helpfully" special-cased strip is a
+    /// attribution block is an ordinary `System` item like the other two —
+    /// asserted here so a future "helpfully" special-cased strip is a
     /// failing test rather than a session that forks on every client upgrade.
     #[test]
     fn the_live_client_body_canonicalizes_block_by_block() {
@@ -1120,7 +1120,7 @@ mod tests {
     /// Properties the beta schema adds are accepted, and none of them becomes
     /// an item.
     ///
-    /// The exact property set the 2.1.247 capture carried (§5.5 ¶4). A closed
+    /// The exact property set the 2.1.247 capture carried. A closed
     /// request type would 4xx every turn of the shipping client, and the failure
     /// would arrive as "roundhouse is broken" rather than as "roundhouse is one
     /// beta behind".
@@ -1153,7 +1153,7 @@ mod tests {
     }
 
     /// **The client's remaining-budget notice is ephemeral and never becomes an
-    /// item** (R-A; §5.7, §5.7.1).
+    /// item** (2.1.257).
     ///
     /// The three shapes the notice arrives in, and the two it must not be
     /// confused with. A `--continue` on the current client line appends a

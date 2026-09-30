@@ -62,8 +62,7 @@ pub(crate) enum KeyFamily {
     /// rather than one per entity, and why it carries no hash tag when the
     /// other families do.
     Directory,
-    /// The online routing learner's shared counters (M7 of
-    /// `agent-docs/PLAN-online-routing-learner.md`): per project, a watermark
+    /// The online routing learner's shared counters: per project, a watermark
     /// hash, and per epoch the quality hashes, the operations hash and the
     /// `seen` sets. See [`crate::learn`] for the layout.
     Learn,
@@ -332,8 +331,7 @@ mod tests {
         );
     }
 
-    /// F6 correction: the ruling named three forbidden shapes, not only the
-    /// hash tag the finding's own `how_to_prove` covered — `:` collides with
+    /// Three shapes are refused, not only the hash tag: `:` collides with
     /// this crate's own field separator, and embedded whitespace is a key
     /// nobody will type back correctly.
     #[test]

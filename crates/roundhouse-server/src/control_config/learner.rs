@@ -2,18 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! What a project says about the online routing learner, and what it resolves
-//! to (draft section 12.1, milestone M8 of
-//! `agent-docs/PLAN-online-routing-learner.md`).
+//! to (design in `docs/src/concepts/routing-learner.md`).
 //!
 //! **Off unless a project says otherwise.** `mode` defaults to `off`, and an
 //! `off` block resolves to no learner at all: the engine takes today's path,
 //! reads no store and computes no draw.
 //!
-//! **Two ruled defaults, and only two.** `on_infeasible` defaults to
-//! `serve_rules` (2026-09-28 ruling 7) and `exploration.rate` to 5% when the
-//! block is present (ruling 8). Every other field is required once the mode is
-//! `shadow` or `live`, and none has a default: the starting numbers of ruling
-//! 13 are written into a deployment's file, never supplied by code, so a
+//! **Two defaults, and only two.** `on_infeasible` defaults to
+//! `serve_rules` and `exploration.rate` to 5% when the block is present. Every
+//! other field is required once the mode is `shadow` or `live`, and none has a
+//! default: the starting numbers are written into a deployment's file, never supplied by code, so a
 //! number a project runs under is always one somebody wrote down.
 //!
 //! **Checked whatever the mode.** A present field is checked even on an `off`
@@ -34,7 +32,7 @@ use roundhouse_core::routing::learn::{
 use super::config::ControlPlaneError;
 
 /// The exploration rate a present `exploration` block runs at when it names
-/// none (2026-09-28 ruling 8).
+/// none.
 pub const DEFAULT_EXPLORATION_RATE: f64 = 0.05;
 
 /// One project's `"learner"` object.
@@ -63,7 +61,7 @@ pub struct LearnerConfig {
     pub artifact: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quality: Option<QualityConfig>,
-    /// First output from turn start, in milliseconds (ruling 10).
+    /// First output from turn start, in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_limit_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -108,7 +106,7 @@ fn default_rate() -> f64 {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum LearnerConfigError {
     /// A strategy is a tier pick, so a learner has nothing to choose between
-    /// without a recipe (draft 4.2).
+    /// without a recipe.
     #[error("a `learner` block needs the project's `tiers` recipe, and this project has none")]
     NoTiers,
     #[error("`{field}` is required when the mode is `{mode}`")]
@@ -126,7 +124,7 @@ pub enum LearnerConfigError {
     ZeroLatencyLimit,
     #[error("the strategy list is refused: {0}")]
     Strategies(String),
-    /// Refused rather than left inert: exploration is live-only by ruling 8,
+    /// Refused rather than left inert: exploration is live-only,
     /// and a block on a `shadow` project would read as a setting that does
     /// something.
     #[error("an `exploration` block is accepted only when the mode is `live`")]

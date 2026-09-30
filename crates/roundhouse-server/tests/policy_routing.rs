@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M2 of `PLAN-agentic-control-plane.md`: a per-principal policy that visibly
-//! changes routing.
+//! A per-principal policy that visibly changes routing.
 //!
 //! Every claim here is about a *difference between two principals given the
 //! identical prompt*, which is why none of them is a unit test. The unit tests

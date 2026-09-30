@@ -233,7 +233,7 @@ async fn repeated_replay_after_recovery_charges_once_and_buys_no_second_call() {
 ///
 /// The answer arrived without a usage block. What that call billed is exactly
 /// what this deployment does not know, so the settle books the grant's
-/// estimate (2026-09-28 ruling 3) — and the durable record must go on saying
+/// estimate — and the durable record must go on saying
 /// the accounting is unknown. The repair re-drives the amount the record says
 /// was submitted: a zero would hand back money the call may have spent, and a
 /// measured figure would invent a number nobody reported.

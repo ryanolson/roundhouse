@@ -5,9 +5,9 @@ SPDX-License-Identifier: Apache-2.0
 
 # Working on Roundhouse
 
-Project-specific practice. The architecture itself is documented in `README.md`
-and in module-level docs; this file is about *how we work*, not what the code
-does.
+Project-specific practice. The architecture itself is documented in the book
+(`docs/`) and in module-level docs; this file is about *how we work*, not what
+the code does.
 
 ## What the product is
 
@@ -29,15 +29,17 @@ loses the agent loop — which is why routing decisions carry quality
 priors, exact prices, and TTFT together, and why the savings dashboard
 is never allowed to claim one without measuring the others.
 
-## Where documents live
+## Documentation
 
-Plans, synergy rulings, deep-dive evidence, and design records go in
-`agent-docs/` — see its README for the evidence-vs-ruling pairing and the
-dated-addendum discipline. Deep-dive evidence goes in
-`agent-docs/research/`, synergy rulings in `agent-docs/synergies/`, and
-plans at the `agent-docs/` root. `README.md` and module docs describe the
-code as it is; `agent-docs/` records where it is going and why. A new
-plan or deep dive that lands at the repo root is in the wrong place.
+The documentation is an mdBook in `docs/` (`docs/book.toml`, chapters in `docs/src/`). `.github/workflows/pages.yml` publishes it to https://ryanolson.github.io/roundhouse/ on each push to `main`; the `Book` job in `ci.yml` builds it and checks links on every PR. Build it locally with `bash scripts/build-book.sh`. `docs/src/development/documentation.md` says which text goes where.
+
+Rules:
+
+- **`agent-docs/` never merges to `main`.** It holds in-progress `.md` work (plans, measurements, session notes) on a work branch only. Before a PR merges, carry the lasting parts into the book and delete `agent-docs/` from the branch.
+- **The book carries only the bare necessities**: how it works, why (with the rejected alternative), measured numbers with their setup, and negative results. No detailed plans, no phase or workstream labels ("Phase 3", "W2a", "a.5"), no PR numbers, no handoff notes. History belongs in git.
+- **Write the book, READMEs, and comments with the `simple-english` skill.** Comments are terse but readable: they say why, or which failure the code avoids. Match the surrounding code; a comment that restates the line is noise.
+- **Hard-earned lessons go into tests.** A test's doc comment can be long, because it carries the knowledge forward; a comment alone enforces nothing.
+- **Every merge to `main` updates the book and the top-level `README.md`**, and removes `agent-docs/` from the branch.
 
 ## Synergy dependencies are watched, not just pinned
 
@@ -55,9 +57,10 @@ never just bumping a version:
   week of 2026-08.
 - **Map each change into the product.** The question is not "does it
   compile" but "does this change how an agent hooks up, what a turn
-  costs, where a route can go, or what a document here claims" — and the
-  answer goes into `agent-docs/` as a dated addendum to the affected
-  ruling, the way the Switchyard-main and redis-1.2.4 addenda were done.
+  costs, where a route can go, or what the book claims" — and the
+  answer updates the book chapter that states the affected contract,
+  naming the revision it was read from. The reading itself is work-branch
+  material in `agent-docs/`.
 - **Re-verify pinned-source claims before milestones that rely on
   them.** A ruling read from one revision (e.g. `requires_openai_auth`
   from codex `6344a65`) is stale the day the pin moves; the milestone
@@ -138,7 +141,7 @@ is not more correct, only slower.
 |---|---|
 | **Opus** (`claude-opus-5`) | Load-bearing reasoning: judging whether an invariant actually holds, designing a type that makes an invalid state unrepresentable, tracing a lifecycle across modules, deciding whether a finding is real. Anything where being wrong is expensive and the answer is not lookup-shaped. |
 | **Sonnet** (`claude-sonnet-5`) | Bounded work with a checkable answer: "does anything call this function", "does this parse", mechanical refactors, running a suite and reporting what failed, writing a test for a behavior someone has already characterized. |
-| **Fable** (`claude-fable-5`) | The orchestrator, never the workhorse: planning milestones, authoring the workflow scripts and the design rulings their stage briefs carry, synthesizing across reports into the documents in `agent-docs/`, running the thermo-nuclear review cadence, gating and committing. Fable does not implement milestones or conduct deep research itself — it decides what Opus and Sonnet do and rules on what they return. |
+| **Fable** (`claude-fable-5`) | The orchestrator, never the workhorse: planning milestones, authoring the workflow scripts and the design rulings their stage briefs carry, synthesizing across reports into `agent-docs/` on the work branch and into the book before merge, running the thermo-nuclear review cadence, gating and committing. Fable does not implement milestones or conduct deep research itself — it decides what Opus and Sonnet do and rules on what they return. |
 
 Two rules that matter more than the table:
 
@@ -175,15 +178,16 @@ M0–M6 is the default until something beats it:
 
 Research rounds follow the same split: Opus dives over rev-pinned clones,
 one Sonnet fact-checker per dive re-deriving the highest-stakes claims
-(negatives most of all), and Fable writing the evidence documents and the
-ruling into `agent-docs/`. Workflow stage briefs carry the design rulings
+(negatives most of all), and Fable writing the evidence and the ruling
+into `agent-docs/` on the work branch — and the lasting part into the book
+before the PR merges. Workflow stage briefs carry the design rulings
 resolved in advance — an implementation agent re-litigating a settled
 decision mid-stage is the failure mode the briefs exist to prevent.
 
 **Each major milestone or phase ships as its own PR**, on a branch cut
 from the then-current `main` and named for the phase. A milestone PR
 carries the implementation, its thermo-nuclear review fixes, and the
-documents the phase produced — one reviewable unit per rung, not one
+book chapters it changed — one reviewable unit per rung, not one
 mega-branch accreting forever.
 
 ## Cost and pricing data
@@ -218,10 +222,3 @@ Three cautions if any of that becomes an import rather than a lookup:
 - A price is not a capability claim, and neither is a benchmark score a price.
   Keeping them separate fields sourced from separate columns is what stops a
   cheap lookup from inflating the one number the whole dashboard is judged by.
-
-## Comment and doc style
-
-Match the surrounding code. This codebase explains *why* a decision was made and
-what the alternative would have cost, not what the line does. A comment that
-restates the code is noise; a comment that records the failure mode a design
-avoids is why the next person does not undo it.

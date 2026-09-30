@@ -15,7 +15,7 @@
 //! Responses decoder, and both are right.** Anthropic names the event on the
 //! `event:` line and documents it as the dispatch key; its own client dispatches
 //! there and silently drops frames that lack one
-//! (`research/claude-code-client-surface.md` §3.2). The payload's `type` is
+//! (read from Claude Code 2.1.42). The payload's `type` is
 //! meant to agree, so it is cross-checked when present and a disagreement fails
 //! the stream: one of the two is then lying about what frame this is, and
 //! picking either would be guessing with the turn's accounting. A frame with no
@@ -136,8 +136,8 @@ impl InputSide {
     ///
     /// Each component is updated only when the frame reports a non-zero value,
     /// which is exactly the merge Anthropic's own client performs
-    /// (`research/claude-code-client-surface.md` §3.4: a greater-than-zero guard
-    /// on input and cache counts). The reason is that `message_delta` may repeat
+    /// (Claude Code 2.1.42: a greater-than-zero guard on
+    /// input and cache counts). The reason is that `message_delta` may repeat
     /// the object with only the output count filled in, and a naive overwrite
     /// would then retract everything `message_start` reported.
     fn fold(&mut self, usage: &Usage) {
@@ -662,7 +662,7 @@ impl SseDecoder {
         // assignment therefore loses nothing and makes a frame that omitted the
         // field unable to retract a count already reported — the failure
         // Anthropic's own client leaves open by merging this one field with `??`
-        // (client surface §3.4).
+        // (Claude Code 2.1.42).
         self.output_tokens = self.output_tokens.max(usage.output_tokens);
         // A `message_delta` may also restate the input side under some betas.
         // Folded with the same greater-than-zero guard the prelude uses, so a

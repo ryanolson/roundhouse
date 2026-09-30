@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded exploration (ruling 8, plan sections 3 and 4).
+//! Bounded exploration.
 //!
 //! A turn explores only in `live` mode, only on a session whose validation
 //! arm consults the judge, only when the admitted pool holds a frontier
@@ -9,7 +9,7 @@
 //! of the exploration set, chosen uniformly: an `Unproven` strategy whose
 //! first target meets every hard constraint and costs strictly less than the
 //! reference, or `rules` whenever its first target meets every hard
-//! constraint (the 2026-09-30 ruling). The record carries the probability that the turn served its
+//! constraint. The record carries the probability that the turn served its
 //! first target, summed over every way the policy could have served it, which
 //! is what the offline calibrator weights by.
 
@@ -490,11 +490,10 @@ fn close(left: f64, right: f64) -> bool {
     (left - right).abs() < 1e-12
 }
 
-/// The 2026-09-30 owner ruling: `rules` joins the live exploration set, so a
-/// turn whose learned choice differs from `rules` serves the `rules` route
-/// with probability `rate`. Before the ruling this turn had an empty set and
-/// could not explore at all; it now changes route on a draw below the rate,
-/// which is the ruled intent.
+/// `rules` joins the live exploration set, so a turn whose learned choice
+/// differs from `rules` serves the `rules` route with probability `rate`.
+/// Before that this turn had an empty set and could not explore at all; it now
+/// changes route on a draw below the rate, which is the intent.
 #[test]
 fn a_diverging_live_turn_that_draws_rules_serves_the_rules_route() {
     let (rig, base) = diverging_rig(Vec::new());
@@ -622,7 +621,7 @@ fn a_rules_plan_that_fails_a_hard_constraint_never_joins_the_set() {
     assert_eq!(record.propensity, 1.0);
 }
 
-/// The ruling widens the set, not the fence: a `shadow` turn whose learned
+/// Joining the set widens it, not the fence: a `shadow` turn whose learned
 /// choice differs from `rules` still never explores, and an unreviewed one
 /// neither.
 #[test]
@@ -649,7 +648,7 @@ fn rules_in_the_set_does_not_open_shadow_or_unreviewed_turns() {
     assert_eq!(evidence(&unreviewed).propensity, 1.0);
 }
 
-/// The owner's ruling of 2026-09-30 on `refuse`: `rules` joins the set only
+/// `refuse` and `rules`: `rules` joins the set only
 /// on a turn where some strategy passes. A `refuse` turn that nothing passes
 /// is refused exactly as before `rules` joined: with no cheaper unproven
 /// member it is refused on every draw, and with one it explores only that

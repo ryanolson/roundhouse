@@ -24,7 +24,7 @@
     "the reason: a \"models\" entry speaking a dialect this build cannot serialize",
     "stops the boot -- by design, since the alternative is failing one tenant's turn",
     "for a line in a file -- and it stops it the moment ROUNDHOUSE_FRONTIER_UPSTREAM",
-    "names a real upstream, which is exactly what the README tells an operator to do",
+    "names a real upstream, which is exactly what docs/src/guides/catalog.md tells an operator to do",
     "next. An example that cannot boot the binary it ships with teaches the format",
     "wrong. Copy the definition, replace the placeholders, and add entries that name",
     "it once your build carries a client for that dialect.",

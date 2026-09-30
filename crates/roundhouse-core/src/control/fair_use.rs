@@ -16,8 +16,8 @@
 //! type whose calendar arithmetic that refusal protects, which is exactly the
 //! shape of the M8 hazard. So: its own trait, its own store, its own draws.
 //!
-//! The 2026-08-24 addendum to `PLAN-frontier-selection.md` is what this
-//! implements. Budgets are *unlimited* for the benchmark projects this phase
+//! The 2026-08-24 fair-use design (`docs/src/concepts/control-plane.md`) is what
+//! this implements. Budgets are *unlimited* for the benchmark projects this phase
 //! runs — the reconciliation view already reports an unenforced basis honestly
 //! — and what replaces a hard dollar cap in the architecture is a rolling
 //! 5-hour / 24-hour / 7-day window per project and per member, each optionally

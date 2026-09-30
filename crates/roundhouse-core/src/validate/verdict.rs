@@ -150,7 +150,7 @@ pub enum SteerChannel {
     /// No verdict maps to a tool call any more (M10.0 R1/T2), so a deployment
     /// that configured `tool_call` asked for a channel this build does not
     /// have. Deleting the variant would make serde answer "unknown variant
-    /// `tool_call`" — a parse error that names no plan and reads like a typo —
+    /// `tool_call`" — a parse error that names no retirement and reads like a typo —
     /// and silently remapping it to text would be worse still: the deployment
     /// would go on believing it had opted into the protocol-heavy path.
     /// `ControlPlaneError::SteerChannelRetired` is the named refusal, raised in
@@ -456,8 +456,8 @@ pub fn map(
 /// alternative is what makes that worth a comment: quoting the judge's prose
 /// here — even fenced, attributed and length-bounded — puts text written by a
 /// model that just read attacker-influenceable transcript into the agent's
-/// context, where a `Steer` payload is dispatched as a tool call and a `Halt`
-/// is committed into the conversation permanently, prefixing every later turn.
+/// context, where a `Steer` and a `Halt` are both committed into the conversation
+/// permanently, prefixing every later turn.
 /// A quotation mark is not a security boundary. The description is still
 /// recorded whole in the `ValidationDecided` event, which is where an operator
 /// reading the log and a calibration study comparing verdicts against outcomes
@@ -725,8 +725,8 @@ mod tests {
     #[test]
     fn steering_needs_the_policy_and_a_quiet_recent_history() {
         // Escalation is the default for a real divergence, so every case below
-        // has to have used it up first — which is exactly the state the plan
-        // describes: the disruptive path is the last resort.
+        // has to have used it up first — which is exactly the intended state:
+        // the disruptive path is the last resort.
         let after_escalating = 1;
 
         // Probe: policy allows it and the count is inside the cap.

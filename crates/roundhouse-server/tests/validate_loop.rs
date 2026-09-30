@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M6 of `PLAN-agentic-control-plane.md`: the validate/steer loop, wired.
+//! The validate/steer loop, wired.
 //!
 //! The trigger, the brief, the verdict parse, the action map and the three arms
 //! are proved one layer down, in `roundhouse-core`'s own suite, against a
@@ -2013,10 +2013,9 @@ async fn a_lease_lost_mid_side_call_settles_the_turn_like_any_mid_dispatch_failu
     // of what the fenced owner decided, and it is committed in the same
     // append as `ValidationDecided` (`Session::record_control` /
     // `Session::complete_with_item` push the whole `ControlRecord` in one
-    // `commit`). A fence therefore loses it too — see
-    // `PLAN-agentic-control-plane.md`'s "The side-call" section, which
-    // documents this as the actual behavior rather than a narrower promise
-    // that record_control cannot keep without a second, non-atomic commit.
+    // `commit`). A fence therefore loses it too: that is the actual behavior,
+    // rather than a narrower promise that record_control cannot keep without a
+    // second, non-atomic commit.
     assert!(
         !kinds
             .iter()

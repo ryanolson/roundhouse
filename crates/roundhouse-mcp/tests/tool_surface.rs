@@ -371,7 +371,7 @@ async fn every_tool_result_is_a_single_text_block() {
 
 #[tokio::test]
 async fn an_over_asking_overlay_is_narrowed_and_says_so() {
-    // The plan's own example: `prefer frontier` on a local-only project. The
+    // The motivating example: `prefer frontier` on a local-only project. The
     // ask cannot be honored -- there is no hosted target this key may use --
     // and honoring it as written would narrow the admissible set to nothing,
     // which fails every remaining turn of the session at a seam the agent
@@ -2162,10 +2162,10 @@ async fn an_argument_that_contradicts_the_clients_correlator_is_refused() {
     assert!(refused.text().contains(thread.as_str()));
 }
 
-/// A Claude-shaped call is untouched by R-M7: no `threadId`, and the tool-use
+/// A Claude-shaped call is untouched by thread-id correlation: no `threadId`, and the tool-use
 /// id decides exactly as it did.
 ///
-/// The narrow guard the ruling's "existing tests stay green" clause deserves
+/// The narrow guard that existing behaviour is unchanged deserves
 /// on its own, rather than only as a side effect of the M12 tests above: a
 /// resolver that read the *wrong* correlator first would still pass those, as
 /// long as it happened to reach the same session. Here the thread id is absent
@@ -2407,7 +2407,7 @@ async fn an_independent_reads_impl_cannot_invert_the_shared_resolution_order() {
     // R-M2: a call answering `toolu_sub` must resolve to the subagent's
     // conversation, not to the principal's most recent one — from an
     // implementor that shares no resolution code with `FakeDeployment` beyond
-    // the one function that holds the ruling.
+    // the one function that holds the rule.
     let answered =
         served(&call_answering(&surface, &ada(), "status", json!({}), "toolu_sub").await);
     assert_eq!(

@@ -9,7 +9,7 @@
 //! `project` on a follower that cannot be built without a store and an engine,
 //! so its narrowing is only reachable through a socket. This surface has a
 //! stricter client — Claude Code *throws* on four distinct ordering mistakes
-//! (`research/claude-code-client-surface.md` §3.3) where a Responses client
+//! (read from Claude Code 2.1.42) where a Responses client
 //! merely drops a frame — so the sequencing is worth asserting directly.
 //!
 //! **What the client enforces, and how the shape here makes it unreachable.**
@@ -40,7 +40,7 @@
 //! eager open bought is kept where it belongs: a stream that reaches
 //! `message_stop` having completed *no* content block is one of the two
 //! conditions that make Claude Code re-issue the whole turn non-streaming
-//! (§3.6), so [`MessageEmission::stopped`] emits an empty text block for a turn
+//! (v2.1.42), so [`MessageEmission::stopped`] emits an empty text block for a turn
 //! that produced nothing at all.
 //!
 //! **Usage crosses an axis change here and it is the most dangerous line in the
@@ -78,7 +78,7 @@ pub const FIRST_BLOCK_INDEX: u64 = 0;
 ///
 /// One, never zero and never the real figure. The real figure is not known when
 /// the prelude goes out, and the client's merge takes `output_tokens` with `??`
-/// rather than the `> 0` guard it applies to the input counters (§3.4), so the
+/// rather than the `> 0` guard it applies to the input counters (v2.1.42), so the
 /// final `message_delta` overwrites whatever is here — as long as this frame is
 /// not the *last* one to carry a count. `1` is what the upstream API itself
 /// sends in the prelude, and it is the honest floor: a stream that dies before
@@ -95,7 +95,7 @@ const ASSISTANT: &str = "assistant";
 
 /// The one mid-stream error type Claude Code retries.
 ///
-/// **A deliberate vocabulary borrow, not a description.** §3.2: an `event:
+/// **A deliberate vocabulary borrow, not a description.** In v2.1.42 an `event:
 /// error` builds an `APIError` with `status = undefined`, and the client's
 /// retry predicate short-circuits on a missing status unless the serialised
 /// body contains the literal `"type":"overloaded_error"` — with the one
@@ -178,7 +178,7 @@ pub fn terminal_for(reason: &IncompleteReason) -> Terminal {
         // Nobody is reading this frame — the client hung up, which is what the
         // reason means. It is emitted anyway because the alternative is a
         // stream that ends without a terminal frame, and *that* is the shape
-        // that costs a second full-price non-streaming turn (§3.6) if the
+        // that costs a second full-price non-streaming turn (v2.1.42) if the
         // client turns out to still be there.
         IncompleteReason::ClientCancelled => Terminal::Failed {
             kind: API_ERROR,
@@ -211,7 +211,7 @@ impl Frame {
     ///
     /// Load-bearing rather than decorative on this wire, unlike the Responses
     /// surface where the client reads the type out of the JSON and ignores the
-    /// line. Claude Code dispatches on the *name* (§3.2) and silently drops a
+    /// line. Claude Code dispatches on the *name* (v2.1.42) and silently drops a
     /// frame that has none — the stream then ends with nothing consumed, and
     /// the turn is re-issued non-streaming at full price.
     pub fn name(&self) -> &'static str {
@@ -404,7 +404,7 @@ fn content_block_stop(index: u64) -> Frame {
 /// The terminal metadata: why generation stopped, and what it cost.
 ///
 /// **The `usage` object is omitted entirely when there is no output to report,
-/// and that is the whole reason this function has a branch.** §3.4: the client
+/// and that is the whole reason this function has a branch.** In v2.1.42 the client
 /// merges `output_tokens` with `??`, not with the `> 0` guard it applies to the
 /// input counters, so an explicit `"output_tokens": 0` here *overwrites* a
 /// non-zero accumulated count and the turn bills as free. Omitting the whole
@@ -439,13 +439,14 @@ fn message_stop() -> Frame {
 /// A keepalive, as an event with a payload rather than as an SSE comment.
 ///
 /// Both satisfy Claude Code's 300-second byte watchdog, which counts every byte
-/// relayed including comment lines (§3.5), and the client skips a `ping` event
-/// explicitly (§3.2) so neither costs anything to parse. The tie is broken by
-/// the chained topology: NeMo Relay's SSE re-encoder discards frames with no
-/// `data:` line, so a bare comment keeps a direct connection alive and lets a
-/// chained one die silently at exactly the 300-second mark — the failure that
-/// looks like an upstream hang and is not one. One shape that survives both
-/// topologies beats two shapes chosen per topology.
+/// relayed including comment lines (Anthropic's gateway protocol docs), and the
+/// client skips a `ping` event explicitly so neither costs anything to parse.
+/// The tie is broken by the chained topology: NeMo Relay's SSE re-encoder
+/// discards frames with no `data:` line, so a bare comment keeps a direct
+/// connection alive and lets a chained one die silently at exactly the
+/// 300-second mark — the failure that looks like an upstream hang and is not
+/// one. One shape that survives both topologies beats two shapes chosen per
+/// topology.
 pub fn keepalive() -> Frame {
     frame(StreamEvent::Ping {
         extra: Extra::new(),
@@ -527,7 +528,7 @@ pub struct MessageEmission {
     /// whole answer is a tool call — the ordinary agent turn — the stored
     /// history would hold an empty text item the resend does not, and the
     /// session would fork on the very next turn. The property the eager open
-    /// bought (never reaching `message_stop` with no completed block, §3.6,
+    /// bought (never reaching `message_stop` with no completed block,
     /// which costs a second full-price non-streaming turn) is kept by
     /// [`Self::stopped`]'s empty-block fallback instead.
     open_text: Option<u64>,
@@ -698,7 +699,7 @@ impl MessageEmission {
     pub fn failed(&mut self, kind: &'static str, message: &str) -> Vec<Frame> {
         // No prelude is synthesized here, unlike every other arm. An error
         // event is legal on its own — the client throws at the SSE layer before
-        // the accumulator sees anything (§3.2) — whereas a `message_start` for
+        // the accumulator sees anything (v2.1.42) — whereas a `message_start` for
         // a turn that produced nothing would be a message id naming a response
         // the log may not contain, which is the same thing the Responses
         // surface's `failed_frame` declines to invent.
@@ -713,7 +714,7 @@ impl MessageEmission {
     /// Called by every arm that emits anything, which is what makes
     /// "`message_start` first" true by construction rather than by ordering
     /// discipline — a `content_block_stop` before one is `Error("Message not
-    /// found")` in the client's accumulator (§3.3), and a throw mid-stream is a
+    /// found")` in the client's accumulator (v2.1.42), and a throw mid-stream is a
     /// lost turn. The content block that used to ride along here is opened by
     /// whatever fills it instead; see [`Self::open_text`].
     fn opening(&mut self) -> Vec<Frame> {
@@ -793,7 +794,7 @@ impl MessageEmission {
             // lazy rather than free.** A stream that reaches `message_stop`
             // having completed no content block is one of the two conditions
             // that make Claude Code re-issue the entire turn non-streaming
-            // (§3.6), at full price. A turn that produced nothing — a refusal
+            // (v2.1.42), at full price. A turn that produced nothing — a refusal
             // the seam answered with silence, an upstream that streamed no
             // deltas — says so with an empty text block for free. Reached only
             // when *nothing* was emitted, so a tool-only turn does not get one.
@@ -995,8 +996,8 @@ mod tests {
     ///
     /// The sequence is the contract: `message_start` first, exactly one
     /// start/stop pair around the deltas at one index, `message_delta` then
-    /// `message_stop` last. §3.3 turns three of those into thrown exceptions
-    /// rather than into dropped frames, so this is the test the whole module's
+    /// `message_stop` last. The v2.1.42 client turns three of those into thrown
+    /// exceptions rather than into dropped frames, so this is the test the whole module's
     /// shape exists to make true.
     #[test]
     fn a_dispatched_turn_streams_the_sequence_the_client_enforces() {
@@ -1106,7 +1107,7 @@ mod tests {
 
     /// **A `message_delta` never writes an explicit zero output count.**
     ///
-    /// §3.4: the client merges `output_tokens` with `??`, so `0` on the wire
+    /// In v2.1.42 the client merges `output_tokens` with `??`, so `0` on the wire
     /// overwrites a non-zero accumulated value and the turn bills as free — the
     /// one accounting error that reads as a saving. The control is the
     /// non-zero case, which must carry the count: a builder that omitted
@@ -1367,8 +1368,8 @@ mod tests {
     ///
     /// The table is asserted as a whole rather than reason by reason because
     /// the property that matters is a partition: exactly the two transient
-    /// reasons spell `overloaded_error`, which §3.2 makes the only mid-stream
-    /// wording a subscription-OAuth client retries. A refusal wearing that
+    /// reasons spell `overloaded_error`, the only mid-stream wording a
+    /// subscription-OAuth client retries (v2.1.42). A refusal wearing that
     /// spelling would loop the agent forever on a policy nobody is going to
     /// change; a transient fault without it ends the loop on a fault a retry
     /// would clear.
@@ -1606,7 +1607,7 @@ mod tests {
     ///
     /// "Stream completed with `message_start` but no content blocks completed"
     /// is one of the two conditions that make Claude Code re-issue the entire
-    /// turn non-streaming (§3.6) — one malformed stream, one extra full-price
+    /// turn non-streaming (v2.1.42) — one malformed stream, one extra full-price
     /// answer. The terminal's empty-block fallback is what buys this now that
     /// the prelude no longer opens a block eagerly.
     #[test]
@@ -1894,7 +1895,7 @@ mod tests {
     /// `data:`. Only inspecting the rendered [`axum::response::sse::Event`] can
     /// tell a real `event: ping\ndata: …` frame apart from
     /// `Event::default().comment("keepalive")`, which satisfies Claude Code's
-    /// byte watchdog identically (§3.5) and is silently discarded by a chained
+    /// byte watchdog identically and is silently discarded by a chained
     /// NeMo Relay's re-encoder — the module doc's own reason for choosing the
     /// event shape in the first place.
     ///
@@ -1928,9 +1929,9 @@ mod tests {
         );
     }
 
-    /// F15: pins the plan's ruling that the Messages surface offers no SSE
+    /// Pins that the Messages surface offers no SSE
     /// `id:` line — [`Frame::into_sse`] never calls [`Event::id`] — because
-    /// that ruling justifies not relying on Relay's SSE decoder for anything
+    /// that is what justifies not relying on Relay's SSE decoder for anything
     /// id-based, and today nothing in this module asserts the absence. A
     /// future `.id(response_id)` addition to `into_sse` would land silently
     /// (every other rendering test only checks for `event:`/`data:`) and

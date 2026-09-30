@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `learner` block at the configuration boundary: each refusal the plan's
-//! M8 settled points list, the two ruled defaults, and the resolved terms a
+//! The `learner` block at the configuration boundary: each refusal the
+//! configuration boundary makes, the two defaults, and the resolved terms a
 //! key's admission carries.
 
 use roundhouse_core::routing::learn::{Artifact, LearnerMode, OnInfeasible, Strategy};
@@ -312,7 +312,7 @@ fn every_numeric_refusal_names_its_field() {
 }
 
 /// An `off` block keeps the apply timeout it wrote: a session of a project
-/// now `off` still delivers its pending entries (draft section 23), and it
+/// now `off` still delivers its pending entries, and it
 /// delivers them under the number the operator wrote, not a built-in one.
 #[test]
 fn an_off_block_keeps_its_written_apply_timeout() {

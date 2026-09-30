@@ -70,10 +70,9 @@ pub const CODEX_HOME_ENV: &str = "CODEX_HOME";
 /// driving by hand: an autoupdate mid-session swaps the binary whose wire
 /// behaviour this deployment's dialect was verified against, and the
 /// non-essential traffic is telemetry about a session that is not Anthropic's
-/// to see. Both are overridable by the operator's own environment — they are
-/// layered *under* nothing, so an explicit ambient value of either name is
-/// overwritten; an operator who means the opposite says so in the profile's
-/// argv or turns off the launcher.
+/// to see. Neither can be turned off through the operator's own environment:
+/// [`layered`] writes them over any ambient value of the same name, so an
+/// operator who wants either off launches the client without this launcher.
 pub(crate) const CLAUDE_DEPLOYMENT_POLICY: &[(&str, &str)] = &[
     ("DISABLE_AUTOUPDATER", "1"),
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),

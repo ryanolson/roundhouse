@@ -765,7 +765,7 @@ pub fn mode_of(evidence: &LearnedEvidence) -> ActiveMode {
 // ----------------------------------------------------------------- seeding
 
 /// Write quality evidence into the store directly, as one session of its own
-/// (draft 7.8: serving without exploration cannot produce these states).
+/// (serving without exploration cannot produce these states).
 pub async fn seed(
     store: &ProbeStore,
     project: &str,

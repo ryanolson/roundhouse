@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The node-local control store: overlays, intents, steer payloads, bindings.
+//! The node-local control store: overlays, intents, outcomes, bindings.
 //!
 //! # In-process, deliberately, and on a stated precedent
 //!
@@ -24,15 +24,15 @@
 //! deployment it applies only on the node that took the MCP call. Both are
 //! acceptable *because of what an overlay is* — a narrowing, so losing one
 //! widens back to the deployment's ceiling and never past it, and the audit
-//! trail shows the change through `turn_policy_digest` either way. A steer
-//! payload lost to a restart is the one real hole, and it is bounded the same
-//! way: the log holds the emitted call, so `fetch_steer` refuses rather than
-//! inventing, and the turn continues.
+//! trail shows the change through `turn_policy_digest` either way. A lost
+//! intent or outcome report costs only advisory context: `fetch_steer` folds
+//! the correction from the log and not from this store, so nothing is invented
+//! and the turn continues.
 //!
 //! # One store, four families
 //!
-//! Overlays, intents and steer payloads are the three the plan names; session
-//! bindings are the fourth, and they are here rather than in a store of their
+//! Overlays, intents and outcome reports are three; session bindings are the
+//! fourth, and they are here rather than in a store of their
 //! own for the reason the other three share one — they are all node-local
 //! process state keyed by something a session owns, they all become rows in the
 //! same durable store in M8, and three lookalike `Mutex<HashMap<…>>` types
@@ -72,13 +72,10 @@
 //!
 //! # The log is the truth; this is a projection
 //!
-//! A steer payload is deposited *after* the log commit that emitted its call —
-//! see the engine's interjection seam. The ordering is what makes the failure
-//! mode benign: a crash between the two leaves a call in the log with no
-//! payload here, and `fetch_steer` refuses an id it cannot resolve. The
-//! opposite ordering would leave a payload for a call that was never emitted,
-//! which is a steer an agent can fetch and answer against a session that never
-//! asked.
+//! A steer is the text of a turn's answer, so it lives in the log and
+//! `fetch_steer` folds it from there. What this store holds is the agent's side
+//! — an overlay it asked for, an intent it declared, an outcome it reported —
+//! so losing a record loses a narrowing or a note, never a correction.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -94,9 +91,8 @@ use crate::surface::SteerOutcome;
 ///
 /// One day, and the same day for all four families. The number is chosen from
 /// the consequence of getting it wrong in each direction rather than from a
-/// measurement: too short and a steer is swept while the turn that was told to
-/// fetch it is still running, which is `fetch_steer` refusing a correction the
-/// log says was emitted; too long and a node's state is bounded by how many
+/// measurement: too short and an overlay or an outcome report is swept while the
+/// conversation it belongs to is still running; too long and a node's state is bounded by how many
 /// conversations it has *ever* served. A day sits far above any single agent
 /// turn and far below a node's uptime. It is deliberately not tunable — a knob
 /// here would be a per-family lifecycle in disguise, which is M8's.
@@ -495,9 +491,8 @@ impl ControlStore {
     /// conversation is this?" from the client's conversation name and from
     /// `Conversations::latest`, never from a binding — which is why the tool
     /// that mints an id is honest about recording it rather than about using
-    /// it. M7 is where the read lands, per the plan's §3: it is the milestone
-    /// that gives a request an identity resolved from the log rather than from
-    /// a header the client cannot set.
+    /// it. The read lands with the work that gives a request an identity
+    /// resolved from the log rather than from a header the client cannot set.
     pub fn binding_in_log(
         &self,
         principal: &Principal,

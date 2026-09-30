@@ -885,7 +885,7 @@ async fn a_spent_review_budget_releases_the_turn_and_records_why() {
 #[tokio::test]
 async fn a_steered_turn_completes_with_the_guidance_and_the_restated_request() {
     // Past the first intervention, so escalation is spent and the steer is what
-    // is left — which is the order the plan puts them in.
+    // is left — which is the order they are tried in.
     let mut state = stuck_in_arm(Arm::Live);
     state.consecutive_interventions = 1;
     // The pending request, appended so the seam has something to restate. The

@@ -48,17 +48,18 @@ pub struct TipKey(pub [u8; 16]);
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Anchor(pub [u8; 16]);
 
-/// `S`, sent as `x-dynamo-session-id`.
+/// `S`, the value meant for `x-dynamo-session-id`. No dispatch path sends it
+/// today: the fleet passes the plain session id as `SelectRequest.session_id`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SequenceDigest(pub [u8; 16]);
 
 impl SequenceDigest {
-    /// All 32 hex characters: the header value.
+    /// All 32 hex characters: the value for that header.
     pub fn to_hex(&self) -> String {
         hex::encode(self.0)
     }
 
-    /// The first 8 hex characters: the most a log line may carry (§3.8).
+    /// The first 8 hex characters: the most a log line may carry.
     pub fn short(&self) -> String {
         hex::encode(&self.0[..4])
     }

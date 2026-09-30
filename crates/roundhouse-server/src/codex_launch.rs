@@ -14,17 +14,17 @@
 //! add no capability — a client without them still reaches every tool — and
 //! separate because they are the only generated files whose audience is the
 //! model rather than the client. See that module for why they are skills and
-//! not the `prompts/` directory the plan named.
+//! not a `prompts/` directory.
 //!
 //! **Which topology this is.** The *Direct* one — an agent pointed straight at
-//! roundhouse — and it is the reference by ruling rather than by default.
-//! `agent-docs/synergies/ecosystem-round-2.md`'s launch-surface dedup found
-//! three implementations of one surface (Relay's Rust launchers, Switchyard's
-//! Python launcher, this) and kept Direct as the reference with roundhouse
-//! generating its own minimal config, because the one test M9 exists for — a
-//! real codex binary executing our synthetic tool call — cannot be delegated
-//! to a launcher we do not own. Relay's CLI stays the supported instrumented
-//! front end for the *chained* topology; Switchyard's launcher is reference
+//! roundhouse — and it is the reference by choice rather than by default.
+//! Comparing the launchers found three implementations of one surface (Relay's
+//! Rust launchers, Switchyard's Python launcher, this) and kept Direct as the
+//! reference with roundhouse generating its own minimal config, because the
+//! tests that matter here — a real codex binary driving roundhouse's own
+//! Responses and MCP surface — cannot be delegated to a launcher we do not own.
+//! Relay's CLI stays the supported instrumented front end for the *chained*
+//! topology; Switchyard's launcher is reference
 //! and evidence — its `caller_auth_kind` conditional is exactly what
 //! [`CodexAuthKind`] mirrors — and not a blessed front end.
 //!
@@ -123,7 +123,7 @@ pub const DEFAULT_MODEL_SLUG: &str = "roundhouse-local";
 const PROVIDER_KEY: &str = "roundhouse";
 
 /// What `[mcp_servers.<key>].default_tools_approval_mode` is set to, and the
-/// home of the ruling on why it is server-wide rather than per tool.
+/// home of the reasoning on why it is server-wide rather than per tool.
 ///
 /// A constant rather than a literal inside the template because the review
 /// (F01) proposed replacing it with `[mcp_servers.<key>.tools.fetch_steer]
@@ -164,7 +164,7 @@ const TOOLS_APPROVAL_MODE: &str = "approve";
 ///
 /// A stated number rather than `null`, because the client accumulates the usage
 /// roundhouse reports into a session total and compares it against this — so a
-/// deployment reading the §10.2 usage evidence needs to know what the client
+/// deployment reading the usage roundhouse reports needs to know what the client
 /// was measuring against. Matches the figure 0.146.0's own fallback metadata
 /// uses, so pinning the catalog does not silently change the client's
 /// compaction arithmetic relative to an unpinned run.
@@ -432,22 +432,22 @@ impl CodexLaunch {
              {header} = {key_env}\n\
              \n\
              # The control surface. The table key is load-bearing: codex builds the tool\n\
-             # namespace as `{MCP_NAMESPACE_PREFIX}<key>`, and roundhouse emits its synthetic calls under\n\
-             # `{DEFAULT_MCP_NAMESPACE}` -- a different key here makes every steer resolve\n\
-             # against nothing and come back to the model as an unsupported call.\n\
+             # namespace as `{MCP_NAMESPACE_PREFIX}<key>`, and roundhouse's tools are named under\n\
+             # `{DEFAULT_MCP_NAMESPACE}` -- a different key here makes every call the model\n\
+             # makes resolve against nothing and come back as an unsupported call.\n\
              [mcp_servers.{server_key}]\n\
              url = {mcp_url}\n\
              bearer_token_env_var = {key_env}\n\
              # Roundhouse's own tools run without asking the operator first, and that is a\n\
              # property of what they do rather than a convenience. `fetch_steer` reads back the\n\
-             # correction this same deployment just emitted; the writing tools only ever narrow\n\
+             # correction this same deployment just delivered; the writing tools only ever narrow\n\
              # what the caller's own key already allows, never widen it. The tools say so\n\
              # themselves, in their MCP annotations, so a client that was handed no config at\n\
              # all already runs them. This line is the belt for the one that was: codex 0.146.0\n\
              # treats a tool it sees *no* annotations on as needing approval, and under\n\
              # `approval_policy = never` -- which `codex exec` forces -- an approval nobody\n\
              # can be asked for resolves to *cancelled*: the agent is handed a cancellation\n\
-             # notice in place of the steer, and roundhouse's correction never arrives.\n\
+             # notice in place of the tool's answer, and roundhouse's reply never arrives.\n\
              default_tools_approval_mode = \"{TOOLS_APPROVAL_MODE}\"\n\
              \n\
              [features]\n\
@@ -490,10 +490,10 @@ impl CodexLaunch {
             "supports_parallel_tool_calls": false,
             "supports_image_detail_original": false,
             "context_window": CONTEXT_WINDOW_TOKENS,
-            // Left off on purpose: roundhouse reports the *judge's* usage on a
-            // steered turn, and a compaction limit would make the client rewrite
-            // its own history off the back of a number that describes a side
-            // call. See the plan's §10.2.
+            // Left off on purpose: a steered turn reports the context it admitted,
+            // not a model call's usage, and a compaction limit would make the
+            // client rewrite its own history off the back of a number that
+            // describes no dispatch.
             "auto_compact_token_limit": null,
             "effective_context_window_percent": 95,
             "experimental_supported_tools": [],
@@ -546,7 +546,7 @@ impl CodexLaunch {
 /// string with a suffix: `base_url` ends in the API version and the MCP route
 /// is mounted beside it, at the deployment root. Getting it wrong produces a
 /// client that starts, times out reaching its MCP server, and then runs turns
-/// perfectly — with every steer silently unresolvable.
+/// perfectly — with every MCP tool call silently unresolvable.
 ///
 /// The version it strips is [`API_PREFIX`], read from the module that serves
 /// the route, not a second `"/v1"` spelled here (F14). Two literals agreed
@@ -644,7 +644,7 @@ mod tests {
     ///
     /// The failure this catches is a config where the provider authenticates
     /// and the MCP surface does not: the client starts, runs turns, and only
-    /// the steer path is dead.
+    /// the MCP tools are dead.
     #[test]
     fn every_credential_reference_names_the_same_one_env_var() {
         let launch = launch().with_key_env("MY_KEY");
@@ -749,7 +749,7 @@ mod tests {
     }
 
     /// The MCP table key is exactly what codex needs to rebuild the namespace
-    /// roundhouse emits its steers under.
+    /// roundhouse's tools are namespaced under.
     #[test]
     fn the_mcp_table_key_rebuilds_the_namespace_roundhouse_emits() {
         let config = parsed(&launch());
@@ -770,8 +770,8 @@ mod tests {
     ///
     /// Not a convenience knob: `codex exec` forces `approval_policy = never`,
     /// and at 0.146.0 an unannotated MCP tool under that policy is *cancelled*
-    /// rather than run. Without this line every steer comes back to the agent
-    /// as a cancellation notice -- the correction is never read, and nothing in
+    /// rather than run. Without this line every tool call comes back to the agent
+    /// as a cancellation notice -- the answer is never read, and nothing in
     /// the turn says so.
     #[test]
     fn the_client_is_told_to_trust_the_deployments_own_control_tools() {

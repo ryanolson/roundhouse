@@ -50,7 +50,7 @@
 //! correlated forward by `tool_call_id` across the turn boundary, which is what
 //! puts a call and its result on one step rather than on two.
 //!
-//! **A steered turn is an ordinary tool call here.** See the crate
+//! **A steered turn is an ordinary turn here.** See the crate
 //! documentation: that divergence is documented rather than reconciled, and the
 //! `steered` flag in the step's routing facts is what makes it findable.
 
@@ -351,7 +351,7 @@ pub struct AtifTrajectory {
 /// What every trajectory this crate produces says about itself.
 const NOTES: &str = "Produced by cold replay of roundhouse's durable session log. \
      A turn steered by roundhouse's validate loop appears here as an ordinary \
-     tool call; `extra[\"roundhouse/route\"].steered` marks which.";
+     turn; `extra[\"roundhouse/route\"].steered` marks which.";
 
 /// One session's trajectory.
 pub fn trajectory(events: &[SessionEvent]) -> AtifTrajectory {

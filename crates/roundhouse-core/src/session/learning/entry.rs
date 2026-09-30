@@ -9,15 +9,14 @@
 //!
 //! **An entry says how much, never how many sessions.**
 //! [`LearnerStore::apply`](crate::learn_store::LearnerStore::apply) counts a
-//! session once per key and strategy from its own `seen` set (draft section
-//! 11.4), so a session's second interval on a key adds units and no session.
+//! session once per key and strategy from its own `seen` set, so a session's
+//! second interval on a key adds units and no session.
 
 use crate::routing::learn::{
     CacheReuse, EpochId, JevCounts, LatencySum, LevelKey, Strategy, Units,
 };
 
-/// How many entries the session fold holds for delivery at most (draft
-/// section 11.5).
+/// How many entries the session fold holds for delivery at most.
 ///
 /// An implementation bound, not a policy: entries past it are counted in
 /// [`crate::session::SessionState::learning_beyond`] and refilled by a
@@ -28,7 +27,7 @@ pub const LEARNING_PAGE: usize = 64;
 ///
 /// `(project, session, seq)` is its identity, and `prev_seq` chains it to the
 /// entry before it in the session, so the store can refuse a batch that skips
-/// one (draft section 11.2).
+/// one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LearningEntry {
     /// The log sequence of the source event.
@@ -121,8 +120,8 @@ pub struct JevDelta {
 
 /// Why an accepted interval credited nothing, counted per session.
 ///
-/// Each count is one accepted review whose entry carries no quality deltas
-/// (draft section 10). Reviews the fold rejected are already counted by
+/// Each count is one accepted review whose entry carries no quality deltas.
+/// Reviews the fold rejected are already counted by
 /// [`crate::session::SessionState::rejected_reviews`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LearningCauses {

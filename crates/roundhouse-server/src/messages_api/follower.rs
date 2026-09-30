@@ -328,7 +328,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> MessagesFoll
     /// `api_error` and not `overloaded_error`: this is a turn whose task is
     /// gone, so the same request will not be answered by trying again — and
     /// `overloaded_error` is the one string that makes Claude Code retry
-    /// regardless of anything else (§3.2). Spelling a permanent fault retryable
+    /// regardless of anything else (v2.1.42). Spelling a permanent fault retryable
     /// is how an agent spends its whole retry budget on a turn that can never
     /// succeed.
     fn fail(&mut self, message: &str) {
@@ -482,7 +482,7 @@ impl BlockAccumulator {
 ///
 /// **Assembled from the frames the streaming path would have emitted, not from
 /// a second reading of the log.** Claude Code's auth and quota probes are
-/// one-token `stream`-less creates (§3.6) and its streaming fallback re-issues a
+/// one-token `stream`-less creates (v2.1.42) and its streaming fallback re-issues a
 /// whole turn this way, so this path is reached with the *same* turn a stream
 /// would have carried — and two projections that could disagree about it would
 /// be two answers to one question, discovered by a client that got a different
@@ -518,7 +518,7 @@ where
                     stop_reason = reason.clone();
                 }
                 // NOT a field-by-field merge like the client's own
-                // accumulator (§3.4: a `> 0` guard per input-side counter,
+                // accumulator (v2.1.42: a `> 0` guard per input-side counter,
                 // `??` on output_tokens -- both documented on `message_delta`
                 // above). This replaces the whole `Usage` object wholesale
                 // when the terminal frame carries one, and leaves the

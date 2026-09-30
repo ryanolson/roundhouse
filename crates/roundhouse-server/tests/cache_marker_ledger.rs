@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! P2 of `PLAN-cache-affinity.md` — the next quote is warm only through the
-//! last cache marker the previous request actually carried.
+//! The next quote is warm only through the last cache marker the previous
+//! request actually carried.
 //!
 //! This binary owns the engine half of the join: that a dispatch records
 //! where its own marker went on its `Routed` decision, and that the following

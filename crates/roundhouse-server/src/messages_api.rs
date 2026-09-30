@@ -37,7 +37,7 @@
 //!
 //! Every other transport in this crate fails loudly. This one has a client that
 //! recovers from a malformed stream by **re-issuing the whole turn without
-//! streaming** (client surface §3.6), so a framing mistake shows up as a
+//! streaming** (read from Claude Code 2.1.42), so a framing mistake shows up as a
 //! deployment that works and costs twice, not as a deployment that is broken.
 //! That is the reason the two submodules are pure and separately tested, the
 //! reason the strict oracle in `tests/common/anthropic.rs` exists at all, and
@@ -130,29 +130,29 @@ const COUNT_TOKENS_PATH: &str = "messages/count_tokens";
 /// How long a silent stream waits before emitting a `ping`.
 ///
 /// The ceiling is the client's: it aborts a stream that relays no bytes for 300
-/// seconds (§3.5), and v2.1.42 logs a `tengu_streaming_stall` at 30. Fifteen
+/// seconds (Anthropic's gateway protocol docs), and v2.1.42 logs a
+/// `tengu_streaming_stall` at 30. Fifteen
 /// seconds puts two keepalives inside the shorter of those two windows, which
 /// makes a stalled *upstream* visible in our own logs as a run of pings rather
-/// than as a client-side abort with nothing on our side to correlate it to.
-/// No source establishes a required cadence, only the ceiling (Dive C open
-/// question 4), so this is chosen against the *stall log* rather than against
-/// the abort — the abort is the failure we must never reach, not the one to
-/// aim at.
+/// than as a client-side abort with nothing on our side to correlate it to. No
+/// source establishes a required cadence, only the ceiling, so this is chosen
+/// against the *stall log* rather than against the abort — the abort is the
+/// failure we must never reach, not the one to aim at.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// The largest request body this surface will buffer.
 ///
 /// **The platform's own number, and it is nearly sixteen times axum's.** The
 /// Messages and Token Counting APIs both cap a request at 32 MB and answer a
-/// larger one with `413 request_too_large` (`platform.claude.com/docs/en/api/errors`,
-/// quoted in `research/claude-code-client-surface.md` §3.6). Axum's `Bytes`
-/// extractor applies its own undisclosed 2 MiB default unless a route says
-/// otherwise, and 2 MiB is not a hypothetical ceiling for this dialect: an
-/// agentic client resends its entire history on every turn, this suite's own
-/// captured two-turn fixture is already 90 KB, and a single pasted screenshot
-/// is a megabyte of base64 in one block. A client that crossed the default got
-/// a turn refused for a limit nobody chose, in a plain-text envelope its parser
-/// cannot read (M11.1 review, F3).
+/// larger one with `413 request_too_large`
+/// (`platform.claude.com/docs/en/api/errors`). Axum's `Bytes` extractor applies
+/// its own undisclosed 2 MiB default unless a route says otherwise, and 2 MiB
+/// is not a hypothetical ceiling for this dialect: an agentic client resends
+/// its entire history on every turn, this suite's own captured two-turn fixture
+/// is already 90 KB, and a single pasted screenshot is a megabyte of base64 in
+/// one block. A client that crossed the default got a turn refused for a limit
+/// nobody chose, in a plain-text envelope its parser cannot read (M11.1 review,
+/// F3).
 ///
 /// Matching the platform rather than inventing a number is the whole point: a
 /// proxy that refuses what the upstream would have served is a proxy that
@@ -585,12 +585,12 @@ fn anonymous_key() -> String {
 /// roundhouse will bill and admit — and it is *not* what the model this turn
 /// gets routed to would count. Two vocabularies are in play at once: the
 /// client's question is "how much of Anthropic's context will this fill", and a
-/// turn routed to a local model is measured by that model's tokenizer instead
-/// (Dive D §5). The number is therefore a planning aid, never a quota.
+/// turn routed to a local model is measured by that model's tokenizer instead.
+/// The number is therefore a planning aid, never a quota.
 ///
 /// **Served rather than refused, and that is a cost decision.** When
 /// `count_tokens` fails, Claude Code falls back to a real one-token `create`
-/// against the routed model (§2.4) — so refusing this endpoint does not save
+/// against the routed model (v2.1.42) — so refusing this endpoint does not save
 /// the estimate's cost, it converts it into a dispatch. For the same reason the
 /// fair-use ceiling is *not* applied here: refusing a rate-limited agent's
 /// estimate would push it into the path that spends money, which is the
@@ -640,8 +640,8 @@ where
 /// vocabulary would mean each of those refusals existed twice, with the second
 /// copy free to drift. What changes here is the *envelope*, not the decision.
 ///
-/// **§3.7's rule is about not wrapping somebody else's error, and it is
-/// respected by construction here**: nothing on this path forwards an upstream
+/// **The gateway rule against wrapping somebody else's error (Anthropic's gateway
+/// protocol docs) is respected by construction here**: nothing on this path forwards an upstream
 /// body. Every error this renders is roundhouse's own, so putting it in
 /// Anthropic's shape is translation rather than encapsulation — and the retry
 /// vocabulary below is chosen so the client's own recovery logic reads it
@@ -670,7 +670,7 @@ impl From<AuthError> for MessagesError {
 /// The error `type` a status maps to.
 ///
 /// Anthropic's published vocabulary, chosen for what the *client* does with each
-/// value rather than for descriptive accuracy (§2.5's retry predicate):
+/// value rather than for descriptive accuracy (its retry predicate, v2.1.42):
 ///
 /// - `rate_limit_error` on 429 — under subscription OAuth this is not retried by
 ///   the backoff at all but routed to the rate-limit UI, which reads
@@ -728,7 +728,7 @@ impl IntoResponse for MessagesError {
 
         let mut response = (status, axum::Json(body)).into_response();
         // **Where the client actually reads a retry time.** Its backoff takes
-        // `retry-after` in seconds when present (§2.5's `Dp`), and under
+        // `retry-after` in seconds when present (v2.1.42's `Dp`), and under
         // subscription OAuth the 429 path sleeps on the same header, defaulting
         // to *thirty minutes* when it is absent. So a fair-use window of two
         // minutes reported only in the body is a two-minute ceiling the client
@@ -815,7 +815,7 @@ mod tests {
     #[test]
     fn only_the_service_unavailable_refusal_is_spelled_retryable() {
         // The partition, not the table: `overloaded_error` is the one string
-        // Claude Code retries on regardless of status (§3.2), so exactly one
+        // Claude Code retries on regardless of status (v2.1.42), so exactly one
         // pre-stream refusal may carry it.
         let overloaded: Vec<u16> = (400u16..600)
             .filter_map(|code| StatusCode::from_u16(code).ok())

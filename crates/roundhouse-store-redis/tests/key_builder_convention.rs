@@ -266,7 +266,7 @@ const LEARN_SCRIPT_COMMANDS: [&str; 6] = ["TYPE", "HGET", "HMGET", "HSET", "SISM
 /// M7 of the online routing learner: every key of the `learn` family is built
 /// by the shared builder, and its scripts name no key of their own.
 ///
-/// Two halves. Each of the four key shapes of draft section 11.4 is a named
+/// Two halves. Each of the four key shapes is a named
 /// `fn *_key` in `src/learn.rs`, so the scan above holds it to `build_key`,
 /// and each one names `KeyFamily::Learn`, so none borrows another family's
 /// version. And every `redis.call` in `src/learn/scripts.rs` reaches its key

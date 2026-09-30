@@ -1182,37 +1182,37 @@ fn f12_the_cursor_is_shown_before_an_exec_that_skips_the_terminals_drop() {
     );
 }
 
-/// F13: README.md:72 and :698 described the interactive screen as fronting
-/// "the same four" subcommands — plan, launch, relay, and **mint** — but
-/// [`Action`] has no `Mint` variant: the screen's own [`TuiError::Terminal`]
-/// message names `mint` as one of the subcommands to run *instead of* the
-/// screen, precisely because the screen cannot do it.
+/// F13: the topham guide (`docs/src/guides/topham.md`) once described the
+/// interactive screen as fronting "the same four" subcommands — plan, launch,
+/// relay, and **mint** — but [`Action`] has no `Mint` variant: the screen's own
+/// [`TuiError::Terminal`] message names `mint` as one of the subcommands to run
+/// *instead of* the screen, precisely because the screen cannot do it.
 ///
 /// Pinned in both directions, because either half can drift into the lie: the
-/// README must not go back to claiming four, and `Action` must not grow the
+/// guide must not go back to claiming four, and `Action` must not grow the
 /// missing variant without those sentences being rewritten with it. The source
 /// scan is a substring rather than a parse, so the second assertion is also
 /// tripped by a *comment* mentioning the variant — deliberately, since a
 /// comment about a `Mint` action is itself a claim this test exists to keep
 /// honest.
 #[test]
-fn readme_names_the_three_subcommands_the_screen_fronts() {
-    let readme = include_str!("../../../../README.md");
+fn the_topham_guide_names_the_three_subcommands_the_screen_fronts() {
+    let guide = include_str!("../../../../docs/src/guides/topham.md");
     let source = include_str!("../tui.rs");
 
     assert!(
         !source.contains("Mint"),
-        "`Action` grew a mint variant: the README sentences about the screen \
-         now undercount what it fronts"
+        "`Action` grew a mint variant: the topham guide's sentences about the \
+         screen now undercount what it fronts"
     );
     assert!(
-        !readme.contains("the same four"),
-        "README claims the screen fronts four subcommands, but `Action` is \
+        !guide.contains("the same four"),
+        "the topham guide claims the screen fronts four subcommands, but `Action` is \
          Show/Save/Reload/Launch/Relay -- mint takes the tenancy arguments a \
          profile does not carry, so the screen has no business holding it"
     );
     assert!(
-        readme.contains("plan, launch and relay, on a screen"),
-        "the walkthrough must name what the screen actually fronts"
+        guide.contains("plan, launch and relay, on a screen"),
+        "the topham guide must name what the screen actually fronts"
     );
 }

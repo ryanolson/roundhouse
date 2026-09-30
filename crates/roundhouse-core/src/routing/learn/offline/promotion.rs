@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The promotion summary: ruling 13's tests, staged by the owner's rulings of
-//! 2026-09-29.
+//! The promotion summary: the tests a learned candidate must pass before the
+//! owner promotes it.
 //!
 //! **Every test compares its two sides on one interval set.** A `shadow`
 //! project never explores, so the learned candidate has weight only on the
@@ -24,8 +24,7 @@
 //!   wherever a side has no logging probability; the M11 rerun after the
 //!   first live sessions is the binding quality test.
 //!
-//! **The agreeing test is paired** (the M10 review-fix ruling of
-//! 2026-09-30). It reads the bootstrap lower bound of learned minus `rules`,
+//! **The agreeing test is paired.** It reads the bootstrap lower bound of learned minus `rules`,
 //! both sides summed over the same resampled clusters, against
 //! `-QUALITY_ALLOWANCE`. Comparing the learned lower bound with the `rules`
 //! point estimate instead asks whether a bound lies within 0.02 of its own
@@ -37,12 +36,11 @@
 //! passes once the set meets `quality.min_sessions` with support. It cannot
 //! show a loss, because on these intervals none can exist.
 //!
-//! **`quality.min_sessions` counts sessions that carry weight** (the round-2
-//! ruling of 2026-09-30): the sessions with an agreeing interval where the
-//! learned candidate has weight above zero. In `shadow` that is every
-//! session with an agreeing interval. In `live` an explored interval weighs
-//! nothing, and counting its session would let a set the bootstrap never
-//! reads meet the minimum.
+//! **`quality.min_sessions` counts sessions that carry weight**: the sessions
+//! with an agreeing interval where the learned candidate has weight above zero.
+//! In `shadow` that is every session with an agreeing interval. In `live` an
+//! explored interval weighs nothing, and counting its session would let a set
+//! the bootstrap never reads meet the minimum.
 //!
 //! A test without support reads `not evaluable`, never `pass`.
 
@@ -98,7 +96,7 @@ impl TestResult {
     }
 }
 
-/// Ruling 13's quality comparison: the candidate's lower bound at most
+/// The quality comparison: the candidate's lower bound at most
 /// [`QUALITY_ALLOWANCE`] below the `rules` rate. Inclusive.
 pub fn quality_gate(lower: f64, rate: f64) -> TestResult {
     if lower >= rate - QUALITY_ALLOWANCE {
@@ -118,7 +116,7 @@ pub fn paired_quality_gate(lower: f64) -> TestResult {
     }
 }
 
-/// Ruling 13's cost comparison: the candidate at least [`COST_REDUCTION`]
+/// The cost comparison: the candidate at least [`COST_REDUCTION`]
 /// below `rules`. Inclusive.
 pub fn cost_gate(candidate: f64, rules: f64) -> TestResult {
     if candidate <= rules * (1.0 - COST_REDUCTION) {
@@ -160,10 +158,10 @@ pub fn quality_test(learned: &Estimate, rules_rate: Option<f64>) -> TestResult {
 
 /// A plan's cost as a corrected quote estimate.
 ///
-/// **The conservative side of the correction.** M3 only ever raises a quote,
+/// **The conservative side of the correction.** It only ever raises a quote,
 /// so `adjusted_usd` is already the bound; the `max` keeps that true for any
-/// record. `NoPredictedReuse` had its samples, and M3 re-priced its quote
-/// with no cached tokens (the 2026-09-30 ruling), so its `adjusted_usd` is
+/// record. `NoPredictedReuse` had its samples, and the correction re-priced its
+/// quote with no cached tokens, so its `adjusted_usd` is
 /// the bound too. With too few samples there is no residual to correct by,
 /// and a local quote has no ledger model: both are unpriced, never $0.
 pub fn corrected_cost(cost: &CostEvidence) -> Money {
@@ -244,7 +242,7 @@ pub struct PairedQualityTest {
     pub result: TestResult,
 }
 
-/// Ruling 13's tests for the learned candidate, staged.
+/// The promotion tests for the learned candidate, staged.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PromotionSummary {
     pub intervals: usize,
@@ -558,8 +556,7 @@ impl PromotionSummary {
         let _ = writeln!(o);
         let _ = writeln!(
             o,
-            "## Promotion summary (ruling 13, staged by the owner's rulings of 2026-09-29, for \
-             the learned candidate; the owner approves each promotion)"
+            "## Promotion summary (for the learned candidate; the owner approves each promotion)"
         );
         let differed = self.intervals - self.agreeing;
         let _ = writeln!(

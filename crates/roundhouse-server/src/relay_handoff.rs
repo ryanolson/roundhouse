@@ -20,7 +20,7 @@
 //! with one key and an `[agents.<name>]` table with a `command`, differing only
 //! in which two identifiers go in the holes. Two copies would spell the same
 //! four lines twice, and Relay's `FileUpstreamConfig` is
-//! `#[serde(deny_unknown_fields)]` (Relay evidence §2.4) — so a key that drifted
+//! `#[serde(deny_unknown_fields)]` — so a key that drifted
 //! in one copy is a hard parse error on exactly the topology that copy serves,
 //! discovered by whichever agent nobody ran this week. One rendering
 //! parameterised by [`RelayAgent`] makes the divergence a two-arm `match` a
@@ -29,10 +29,10 @@
 //! What is *not* shared is the base URL's shape, and that asymmetry is the
 //! reason both constructors take a **deployment root** rather than an upstream
 //! URL. Relay's `anthropic_base_url` defaults to `https://api.anthropic.com` and
-//! its `openai_base_url` to `https://api.openai.com/v1` (Relay evidence
-//! §2.4, and both echoed by a 0.8.2 `--dry-run`): the OpenAI one carries the API
+//! its `openai_base_url` to `https://api.openai.com/v1` (both echoed
+//! by a 0.8.2 `--dry-run`): the OpenAI one carries the API
 //! prefix and the Anthropic one does not, because Relay concatenates the
-//! inbound `path_and_query` onto the Anthropic base whole (§A.4) and the codex
+//! inbound `path_and_query` onto the Anthropic base whole and the codex
 //! wire's own base already ends at the version segment. That is the same split
 //! the two generators make — `ClaudeLaunch::new` **refuses** a base URL carrying
 //! [`API_PREFIX`] and `CodexLaunch`'s base URL requires it — so deriving both
@@ -44,17 +44,17 @@
 //! **No `anthropic_auth_header` / `openai_auth_header`.** The reference chained
 //! wiring is the client carrying the turn key on its own dedicated header and
 //! Relay forwarding it untouched (`claude_launch`'s chained runbook, from Relay
-//! evidence §A.7 and §A.13). An upstream auth header here would be the
+//! 0.8.2's header-merge and forwarding rules). An upstream auth header here would be the
 //! *fallback* wiring, which that runbook records as deliberately untested and
 //! which requires a credential-less client. It also cannot survive contact with
 //! hazard 4: `replace_upstream_base_url` clears a configured auth header
-//! whenever a different layer supplies the base URL (§A.5), so a header written
+//! whenever a different layer supplies the base URL, so a header written
 //! here is one system config file away from silently vanishing while every
 //! request still succeeds.
 //!
-//! **No `[gateway] bind`.** 0.8.2 refuses a non-loopback bind outright
-//! (§A.10.1), so the default is the only value that works and naming it would
-//! be a knob whose every other setting is an error.
+//! **No `[gateway] bind`.** 0.8.2 refuses a non-loopback bind outright, so the
+//! default is the only value that works and naming it would be a knob whose
+//! every other setting is an error.
 //!
 //! **No header comment.** A generated file usually earns one, and this one does
 //! not: [`RelayHandoff::config_toml`]'s bytes are pinned by a guard test against
@@ -67,9 +67,9 @@
 //!
 //! `--config` replaces Relay's *user* config layer only; the system layer at
 //! [`RELAY_SYSTEM_CONFIG`] is folded in **after** it and a leaf appearing in
-//! both wins from the system file (Relay evidence §2.4). The switch that would
+//! both wins from the system file. The switch that would
 //! turn that off is behind a test-only cargo feature absent from the published
-//! binary (§A.10.4). So an operator box with a system Relay install can re-aim a
+//! binary. So an operator box with a system Relay install can re-aim a
 //! chained launch — carrying a real turn key — at whatever that file names,
 //! while everything downstream reads perfectly green.
 //!
@@ -115,7 +115,7 @@ pub const RELAY_STATE_VARS: [&str; 4] = [
 ///
 /// The two facts this enum carries are not independent: `--agent claude` routes
 /// `/v1/messages` to `anthropic_base_url` and `--agent codex` routes
-/// `/v1/responses` to `openai_base_url` (Relay evidence §2.4, §A.4). Pairing
+/// `/v1/responses` to `openai_base_url`. Pairing
 /// them in one type is what stops a config that names one agent and aims the
 /// other one's upstream — a combination Relay accepts and which forwards every
 /// turn to Relay's *default* upstream, i.e. straight to a frontier lab, with
@@ -146,7 +146,7 @@ impl RelayAgent {
 
     /// The `NEMO_RELAY_*` variable that overrides this agent's upstream.
     ///
-    /// It layers **above** an explicit `--config` (Relay evidence §2.4), which
+    /// It layers **above** an explicit `--config`, which
     /// is why a launcher has to look at it directly: an isolated `--dry-run`
     /// preflight deliberately clears it, so the one check that would catch it is
     /// the one the preflight cannot make. The same shape as
@@ -162,8 +162,8 @@ impl RelayAgent {
     /// Everything before the agent's own argv, `--` included.
     ///
     /// `run` rather than the bare `nemo-relay claude` shortcut: the shortcut
-    /// runs an interactive setup wizard when no config layer exists (Relay
-    /// evidence §4.2's wizard, which requires a TTY), and a wizard is a hang in
+    /// runs an interactive setup wizard when no config layer exists (the
+    /// wizard requires a TTY), and a wizard is a hang in
     /// a rig and a surprise in a launcher. The trailing `--` is not optional —
     /// Relay's `RunCommand::command` is `#[arg(last = true)]`, so without it the
     /// agent's own flags are parsed as Relay's.
@@ -358,8 +358,8 @@ impl RelayHandoff {
     /// `NEMO_RELAY_*` environment layer *above* the explicit `--config`, so a
     /// preflight that inherited the operator's environment would be checking a
     /// resolution the real launch does not have — and, since a differing
-    /// `NEMO_RELAY_ANTHROPIC_BASE_URL` also clears any configured auth header
-    /// (§A.5), could report drift that is entirely its own.
+    /// `NEMO_RELAY_ANTHROPIC_BASE_URL` also clears any configured auth header,
+    /// could report drift that is entirely its own.
     ///
     /// `PATH` is the one thing carried over, because the binary has to find its
     /// loader; `HOME` and [`RELAY_STATE_VARS`] all point at one scratch

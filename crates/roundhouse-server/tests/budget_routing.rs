@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M3 of `PLAN-agentic-control-plane.md`: a budget that visibly changes
-//! routing, and an exhausted one that keeps serving.
+//! A budget that visibly changes routing, and an exhausted one that keeps
+//! serving.
 //!
 //! Every claim here is about *what a deployment does once the money runs out*,
 //! which is why none of them is a unit test. The contract suite one layer down

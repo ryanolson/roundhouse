@@ -9,10 +9,10 @@
 //! Pure functions over plain numbers, so every rule is checked on hand-built
 //! inputs before any log reaches it.
 //!
-//! **A mismatch anywhere zeroes the trajectory** (draft 14.3). The weight is a
+//! **A mismatch anywhere zeroes the trajectory.** The weight is a
 //! product over every covered turn of `1[candidate == served] / p_log`.
-//! Multiplying only over the matching turns, the rule revision 2 wrote, gives
-//! the reviewer's uniform A/B case 0.5 and 1/3 where the true value is 0.
+//! Multiplying only over the matching turns would give a uniform A/B case 0.5
+//! and 1/3 where the true value is 0.
 //!
 //! **Resampling does not create support.** The bootstrap measures sampling
 //! variation over the clusters the manifest holds; a candidate with no

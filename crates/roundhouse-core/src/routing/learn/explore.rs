@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded exploration (the 2026-09-28 ruling 8, plan sections 3 and 4).
+//! Bounded exploration.
 //!
 //! Exploration is a quality bypass, so it is fenced on every side. The policy
 //! decides *whether* a turn could explore ([`LearnedPolicy`](super::LearnedPolicy));
@@ -86,28 +86,26 @@ impl Draw {
 /// bypass to learn nothing about cost. [`propensity`] does not rely on it:
 /// it sums over every way the served route could have been chosen.
 ///
-/// **`rules` joins exempt from both filters** (the owner's ruling of
-/// 2026-09-30). It is not a probe for a cheaper route but the baseline every
-/// candidate is compared with: without it, `rules` has zero logging
-/// probability wherever the learned choice differs, and the binding M11
-/// quality comparison (test 1b) can never be evaluated there. So it joins
-/// whether it passed, is unproven or sits below the floor, and whatever it
-/// costs against the exploit. It is placed last so that the members before
-/// it keep their configured order and their member indices; when the M4
-/// filters already admit it, it keeps its place and is not listed twice,
-/// since [`propensity`] counts members and a repeat would inflate its share.
+/// **`rules` joins exempt from both filters**. It is not a probe for a cheaper
+/// route but the baseline every candidate is compared with: without it, `rules`
+/// has zero logging probability wherever the learned choice differs, and the
+/// binding quality comparison (test 1b) can never be evaluated there. So it
+/// joins whether it passed, is unproven or sits below the floor, and whatever
+/// it costs against the exploit. It is placed last so that the members before
+/// it keep their configured order and their member indices; when the M4 filters
+/// already admit it, it keeps its place and is not listed twice, since
+/// [`propensity`] counts members and a repeat would inflate its share.
 ///
 /// **Every hard constraint**, by [`PlanEvidence::meets_hard`], the predicate
 /// the exploit path uses, for `rules` too: a `rules` plan over the grant or
 /// the latency limit never explores, as no other member does.
 ///
-/// **Under `refuse`, `rules` joins only when some strategy passes** (the
-/// owner's ruling of 2026-09-30). A `refuse` project has chosen to fail a
-/// turn nothing passes rather than serve `rules` unvalidated; letting the
-/// baseline in by exploration would serve exactly that turn at the rate.
-/// Such a turn is refused as before `rules` joined, unless a cheaper
-/// unproven member explores. Under `serve_rules` a turn nothing passes serves
-/// `rules` anyway, so `rules` joins there too.
+/// **Under `refuse`, `rules` joins only when some strategy passes**. A `refuse`
+/// project has chosen to fail a turn nothing passes rather than serve `rules`
+/// unvalidated; letting the baseline in by exploration would serve exactly that
+/// turn at the rate. Such a turn is refused as before `rules` joined, unless a
+/// cheaper unproven member explores. Under `serve_rules` a turn nothing passes
+/// serves `rules` anyway, so `rules` joins there too.
 ///
 /// Changing this rule is a new
 /// [`LEARNED_SELECTOR_REVISION`](crate::routing::LEARNED_SELECTOR_REVISION).
@@ -148,8 +146,7 @@ pub(crate) fn has_default(some_passes: bool, on_infeasible: OnInfeasible) -> boo
 }
 
 /// The probability that a turn which could explore over `set` served
-/// `served`, summed over every way the policy could have served it (draft
-/// 14.2, plan section 3 item 2).
+/// `served`, summed over every way the policy could have served it.
 ///
 /// With probability `1 - rate` the turn does not explore and serves
 /// `default`: the exploit target, or the `rules` target under `serve_rules`

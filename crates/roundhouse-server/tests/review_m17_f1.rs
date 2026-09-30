@@ -1,29 +1,24 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M17 thermo-nuclear review, finding F1 — confirmed.
+//! The documentation does not carry two stale sentences about control-call
+//! recognition.
 //!
-//! **The claim.** README.md's "Control tools from Claude Code" section
-//! (around line 702) says "nothing renders a tool call outbound any more",
-//! and the "Escalation" section (around line 333) says the Responses wire
-//! "has dropped the namespace into a field canonicalization discards" and
-//! that "a third party's MCP server offering its own `status` is exempted
-//! too". Both sentences are pre-M17: `responses_api::wire::function_call_item`
-//! now re-emits the namespace on the outbound projection, and
-//! `ControlCallDialect::CodexResponses::recognises` no longer exempts a
-//! foreign `Some` namespace — it is matched to `false`, not swallowed. The
-//! README states both in the plain indicative, with no dated bracket noting
-//! they describe the base tree rather than HEAD.
+//! The sentences were "nothing renders a tool call outbound any more" and "a
+//! third party's MCP server offering its own `status` is exempted too" (with
+//! "the Responses wire has dropped the namespace into a field canonicalization
+//! discards"). Both describe a tree that no longer exists:
+//! `responses_api::wire::function_call_item` re-emits the namespace on the
+//! outbound projection, and `ControlCallDialect::CodexResponses::recognises`
+//! matches a foreign `Some` namespace to `false` rather than exempting it.
 //!
-//! **This test.** The two `assert!`s tagged CONTROL below exercise the real
-//! HEAD behavior directly (no mutation, no doc-parsing needed to prove the
-//! code side) and pass today — that is what establishes the two README
-//! sentences are stale rather than merely re-phrased. The two `assert!`s
-//! tagged CLAIM read README.md itself and fail today, because both stale
-//! sentences are still present verbatim. Marked `#[ignore]` per the fix
-//! contract: an ignored test enforces nothing, and removing the ignore is
-//! the first step of the actual fix (a dated bracketed note per the
-//! finding's own `how_to_prove`, not a rewrite).
+//! **Contract.** These sentences must not appear anywhere in the documentation:
+//! `README.md` or any `*.md` under `docs/src/`. The two tests that call
+//! `function_call_item` and `is_control_call_on` are controls: they exercise the
+//! real behavior directly and establish that the sentences are false rather than
+//! merely rephrased, so the absence checks cannot pass for want of a target. The
+//! absence checks read the whole documentation corpus, so moving a sentence
+//! between chapters does not hide it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,9 +37,37 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn read_readme() -> String {
-    let path = repo_root().join("README.md");
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+/// Every `*.md` file under `dir`, recursively, in path order so a failure
+/// message is stable.
+fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+        .map(|entry| entry.expect("directory entry").path())
+        .collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            markdown_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "md") {
+            out.push(path);
+        }
+    }
+}
+
+/// The whole documentation corpus, concatenated: `README.md` plus every `*.md`
+/// under `docs/src/`. Read at run time so a chapter added later is covered
+/// without editing this file.
+fn read_docs() -> String {
+    let root = repo_root();
+    let mut files = vec![root.join("README.md")];
+    markdown_files(&root.join("docs/src"), &mut files);
+    files
+        .iter()
+        .map(|path| {
+            fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Markdown hand-wraps at ~80 columns, so a sentence this test greps for can
@@ -60,8 +83,8 @@ fn head_outbound_projection_now_renders_the_namespace() {
     // CONTROL (passes): since M17, `function_call_item` — the Responses
     // outbound projection — re-emits a carried namespace rather than
     // dropping it. Something *does* render a tool call outbound with the
-    // field intact, which is the opposite of README.md's "nothing renders a
-    // tool call outbound any more".
+    // field intact, which is the opposite of the stale "nothing renders a tool
+    // call outbound any more".
     let item = function_call_item("call_1", "status", Some(CONTROL_TOOL_NAMESPACE), "{}");
     assert_eq!(
         item.get("namespace").and_then(|v| v.as_str()),
@@ -76,7 +99,7 @@ fn head_no_longer_exempts_a_foreign_namespace_status_call() {
     // CONTROL (passes): a third party's own `status` tool, under a foreign
     // namespace, is recognised as *not* ours — `Some(_) => false` — rather
     // than being swallowed by the bare-name fallback the way the pre-M17
-    // code (and the README's description of it) did.
+    // code (and the documentation's description of it) did.
     assert!(
         !is_control_call_on(
             "status",
@@ -90,30 +113,28 @@ fn head_no_longer_exempts_a_foreign_namespace_status_call() {
 }
 
 #[test]
-fn readme_no_longer_claims_nothing_renders_a_tool_call_outbound() {
-    let readme = unwrapped(&read_readme());
+fn the_docs_do_not_claim_nothing_renders_a_tool_call_outbound() {
+    let docs = unwrapped(&read_docs());
     assert!(
-        !readme.contains("nothing renders a tool call outbound any more"),
-        "README.md still asserts, in the plain indicative, that nothing \
-         renders a tool call outbound any more; HEAD's outbound projection \
+        !docs.contains("nothing renders a tool call outbound any more"),
+        "the documentation still asserts, in the plain indicative, that nothing \
+         renders a tool call outbound any more; the outbound projection \
          already does (F1)",
     );
 }
 
 #[test]
-fn readme_no_longer_claims_third_party_status_is_exempted() {
-    let readme = unwrapped(&read_readme());
+fn the_docs_do_not_claim_third_party_status_is_exempted() {
+    let docs = unwrapped(&read_docs());
     assert!(
-        !readme.contains("is exempted too"),
-        "README.md still asserts that a third party's MCP server offering \
-         its own `status` is exempted from control-call recognition; HEAD's \
-         CodexResponses arm rejects a foreign namespace outright since M17 \
-         (F1)",
+        !docs.contains("is exempted too"),
+        "the documentation still asserts that a third party's MCP server offering \
+         its own `status` is exempted from control-call recognition; the \
+         CodexResponses arm rejects a foreign namespace outright (F1)",
     );
     assert!(
-        !readme.contains("canonicalization discards"),
-        "README.md still asserts the Responses wire drops the namespace at \
-         canonicalization; HEAD's canonical_item reads it via optional_str \
-         instead (F1)",
+        !docs.contains("canonicalization discards"),
+        "the documentation still asserts the Responses wire drops the namespace at \
+         canonicalization; canonical_item reads it via optional_str instead (F1)",
     );
 }

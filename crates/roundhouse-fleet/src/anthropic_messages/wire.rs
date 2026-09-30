@@ -12,9 +12,8 @@
 //! `additionalProperties: false` sits entirely on *request* schemas, so a
 //! faithful generation would make the serve surface fail closed on the day a
 //! client sends a field newer than our snapshot, and it still would not produce
-//! the two SSE events the spec omits. (Ruling R1 of
-//! `agent-docs/PLAN-anthropic-messages.md`; evidence
-//! `agent-docs/research/anthropic-messages-wire-crates.md` §1, §3, §5.)
+//! the two SSE events the spec omits. (The crates
+//! considered and why none is used are in `docs/src/development/upstream.md`.)
 //!
 //! **The polarity, everywhere: typed where roundhouse reads or originates, open
 //! everywhere else.** Typed are the stream events, [`Usage`] with the full
@@ -39,7 +38,7 @@
 //! `ping` and mid-stream `error` appear nowhere in the 2.4 MB OpenAPI document —
 //! the literal string `"ping"` occurs zero times, and `MessageStreamEvent` is a
 //! union of exactly six members — yet both are real on the wire and Claude Code
-//! dispatches on both (evidence doc §3.1, client surface §3.2). They are typed
+//! dispatches on both (read from Claude Code 2.1.42). They are typed
 //! here and pinned by this module's own tests rather than by [`SPEC_PIN_JSON`],
 //! so that their *absence* from a future spec diff is never read as a removal.
 
@@ -129,7 +128,7 @@ pub const USAGE_PROPERTIES_READ: [&str; 5] = [
 ///
 /// Roundhouse is the first Rust implementation to model these at all: the crate
 /// survey found none, and the one crate that tried invented
-/// `cache_creation_input_tokens_1h`, which does not exist (evidence doc §5.4).
+/// `cache_creation_input_tokens_1h`, which does not exist.
 pub const SPEC_CACHE_CREATION_FIELDS: [&str; 2] =
     ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"];
 
@@ -566,7 +565,7 @@ pub struct CacheCreation {
 /// A token count that tolerates an explicit `null`.
 ///
 /// Anthropic's own client null-guards these fields before comparing them
-/// (`input_tokens !== null && input_tokens > 0`, client surface §3.4), which is
+/// (`input_tokens !== null && input_tokens > 0`, read from Claude Code 2.1.42), which is
 /// the strongest available evidence that `null` reaches the wire on some
 /// beta shapes. Reading it as zero rather than failing the parse is the open
 /// direction, and it is the *safe* open direction here: an absent count already
@@ -773,10 +772,9 @@ mod tests {
     /// Pinned here rather than in `spec_pin.json` on purpose: the sync skill
     /// diffs that file against the spec, and a `ping` entry there would show up
     /// as a phantom removal on every single run. The evidence is
-    /// `research/anthropic-messages-wire-crates.md` §3.1 — the literal string
-    /// `"ping"` occurs zero times in the 2.4 MB document — and
-    /// `research/claude-code-client-surface.md` §3.2, where the real client
-    /// dispatches on both names.
+    /// that the literal string `"ping"` occurs zero times in the 2.4 MB
+    /// document, and that the real client (Claude Code 2.1.42) dispatches on
+    /// both names.
     #[test]
     fn the_two_transport_events_the_spec_omits_are_typed_anyway() {
         let pin = spec_pin();

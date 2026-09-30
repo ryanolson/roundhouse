@@ -4,7 +4,7 @@
 //! M10.1 P4: an external provider's key rides the three tiers that already
 //! exist.
 //!
-//! R7 of `PLAN-frontier-selection.md` rules that attaching an OpenRouter key
+//! The provider design rules that attaching an OpenRouter key
 //! adds **no credential variant and no schema change** — deployment, project and
 //! member are already the three scopes, and `"openrouter"` is just another
 //! provider name in the block a project or a key already writes. A ruling like
@@ -33,10 +33,9 @@ use roundhouse_server::{ControlPlane, ControlPlaneConfig};
 mod common;
 use common::{key, sha256_hex};
 
-/// The provider under test. A real OpenRouter model id, written in full —
-/// `openrouter-api-surface.md` Q2 is emphatic that a bare vendor name is a
-/// different row from a dated one, and a fixture that wrote `kimi` would teach
-/// the wrong habit.
+/// The provider under test. A real OpenRouter model id, written in full — a
+/// bare vendor name is a different row from a dated one on OpenRouter, and a
+/// fixture that wrote `kimi` would teach the wrong habit.
 const PROVIDER: &str = "openrouter";
 const MODEL: &str = "moonshotai/kimi-k3";
 

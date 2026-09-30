@@ -58,7 +58,7 @@ pub(super) struct ProbeReport {
 }
 
 impl ProbeReport {
-    /// The line the live run records in the ruling.
+    /// The line the live run reports.
     ///
     /// States the verdict rather than leaving a reader to derive it: the
     /// interesting failure is a second-turn zero, and it means nothing until

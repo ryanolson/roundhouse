@@ -486,7 +486,7 @@ async fn a_pinned_log_that_no_longer_matches_its_digest_is_refused() {
     ));
 }
 
-/// Rollback names the previous artifact again (draft 14.6). Its bytes give its
+/// Rollback names the previous artifact again. Its bytes give its
 /// epoch, a rerun pinned to its manifest writes the same bytes, and the store
 /// still holds the counters learned under that epoch.
 #[tokio::test]

@@ -277,7 +277,7 @@ fn booked_estimate_result(
 /// what the settle submitted — the estimate, for a call whose usage never
 /// arrived. The same call acknowledged first time must land the same dollars,
 /// or the dashboard's committed figure would depend on whether one ledger
-/// reply arrived, and would under-count exactly the calls ruling 3 books.
+/// reply arrived, and would under-count exactly the calls that book an estimate.
 #[test]
 fn a_booked_estimate_is_committed_the_same_whether_acknowledged_first_time_or_repaired() {
     let committed_first_time = {

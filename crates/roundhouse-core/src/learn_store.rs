@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The learner store: the shared counters the online routing learner reads at
-//! selection and adds learning entries to (draft section 11 of
-//! `agent-docs/DRAFT-online-routing-learner.md`, milestone M6 of
-//! `agent-docs/PLAN-online-routing-learner.md`).
+//! selection and adds learning entries to (design in
+//! `docs/src/concepts/routing-learner.md`).
 //!
 //! **The engine is the caller** (the server's `engine::learning`, milestone
 //! M8): `read` in `plan` for a project whose learner is `shadow` or `live`,
@@ -22,10 +21,10 @@
 //! [`LearnerError::ChainGap`] rather than moving the watermark past the entry
 //! it never saw. An entry whose predecessor is below the watermark is refused
 //! with [`LearnerError::ChainDiverged`]: its chain lacks the store's entry, and
-//! no backfill can supply it. A batch-level comparison fails both ways: it drops the new
-//! entries of a resend, or it skips the missing one for good (draft section
-//! 15). The rule does not depend on the session lease, because every node
-//! folds the same entries from the same log.
+//! no backfill can supply it. A batch-level comparison fails both ways: it
+//! drops the new entries of a resend, or it skips the missing one for good. The
+//! rule does not depend on the session lease, because every node folds the same
+//! entries from the same log.
 //!
 //! **All or nothing.** `apply` checks the whole batch before it writes
 //! anything: the chain, every new counter value against its range, and (in a
@@ -290,13 +289,11 @@ pub struct Applied {
 /// reports it, and the project's other sessions carry on. `CounterRange` and
 /// `Malformed` do not go away on a retry either, nor under a new epoch: the
 /// refused entry stays in its session's page under the epoch it was written
-/// in, so the engine stops that session's delivery the same way (M8 review
-/// ruling, which supersedes the draft's project-epoch stop, section 11.3).
+/// in, so the engine stops that session's delivery the same way.
 /// `Unavailable` leaves the result unknown, and a resend is safe under the
 /// identity rule. `WrongType` leaves the entries pending, like `Unavailable`:
 /// the foreign key is an operator's to remove, and the source marks keep the
-/// entries for the next turn or the recovery task once it is gone (M8 ruling,
-/// which supersedes the draft's epoch stop for this variant).
+/// entries for the next turn or the recovery task once it is gone.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LearnerError {
     /// The batch skips an entry. Backfill from `store_watermark`, the

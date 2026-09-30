@@ -1361,7 +1361,7 @@ impl SessionState {
     }
 
     /// Rebuild a session's learning entries above `hold_after`, **taking no
-    /// lease**: the backfill of draft section 11.5.
+    /// lease**: the learning backfill.
     ///
     /// The same replay [`Self::project`] runs, with the page floor at
     /// `hold_after`, so the page holds the first [`LEARNING_PAGE`] entries

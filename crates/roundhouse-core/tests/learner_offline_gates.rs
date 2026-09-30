@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The promotion gates' inputs, one rule per test (the M10 round-2 fixes of
-//! `agent-docs/PLAN-online-routing-learner.md`): which recorded number each
+//! The promotion gates' inputs, one rule per test (design in
+//! `docs/src/concepts/routing-learner.md`): which recorded number each
 //! gate reads, which guard answers first, what each counter counts, and which
 //! interval is excluded before any weight can stop being a number.
 //!
@@ -251,8 +251,8 @@ fn the_cost_test_reads_the_larger_of_the_corrected_and_the_quoted_cost() {
     }
 }
 
-/// A `NoPredictedReuse` quote is priced, at the uncached bound M3 recorded
-/// in `adjusted_usd` (the 2026-09-30 ruling), and the census says so.
+/// A `NoPredictedReuse` quote is priced, at the uncached bound the correction recorded
+/// in `adjusted_usd`, and the census says so.
 #[test]
 fn a_no_predicted_reuse_quote_is_priced_at_its_uncached_bound() {
     let calibrated = run(

@@ -72,9 +72,9 @@
 //! judged by.
 //!
 //! **The bounded worst case is bounded by a window's width, not by one
-//! command** (M13.1 review, F7). A scope idle for almost a window and then
-//! resumed reads every bucket that aged out, and those reads are chunked at
-//! four hundred fields per `HMGET` because Lua's `unpack` is bounded: six
+//! command.** A scope idle for almost a window and then resumed reads every
+//! bucket that aged out, and those reads are chunked at four hundred buckets
+//! (eight hundred fields) per `HMGET` because Lua's `unpack` is bounded: six
 //! commands for the seven-day window's 2016 buckets, plus the one that read
 //! the sum — seven, measured, not one. It is paid once, after which the sum is
 //! current again. A *refusal* still walks buckets under the same chunking,

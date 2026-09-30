@@ -335,8 +335,7 @@ fn decode_page(reply: &[Value], limit: NonZeroUsize) -> Result<LearningPage, Sto
     // undecodable member still fails the whole page here: `SessionId` (and
     // the cursor built from it) cannot carry non-UTF-8 bytes, so there is no
     // id to name it with in `unreadable` the way an orphan or an unparseable
-    // mark is named. Unruled residual, not fixed by this item -- see
-    // `agent-docs/PLAN-online-routing-learner.md` section 9, M9 round-4.
+    // mark is named. A known residual, deliberately not fixed here.
     let mut unreadable = unreadable;
     let mut sessions = Vec::with_capacity(fields.len() / 4);
     for entry in fields.chunks_exact(4) {

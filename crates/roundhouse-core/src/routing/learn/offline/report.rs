@@ -191,7 +191,7 @@ impl Report {
         let _ = writeln!(o, "artifact sha256: {}", self.artifact_sha256);
         let _ = writeln!(
             o,
-            "estimand: {ESTIMAND_LABEL} (logged-boundary, interval-local weights, ruling 12)"
+            "estimand: {ESTIMAND_LABEL} (logged-boundary, interval-local weights)"
         );
         let _ = writeln!(o, "cluster unit: {unit}");
 

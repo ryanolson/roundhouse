@@ -769,7 +769,7 @@ async fn f5_the_outage_refusal_is_spelled_overloaded_error_at_the_messages_wire(
     assert_eq!(
         body["error"]["type"], "overloaded_error",
         "the Messages dialect's client retries on this string regardless of \
-         status (§3.2) -- a mapping regression here is invisible to every \
+         status (v2.1.42) -- a mapping regression here is invisible to every \
          existing fair-use test, which asserts the raw `ApiError` and never \
          routes through `MessagesError::into_response`: {body}"
     );

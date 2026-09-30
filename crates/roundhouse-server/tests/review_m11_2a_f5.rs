@@ -12,12 +12,11 @@
 //! fallback's `self.tokenizer.encode(text).len()` is not merely imprecise on
 //! that turn, it is structurally zero.
 //!
-//! R2's own ruling (`agent-docs/PLAN-anthropic-messages.md:145-157`) records
-//! that the Anthropic dispatch client emits **no** `Done` at all for a stream
-//! that never completes, specifically so the estimate — not a fabricated
-//! zero-token `Done` — stays authoritative, because "a zero-token `Done`
-//! reads as a saving" is named there as "the one failure the metrics chapter
-//! is built against". This file checks whether the estimate the design
+//! The Anthropic dispatch client emits **no** `Done` at all for a stream that
+//! never completes, specifically so the estimate — not a fabricated
+//! zero-token `Done` — stays authoritative, because a zero-token `Done` reads
+//! as a saving, the one failure the cost accounting is built against. This
+//! file checks whether the estimate the design
 //! deliberately routes around that failure to reaches recreates it anyway for
 //! the one turn shape `spoken` cannot see. The sibling `context_contribution`
 //! (`engine.rs:1653-1671`) gets the same question right forty lines away, on
@@ -105,10 +104,9 @@ fn rate_card() -> ProviderPricing {
 /// arguments.
 ///
 /// **The stream ends with no `Done` at all**, which is not a contrived
-/// malformed frame: it is R2's own documented shape for "unreported"
-/// (`agent-docs/PLAN-anthropic-messages.md:154-157`, "a stream that never
-/// completes still yields no `Done`"), the exact case the fallback exists to
-/// survive.
+/// malformed frame: it is the Anthropic client's documented shape for
+/// "unreported" (a stream that never completes still yields no `Done`), the
+/// exact case the fallback exists to survive.
 ///
 /// **Ruled valid, and fixed.** `estimated_usage` now sums the same
 /// `render()`-based measure `context_contribution` already applies to a

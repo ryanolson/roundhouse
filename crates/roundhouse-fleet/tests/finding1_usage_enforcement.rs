@@ -100,9 +100,9 @@ fn protocol_of(quote: &FrontierQuote) -> Option<WireProtocol> {
     Some(quote.wire_protocol)
 }
 
-/// The provider client the README lists under "Not yet built", reduced to the
-/// one thing it must do before it sends anything: serialize a streaming request
-/// and make the provider account for the call.
+/// The provider client `docs/src/appendix/limitations.md` lists as not yet
+/// built, reduced to the one thing it must do before it sends anything:
+/// serialize a streaming request and make the provider account for the call.
 #[derive(Default)]
 struct SerializingFrontierClient {
     last_body: Mutex<Option<Value>>,

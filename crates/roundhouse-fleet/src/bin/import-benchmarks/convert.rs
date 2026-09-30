@@ -540,7 +540,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no provenance entry for `{model}`"))
     }
 
-    /// The plan's named test for this rung.
+    /// The provenance test for this rung.
     ///
     /// All three provenance facts in one assertion because they are one claim:
     /// a number without them is not republishable. `meta.citation` being null
@@ -582,16 +582,15 @@ mod tests {
         }
     }
 
-    /// G13: the README says the tool "refuses to emit without" a citation.
+    /// G13: the docs once said the tool "refuses to emit without" a citation.
     /// A null `meta.citation` is the ordinary multi-source case -- the
     /// SNAPSHOT fixture's own comment says so -- and it is *emitted*, with
     /// `citation: null` plus the item's own `source` discriminator, not
     /// refused. `NoAttribution` only fires when neither `meta.citation` nor
     /// the item's `source` is present, a path this fixture never takes.
     /// Left as a live (non-`#[ignore]`) guard: it already passes today, and
-    /// that pass *is* the evidence the README sentence overstates the
-    /// refusal -- once the doc is corrected this test is what keeps it
-    /// correct.
+    /// that pass *is* the evidence that sentence overstated the
+    /// refusal -- this test is what keeps the corrected docs correct.
     #[test]
     fn a_null_meta_citation_is_emitted_when_the_items_name_their_own_source() {
         let import = convert(SNAPSHOT, &request()).expect("a null meta.citation is not a refusal");

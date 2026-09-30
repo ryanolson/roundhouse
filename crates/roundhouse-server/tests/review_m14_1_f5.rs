@@ -5,7 +5,7 @@
 //!
 //! **The claim, narrowed to what a test can reach.** F5 bundles four
 //! doc/code mismatches; the ordering half is the only one with a resolver
-//! behavior to disagree about, so it is what this file proves. README.md:60
+//! behavior to disagree about, so it is what this file proves. The docs
 //! said codex's session id (the `x-codex-turn-metadata.session_id` cache key)
 //! "is weighed last of the three" correlators. `ControlReads::resolve_session`
 //! (`reads.rs:322-339`) matches `(named, thread.or(cache_key).or(call))` —
@@ -14,8 +14,8 @@
 //! (`correlators.tool_use_id`, Claude Code's `claudecode/toolUseId`) is never
 //! consulted at all. The cache key is weighed **before** the call, i.e.
 //! second of the three, not last — the call is what is actually weighed
-//! last. The PLAN addendum (`agent-docs/PLAN-anthropic-messages.md`) already
-//! said as much in prose ("the arm sits after the thread arm and before the
+//! last. The design notes already said
+//! as much in prose ("the arm sits after the thread arm and before the
 //! tool-use id"), which is what this test turns into a resolver disagreement
 //! an agent could actually hit: a codex call whose thread is unbound, whose
 //! cache key names one conversation, and whose `claudecode/toolUseId` names
@@ -43,12 +43,12 @@
 //! **Ruling: partially valid — and fixed the way the resolver, not the doc,
 //! was already right about.** The ordering half of F5 was confirmed by the
 //! test below at refute time: the resolved conversation was the cache key's,
-//! not the call's, contradicting README's old "weighed last of the three".
+//! not the call's, contradicting the docs' old "weighed last of the three".
 //! But `reads.rs`'s own order — thread, then cache key, then call — is the
-//! order R-C5 actually ruled (the PLAN addendum already had it right), so the
-//! fix corrects the *sentence*, not the resolver: README now says the cache
+//! intended order (the design notes already had it right), so the
+//! fix corrects the *sentence*, not the resolver: the docs now say the cache
 //! key is weighed after the thread arm and before the tool-use id, and the
-//! test below is turned from a red assertion of README's old (wrong) claim
+//! test below is turned from a red assertion of the docs' old (wrong) claim
 //! into a live confirmation of the resolver's real order, over a real Redis.
 //! The finding's other three claims — lib.rs's self-contradiction about
 //! where an aged-out thread ends up, and the stale "this node" scope
@@ -193,16 +193,16 @@ fn served_conversation(reply_text: &str) -> String {
 /// F5's ordering claim, made into a resolver disagreement: a thread the
 /// deployment never bound (so the thread arm answers nothing), a cache key
 /// naming `main`, and a `claudecode/toolUseId` already bound to `other` —
-/// the same call carrying both the correlator README used to claim was
+/// the same call carrying both the correlator the docs used to claim was
 /// weighed last and the one `reads.rs`'s `.or()` chain actually consults
 /// last (`call`).
 ///
-/// README (fixed) now says the cache key is weighed *before* the tool-use
+/// The docs now say the cache key is weighed *before* the tool-use
 /// id, so a caller who also supplies an exact `claudecode/toolUseId` naming a
 /// different, real conversation should still have the cache key win —
 /// `reads.rs`'s own order (thread, then cache key, then call) is unchanged by
 /// this rung, because it was the doc that was wrong, not the resolver. The
-/// assertion below is what used to be README's (wrong) claim, now flipped to
+/// assertion below is what used to be the docs' (wrong) claim, now flipped to
 /// match the resolver `reads.rs` actually ships and the doc now says.
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
@@ -262,7 +262,7 @@ async fn the_family_cache_key_outranks_a_bound_tool_use_id() {
     assert_eq!(
         resolved,
         main_session.as_str(),
-        "F5: README (fixed) says the cache key (here naming `main`) is \
+        "F5: the docs say the cache key (here naming `main`) is \
          weighed *before* the tool-use id, so it should win over an exact \
          `claudecode/toolUseId` naming `other`. It did not: resolve_session \
          answered {resolved:?} instead of the cache key's session -- \

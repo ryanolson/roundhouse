@@ -836,8 +836,8 @@ async fn an_exhausted_recipe_leaves_its_last_dead_provider_unmarked() {
     );
 
     // The event the count is folded from, and what it says. `failed_attempts`
-    // collapses to `(ModelKey, count)`, so the *class* the ruling asked the
-    // terminal attempt to carry ("target + error class") is written and read
+    // collapses to `(ModelKey, count)`, so the *class* the terminal attempt
+    // is meant to carry ("target + error class") is written and read
     // nowhere else -- without this, flipping `Status { 503 }` to `Timeout`
     // leaves every guard above green. It also pins the new field's serde
     // round-trip on the incomplete side.
@@ -938,7 +938,7 @@ async fn a_single_provider_outage_names_the_provider_rather_than_reporting_nothi
 /// A grant per *turn*, not per attempt — and a failed attempt is marked rather
 /// than free.
 ///
-/// Risk 3 in the plan, and the sharp edge of the whole mechanism: a hold opened
+/// The sharp edge of the whole mechanism: a hold opened
 /// per attempt would let a flaky provider pyramid reservations until the ledger
 /// refused a turn nobody had spent anything on.
 #[tokio::test]

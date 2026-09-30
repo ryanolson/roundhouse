@@ -664,7 +664,7 @@ fn priced_snapshot(fold: &MetricsFold) -> MetricsSnapshot {
 }
 
 /// **With a price, local capacity spend is reported and the routing saving
-/// is net of it** (ruling 6, 2026-09-28). Both savings estimates move: the
+/// is net of it**. Both savings estimates move: the
 /// correlary one loses the capacity cost, and the at-decision one loses
 /// the local quote the router actually served on.
 #[test]

@@ -4,7 +4,7 @@
 //! C2's live evidence, and the fake-server proof that the probe itself is
 //! honest.
 //!
-//! `PLAN-cache-affinity.md` C2 places a second `cache_control` marker back
+//! The cache-affinity design places a second `cache_control` marker back
 //! where the previous request to a target wrote its entry, because Anthropic
 //! looks at most twenty block positions back from a marker. The unit tests
 //! prove that arithmetic against `body()`. Whether the provider agrees is

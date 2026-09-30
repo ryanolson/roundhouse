@@ -13,7 +13,6 @@ rather than a 2.4 MB YAML read.
 
 Usage:
   spec_sync.py --pin <spec_pin.json> [--workdir DIR]     # normal run
-  spec_sync.py --pinned-sha <sha256> [--workdir DIR]     # pre-M11.0: pin from the evidence doc
   spec_sync.py --diff-only <old.yml> <new.yml>           # offline re-diff
 
 Exit codes: 0 = spec unmoved, 2 = spec moved (diff printed), 1 = error.
@@ -159,9 +158,7 @@ def diff(old: dict, new: dict, prefix=""):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--pin", type=Path, help="spec_pin.json to diff against")
-    ap.add_argument("--pinned-sha", help="pinned body sha256 when no fixture exists yet (pre-M11.0)")
-    ap.add_argument("--pinned-url", help="pinned openapi_spec_url when no fixture exists yet (pre-M11.0)")
+    ap.add_argument("--pin", type=Path, help="spec_pin.json to diff against (required unless --diff-only)")
     ap.add_argument("--workdir", type=Path, default=None)
     ap.add_argument("--diff-only", nargs=2, type=Path, metavar=("OLD_YML", "NEW_YML"))
     args = ap.parse_args()
@@ -172,6 +169,9 @@ def main():
         print("vocabulary diff:")
         sys.exit(2 if diff(old_v, new_v) else 0)
 
+    if not args.pin:
+        sys.exit("error: give --pin crates/roundhouse-fleet/src/anthropic_messages/spec_pin.json")
+
     workdir = args.workdir or Path(tempfile.mkdtemp(prefix="anthropic-spec-sync-"))
     workdir.mkdir(parents=True, exist_ok=True)
     print(f"workdir: {workdir}")
@@ -179,39 +179,22 @@ def main():
     rev, url, _ = discover(workdir)
     print(f"anthropic-sdk-typescript @ {rev}\nopenapi_spec_url: {url}")
 
-    pin = json.loads(args.pin.read_text()) if args.pin else None
-    pinned_body_sha = pin["spec_sha256"] if pin else args.pinned_sha
-    pinned_url = pin.get("spec_url") if pin else args.pinned_url
-    if not pinned_body_sha and not pinned_url:
-        sys.exit("error: give --pin, or --pinned-sha/--pinned-url; the skill says where the pin lives")
-
-    if pinned_url and url == pinned_url:
+    pin = json.loads(args.pin.read_text())
+    if url == pin["spec_url"]:
         print("spec unmoved: .stats.yml still names the pinned URL — record a dated re-verification and stop")
         sys.exit(0)
-    if pinned_url is None:
-        # Body-sha-only pin (pre-M11.0): download and compare our own hash.
-        probe = fetch(url, workdir)
-        got = hashlib.sha256(probe.read_bytes()).hexdigest()
-        if got == pinned_body_sha:
-            print(f"spec unmoved: body sha256 matches pinned {pinned_body_sha[:12]}… — record a dated re-verification and stop")
-            sys.exit(0)
-        spec_path = probe
-    else:
-        spec_path = fetch(url, workdir)
+    spec_path = fetch(url, workdir)
     new_v = extract_vocabulary(load_spec(spec_path))
     (workdir / "vocabulary-current.json").write_text(json.dumps(new_v, indent=2))
     print(f"current vocabulary written: {workdir}/vocabulary-current.json")
 
-    if pin and "vocabulary" in pin:
-        print("vocabulary diff (pinned -> current):")
-        moved = diff(pin["vocabulary"], new_v)
-        if not moved:
-            print("  (URL moved but the pinned vocabulary is unchanged — an additive-elsewhere spec churn; still update the pin's sha/rev/date)")
-    else:
-        print("no pinned vocabulary to diff (pre-M11.0 run) — read vocabulary-current.json against the evidence doc's §3.2")
+    print("vocabulary diff (pinned -> current):")
+    moved = diff(pin["vocabulary"], new_v)
+    if not moved:
+        print("  (URL moved but the pinned vocabulary is unchanged — an additive-elsewhere spec churn; still update the pin's sha/rev/date)")
     print(f"\nnext (skill steps 4-6): update the pin fixture with sha/rev/date/vocabulary, run\n"
           f"  timeout 300 cargo test -p roundhouse-fleet anthropic_messages\n"
-          f"and treat every red pinning test as the worklist; then the dated addendum.")
+          f"and treat every red pinning test as the worklist; then the dated note in docs/src/development/upstream.md.")
     sys.exit(2)
 
 

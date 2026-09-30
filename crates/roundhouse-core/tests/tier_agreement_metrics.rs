@@ -478,7 +478,7 @@ fn agreement_counts_the_served_tier_against_the_jev_tier_for_each_project() {
 ///
 /// Both turns were picked `efficient` and moved by the cost guard onto the
 /// capable model. The first was served there, so a classifier that said
-/// `capable` agrees with it. The second failed over, and under ruling 4 the
+/// `capable` agrees with it. The second failed over, and the
 /// guarded turn's fallback runs through the efficient tier first: the serving
 /// dispatch is the efficient model, so the same answer disagrees. Reading the
 /// pick, the outcome arm, or the first dispatch each gets one of the two wrong.

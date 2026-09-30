@@ -25,11 +25,11 @@
 //!
 //! 1. **The system layer.** `--config` replaces only the *user* layer;
 //!    `/etc/nemo-relay/config.toml` is folded in **after** it and wins on any
-//!    key both name (Relay evidence §2.4). Caught by [`preflight`], which asks
+//!    key both name. Caught by [`preflight`], which asks
 //!    Relay itself what it resolved — with the environment cleared, the rig's
 //!    rule (M11.2b review F7), so what is left resolving is the explicit config
 //!    plus exactly the layer an operator cannot see.
-//! 2. **The environment layer**, which sits *above* `--config` (§2.4). The
+//! 2. **The environment layer**, which sits *above* `--config`. The
 //!    preflight cannot catch this one **because the preflight clears it**, and
 //!    clearing it is right: a probe carrying `NEMO_RELAY_ANTHROPIC_BASE_URL`
 //!    would be checking a resolution the operator's own launch does not have.
@@ -65,7 +65,7 @@
 //! this launcher generated. So on the chained codex path the client presents
 //! Relay's `x-nemo-relay-proxy-token` and **not** the generated
 //! `env_http_headers` turn-key header — which Relay then strips as its own
-//! (Relay evidence §A.13) — and roundhouse sees a credential-less turn, admits
+//! — and roundhouse sees a credential-less turn, admits
 //! it, and degrades to local-only routing with nothing reporting it.
 //!
 //! Stated rather than solved, and stated where an operator reads it
@@ -243,7 +243,7 @@ pub fn plan(
     // which is the one thing the chained runbook does not carry through Relay:
     // Relay proxies the Anthropic route and nothing else, so the `url` in the
     // generated registration reaches roundhouse's `/mcp` without a hop. Stated
-    // rather than proven — the plan's own "left open" — and it is here rather
+    // rather than proven, and it is here rather
     // than absent because a chained launch that silently had no control surface
     // would be the same client as a direct one in every respect an operator can
     // see.

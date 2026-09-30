@@ -44,7 +44,7 @@
 //! sight — which is why this paragraph exists.
 //!
 //! **The auth seam is [`ControlPlane::scope`], and it is the only one.** It
-//! reads the header, applies the plan's error table — missing `Authorization`
+//! reads the header, applies the error table — missing `Authorization`
 //! is `401 missing_key`, a header that is not
 //! `Bearer rh_(turn|admin)_<43 base62 chars>` is `401 malformed_key`, a hash
 //! with no record is `401 unknown_key` — and hands back the [`KeyScope`] the
@@ -270,8 +270,7 @@ pub async fn boot_directory(
 /// device-login stanza the client's `Authorization` belongs to *its* upstream —
 /// it is the ChatGPT bearer codex forwards — so roundhouse's own key has to
 /// arrive somewhere else, and `[model_providers.*.env_http_headers]` is the
-/// mechanism codex offers (stage 0's ruling; PLAN §3). This is the header name
-/// that stanza writes.
+/// mechanism codex offers. This is the header name that stanza writes.
 ///
 /// The name is lowercase because `HeaderMap` lookups are case-insensitive and a
 /// constant that matched only one capitalization would be a rule about how a
@@ -291,7 +290,7 @@ pub const TURN_KEY_HEADER: &str = "x-roundhouse-key";
 ///
 /// **Why a launched client needs any value in that variable.** Claude Code
 /// suppresses a subscription login whenever an `ANTHROPIC_API_KEY` resolves
-/// (`agent-docs/research/claude-code-client-surface.md` §1.3, `VV()`), and that
+/// (the client's `VV()` auth check, read from Claude Code 2.1.42), and that
 /// suppression is what makes a `RoundhouseKey` launch deterministic: with the
 /// variable empty, an ambient login's OAuth token is presented to roundhouse as
 /// though the operator had chosen to forward it. It is the exact analogue of
@@ -1065,7 +1064,7 @@ impl ControlPlane {
     ///
     /// **The header is a necessary condition and not a sufficient one**, and
     /// the difference is a real client's doing rather than a hypothetical's:
-    /// PLAN §3's BYOK stanza sends the same `rh_turn_…` value in `env_key` *and*
+    /// the BYOK stanza sends the same `rh_turn_…` value in `env_key` *and*
     /// in `env_http_headers`, so "the key arrived in the dedicated header" is
     /// true of a request whose `Authorization` is also roundhouse's own key.
     /// The value is therefore checked as well as the header —
@@ -1362,7 +1361,7 @@ pub struct Admission {
     /// routing exactly: the engine never reads the learner store or draws for
     /// such a turn. A session that already has learned history still has its
     /// pending entries delivered, because delivery follows the log and not the
-    /// current mode (draft section 23).
+    /// current mode.
     ///
     /// Behind an `Arc` for the reason `policy` is.
     pub learner: Option<Arc<LearnerTerms>>,
@@ -1787,7 +1786,7 @@ mod tests {
     /// boundary**, which is what lets a `RoundhouseKey` launch set it at all.
     ///
     /// The variable has to hold *something* — an empty one lets an ambient login
-    /// present its OAuth token to roundhouse (§1.3), which is the failure the
+    /// present its OAuth token to roundhouse (v2.1.42), which is the failure the
     /// sentinel exists to close — and a Claude client that resolves it sends the
     /// value on `x-api-key`, a header the Anthropic allowlist row admits as a
     /// credential. So without this rule the value roundhouse itself generated
@@ -1797,7 +1796,7 @@ mod tests {
     ///
     /// Asserted at the *value*, not at "the client would never send both": the
     /// one-capture evidence says a subscription login nulls the API key
-    /// (§1.4, §5.7's header table), so today the two headers do not co-occur
+    /// (v2.1.42 read; 2.1.257 header capture), so today the two headers do not co-occur
     /// from this client — which is precisely the kind of guarantee that belongs
     /// to a client version rather than to roundhouse. Chained through a Relay
     /// makes the pairing reachable without the client changing at all: Relay
@@ -1912,8 +1911,8 @@ mod tests {
     fn roundhouses_own_secret_is_never_the_credential_that_gets_forwarded() {
         let plane = pass_through_plane();
 
-        // PROBE: the pair of headers the *documented* BYOK stanza sends. PLAN
-        // §3 puts the same `rh_turn_…` value in `env_key` and in
+        // PROBE: the pair of headers the *documented* BYOK stanza sends. The BYOK
+        // stanza puts the same `rh_turn_…` value in `env_key` and in
         // `env_http_headers`, so a capture gated only on "the turn key arrived
         // in the dedicated header" takes roundhouse's own turn key off
         // `Authorization` and forwards it to a frontier provider — on the happy

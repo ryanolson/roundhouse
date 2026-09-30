@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! C3 of `PLAN-cache-affinity.md` — the Dynamo residency call becomes a
-//! decision.
+//! The Dynamo residency call becomes a decision.
 //!
 //! `LocalFleet::price` is not a lookup: it is a realtime residency check that
 //! sends this turn's block and sequence hashes to the selector and waits for
@@ -21,8 +20,7 @@
 //! test.
 //!
 //! **When the call is made and fails, the turn fails open within a bound**
-//! (ruled 2026-09-28, ruling 5 in
-//! `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`). A fleet
+//! (ruled 2026-09-28; see `docs/src/concepts/routing.md`). A fleet
 //! error, or no answer inside `fleet_quote_deadline_ms`, drops the local
 //! candidate and the turn routes among its hosted targets, recording why. A
 //! turn with no admitted hosted target still fails, so a local-only session

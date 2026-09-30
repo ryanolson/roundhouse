@@ -264,7 +264,7 @@ fn the_session_key_this_surface_mints_folds_under_the_messages_dialect() {
 
 /// **The header wins, then either `user_id` shape, then the whole string.**
 ///
-/// One test for the whole order because the order *is* the ruling, and the
+/// One test for the whole order because the order *is* the rule, and the
 /// interesting failures are precedence failures: a reader that prefers
 /// `user_id` binds a subagent's turns to its parent's session, and a reader
 /// that handles only one `user_id` shape re-keys every session the day a

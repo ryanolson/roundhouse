@@ -57,7 +57,7 @@
 //!   summary. The description is the entire selection surface: the model
 //!   decides from that one line whether to open the `SKILL.md` at all.
 //!
-//! The ruling's intent survives the correction unchanged — emit plugin-surface
+//! The original intent survives the correction unchanged — emit plugin-surface
 //! files whose text sends the model to the MCP tools, with the tool names
 //! derived from the descriptors rather than retyped. Only the directory was
 //! wrong. `codex_e2e.rs`'s

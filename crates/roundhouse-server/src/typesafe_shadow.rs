@@ -252,9 +252,9 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
     /// holds for the judge. The three taxonomy axes describe the turn and leave
     /// the mapping to code. The tier question ([`TierChoice`]) asks which tier
     /// of *work* the turn is, `capable` or `efficient`, with a rubric that
-    /// describes kinds of work: the 2026-09-17 ruling, section 2, allowed
-    /// exactly that question. Its answer is compared with the served tier on
-    /// the metrics document and never routes a turn or rewards one.
+    /// describes kinds of work and names no model or price. Its answer is
+    /// compared with the served tier on the metrics document and never routes a
+    /// turn or rewards one.
     ///
     /// Built from the axis definitions rather than written out, so a new option
     /// is added in one place and the request, the parser and the durable record
@@ -869,7 +869,7 @@ enum SettleFailure {
 /// billed — a reset after the write, an answer too slow or too large to read,
 /// an envelope this deployment could not parse — then vanished from the
 /// evaluation budget, which is the direction that makes the evaluation arm
-/// look cheaper than it is (2026-09-28 ruling 3). The grant is the estimate
+/// look cheaper than it is. The grant is the estimate
 /// because it is what the ledger already held against the quote for these
 /// exact bytes; re-pricing here would be a second quote of the same call.
 ///

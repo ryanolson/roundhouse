@@ -407,8 +407,7 @@ impl<S: SessionStore> Rig<S> {
 /// `#g1` holding what the pre-restart process had already forked to — and
 /// a node whose counter re-derives generation zero from nothing. A claim
 /// that disagrees with generation zero and equals `#g1` (plus one
-/// genuinely new turn) must land on `#g1` with only that turn appended:
-/// the D1 inventory's §6(a), verified.
+/// genuinely new turn) must land on `#g1` with only that turn appended.
 #[tokio::test]
 async fn a_restart_lands_on_the_generation_the_store_already_holds() {
     let rig = Rig::new("acme/ada/restart");

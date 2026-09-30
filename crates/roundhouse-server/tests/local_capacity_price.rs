@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! A configured price for local capacity (ruled 2026-09-28, ruling 6 in
-//! `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`).
+//! A configured price for local capacity (ruled 2026-09-28; see
+//! `docs/src/concepts/routing.md`).
 //!
 //! Until this change a local candidate quoted zero dollars on every turn, so
 //! local won every cost comparison against a hosted target and the router gave

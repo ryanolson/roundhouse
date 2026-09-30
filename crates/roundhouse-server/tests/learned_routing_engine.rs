@@ -1,20 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The online routing learner through `Engine::run_turn` (milestone M8 of
-//! `agent-docs/PLAN-online-routing-learner.md`).
+//! The online routing learner through `Engine::run_turn` (design in
+//! `docs/src/concepts/routing-learner.md`).
 //!
 //! The policy is proven pure one crate down (`learned_policy_examples.rs`
-//! runs every row of draft 7.8 against `LearnedPolicy::choose`). What only an
+//! runs every worked-example row against `LearnedPolicy::choose`). What only an
 //! engine can prove is the join: that `plan` reads the store for the key the
 //! decision records, computes the draw from the session and the response,
 //! reaches the policy only for `shadow` and `live`, maps a refusal to a failed
 //! turn, and that the `run_turn` tail delivers what the log owes the store,
 //! exactly once, through reopen, replay, failures and a successor.
 //!
-//! Rows 1 to 4 of draft 7.8 put evidence into keys where `rules` picks
+//! Rows 1 to 4 of the learned policy's worked examples put evidence into keys where `rules` picks
 //! capable. Serving cannot produce that state without exploration, so the
-//! tests write it into the store directly, as the draft says.
+//! tests write it into the store directly.
 
 #[allow(dead_code)]
 #[path = "learned_routing_engine/rig.rs"]
@@ -120,8 +120,8 @@ async fn row_1_a_proven_cheap_strategy_serves_its_own_target() {
     );
 }
 
-/// A learned route fails over to the passing plans' first targets (draft
-/// 7.6): `small` is down, so the turn falls to `large`, both dispatches carry
+/// A learned route fails over to the passing plans' first targets:
+/// `small` is down, so the turn falls to `large`, both dispatches carry
 /// the one learned selection, the metrics count one decision, and the turn's
 /// operational rows count one failover on `small`.
 #[tokio::test]
@@ -555,7 +555,7 @@ async fn row_8_without_exploration_serving_produced_state_serves_the_rules_route
 
 /// The exploration row. A live project that explores, on a reviewed session,
 /// with `efficient` unproven and cheaper than the exploit target: the set is
-/// `efficient`, then `rules` (the 2026-09-30 ruling), and the turn serves the
+/// `efficient`, then `rules`, and the turn serves the
 /// member its draw names. The record's draw is the one the salt, the session
 /// and the recorded response give, and its propensity is the policy's own.
 ///

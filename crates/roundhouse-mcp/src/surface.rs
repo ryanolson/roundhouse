@@ -82,7 +82,7 @@ impl Caller {
     /// (M12.1 review, F5). The builder existed to stop two adjacent
     /// `Option<String>` parameters being transposed — the correlators are
     /// weighed in a fixed order, so a swap at the door would compile and
-    /// silently invert the ruling — and a struct with named fields makes that
+    /// silently invert the order — and a struct with named fields makes that
     /// swap unspellable for the same reason, without a second vocabulary for
     /// one pair of strings.
     pub fn correlated(principal: Principal, correlators: Correlators) -> Self {
@@ -435,7 +435,7 @@ pub struct OverlayResponse {
 /// `(principal, session)`, and returned in a form a client will keep. Nothing
 /// in the deployment *reads* it back — `mcp_api::resolve_session` answers from
 /// the client's conversation name and from the node's conversation table, and
-/// never from a binding. The read side is M7's, per the plan's §3. Both this
+/// never from a binding. The read side is later work. Both this
 /// type's [`Self::note`] and the tool description are written to match: they
 /// ask the client to keep the token and say what keeping it makes possible,
 /// and neither claims a correlation is being performed on this turn.

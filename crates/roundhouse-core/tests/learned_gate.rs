@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The quality gate, `wilson-v1` (draft section 7.4, plan section 4).
+//! The quality gate, `wilson-v1`.
 //!
 //! Three claims. The bounds are the Wilson score interval over credit units
 //! scaled to intervals. The gate reads the most specific level whose live

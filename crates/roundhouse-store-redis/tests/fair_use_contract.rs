@@ -629,7 +629,7 @@ async fn f8_a_draw_a_bucket_ahead_of_the_check_clock_is_reached_by_the_retry_wal
 /// the permissive direction, with a one-millisecond backwards step across a
 /// boundary enough to reach it.
 ///
-/// The ruling (R-F9) put the clock in the specification rather than making
+/// The rule put the clock in the specification rather than making
 /// the decay reversible: each scope's clock is the high-water mark of every
 /// time handed to it, in *both* ledgers, so the second check below is
 /// evaluated at the first check's `now_ms` and the two agree on `None`. The

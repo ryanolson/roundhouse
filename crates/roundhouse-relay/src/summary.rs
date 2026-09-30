@@ -48,8 +48,8 @@
 //!
 //! Relay's own producer writes `Complete` if and only if `limitations` is empty,
 //! and a summary claiming `Complete` while listing a limitation would be
-//! incoherent, so this one does the same. Two consequences the ruling states
-//! rather than discovers:
+//! incoherent, so this one does the same. Two consequences that were decided
+//! rather than discovered:
 //!
 //! - a turn whose correlary is [`Correlary::Unpriced`] publishes as `Partial`,
 //!   carrying `roundhouse_correlary_unpriced:<reason>`;
@@ -409,10 +409,10 @@ fn limitations(turn: &TurnRecord, baseline: &Baseline<'_>) -> Vec<String> {
     if turn.usage.accounting == Accounting::Estimated {
         limitations.push("roundhouse_usage_estimated".to_string());
     }
-    // On every turn that sought a counterfactual, priced or not: the round-2
-    // ruling asks that a gated number never sit indistinguishable beside an
-    // ungated one, and a reader cannot tell the difference from a band that is
-    // only published when the gate refused.
+    // On every turn that sought a counterfactual, priced or not: a gated number
+    // must never sit indistinguishable beside an ungated one, and a reader
+    // cannot tell the difference from a band that is only published when the
+    // gate refused.
     //
     // The band is rendered by `f64`'s own shortest round-trip form, which is
     // safe to grep because of where it comes from: `capability_band` is a JSON
@@ -427,7 +427,7 @@ fn limitations(turn: &TurnRecord, baseline: &Baseline<'_>) -> Vec<String> {
             baseline.capability_band
         ));
     }
-    // Not in the ruling's three either, and for the seat's reason below: an
+    // Not one of the three above either, and for the seat's reason below: an
     // unpriced local turn publishes no `actual_cost`, because unpriced capacity
     // is unknown, not free. Without a name for that gap the only limitation on
     // it would be the capability gate, which every local turn carries priced
@@ -441,7 +441,7 @@ fn limitations(turn: &TurnRecord, baseline: &Baseline<'_>) -> Vec<String> {
         {
             limitations.push("roundhouse_local_capacity_unpriced".to_string());
         }
-        // Not in the ruling's three, and added because omitting it would make
+        // Not one of the three above, and added because omitting it would make
         // the status field lie: a forwarded seat publishes no cost of any
         // kind, and a summary with no money in it and `status: Complete`
         // claims every requested calculation was available.

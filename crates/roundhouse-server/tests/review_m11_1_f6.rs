@@ -31,11 +31,11 @@
 //! The subagent half is pinned here as a *server-side* property: given the
 //! header, the two agents get two sessions. Whether the shipping client sends
 //! it on a Task-tool request is a claim about upstream behaviour this crate
-//! cannot settle -- `claude-code-client-surface.md` sources the subagent path
-//! only from a v2.1.42 static read (§4.3), and both live captures (§5.5, §5.6)
-//! were single-agent. What is inside roundhouse's control is that the name is
-//! *ready* for it, and that a deployment whose clients never send the header
-//! sees exactly the names it saw before.
+//! cannot settle -- the subagent path is known only from a v2.1.42 static read,
+//! and the live captures (2.1.247, 2.1.251) were single-agent. What is inside
+//! roundhouse's control is that the name is *ready* for it, and that a
+//! deployment whose clients never send the header sees exactly the names it saw
+//! before.
 
 use std::sync::Arc;
 
@@ -431,7 +431,7 @@ async fn f6_alternating_dialects_under_one_name_are_two_conversations() {
 /// **A Task-tool subagent gets a sibling session, not its parent's log.**
 ///
 /// The other half of F6. A subagent runs inside the parent's process and the
-/// client-surface read has it inheriting the parent's session id, so without a
+/// v2.1.42 static read has it inheriting the parent's session id, so without a
 /// second dimension the two interleave their turns on one log -- and since
 /// neither one's resent history contains the other's items, every alternating
 /// turn diverges and forks, exactly as the cross-dialect collision above did.

@@ -56,13 +56,11 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # emits one; the day something does, 0.7.3 cannot express it at all and this
 # line moves to `=0.8.0` -- final, published 2026-08-26 [dated correction
 # 2026-08-27: an earlier version of this comment said 0.8.0 final "is not out
-# yet"]. The 2026-08-27 re-read (research/nemo-relay-0.8.0-published-read.md
-# §5) verified every item this crate imports is byte-identical at 0.8.0 and
+# yet"]. The 2026-08-27 re-read of the published 0.8.0 verified every item this crate imports is byte-identical at 0.8.0 and
 # that 0.8.0 still pins `uuid = "=1.18.1"`, so the move stays zero-cost, the
 # ceiling stays, and the trigger above is unchanged.
 #
-# [2026-09-01: the M11.2b re-read (research/nemo-relay-0.8.0-published-read.md
-# Addendum 2026-09-01) covered 0.8.2, the release the Chained e2e suite ran
+# [2026-09-01: a re-read covered 0.8.2, the release the Chained e2e suite ran
 # against. `nemo-relay-types` at 0.8.2 is byte-identical to 0.8.0 -- still
 # `uuid = "=1.18.1"` -- so the ceiling and the unlock condition above are
 # unchanged; this line stays `=0.7.3` on zero new evidence to move it.]

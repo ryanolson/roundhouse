@@ -84,7 +84,7 @@ pub const DEFAULT_API_BASE: &str = "https://api.anthropic.com";
 /// difference from the Responses client: a ChatGPT device login addresses
 /// `chatgpt.com/backend-api/codex` rather than the platform API, whereas Claude
 /// Code's OAuth bearer goes to `api.anthropic.com` exactly as an API key does
-/// (`research/claude-code-client-surface.md` §1.3). The two bases stay separate
+/// (read from Claude Code 2.1.42). The two bases stay separate
 /// *fields* anyway, because a deployment that fronts a seat through a gateway
 /// and its own key through another still needs to say so — and because a
 /// forwarded credential must not be able to inherit a base URL that was
@@ -126,11 +126,10 @@ const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-api-key");
 /// endpoint authenticates a key on [`API_KEY_HEADER`] and answers a bearer with
 /// a 401 whose message does not say why. OpenRouter's GA `/messages` route
 /// speaks the same dialect and authenticates only on `Authorization: Bearer` —
-/// probed live, an `x-api-key` there answers `"Missing Authentication header"`
-/// (`research/openrouter-api-surface.md`). So a client that hardcoded either
-/// spelling makes the other provider unreachable, which is what R3 asked for
-/// when it named OpenRouter's route the second `anthropic_messages`-speaking
-/// provider.
+/// probed live, an `x-api-key` there answers `"Missing Authentication header"`.
+/// So a client that hardcoded either spelling makes the other provider
+/// unreachable, which matters because OpenRouter's route is the second
+/// `anthropic_messages`-speaking provider.
 ///
 /// **Configuration resolved at boot, never a host sniff at dispatch.** The
 /// alternative — matching on the base URL, or on the provider name, inside
@@ -1027,7 +1026,7 @@ mod tests {
 
     /// **The outbound body names only properties the schema has**, because
     /// `CreateMessageParams` carries `additionalProperties: false` — the one
-    /// place this API is strict (evidence doc §3). An extra top-level field is
+    /// place this API is strict. An extra top-level field is
     /// not ignored here the way it is on the Responses wire; it is a 400 on
     /// every turn.
     ///
@@ -1423,14 +1422,14 @@ mod tests {
         );
     }
 
-    /// F4 (thermo-nuclear review of d0821f9, **valid**): R3 names OpenRouter's
+    /// F4 (thermo-nuclear review of d0821f9, **valid**): the design names OpenRouter's
     /// GA `/messages` route as the second `anthropic_messages`-speaking
-    /// provider, "stored-key only" (`PLAN-anthropic-messages.md:166-169`), and
+    /// provider, "stored-key only", and
     /// `route()`'s `Stored` arm used to insert `API_KEY_HEADER` unconditionally
     /// for every provider name — while OpenRouter's `/messages` route
     /// authenticates only on `Authorization: Bearer`, never `x-api-key`
-    /// (`research/openrouter-api-surface.md:528`: probed live, `x-api-key:` +
-    /// `anthropic-version:` -> `"Missing Authentication header"`). So that
+    /// (probed live: `x-api-key:` + `anthropic-version:` ->
+    /// `"Missing Authentication header"`). So that
     /// provider could not authenticate at all.
     ///
     /// **The remedy is configuration, not a host sniff**, which is why this

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The calibration artifact a project's learner starts from, and the epoch id
-//! it names (draft sections 6 and 14.5).
+//! it names.
 //!
 //! **Parsed here, read from disk by the caller.** The server's configuration
 //! loader reads the file and hands the bytes over; the offline calibrator
@@ -11,8 +11,8 @@
 //!
 //! **The epoch hashes the artifact's bytes, not its parsed value.** Two
 //! artifacts that parse to the same prior but differ by a byte are two
-//! epochs. The calibrator writes byte-identical output for identical input
-//! (draft 14.5), so an unchanged calibration keeps its epoch, and any edit,
+//! epochs. The calibrator writes byte-identical output for identical input,
+//! so an unchanged calibration keeps its epoch, and any edit,
 //! even whitespace, starts a new one rather than silently reusing counters
 //! learned under the old file.
 
@@ -224,7 +224,7 @@ impl Artifact {
 
 /// The epoch id: SHA-256 over the SHA-256 of the artifact bytes, the ordered
 /// strategy list and the four revisions an artifact names, truncated to 16
-/// bytes (draft section 6).
+/// bytes.
 ///
 /// `rules` is versioned by [`STAGE_SELECTOR_REVISION`], and a change to the
 /// stage router's pick changes what a `rules` plan is, so that revision is

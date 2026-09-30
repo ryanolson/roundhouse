@@ -42,13 +42,10 @@
 //!   per-deployment rename; the control plane refuses a config that asks for
 //!   one.
 //!
-//! The history behind that — R-M0's reading of codex at pin `6344a65`, why the
+//! The history behind that — the reading of codex at pin `6344a65`, why the
 //! original "neutral stored name rendered outward" paragraph was half right,
-//! and what the bare-name recognizer costs — is in
-//! `agent-docs/PLAN-anthropic-messages.md`, addendum "M12 — the MCP control
-//! surface for Claude Code" and its "What the implementation settled" section.
-//! It is recorded there rather than here because that is where dated addenda
-//! belong; this module states the code as it is.
+//! and what the bare-name recognizer costs — is in git history rather than
+//! here; this module states the code as it is.
 
 /// The namespace this deployment serves under, and the name a client's MCP
 /// registration has to use.
@@ -70,8 +67,8 @@ pub const DEFAULT_MCP_NAMESPACE: &str = roundhouse_core::validate::CONTROL_TOOL_
 ///
 /// A fact about the *clients*, and about both of them: codex builds a
 /// `mcp__{server}` namespace object and Claude Code builds a flat
-/// `mcp__{server}__{tool}` name (`research/claude-code-client-surface.md`
-/// §5.8). Here rather than in either launcher because the two generators would
+/// `mcp__{server}__{tool}` name (seen on the wire from Claude Code 2.1.257).
+/// Here rather than in either launcher because the two generators would
 /// otherwise each carry a copy, and the thing they derive from it — the server
 /// name a registration must use — has to be one answer or the namespace stops
 /// being one.
@@ -250,10 +247,8 @@ mod tests {
     /// It landed red at 139 `//!` lines — an original paragraph marked half
     /// right, a replay paragraph kept while saying it described a rendering
     /// that does not happen, a "Superseded in part" aside, and two dated
-    /// addenda — and came live when the history moved to
-    /// `agent-docs/PLAN-anthropic-messages.md`, which is where CLAUDE.md
-    /// assigns dated addenda and which already carried this same R-M0
-    /// archaeology with the codex `6344a65` citations.
+    /// addenda — and came live when the history moved out of the module and
+    /// into git history, codex `6344a65` citations included.
     ///
     /// A budget rather than an exact count, and set well above the contract's
     /// own length: the failure being guarded against is the doc growing back
@@ -266,9 +261,8 @@ mod tests {
             .count();
         assert!(
             doc_lines <= 60,
-            "module doc is {doc_lines} `//!` lines; CLAUDE.md assigns dated \
-             addenda to agent-docs and says module docs describe the code as \
-             it is, not the addenda that got it there"
+            "module doc is {doc_lines} `//!` lines; module docs describe the \
+             code as it is, and the history that got it there belongs in git"
         );
     }
 }

@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M5 of `PLAN-agentic-control-plane.md`: the roundhouse MCP surface, wired
-//! into a running deployment.
+//! The roundhouse MCP surface, wired into a running deployment.
 //!
 //! `roundhouse-mcp`'s own suite proves the tools against the [`ControlReads`]
 //! seam with no engine and no socket. What it cannot prove is the half this
@@ -958,8 +957,8 @@ async fn a_get_on_the_mcp_endpoint_is_405() {
     assert_eq!(
         response.status(),
         StatusCode::METHOD_NOT_ALLOWED,
-        "this deployment offers no stream — §1 of the plan established that \
-         nothing we could push would reach the model — and the specification \
+        "this deployment offers no stream — nothing we could push would reach the \
+         model — and the specification \
          permits a server that offers none to refuse the GET"
     );
 
@@ -1122,7 +1121,7 @@ async fn an_overlay_set_by_the_agent_changes_the_next_turns_policy_digest() {
 
 #[tokio::test]
 async fn an_overlay_cannot_widen_what_the_key_may_do() {
-    // The plan's own example: `prefer frontier` on a local-only project. The
+    // The motivating example: `prefer frontier` on a local-only project. The
     // ask cannot be honored — this key may reach nothing hosted — and the rule
     // is that it is *reported*, never applied and never refused. Applying it
     // would empty the admissible set and fail every remaining turn of the
@@ -2371,7 +2370,7 @@ async fn a_codex_call_falls_back_to_the_cache_key_its_turn_metadata_carries() {
 /// R-M7's refusal, over the real adapter: the model named one conversation and
 /// the client correlated the call to another.
 ///
-/// Both correlators are exercised, because the ruling is about a caller
+/// Both correlators are exercised, because the refusal is about a caller
 /// contradicting itself and not about one `_meta` key. The two conversations
 /// both exist and both belong to this caller, so neither half is refused by the
 /// foreign-name door — the refusal can only be the contradiction.

@@ -160,10 +160,10 @@ use roundhouse_core::ids::SessionId;
 
 /// How many keys this node's generation memo holds at once.
 ///
-/// **A cache's cap, not the correlation store's staleness bound** (M14.2,
-/// R-S2), and the distinction is the whole of the ruling: [`CorrelationMaps`]'
-/// call and thread bindings age out because a *wrong* answer there is served
-/// to an agent with a 200 on it, where a wrong entry here is never served —
+/// **A cache's cap, not the correlation store's staleness bound**, and the distinction is the
+/// whole of the point: [`CorrelationMaps`]' call and thread bindings age out
+/// because a *wrong* answer there is served to an agent with a 200 on it, where
+/// a wrong entry here is never served —
 /// [`Conversations::generation`] hands the memo out only as a hint a probe
 /// starts from and corrects, never as an answer a caller trusts unchecked
 /// (see the module doc's "no reader is cached" section). So an entry going

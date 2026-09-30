@@ -2564,10 +2564,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         //
         // **One grant and one settle, however many attempts — but one `Routed`
         // per attempt.** The grant was opened above, before `choose`, and
-        // nothing in this loop reopens it: a failover is a second attempt at the
-        // *same* turn, so a second grant would let a flaky provider pyramid
+        // nothing in this loop reopens it: a failover is a second attempt at
+        // the *same* turn, so a second grant would let a flaky provider pyramid
         // holds until the ledger refused a turn nobody had spent anything on.
-        // That is risk 3 in the plan, and this is the line that answers it.
+        // That is the hazard a per-turn grant exists to prevent, and this is
+        // the line that answers it.
         //
         // **Every dispatch is recorded before its request goes out**, which is
         // why `record_routing` is inside this loop and not after it. That is the
@@ -3230,8 +3231,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// Ask the fleet what it holds for this turn, failing open within a bound
     /// when the turn has a hosted target to go to instead.
     ///
-    /// **C3, ruled 2026-09-28 (ruling 5 in
-    /// `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`).** The
+    /// **Ruled 2026-09-28 (see `docs/src/concepts/routing.md`).** The
     /// residency call is an HTTP round trip on the path to first token. A
     /// fleet error used to fail the turn, and a silent fleet held it for the
     /// whole turn deadline, even when a hosted target was admitted and the

@@ -689,8 +689,8 @@ pub fn xdg(root: &Path, what: &str) -> PathBuf {
 /// of the closure tests. `topham`'s own suite proves the round trip — that what
 /// `save` writes is what `load` reads — which is a claim about two functions
 /// agreeing with each other. What no test in that crate can make is the claim
-/// these files need: that the file *an operator types*, from the vocabulary the
-/// README documents, resolves into a launch a real client hooks up with. A
+/// these files need: that the file *an operator types*, from the vocabulary
+/// `docs/src/guides/topham.md` documents, resolves into a launch a real client hooks up with. A
 /// fixture built by the serializer would agree with a renamed field on both
 /// sides and say nothing.
 ///

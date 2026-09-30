@@ -269,8 +269,7 @@ impl ProviderPricing {
 /// A configured per-million-token price for our own fleet's capacity.
 ///
 /// **Approximate on purpose, and never below the truth by design.** Ruled
-/// 2026-09-28 (ruling 6 in
-/// `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`): a local
+/// 2026-09-28 (see `docs/src/concepts/routing.md`): a local
 /// quote of zero dollars wins every cost comparison and gives no signal of
 /// cost effectiveness, so a deployment may state what its GPU time is worth
 /// per token and have the router and the dashboard both use it. Absent, local
@@ -307,7 +306,7 @@ impl LocalCapacityPrice {
     ///
     /// A serving plane that reports no cache reads leaves every prompt token
     /// uncached, so this then charges the whole prompt. That errs towards
-    /// more cost, which is the direction the ruling allows.
+    /// more cost, which is the conservative direction.
     pub fn price(&self, usage: &Usage) -> f64 {
         self.price_tokens(
             usage.uncached_input_tokens() as f64,

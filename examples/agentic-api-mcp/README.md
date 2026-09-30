@@ -125,12 +125,11 @@ log to read. The gateway renders the refusal as an `mcp_call` with
 Also worth being plain about:
 
 * **The client is a `curl` script**, not a coding agent. Codex cannot produce
-  this request: its `ToolSpec` has no `mcp` arm (codex `6344a65`, carried from
-  the round-3 dive — see `agent-docs/research/agentic-api-mcp-compat.md`), which
-  is why row B is unreachable through codex and row C needs a non-codex client.
+  this request: its `ToolSpec` has no `mcp` arm (codex `6344a65`; see
+  `docs/src/guides/examples.md`), which is why row B is unreachable through codex and row C needs a non-codex client.
 * **The "model" is a fixture** that always calls the tool. Nothing here is
   evidence that a real model would choose to.
-* **`read_only` is reported as `false` for `status`.** agentic-api derives it
-  from the tool's `read_only_hint` annotation and defaults to `false` when there
-  is none (`tool/mcp/handler.rs:248-262` @ `e35fbb2`); this branch publishes no
-  annotations. Downstream of M9, which does, the same run reports `true`.
+* **`read_only` follows the tool's annotation.** agentic-api derives it from
+  `read_only_hint` and defaults to `false` when there is none
+  (`tool/mcp/handler.rs:248-262` @ `e35fbb2`). Roundhouse publishes the hint
+  (`crates/roundhouse-mcp/src/tools.rs`), so `status` reports `true`.

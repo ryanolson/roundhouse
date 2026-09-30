@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M1 of `PLAN-agentic-control-plane.md`: identity in the log, attribution in
-//! the fold, and the gate in front of both.
+//! Identity in the log, attribution in the fold, and the gate in front of both.
 //!
 //! Every test here drives a real router. The claims are about what a *second*
 //! tenant can see and be charged for, and none of them can be made against a

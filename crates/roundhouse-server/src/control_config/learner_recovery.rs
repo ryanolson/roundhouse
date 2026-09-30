@@ -3,8 +3,7 @@
 
 //! The deployment's `learner_recovery` block: how often the recovery task
 //! sweeps, how much one sweep does, and how long each of its calls may take
-//! (draft section 12.1, milestone M9 of
-//! `agent-docs/PLAN-online-routing-learner.md`).
+//! (design in `docs/src/concepts/routing-learner.md`).
 //!
 //! **Required once any project enables the learner, and never defaulted.**
 //! The task is what delivers a session that went idle with entries owed, so a

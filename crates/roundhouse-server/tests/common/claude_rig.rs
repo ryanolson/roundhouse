@@ -102,10 +102,9 @@ pub const VERIFIED_VERSION: &str = "2.1.257";
 ///
 /// Longer than [`CHILD_DEADLINE`] because the chain is three processes rather
 /// than two: Relay resolves its configuration, binds an ephemeral loopback
-/// gateway, runs `claude --version` for its own minimum-version gate
-/// (Relay evidence §A.7), writes a temporary plugin
-/// directory and a synthesized `--settings` document, and only then spawns the
-/// client this suite is actually about.
+/// gateway, runs `claude --version` for its own minimum-version gate, writes a
+/// temporary plugin directory and a synthesized `--settings` document, and only
+/// then spawns the client this suite is actually about.
 pub const CHAINED_DEADLINE: Duration = Duration::from_secs(180);
 
 /// The environment variable that names the Relay binary the chained tests drive.
@@ -114,10 +113,9 @@ pub const RELAY_BIN_VAR: &str = "ROUNDHOUSE_TEST_RELAY_BIN";
 /// The Relay release the chained assertions were written against.
 ///
 /// Compared against the last whitespace-delimited token of
-/// `nemo-relay --version`, which at this line prints `nemo-relay 0.8.2`. The
-/// evidence the chained tests rest on is
-/// `agent-docs/research/nemo-relay-0.8.0-published-read.md`'s 2026-09-01
-/// addendum, which re-derived every hazard below against exactly this tarball.
+/// `nemo-relay --version`, which at this line prints `nemo-relay 0.8.2`. Every
+/// hazard the chained tests rest on was re-derived against exactly this
+/// tarball on 2026-09-01.
 pub const VERIFIED_RELAY_VERSION: &str = "0.8.2";
 
 // ---------------------------------------------------------------------------
@@ -405,10 +403,10 @@ impl Rig {
     /// claude` (R-D, R-D′).
     ///
     /// **The client's environment is the same [`ClaudeEnv`] the Direct tests
-    /// use, and that is the ruling this constructor exists to instantiate.**
+    /// use, and that is the rule this constructor exists to instantiate.**
     /// Relay overwrites `ANTHROPIC_BASE_URL` with its own gateway and *merges*
     /// its proxy token into `ANTHROPIC_CUSTOM_HEADERS` rather than replacing the
-    /// block (Relay evidence §A.7 — `replace_custom_header`
+    /// block (`replace_custom_header`
     /// drops only a line whose name matches), so the turn key survives the hop
     /// on [`TURN_KEY_HEADER`] and a chained turn keeps exactly Direct's
     /// semantics. One generator, two topologies.
@@ -417,12 +415,11 @@ impl Rig {
     /// ruling:
     ///
     /// - `[upstream] anthropic_base_url` is this deployment's **root**. Relay
-    ///   concatenates the inbound `path_and_query` onto it whole
-    ///   (Relay evidence §A.4), so a value carrying `/v1` would send
-    ///   `/v1/v1/messages`.
+    ///   concatenates the inbound `path_and_query` onto it whole,
+    ///   so a value carrying `/v1` would send `/v1/v1/messages`.
     /// - **No `anthropic_auth_header`.** Relay injects one only when the inbound
     ///   request carries none of `authorization` / `x-api-key` / `api-key` /
-    ///   `anthropic-api-key` (Relay evidence §2.3, the `already_authed`
+    ///   `anthropic-api-key` (the `already_authed`
     ///   short circuit), and a client launched with [`ClaudeAuthKind::RoundhouseKey`]
     ///   always carries the sentinel on `x-api-key`. Configuring one here would
     ///   therefore be dead configuration that silently becomes live the day the
@@ -434,7 +431,7 @@ impl Rig {
     ///
     /// The bind address is deliberately **not** configured: `run` picks an
     /// ephemeral loopback port, and 0.8.2 refuses a non-loopback bind outright
-    /// (Relay evidence §A.10.1, new at this release), so naming one here could
+    /// (new at this release), so naming one here could
     /// only make the run fail in a way the evidence already predicts.
     ///
     /// **Constructed chained, never mutated into it** (M11.2b review F2). This
@@ -675,7 +672,7 @@ impl Rig {
     /// **The preflight is M11.2b review F8, and it exists because the layering
     /// cannot be excluded.** `--config` replaces the *user* layer only; Relay
     /// then folds `/etc/nemo-relay/config.toml` in after it, and a leaf that
-    /// appears in both wins from the system file (Relay evidence §2.4). The
+    /// appears in both wins from the system file. The
     /// switch that would turn that off, `skip_implicit_config`, is behind a
     /// test-only cargo feature and is not in the published binary. So an
     /// operator box with a system Relay install could re-aim a chained turn —
@@ -745,7 +742,7 @@ impl Rig {
     /// Filtered on the JSON-RPC method and not on the path: the client reaches
     /// `/mcp` four times before it dispatches anything — `initialize`,
     /// `notifications/initialized`, the optional `GET` stream this deployment
-    /// answers `405`, and `tools/list` (§5.8) — so a count of requests to the
+    /// answers `405`, and `tools/list` (2.1.257) — so a count of requests to the
     /// path would be a claim about a client's startup sequence rather than
     /// about its tool loop.
     pub fn control_calls(&self) -> Vec<Exchange> {
@@ -1119,7 +1116,7 @@ pub fn build_child_command(
     // inherited. `CLAUDE_CODE_REMOTE=true` — the ambient value inside the
     // container this repository's own sessions run in — makes the client present
     // that container's managed OAuth token to whatever `ANTHROPIC_BASE_URL`
-    // names (§5.7), which here is a socket that records every header. The
+    // names (2.1.257 capture), which here is a socket that records every header. The
     // allowlist below is the one
     // `the_childs_environment_is_the_generated_map_plus_the_isolation_vars`
     // checks against; change one without the other and that test goes red.
@@ -1156,10 +1153,10 @@ pub fn build_child_command(
 /// The client's own argv, identical on both topologies.
 ///
 /// The point of the split: under Chained this vector is handed to Relay after a
-/// `--` and Relay splices its own `--plugin-dir` and `--settings` into it
-/// (Relay evidence §A.7), so what the client is *asked* to
-/// do is by construction the same thing on both paths and any difference in
-/// outcome is Relay's doing rather than the harness's.
+/// `--` and Relay splices its own `--plugin-dir` and `--settings` into it, so
+/// what the client is *asked* to do is by construction the same thing on both
+/// paths and any difference in outcome is Relay's doing rather than the
+/// harness's.
 pub fn claude_argv(prompt: &str, extra: &[&str], resume: bool) -> Vec<String> {
     let mut argv: Vec<String> = Vec::new();
     if resume {
@@ -1168,7 +1165,7 @@ pub fn claude_argv(prompt: &str, extra: &[&str], resume: bool) -> Vec<String> {
         argv.push("--continue".into());
     }
     // `-p` is what makes this non-interactive, and non-interactive is what makes
-    // the sentinel deterministic: §1.3's documented behaviour is that a resolved
+    // the sentinel deterministic: the documented behaviour (v2.1.42) is that a resolved
     // API key is used without asking in print mode, and merely *offered* to
     // override a subscription in interactive mode.
     argv.extend(["-p", "--output-format", "json"].map(String::from));

@@ -16,7 +16,7 @@
 //! A zero-dollar release must never trigger that same withhold at all, and
 //! the shape above does not test that either. A zero-dollar release is what
 //! a call the service refused with an error status submits; a call that may
-//! have been billed books its estimate instead (2026-09-28 ruling 3), so the
+//! have been billed books its estimate instead, so the
 //! zero-dollar fixtures here answer 529 rather than hang.
 //! [`settlement_repair::SettleOnceFailingLedger`] leaves that release
 //! unconfirmed the same way it does any other first settle.

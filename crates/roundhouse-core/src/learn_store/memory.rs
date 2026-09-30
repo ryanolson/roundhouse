@@ -3,7 +3,7 @@
 
 //! The in-process [`LearnerStore`]: one lock over every project's counters.
 //!
-//! **The layout mirrors the Redis layout of draft section 11.4**, one map per
+//! **The layout mirrors the Redis layout**, one map per
 //! key family, so the Redis backend's apply script (`roundhouse-store-redis`'s
 //! `learn::scripts`) is a translation of `stage` and `Staged::commit` rather
 //! than a second design:
@@ -69,7 +69,7 @@ struct StrategyCell {
 }
 
 /// The operations key: per-target rows, and the project's overhead sum under
-/// `turn:pre_sum` and `turn:pre_n` (plan section 4).
+/// `turn:pre_sum` and `turn:pre_n`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OpsHash {
     targets: HashMap<String, TargetCell>,
@@ -292,7 +292,7 @@ struct Staged {
     seen: HashMap<EpochId, BTreeSet<(LevelKey, Strategy)>>,
 }
 
-/// The check phase of draft section 11.2, over one project's state.
+/// The check phase, over one project's state.
 ///
 /// Each entry is compared with the watermark as the entries before it moved
 /// it: at or below, skipped by its identity; above, applied only if its

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The offline calibrator over crafted logs (milestone M10 of
-//! `agent-docs/PLAN-online-routing-learner.md`): weights, exclusions, the
+//! The offline calibrator over crafted logs (design in
+//! `docs/src/concepts/routing-learner.md`): weights, exclusions, the
 //! estimand's label, cost, latency, the promotion summary and the artifact.
 //!
 //! The store-facing half (enumeration, read-only, drift, rollback) is in
@@ -777,8 +777,7 @@ fn the_promotion_summary_states_each_of_the_three_ruled_tests_and_its_result() {
 /// A learned candidate that differs from `rules` in shadow has no weight, so
 /// no quality support: the quality tests say they cannot be evaluated rather
 /// than inventing a number. Cost and latency are still read, from the
-/// corrected quotes of the plan the learner chose (the owner's ruling of
-/// 2026-09-29), on every interval.
+/// corrected quotes of the plan the learner chose, on every interval.
 #[test]
 fn a_shadow_candidate_that_differs_from_rules_is_priced_from_quotes_but_not_quality_gated() {
     let mut script = Script::named("acme/ada/one#g0");

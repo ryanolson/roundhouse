@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `LearnedPolicy::choose` without exploration (draft sections 7.2 to 7.6).
+//! `LearnedPolicy::choose` without exploration.
 //!
 //! The served plan is the cheapest strategy that meets every hard constraint:
 //! the grant on the corrected cost, the modeled first output under the limit,
 //! and the gate. When none does, the turn serves the `rules` decision exactly
-//! (`serve_rules`, the ruled default) or fails with the unmet constraints
+//! (`serve_rules`, the default) or fails with the unmet constraints
 //! (`refuse`). Fallbacks are only other passing strategies' first targets, so
 //! no unchecked target rides along behind a checked one.
 

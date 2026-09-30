@@ -151,9 +151,9 @@ async fn the_tier_question_rides_the_same_request_as_the_taxonomy() {
 
 /// **The tier options describe the work and name no model and no price.**
 ///
-/// The 2026-09-17 ruling, section 2, allowed a tier question only when its
-/// criteria describe the work. A rubric that named a model would ask a third
-/// party to route; one that named a price would make it a cost question.
+/// A tier question is acceptable only when its criteria describe the work. A
+/// rubric that named a model would ask a third party to route; one that named a
+/// price would make it a cost question.
 #[test]
 fn a_tier_option_rubric_names_no_model_and_no_price() {
     let questions = TypeSafeShadow::<ByteTokenizer>::questions();

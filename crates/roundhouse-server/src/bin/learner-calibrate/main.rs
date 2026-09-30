@@ -13,7 +13,7 @@
 //! report and the resolved input manifest into `<out-dir>`. It only reads the
 //! stores. The manifest format and the files are documented on
 //! `roundhouse_server::learner_calibrate`, the calibration itself on
-//! `roundhouse_core::routing::learn::offline`, and both in the README.
+//! `roundhouse_core::routing::learn::offline`, and both in `docs/src/concepts/routing-learner.md`.
 //!
 //! Thin on purpose: everything a test needs to check is in the library, so
 //! this file parses two arguments and prints where the files went.

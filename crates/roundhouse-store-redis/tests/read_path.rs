@@ -246,7 +246,7 @@ async fn a_non_utf8_stream_field_name_is_corrupt_not_a_backend_failure() {
 /// `false`, not `true`. A mutation that drops the NX check (`Ok(true)`
 /// unconditionally at `lib.rs:234`) would then read every re-creation as
 /// fresh, which is the pre-R13 duplicated-prefix bug reintroduced under
-/// exactly the backend the ruling names as its cause.
+/// exactly the backend that bug came from.
 ///
 /// Proven false: this crate already carries a false-on-second-create
 /// assertion against real Redis --

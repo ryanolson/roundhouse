@@ -800,7 +800,7 @@ mod tests {
     }
 
     /// **The page renders local capacity spend when priced, and says local is
-    /// unpriced when not** (ruling 6, 2026-09-28).
+    /// unpriced when not**.
     ///
     /// `field_paths` only scans `data.evaluation.` and `data.observed_cost.`,
     /// so the top-level price and the savings field are named here. Both

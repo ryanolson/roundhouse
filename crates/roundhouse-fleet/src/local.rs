@@ -170,8 +170,7 @@ impl LocalQuote {
     /// Project onto the common comparison axis.
     ///
     /// **Dollars are the configured capacity price, or zero without one**
-    /// (ruled 2026-09-28, ruling 6 in
-    /// `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`). A
+    /// (ruled 2026-09-28; see `docs/src/concepts/routing.md`). A
     /// quote of zero wins every cost comparison against a hosted target and
     /// says nothing about cost effectiveness, so a catalog may set
     /// `local_capacity_price`, and this quote then charges the residency

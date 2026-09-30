@@ -18,7 +18,7 @@
 //! when to call one.
 //!
 //! **`--mcp-config <json>`, and the key rides `${VAR}`.** Of the config forms
-//! the 2.1.257 capture found (§5.8), three work and one does not: the CLI flag,
+//! the 2.1.257 capture found, three work and one does not: the CLI flag,
 //! a project `.mcp.json` and the per-directory entries in `~/.claude.json` are
 //! honoured, and a `settings.json` `mcpServers` key is silently inert. The flag
 //! is the only one of the three that writes nothing — a `.mcp.json` lands in
@@ -38,7 +38,7 @@
 //! reaching the deployment at all.
 //!
 //! **`--strict-mcp-config` is off by default.** It excludes *every* other MCP
-//! configuration, not merely a colliding one (§5.8: a project server under a
+//! configuration, not merely a colliding one (in the 2.1.257 capture a project server under a
 //! distinct name was never even initialised), so switching it on means an
 //! operator's own servers stop existing for that launch. A deployment that
 //! wants exactly roundhouse's tools and nothing else says so in the profile.
@@ -98,7 +98,7 @@ impl ClaudeLaunch {
             "mcpServers": {
                 mcp_server_name(): {
                     // `http` and not `sse`: the surface is Streamable HTTP, and
-                    // the 2.1.257 capture (§5.8) shows the client speaking
+                    // the 2.1.257 capture shows the client speaking
                     // JSON-RPC over `POST {url}` under exactly this type.
                     "type": "http",
                     "url": self.mcp_url(),
@@ -208,8 +208,8 @@ mod tests {
     use crate::codex_launch::DEFAULT_KEY_ENV;
     use crate::responses_api::API_PREFIX;
 
-    /// The MCP half of the same 2.1.257 capture the fixtures above come from
-    /// (§5.8): five requests, `initialize` through `tools/call`, made by the real
+    /// The MCP half of the same 2.1.257 capture the fixtures above come from:
+    /// five requests, `initialize` through `tools/call`, made by the real
     /// client against a stub registered exactly the way this module generates one.
     ///
     /// Read by the test below rather than transcribed, because the two facts it is
@@ -336,7 +336,7 @@ mod tests {
             "the variable is the only thing that moves"
         );
         // And the environment map is untouched by it: the header block holds the
-        // key itself, because that variable is not expanded (§1.6).
+        // key itself, because that variable is not expanded (v2.1.42).
         assert_eq!(env_of(&renamed), env_of(&launch()));
     }
 

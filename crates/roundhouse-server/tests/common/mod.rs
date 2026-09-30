@@ -200,8 +200,8 @@ pub const DEFAULT_VERDICT_JSON: &str = r#"{"on_track":true,"reason":"scripted de
 /// get it. It is not referenced by any M0 test — `#![allow(dead_code)]` above
 /// is what keeps that from being a build warning — and its branching rule
 /// (`prompt_cache_key` ending in `#validate` gets the verdict body, everything
-/// else gets the plain reply) is the one the validate/steer design in
-/// `PLAN-agentic-control-plane.md` §6 assumes a judge call is tagged with.
+/// else gets the plain reply) is the one the validate/steer design
+/// (`docs/src/concepts/validate-steer.md`) assumes a judge call is tagged with.
 pub struct ScriptedFrontierClient {
     plain_reply: String,
     verdict_reply: String,

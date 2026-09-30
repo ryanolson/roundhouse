@@ -330,9 +330,9 @@ impl Counters {
 
 /// What one arm's validations came to, for one scope.
 ///
-/// A separate accumulator from [`Counters`], and the separation is the plan's
-/// rule made structural: money facts and control facts must not merge. A Shadow
-/// run spends real money on a judge and takes no action, and a row that summed
+/// A separate accumulator from [`Counters`], and the separation makes the
+/// rule structural: money facts and control facts must not merge. A Shadow run
+/// spends real money on a judge and takes no action, and a row that summed
 /// the two could not tell it from a Live run that spent the same money and
 /// changed the trajectory — which is the one comparison the whole
 /// instrumentation exists to make.

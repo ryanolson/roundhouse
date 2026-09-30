@@ -57,7 +57,7 @@ pub const CONTROL_TOOL_NAMESPACE: &str = "mcp__roundhouse";
 /// joins `{namespace}{DELIMITER}{name}`; [`CONTROL_TOOL_NAMESPACE`] is the
 /// `mcp{DELIMITER}{server}` half without the trailing delimiter. Claude Code
 /// composes the same two halves the same way
-/// (`research/claude-code-client-surface.md` §5.8).
+/// (seen on the wire from Claude Code 2.1.257).
 pub const CONTROL_TOOL_DELIMITER: &str = "__";
 
 /// Roundhouse's own eight control tools, under the names their MCP surface

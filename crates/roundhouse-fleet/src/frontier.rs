@@ -455,8 +455,7 @@ pub enum FrontierChunk {
         ///
         /// **A price, never a token count, and the separation is the point.**
         /// OpenRouter attaches `cost` to the usage object of every response
-        /// (`agent-docs/research/openrouter-api-surface.md` Q3, live
-        /// 2026-08-24); OpenAI's own endpoint does not. Folding it in beside
+        /// (read live on 2026-08-24); OpenAI's own endpoint does not. Folding it in beside
         /// the token counts would put a number we did not derive from our own
         /// rate card into the column the savings figure is computed from, and
         /// the whole reconciliation idea is that those two numbers stay apart

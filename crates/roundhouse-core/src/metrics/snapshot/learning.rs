@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The online learner's section of the metrics document (draft section 12.4).
+//! The online learner's section of the metrics document.
 //!
 //! Counts, never money: what the learner decided, why a turn was infeasible,
 //! how often its store read failed, and how its entries were delivered. The

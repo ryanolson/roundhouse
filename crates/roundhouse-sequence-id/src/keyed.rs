@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The keyed digests built on the unkeyed chain (plan §3.2).
+//! The keyed digests built on the unkeyed chain.
 //!
 //! ```text
 //! t   = SHA-256(tools.to_string())   or 32 zero bytes when none declared
@@ -19,9 +19,10 @@
 //! **Tips are keyed per principal.** Two principals with the same content get
 //! unrelated tips, so no lookup crosses a principal and the store holds nothing
 //! a reader without the secret can test a guessed prompt against. `S` is the
-//! one keyed value that leaves Roundhouse (as `x-dynamo-session-id`); a
-//! deployment learns from it only which requests belong to one sequence, which
-//! the content already shows.
+//! one keyed value meant to leave Roundhouse (as `x-dynamo-session-id`; no
+//! dispatch path sends it yet, the fleet passes the plain session id as
+//! `SelectRequest.session_id`); a deployment would learn from it only which
+//! requests belong to one sequence, which the content already shows.
 //!
 //! **Tools are not in the chain.** They enter only the tip key, so a tool
 //! change makes a new tip the way it makes a new provider cache prefix. That

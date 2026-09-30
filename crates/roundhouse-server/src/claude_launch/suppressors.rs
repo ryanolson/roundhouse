@@ -4,26 +4,25 @@
 //! The table of inputs that change how a launched Claude Code client
 //! authenticates, and the one question a launch asks of it.
 //!
-//! Its own module because it is the half of
-//! [`claude_launch`](super) that is *evidence* rather than mechanism: every row
-//! is a fact about `§1.3`'s `VV()` in
-//! `agent-docs/research/claude-code-client-surface.md`, re-read whenever the
-//! client line moves, while the generator around it is unchanged by any of that.
-//! Keeping them apart means a client-surface re-capture edits one file whose
-//! whole content is claims about the client, and the review that matters is
-//! "does the table still match the capture" rather than a diff threaded through
-//! a builder.
+//! Its own module because it is the half of [`claude_launch`](super) that is
+//! *evidence* rather than mechanism: every row is a fact about the client's
+//! `VV()` auth check (read from Claude Code 2.1.42), re-read whenever the
+//! client line moves, while the generator around it is unchanged by any of
+//! that. Keeping them apart means a client-surface re-capture edits one file
+//! whose whole content is claims about the client, and the review that matters
+//! is "does the table still match the capture" rather than a diff threaded
+//! through a builder.
 
 use super::{API_KEY_ENV, ClaudeAuthKind};
 
 /// Where an OAuth-suppressing input lives, because they are not all environment
 /// variables.
 ///
-/// The distinction is load-bearing for a launcher: four of the five §1.3 names
-/// can be cleared by not passing them to the child process, and `apiKeyHelper`
-/// cannot — it is a settings key, read out of a file the client finds on its
-/// own. A list that flattened the two would promise an enforcement that half of
-/// it cannot deliver.
+/// The distinction is load-bearing for a launcher: four of the five names the
+/// client's auth resolver reads (v2.1.42) can be cleared by not passing them to
+/// the child process, and `apiKeyHelper` cannot — it is a settings key, read
+/// out of a file the client finds on its own. A list that flattened the two
+/// would promise an enforcement that half of it cannot deliver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuppressorSite {
     /// An environment variable the launcher controls.
@@ -59,10 +58,11 @@ pub enum Defeats {
     TheRedirect,
     /// The [`ROUNDHOUSE_API_KEY_SENTINEL`](super::ROUNDHOUSE_API_KEY_SENTINEL),
     /// and only under [`ClaudeAuthKind::RoundhouseKey`] — the mirror image of
-    /// [`Self::TheSubscriptionLogin`]. §1.3's `VV()` guards its [`API_KEY_ENV`]
-    /// arm with `!$6(CLAUDE_CODE_REMOTE)` and nothing else, so this is the one
-    /// input that turns the sentinel off while leaving every other suppressor
-    /// working; a forwarded login is unharmed by it.
+    /// [`Self::TheSubscriptionLogin`]. The client's auth resolver (`VV()` in
+    /// v2.1.42) guards its [`API_KEY_ENV`] arm with `!$6(CLAUDE_CODE_REMOTE)`
+    /// and nothing else, so this is the one input that turns the sentinel off
+    /// while leaving every other suppressor working; a forwarded login is
+    /// unharmed by it.
     TheApiKeySentinel,
 }
 
@@ -81,8 +81,8 @@ pub struct OauthSuppressor {
     /// to [`Self::defeats`].
     ///
     /// Three of these inputs resolve to a bearer credential of the operator's
-    /// own, and the sentinel does not stand between one and the wire: §1.3's
-    /// `VV()` decides what the [`API_KEY_ENV`] arm resolves to, so an
+    /// own, and the sentinel does not stand between one and the wire: the client's
+    /// auth resolver decides what the [`API_KEY_ENV`] arm resolves to, so an
     /// `ANTHROPIC_AUTH_TOKEN`, the contents of a key file descriptor or an
     /// `apiKeyHelper`'s output still reaches `Authorization`, and roundhouse's
     /// edge captures it as the forwarded seat (F2). The kind that promises "a
@@ -121,11 +121,12 @@ impl OauthSuppressor {
     }
 }
 
-/// The inputs §1.3's `VV()` names, in the order it reads them.
+/// The inputs the client's auth resolver (`VV()` in v2.1.42) names, in the order
+/// it reads them.
 ///
 /// Refused **by presence**, not by truthiness, and the honesty is deliberate:
 /// the three cloud selectors are read through a truth function (`$6`) whose body
-/// the evidence does not reproduce, so a rule that admitted
+/// the v2.1.42 static read did not recover, so a rule that admitted
 /// `CLAUDE_CODE_USE_BEDROCK=0` would be guessing at somebody else's parser. The
 /// fail-closed reading costs an operator one deletion and buys never being wrong
 /// about it.

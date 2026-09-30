@@ -5,13 +5,13 @@
 //!
 //! **Enumeration is the source index, never a scan.** Learner sessions are
 //! the permanent marks `SessionStore::learning_sessions` pages through, the
-//! same index the recovery task and the audit read (draft 11.7). The append
+//! same index the recovery task and the audit read. The append
 //! that writes an entry-producing event writes its mark in the same step, so
 //! the list holds every session with a learning entry, whatever the learner
 //! store did. A member whose mark the store cannot read has no project to
 //! file it under, so it is counted as excluded and named, never dropped.
 //!
-//! **The manifest is the cutoff** (draft 14.1). Each session's log is read to
+//! **The manifest is the cutoff.** Each session's log is read to
 //! the sequence the manifest pins, or to its end when nothing is pinned, and
 //! [`InputManifest`] records the ids, the last sequence read and the SHA-256
 //! of the event bytes. A pinned run whose log no longer matches its digest is

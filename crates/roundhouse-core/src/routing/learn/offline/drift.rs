@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The drift check: the counters a point-in-time copy of the learner store
-//! holds, against the counters its own watermarks say it should hold (draft
-//! 14.1).
+//! holds, against the counters its own watermarks say it should hold.
 //!
 //! **Only against a copy.** For each session, the entries at or below the
 //! copy's watermark are rebuilt from the log and summed the way the store sums
