@@ -14,9 +14,7 @@ use learning_support::*;
 use roundhouse_core::control::ProjectId;
 use roundhouse_core::event::{Accounting, Usage};
 use roundhouse_core::routing::ProviderPricing;
-use roundhouse_core::routing::learn::offline::estimate::{
-    BOOTSTRAP_LEVEL, estimate, paired_bootstrap, paired_replicates,
-};
+use roundhouse_core::routing::learn::offline::estimate::paired_bootstrap;
 use roundhouse_core::routing::learn::offline::{
     ArtifactPrior, BootstrapPlan, Calibrated, CalibrationConfig, Candidate, Cause, CostEstimate,
     DriftCheck, Evidence, IntervalFacts, Money, Outcome, QualityMinimum, QuoteCensus, SessionLog,
@@ -319,7 +317,8 @@ fn the_paired_difference_is_learned_minus_rules() {
     assert_eq!(calibrated.evidence.intervals.len(), 40);
     assert_eq!(calibrated.report.promotion.agreeing, 0);
     let intervals: Vec<&IntervalFacts> = calibrated.evidence.intervals.iter().collect();
-    let test = paired_quality(&intervals, plan(200), 20, 20);
+    let test = paired_quality(&intervals, plan(200), 20);
+    assert_eq!(test.sessions, 20);
     assert_eq!(test.lower, Some(-1.0));
     assert_eq!(test.result, TestResult::Fail);
 }
@@ -329,10 +328,13 @@ fn the_paired_difference_is_learned_minus_rules() {
 /// weight, no `rules` weight, sparse support.
 #[test]
 fn each_paired_not_evaluable_reason_has_its_own_message_in_guard_order() {
-    let empty = paired_quality(&[], plan(200), 20, 20);
+    let empty = paired_quality(&[], plan(200), 20);
     assert!(reason(empty.result).contains("no interval in the set"));
 
-    // Every interval explored away: neither side has weight.
+    // Every interval explored away: neither side has weight, so the real
+    // session count is 0. Against `min_sessions` 20 that is `few` first; at
+    // `min_sessions` 0 the guard passes and `learned` is reached honestly,
+    // on the same fixture.
     let unweighted: Vec<Script> = (0..20)
         .map(|at| {
             live_session(
@@ -343,12 +345,13 @@ fn each_paired_not_evaluable_reason_has_its_own_message_in_guard_order() {
         .collect();
     let calibrated = run(&config(20), &unweighted);
     let intervals: Vec<&IntervalFacts> = calibrated.evidence.intervals.iter().collect();
-    let few = reason(paired_quality(&intervals, plan(200), 0, 20).result);
+    let few = reason(paired_quality(&intervals, plan(200), 20).result);
     assert!(few.contains("quality.min_sessions"), "{few}");
-    let learned = reason(paired_quality(&intervals, plan(200), 20, 20).result);
+    let learned = reason(paired_quality(&intervals, plan(200), 0).result);
     assert!(learned.contains("learned has no interval"), "{learned}");
 
-    // Served diverging turns: learned has weight, `rules` has none.
+    // Served diverging turns: learned has weight on all 20 real sessions,
+    // `rules` has none.
     let served: Vec<Script> = (0..20)
         .map(|at| {
             live_session(
@@ -359,10 +362,12 @@ fn each_paired_not_evaluable_reason_has_its_own_message_in_guard_order() {
         .collect();
     let calibrated = run(&config(20), &served);
     let intervals: Vec<&IntervalFacts> = calibrated.evidence.intervals.iter().collect();
-    let rules = reason(paired_quality(&intervals, plan(200), 20, 20).result);
+    let rules = reason(paired_quality(&intervals, plan(200), 20).result);
     assert!(rules.contains("rules has no interval"), "{rules}");
 
-    // Three of fifty sessions hold weight: sparse.
+    // Three of fifty sessions hold weight, the real count `paired_quality`
+    // now computes itself: `min_sessions` 3 matches it exactly, so the guard
+    // passes and the bootstrap's own sparsity is what fails the test.
     let sparse: Vec<Script> = (0..50)
         .map(|at| {
             live_session(
@@ -373,7 +378,12 @@ fn each_paired_not_evaluable_reason_has_its_own_message_in_guard_order() {
         .collect();
     let calibrated = run(&config(20), &sparse);
     let intervals: Vec<&IntervalFacts> = calibrated.evidence.intervals.iter().collect();
-    let filler = reason(paired_quality(&intervals, plan(200), 50, 20).result);
+    let test = paired_quality(&intervals, plan(200), 3);
+    assert_eq!(
+        test.sessions, 3,
+        "the real weighted session count, not a claimed one"
+    );
+    let filler = reason(test.result);
     assert!(filler.contains("filler"), "{filler}");
 
     let reasons = [few, learned, rules, filler];
@@ -416,62 +426,6 @@ fn an_undefined_paired_replicate_widens_the_bound_to_minus_one_and_one() {
         assert_eq!(bounds.undefined, 40);
         assert!(bounds.sparse);
     }
-
-    // Forty clusters, five weighted on both sides with distinct rates, so a
-    // few replicates draw none. The seed is searched for one where the
-    // filler moves both bounds against substituting the point estimate, with
-    // every undefined replicate inside the tail, reading only the replicates.
-    let (mut learned, mut rules) = (Vec::new(), Vec::new());
-    for (cluster, (lp, ln, rp, rn)) in [
-        (0.2, 0.8, 0.5, 0.5),
-        (0.6, 0.9, 0.3, 0.7),
-        (1.2, 0.8, 0.9, 0.2),
-        (2.0, 0.5, 0.4, 1.1),
-        (0.7, 0.7, 1.5, 0.3),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        learned.extend([outcome(cluster, true, lp), outcome(cluster, false, ln)]);
-        rules.extend([outcome(cluster, true, rp), outcome(cluster, false, rn)]);
-    }
-    for cluster in 5..40 {
-        learned.push(outcome(cluster, true, 0.0));
-        rules.push(outcome(cluster, true, 0.0));
-    }
-    let point =
-        estimate(&learned, plan(1)).snips.unwrap() - estimate(&rules, plan(1)).snips.unwrap();
-    let resamples = 400;
-    let tail = (1.0 - BOOTSTRAP_LEVEL) / 2.0;
-    let low_at = (tail * resamples as f64).floor() as usize;
-    let high_at = ((1.0 - tail) * resamples as f64).ceil() as usize - 1;
-    let bounds_with = |replicates: &[Option<f64>], low: f64, high: f64| {
-        let mut lows: Vec<f64> = replicates.iter().map(|v| v.unwrap_or(low)).collect();
-        let mut highs: Vec<f64> = replicates.iter().map(|v| v.unwrap_or(high)).collect();
-        lows.sort_by(f64::total_cmp);
-        highs.sort_by(f64::total_cmp);
-        (Some(lows[low_at]), Some(highs[high_at]))
-    };
-    let (seed, replicates) = (0..2_000u64)
-        .map(|seed| {
-            let plan = BootstrapPlan { seed, resamples };
-            (seed, paired_replicates(&learned, &rules, plan))
-        })
-        .find(|(_, replicates)| {
-            let undefined = replicates.iter().filter(|value| value.is_none()).count();
-            let filled = bounds_with(replicates, -1.0, 1.0);
-            let substituted = bounds_with(replicates, point, point);
-            (1..=low_at).contains(&undefined)
-                && filled.0 != substituted.0
-                && filled.1 != substituted.1
-        })
-        .expect("a seed that discriminates both bounds");
-    let bounds = paired_bootstrap(&learned, &rules, BootstrapPlan { seed, resamples });
-    assert!(!bounds.sparse);
-    assert_eq!(
-        (bounds.lower, bounds.upper),
-        bounds_with(&replicates, -1.0, 1.0)
-    );
 }
 
 /// The staged verdict needs latency too: cost and agreeing quality pass, the

@@ -234,6 +234,10 @@ pub struct QualityTest {
 pub struct PairedQualityTest {
     /// Intervals the comparison is over.
     pub intervals: usize,
+    /// Clusters with an interval in the set where the learned candidate has
+    /// weight above zero: what the bootstrap reads, so what
+    /// `quality.min_sessions` is met on.
+    pub sessions: u64,
     /// The bootstrap lower bound of learned minus `rules`, both sides summed
     /// over the same resampled clusters.
     pub lower: Option<f64>,
@@ -303,27 +307,18 @@ impl PromotionSummary {
                 quotes.count(turn, Strategy::Rules);
             }
         }
-        let weighted: Vec<&IntervalFacts> = agreeing
-            .iter()
-            .copied()
-            .filter(|interval| interval.outcome(Candidate::Learned).weight > 0.0)
-            .collect();
-        let agreeing_sessions = clusters(&weighted);
+        let quality_agreeing =
+            paired_quality(&agreeing, config.bootstrap, config.quality.min_sessions);
         PromotionSummary {
             intervals: intervals.len(),
             agreeing: agreeing.len(),
-            quality_agreeing: paired_quality(
-                &agreeing,
-                config.bootstrap,
-                agreeing_sessions,
-                config.quality.min_sessions,
-            ),
+            quality_agreeing,
             quality_full: quality(intervals.len(), learned, rules),
             cost: cost(intervals),
             latency: latency(intervals, config.latency_limit_ms),
             quotes,
             sessions: clusters(&intervals.iter().collect::<Vec<_>>()),
-            agreeing_sessions,
+            agreeing_sessions: quality_agreeing.sessions,
             min_sessions: config.quality.min_sessions,
             latency_limit_ms: config.latency_limit_ms,
         }
@@ -400,14 +395,17 @@ fn quality(intervals: usize, learned: &Estimate, rules: &Estimate) -> QualityTes
 /// clusters, without learned weight, without `rules` weight, or on sparse
 /// support, in that order, each with its own message.
 ///
-/// `sessions` is the caller's count of the clusters the set holds weight in.
-/// Public so a test can hand it intervals the agreeing filter never passes:
-/// on the agreeing set both sides are equal, and nothing about the order of
-/// the difference, or which side lacks weight, can show there.
+/// **Computes the learned outcomes once**, and counts `sessions` from them:
+/// the clusters holding an interval where the learned candidate has weight
+/// above zero. The caller used to take a second pass over the same intervals
+/// to count that itself and hand the count in, which could name a session
+/// total the outcomes computed here do not agree with. Public so a test can
+/// hand it intervals the agreeing filter never passes: on the agreeing set
+/// both sides are equal, and nothing about the order of the difference, or
+/// which side lacks weight, can show there.
 pub fn paired_quality(
     intervals: &[&IntervalFacts],
     plan: BootstrapPlan,
-    sessions: u64,
     min_sessions: u64,
 ) -> PairedQualityTest {
     let over = |candidate| -> Vec<_> {
@@ -418,6 +416,14 @@ pub fn paired_quality(
     };
     let learned = over(Candidate::Learned);
     let rules = over(Candidate::Fixed(Strategy::Rules));
+    let sessions = clusters(
+        &intervals
+            .iter()
+            .zip(&learned)
+            .filter(|(_, outcome)| outcome.weight > 0.0)
+            .map(|(interval, _)| *interval)
+            .collect::<Vec<_>>(),
+    );
     let bounds = paired_bootstrap(&learned, &rules, plan);
     let weighted = |side: &[Outcome]| side.iter().any(|outcome| outcome.weight > 0.0);
     let result = if intervals.is_empty() {
@@ -438,6 +444,7 @@ pub fn paired_quality(
     };
     PairedQualityTest {
         intervals: intervals.len(),
+        sessions,
         lower: bounds.lower,
         result,
     }
