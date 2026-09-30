@@ -26,7 +26,7 @@ Roundhouse keeps the conversation in a durable, append-only log per session. It 
 - Exposes a control surface to the agent as an MCP server at `/mcp`.
 - Reports cost, savings, and latency on `/v1/metrics` and a dashboard, and emits NeMo Relay's ATOF and ATIF formats from the same log.
 - Launches Codex or Claude Code against it with `topham`, from a saved profile.
-- Checks agent turns with a judge and steers the agent with text when a turn goes wrong.
+- Checks agent turns with a judge and steers the agent with text when a turn goes wrong. The judge sends no credential yet, so on a real provider every check is skipped.
 
 The [limitations](docs/src/appendix/limitations.md) chapter lists what it does not do yet.
 
