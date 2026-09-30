@@ -3,7 +3,8 @@
 
 //! The estimator arithmetic: trajectory weights, the self-normalized
 //! estimate, the support census, the effective sample size, the clustered
-//! bootstrap, and the weighted median.
+//! bootstrap (of one estimate, and of the paired difference of two), and the
+//! weighted median.
 //!
 //! Pure functions over plain numbers, so every rule is checked on hand-built
 //! inputs before any log reaches it.
@@ -116,17 +117,18 @@ pub const BOOTSTRAP_LEVEL: f64 = 0.95;
 /// The name of the resampling stream, as the report prints it.
 pub const BOOTSTRAP_STREAM: &str = "splitmix64";
 
-/// A percentile interval of the self-normalized estimate over cluster
-/// resamples.
+/// A percentile interval of a self-normalized estimate, or of the paired
+/// difference of two, over cluster resamples.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bootstrap {
     /// `None` with no clusters or no resamples.
     pub lower: Option<f64>,
     pub upper: Option<f64>,
-    /// Replicates whose resampled clusters held no weight at all. Each counts
-    /// as `0.0` for the lower bound and `1.0` for the upper, so a sparse
-    /// candidate's interval widens rather than drops the replicates that would
-    /// have said so.
+    /// Replicates whose resampled clusters held no weight at all (on either
+    /// side, for a paired difference). Each counts as the worst the statistic
+    /// can be for each bound, `0.0` and `1.0` for a rate and `-1.0` and `1.0`
+    /// for a difference of two, so a sparse candidate's interval widens rather
+    /// than drops the replicates that would have said so.
     pub undefined: u32,
     /// More replicates held no weight than the lower tail has places, so the
     /// lower bound is one of those fillers rather than an estimate. A test
@@ -311,57 +313,117 @@ pub fn weighted_p50(samples: impl IntoIterator<Item = (u64, f64)>) -> Option<u64
     samples.last().map(|(value, _)| *value)
 }
 
-/// The self-normalized estimate of each of `plan.resamples` resamples of
-/// whole clusters, in draw order; `None` for a replicate whose drawn clusters
-/// hold no weight.
+/// Each of `plan.resamples` resamples of whole clusters, in draw order: per
+/// side, the drawn clusters' `(sum of w r, sum of w)`.
 ///
 /// Each replicate draws as many clusters as the outcomes hold, with
 /// replacement, and every interval of a drawn cluster comes with it:
 /// intervals of one session are correlated, so the cluster is the unit. The
 /// clusters are indexed in ascending id order and drawn from one
 /// [`SplitMix64`] stream seeded by `plan.seed`.
-pub fn bootstrap_replicates(outcomes: &[Outcome], plan: BootstrapPlan) -> Vec<Option<f64>> {
-    let mut ids: Vec<usize> = outcomes.iter().map(|outcome| outcome.cluster).collect();
+///
+/// **Every side rides the same draw.** A paired statistic is paired only if
+/// both of its sides are summed over the same resampled clusters; drawing
+/// each side on its own would add back the between-side noise the pairing
+/// exists to cancel. With one side, the stream and the summation order are
+/// the ones a recorded seed was reported with.
+fn resample<const N: usize>(sides: [&[Outcome]; N], plan: BootstrapPlan) -> Vec<[(f64, f64); N]> {
+    let mut ids: Vec<usize> = sides
+        .iter()
+        .flat_map(|side| side.iter().map(|outcome| outcome.cluster))
+        .collect();
     ids.sort_unstable();
     ids.dedup();
     if ids.is_empty() {
         return Vec::new();
     }
-    // Per cluster, in id order: (sum of w r, sum of w).
-    let mut sums = vec![(0.0f64, 0.0f64); ids.len()];
-    for outcome in outcomes {
-        let at = ids
-            .binary_search(&outcome.cluster)
-            .expect("every outcome's cluster is in the id list");
-        if outcome.positive {
-            sums[at].0 += outcome.weight;
+    // Per cluster, in id order, per side: (sum of w r, sum of w).
+    let mut sums = vec![[(0.0f64, 0.0f64); N]; ids.len()];
+    for (side, outcomes) in sides.iter().enumerate() {
+        for outcome in *outcomes {
+            let at = ids
+                .binary_search(&outcome.cluster)
+                .expect("every outcome's cluster is in the id list");
+            if outcome.positive {
+                sums[at][side].0 += outcome.weight;
+            }
+            sums[at][side].1 += outcome.weight;
         }
-        sums[at].1 += outcome.weight;
     }
     let mut stream = SplitMix64::new(plan.seed);
     (0..plan.resamples)
         .map(|_| {
-            let (mut positive, mut total) = (0.0, 0.0);
+            let mut drawn = [(0.0, 0.0); N];
             for _ in 0..ids.len() {
-                let (p, t) = sums[stream.below(ids.len())];
-                positive += p;
-                total += t;
+                let cluster = &sums[stream.below(ids.len())];
+                for (drawn, (p, t)) in drawn.iter_mut().zip(cluster) {
+                    drawn.0 += p;
+                    drawn.1 += t;
+                }
             }
-            (total > 0.0).then(|| positive / total)
+            drawn
         })
         .collect()
 }
 
-/// The percentile interval of [`bootstrap_replicates`].
+/// The self-normalized estimate of each of `plan.resamples` resamples of
+/// whole clusters (see [`resample`]), in draw order; `None` for a replicate
+/// whose drawn clusters hold no weight.
+pub fn bootstrap_replicates(outcomes: &[Outcome], plan: BootstrapPlan) -> Vec<Option<f64>> {
+    resample([outcomes], plan)
+        .into_iter()
+        .map(|[(positive, total)]| (total > 0.0).then(|| positive / total))
+        .collect()
+}
+
+/// The paired difference of two candidates' self-normalized estimates,
+/// `learned - rules`, on each of `plan.resamples` resamples of whole
+/// clusters, both sides on the same draw (see [`resample`]); `None` for a
+/// replicate where either side's drawn clusters hold no weight.
+///
+/// `learned` and `rules` are two candidates' outcomes on one interval list,
+/// in the same order.
+pub fn paired_replicates(
+    learned: &[Outcome],
+    rules: &[Outcome],
+    plan: BootstrapPlan,
+) -> Vec<Option<f64>> {
+    assert!(
+        learned.len() == rules.len()
+            && learned
+                .iter()
+                .zip(rules)
+                .all(|(learned, rules)| learned.cluster == rules.cluster),
+        "a paired statistic needs both sides on one interval list"
+    );
+    resample([learned, rules], plan)
+        .into_iter()
+        .map(|[(lp, lt), (rp, rt)]| (lt > 0.0 && rt > 0.0).then(|| lp / lt - rp / rt))
+        .collect()
+}
+
+/// The percentile interval of [`bootstrap_replicates`], an undefined
+/// replicate filled with `0.0` and `1.0` (see [`percentile`]).
+pub fn bootstrap(outcomes: &[Outcome], plan: BootstrapPlan) -> Bootstrap {
+    percentile(&bootstrap_replicates(outcomes, plan), 0.0, 1.0)
+}
+
+/// The percentile interval of [`paired_replicates`], an undefined replicate
+/// filled with `-1.0` and `1.0`: the worst each bound of a difference of two
+/// rates can be.
+pub fn paired_bootstrap(learned: &[Outcome], rules: &[Outcome], plan: BootstrapPlan) -> Bootstrap {
+    percentile(&paired_replicates(learned, rules, plan), -1.0, 1.0)
+}
+
+/// The percentile interval of `replicates`.
 ///
 /// The lower bound is the replicate at index `floor(0.025 B)` in ascending
-/// order, and the upper the one at `ceil(0.975 B) - 1`. A replicate with no
-/// weight counts as `0.0` for the lower bound and `1.0` for the upper, never
-/// as the point estimate: that would narrow the interval by exactly the
-/// replicates that say the data is thin. When those fillers reach the lower
-/// index, the bound is [`Bootstrap::sparse`].
-pub fn bootstrap(outcomes: &[Outcome], plan: BootstrapPlan) -> Bootstrap {
-    let replicates = bootstrap_replicates(outcomes, plan);
+/// order, and the upper the one at `ceil(0.975 B) - 1`. An undefined
+/// replicate counts as `low_fill` for the lower bound and `high_fill` for
+/// the upper, never as the point estimate: that would narrow the interval by
+/// exactly the replicates that say the data is thin. When those fillers
+/// reach the lower index, the bound is [`Bootstrap::sparse`].
+fn percentile(replicates: &[Option<f64>], low_fill: f64, high_fill: f64) -> Bootstrap {
     if replicates.is_empty() {
         return Bootstrap {
             lower: None,
@@ -373,11 +435,11 @@ pub fn bootstrap(outcomes: &[Outcome], plan: BootstrapPlan) -> Bootstrap {
     let undefined = replicates.iter().filter(|value| value.is_none()).count() as u32;
     let mut lows: Vec<f64> = replicates
         .iter()
-        .map(|value| value.unwrap_or(0.0))
+        .map(|value| value.unwrap_or(low_fill))
         .collect();
     let mut highs: Vec<f64> = replicates
         .iter()
-        .map(|value| value.unwrap_or(1.0))
+        .map(|value| value.unwrap_or(high_fill))
         .collect();
     lows.sort_by(f64::total_cmp);
     highs.sort_by(f64::total_cmp);

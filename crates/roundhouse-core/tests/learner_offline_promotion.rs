@@ -19,14 +19,16 @@ use roundhouse_core::control::ProjectId;
 use roundhouse_core::event::{Accounting, Usage};
 use roundhouse_core::routing::ProviderPricing;
 use roundhouse_core::routing::learn::offline::estimate::{
-    BOOTSTRAP_LEVEL, bootstrap, bootstrap_replicates, estimate,
+    BOOTSTRAP_LEVEL, bootstrap, bootstrap_replicates, estimate, paired_bootstrap, paired_replicates,
 };
 use roundhouse_core::routing::learn::offline::{
-    ArtifactPrior, BootstrapPlan, COST_REDUCTION, Calibrated, CalibrationConfig, DriftCheck,
-    Evidence, Money, Outcome, QUALITY_ALLOWANCE, QualityMinimum, SessionLog, Source, TestResult,
-    assemble, cost_gate, quality_gate, quality_test,
+    ArtifactPrior, BootstrapPlan, COST_REDUCTION, Calibrated, CalibrationConfig, Candidate,
+    DriftCheck, Evidence, Money, Outcome, QUALITY_ALLOWANCE, QualityMinimum, SessionLog, Source,
+    TestResult, assemble, cost_gate, paired_quality_gate, quality_gate, quality_test,
 };
-use roundhouse_core::routing::learn::{LearnedChoice, Strategy, StrategySet};
+use roundhouse_core::routing::learn::{
+    Draw, ExplorationEvidence, LearnedChoice, Strategy, StrategySet,
+};
 
 fn config(min_sessions: u64) -> CalibrationConfig {
     CalibrationConfig {
@@ -366,5 +368,272 @@ fn estimated_usage_is_unpriced_never_priced_as_measured() {
     assert_eq!(
         calibrated.evidence.intervals[0].turns[0].cost,
         Money::Unpriced
+    );
+}
+
+/// One agreeing `shadow` session: the learned choice is `rules` on `opus`.
+fn agreeing_with(id: &str, positive: bool) -> Script {
+    let spec = Spec::new()
+        .corrected(Strategy::Rules, 0.01, 800.0)
+        .corrected(Strategy::Efficient, 0.002, 600.0)
+        .corrected(Strategy::Capable, 0.01, 800.0);
+    session(id, spec, 1_000, positive)
+}
+
+/// The earlier fixer's fixture: twenty agreeing `shadow` sessions, seventeen
+/// positive. Both policies served the same route on every interval, so no
+/// quality loss can exist.
+fn noisy_agreeing_fixture() -> Vec<Script> {
+    (0..20)
+        .map(|at| agreeing_with(&format!("acme/ada/agree{at:02}#g0"), at >= 3))
+        .collect()
+}
+
+/// The M10 review-fix ruling of 2026-09-30: test 1 is the paired statistic.
+/// On twenty agreeing sessions, seventeen positive, the learned lower bound
+/// sits well below the `rules` point estimate (the unpaired form reads
+/// `fail` on sample noise alone), while the paired difference is exactly
+/// zero on every resample.
+#[test]
+fn the_agreeing_quality_test_is_paired_and_passes_on_sample_noise() {
+    let calibrated = run(&config(20), &noisy_agreeing_fixture());
+    let promotion = &calibrated.report.promotion;
+    assert_eq!((promotion.agreeing, promotion.intervals), (20, 20));
+    assert_eq!(promotion.agreeing_sessions, 20);
+    // The control: the unpaired comparison the ruling retired does fail
+    // here, so a pass below is the paired statistic and not a lenient
+    // fixture.
+    let learned = calibrated.report.estimate(Candidate::Learned).unwrap();
+    let rules = calibrated
+        .report
+        .estimate(Candidate::Fixed(Strategy::Rules))
+        .unwrap();
+    assert_eq!(rules.snips, Some(0.85));
+    assert_eq!(
+        quality_gate(learned.bootstrap.lower.unwrap(), rules.snips.unwrap()),
+        TestResult::Fail,
+        "the unpaired form must fail on this fixture: lower {:?}",
+        learned.bootstrap.lower
+    );
+    assert_eq!(promotion.quality_agreeing.result, TestResult::Pass);
+    let text = calibrated.report.render();
+    println!("{text}");
+    let line = line_with(
+        &text,
+        "quality, on the intervals where learned agreed with rules",
+    );
+    assert!(line.ends_with(": pass"), "{line}");
+    assert!(line.contains("learned minus rules"), "{line}");
+}
+
+/// The agreeing set below `quality.min_sessions` is not evaluable: twenty
+/// sessions against a minimum of twenty-one.
+#[test]
+fn the_agreeing_quality_test_below_min_sessions_is_not_evaluable() {
+    let calibrated = run(&config(21), &noisy_agreeing_fixture());
+    let promotion = &calibrated.report.promotion;
+    assert!(
+        matches!(
+            promotion.quality_agreeing.result,
+            TestResult::NotEvaluable(_)
+        ),
+        "{:?}",
+        promotion.quality_agreeing
+    );
+    assert!(!promotion.promotable());
+    let text = calibrated.report.render();
+    assert!(
+        line_with(&text, "quality.min_sessions 21").ends_with(": not met"),
+        "{text}"
+    );
+}
+
+/// A `live` turn with exploration possible over `efficient`, at propensity
+/// 0.5. Nothing passes, so the learned choice is `rules` on `opus`; an
+/// explored turn served `efficient` on `haiku` instead.
+fn live_turn(explored: bool) -> Spec {
+    let spec = Spec::new().live().propensity(0.5);
+    let exploration = |rate: f64| ExplorationEvidence {
+        draw: Draw { rate, member: 0 },
+        possible: true,
+        set: vec![Strategy::Efficient],
+    };
+    if explored {
+        spec.chosen(haiku())
+            .choice(LearnedChoice::Explore {
+                strategy: Strategy::Efficient,
+                member: 0,
+            })
+            .exploration(exploration(0.0))
+    } else {
+        spec.chosen(opus()).exploration(exploration(0.9))
+    }
+}
+
+/// One `live` session of one-turn intervals, each `(explored, positive)`.
+fn live_session(id: &str, intervals: &[(bool, bool)]) -> Script {
+    let mut script = Script::named(id);
+    for (explored, positive) in intervals {
+        let turn = script.turn(live_turn(*explored).decision());
+        script.review(&[&turn], if *positive { on_track() } else { off_track() });
+    }
+    script
+}
+
+/// The 2026-09-30 ruling expected the paired difference to be nonzero in
+/// `live` with exploration. It is not, and no fixture can make it so: an
+/// agreeing interval is one where the learned action is the
+/// `rules` action on every turn, and a candidate's weight reads only its
+/// action, the served target and the recorded propensity. So both sides
+/// carry the same weight on every agreeing interval, explored or not, and
+/// the paired difference is zero in `live` too. Explored turns zero both
+/// sides together; they never separate them.
+#[test]
+fn on_agreeing_live_intervals_learned_and_rules_carry_the_same_weight() {
+    let scripts: Vec<Script> = (0..20)
+        .map(|at| {
+            live_session(
+                &format!("acme/ada/live{at:02}#g0"),
+                // An explored negative, a served positive, and on every
+                // fourth session a served negative.
+                &[(true, false), (false, true), (false, at % 4 != 0)],
+            )
+        })
+        .collect();
+    let calibrated = run(&config(20), &scripts);
+    let intervals = &calibrated.evidence.intervals;
+    assert_eq!(intervals.len(), 60);
+    assert_eq!(calibrated.report.promotion.agreeing, 60, "all agree");
+    let mut explored_zero = 0;
+    for interval in intervals {
+        let learned = interval.outcome(Candidate::Learned);
+        let rules = interval.outcome(Candidate::Fixed(Strategy::Rules));
+        assert_eq!(learned, rules, "{interval:?}");
+        explored_zero += usize::from(learned.weight == 0.0);
+    }
+    assert_eq!(explored_zero, 20, "every explored interval zeroes both");
+    assert_eq!(
+        calibrated.report.promotion.quality_agreeing.result,
+        TestResult::Pass
+    );
+}
+
+/// A paired outcome pair on one interval: the learned and the `rules` weight.
+fn pair(cluster: usize, positive: bool, learned: f64, rules: f64) -> (Outcome, Outcome) {
+    (
+        outcome(cluster, positive, learned),
+        outcome(cluster, positive, rules),
+    )
+}
+
+fn split(pairs: Vec<(Outcome, Outcome)>) -> (Vec<Outcome>, Vec<Outcome>) {
+    pairs.into_iter().unzip()
+}
+
+/// The statistic itself detects loss where the weights differ: thirty
+/// clusters where the learned side weights a negative that `rules` does not,
+/// so learned is 0.5 and `rules` 2/3 in every cluster. The paired bound is
+/// the difference, -1/6, and the gate fails. The agreeing set never looks
+/// like this (see the `live` test above); the pure function is where the
+/// failing direction is shown.
+#[test]
+fn the_paired_bound_fails_a_loss_the_weights_show() {
+    let (learned, rules) = split(
+        (0..30)
+            .flat_map(|cluster| {
+                [
+                    pair(cluster, true, 1.0, 1.0),
+                    pair(cluster, true, 1.0, 1.0),
+                    pair(cluster, false, 1.0, 1.0),
+                    pair(cluster, false, 1.0, 0.0),
+                ]
+            })
+            .collect(),
+    );
+    let bounds = paired_bootstrap(&learned, &rules, plan(200));
+    assert!(!bounds.sparse);
+    let lower = bounds.lower.unwrap();
+    assert!((lower + 1.0 / 6.0).abs() < 1e-12, "{lower}");
+    assert_eq!(paired_quality_gate(lower), TestResult::Fail);
+    // With no difference, the same clusters pass.
+    let bounds = paired_bootstrap(&learned, &learned, plan(200));
+    assert_eq!(bounds.lower, Some(0.0));
+    assert_eq!(paired_quality_gate(0.0), TestResult::Pass);
+}
+
+/// The paired allowance is inclusive, as ruling 13's is.
+#[test]
+fn a_paired_lower_bound_exactly_the_allowance_below_zero_passes() {
+    assert_eq!(paired_quality_gate(-QUALITY_ALLOWANCE), TestResult::Pass);
+    assert_eq!(
+        paired_quality_gate((-QUALITY_ALLOWANCE).next_down()),
+        TestResult::Fail
+    );
+}
+
+/// The paired bootstrap resamples clusters, not intervals. Copying every
+/// interval three times inside its own cluster scales each cluster's sums
+/// exactly, and keeps the number of clusters each replicate draws, so every
+/// replicate is bitwise the same. A resampler over intervals draws three
+/// times as many units from the stream and gives different replicates.
+#[test]
+fn the_paired_bootstrap_resamples_clusters_not_intervals() {
+    // Twelve clusters with different paired differences, so the replicates
+    // spread and a changed draw shows.
+    let one: Vec<(Outcome, Outcome)> = (0..12)
+        .flat_map(|cluster| {
+            [
+                pair(cluster, true, 1.0, 1.0),
+                pair(cluster, false, 1.0, (cluster % 3) as f64),
+                pair(cluster, cluster % 2 == 0, (cluster % 4) as f64, 1.0),
+            ]
+        })
+        .collect();
+    let tripled: Vec<(Outcome, Outcome)> = one
+        .iter()
+        .flat_map(|pair| [pair.clone(), pair.clone(), pair.clone()])
+        .collect();
+    let (learned, rules) = split(one);
+    let (learned3, rules3) = split(tripled);
+    let plan = plan(200);
+    let replicates = paired_replicates(&learned, &rules, plan);
+    let distinct = {
+        let mut values: Vec<f64> = replicates.iter().flatten().copied().collect();
+        values.sort_by(f64::total_cmp);
+        values.dedup();
+        values.len()
+    };
+    assert!(
+        distinct > 20,
+        "the fixture must spread: {distinct} distinct"
+    );
+    assert_eq!(paired_replicates(&learned3, &rules3, plan), replicates);
+}
+
+/// The support and sparse guards hold for the paired test: a `live` set
+/// where every agreeing interval explored away has no weight, and one where
+/// three of fifty sessions hold weight is sparse. Both read `not evaluable`,
+/// never `pass` and never `fail`.
+#[test]
+fn the_paired_test_without_support_or_on_sparse_support_is_not_evaluable() {
+    let unweighted: Vec<Script> = (0..20)
+        .map(|at| live_session(&format!("acme/ada/live{at:02}#g0"), &[(true, true)]))
+        .collect();
+    let calibrated = run(&config(20), &unweighted);
+    let test = calibrated.report.promotion.quality_agreeing;
+    assert_eq!(test.intervals, 20);
+    assert!(
+        matches!(test.result, TestResult::NotEvaluable(reason) if reason.contains("weight")),
+        "{test:?}"
+    );
+
+    let sparse: Vec<Script> = (0..50)
+        .map(|at| live_session(&format!("acme/ada/live{at:02}#g0"), &[(at >= 3, true)]))
+        .collect();
+    let calibrated = run(&config(20), &sparse);
+    let test = calibrated.report.promotion.quality_agreeing;
+    assert!(
+        matches!(test.result, TestResult::NotEvaluable(reason) if reason.contains("filler")),
+        "{test:?}"
     );
 }

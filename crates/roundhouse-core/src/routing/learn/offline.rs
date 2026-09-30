@@ -81,8 +81,9 @@ pub use extract::{
     replays,
 };
 pub use promotion::{
-    CostTest, LatencyTest, PromotionSummary, QualityTest, QuoteCensus, TestResult, corrected_cost,
-    corrected_first_output, cost_gate, quality_gate, quality_test,
+    CostTest, LatencyTest, PairedQualityTest, PromotionSummary, QualityTest, QuoteCensus,
+    TestResult, corrected_cost, corrected_first_output, cost_gate, paired_quality_gate,
+    quality_gate, quality_test,
 };
 pub use report::Report;
 pub use source::{
@@ -103,7 +104,9 @@ pub const FACTUAL_LABEL: &str = "factual";
 pub const CORRECTED_QUOTE_LABEL: &str = "corrected quote estimate";
 
 /// Ruling 13: the candidate's positive-rate lower bound may be at most this far
-/// below the `rules` rate.
+/// below the `rules` rate. On the agreeing intervals the comparison is paired:
+/// the lower bound of learned minus `rules` may be at most this far below
+/// zero.
 pub const QUALITY_ALLOWANCE: f64 = 0.02;
 
 /// Ruling 13: the candidate's estimated cost must be at least this fraction

@@ -765,11 +765,11 @@ fn a_shadow_candidate_that_differs_from_rules_is_priced_from_quotes_but_not_qual
     assert_eq!(calibrated.evidence.intervals[0].turns[0].learned, haiku());
     let promotion = calibrated.report.promotion;
     assert_eq!(promotion.agreeing, 0);
-    for test in [promotion.quality_agreeing, promotion.quality_full] {
-        assert!(
-            matches!(test.result, TestResult::NotEvaluable(_)),
-            "{test:?}"
-        );
+    for result in [
+        promotion.quality_agreeing.result,
+        promotion.quality_full.result,
+    ] {
+        assert!(matches!(result, TestResult::NotEvaluable(_)), "{result:?}");
     }
     assert_eq!(promotion.quality_full.learned_supported, 0);
     assert_eq!(promotion.cost.learned, CostEstimate::Priced(0.001));

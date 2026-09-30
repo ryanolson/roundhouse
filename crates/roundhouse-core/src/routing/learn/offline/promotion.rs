@@ -24,11 +24,26 @@
 //!   wherever a side has no logging probability; the M11 rerun after the
 //!   first live sessions is the binding quality test.
 //!
+//! **The agreeing test is paired** (the M10 review-fix ruling of
+//! 2026-09-30). It reads the bootstrap lower bound of learned minus `rules`,
+//! both sides summed over the same resampled clusters, against
+//! `-QUALITY_ALLOWANCE`. Comparing the learned lower bound with the `rules`
+//! point estimate instead asks whether a bound lies within 0.02 of its own
+//! estimate, since on these intervals the two sides are one route: that is
+//! a sample-size test, and it fails on noise alone (twenty sessions,
+//! seventeen positive, reads 0.70 against 0.85). On an agreeing interval the
+//! two candidates have the same action on every turn, so the same weight in
+//! either mode: the difference is zero on every resample, and the test
+//! passes once the set meets `quality.min_sessions` with support. It cannot
+//! show a loss, because on these intervals none can exist.
+//!
 //! A test without support reads `not evaluable`, never `pass`.
 
 use std::fmt::Write as _;
 
-use super::estimate::{BootstrapPlan, CostEstimate, Estimate, Money, estimate, weighted_p50};
+use super::estimate::{
+    BootstrapPlan, CostEstimate, Estimate, Money, Outcome, estimate, paired_bootstrap, weighted_p50,
+};
 use super::extract::{Evidence, IntervalFacts, TurnFacts};
 use super::{
     CORRECTED_QUOTE_LABEL, COST_REDUCTION, CalibrationConfig, Candidate, ESTIMAND_LABEL,
@@ -80,6 +95,16 @@ impl TestResult {
 /// [`QUALITY_ALLOWANCE`] below the `rules` rate. Inclusive.
 pub fn quality_gate(lower: f64, rate: f64) -> TestResult {
     if lower >= rate - QUALITY_ALLOWANCE {
+        TestResult::Pass
+    } else {
+        TestResult::Fail
+    }
+}
+
+/// The paired quality comparison: the lower bound of learned minus `rules`
+/// at most [`QUALITY_ALLOWANCE`] below zero. Inclusive.
+pub fn paired_quality_gate(lower: f64) -> TestResult {
+    if lower >= -QUALITY_ALLOWANCE {
         TestResult::Pass
     } else {
         TestResult::Fail
@@ -188,14 +213,25 @@ pub struct QualityTest {
     pub result: TestResult,
 }
 
+/// The paired quality test on the agreeing intervals.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PairedQualityTest {
+    /// Intervals the comparison is over.
+    pub intervals: usize,
+    /// The bootstrap lower bound of learned minus `rules`, both sides summed
+    /// over the same resampled clusters.
+    pub lower: Option<f64>,
+    pub result: TestResult,
+}
+
 /// Ruling 13's tests for the learned candidate, staged.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PromotionSummary {
     pub intervals: usize,
     /// Intervals where the learned choice was the `rules` route on every turn.
     pub agreeing: usize,
-    /// Gates promotion: quality on the agreeing intervals.
-    pub quality_agreeing: QualityTest,
+    /// Gates promotion: paired quality on the agreeing intervals.
+    pub quality_agreeing: PairedQualityTest,
     /// Printed, and binding only at the M11 rerun: quality over every interval.
     pub quality_full: QualityTest,
     pub cost: CostTest,
@@ -243,16 +279,22 @@ impl PromotionSummary {
                 quotes.count(turn, Strategy::Rules);
             }
         }
+        let agreeing_sessions = clusters(&agreeing);
         PromotionSummary {
             intervals: intervals.len(),
             agreeing: agreeing.len(),
-            quality_agreeing: quality(&agreeing, config.bootstrap),
+            quality_agreeing: paired_quality(
+                &agreeing,
+                config.bootstrap,
+                agreeing_sessions,
+                config.quality.min_sessions,
+            ),
             quality_full: quality(&all, config.bootstrap),
             cost: cost(intervals),
             latency: latency(intervals, config.latency_limit_ms),
             quotes,
             sessions: clusters(&all),
-            agreeing_sessions: clusters(&agreeing),
+            agreeing_sessions,
             min_sessions: config.quality.min_sessions,
             latency_limit_ms: config.latency_limit_ms,
         }
@@ -328,6 +370,46 @@ fn quality(intervals: &[&IntervalFacts], plan: BootstrapPlan) -> QualityTest {
         // the comparison this test exists to refuse.
         lower: learned.bootstrap.lower.filter(|_| supported),
         rate: rules.snips.filter(|_| supported),
+        result,
+    }
+}
+
+/// The paired lower bound of learned minus `rules` over `intervals`, against
+/// the allowance. Not evaluable below `min_sessions` clusters, without weight
+/// on either side, or on sparse support, in that order.
+fn paired_quality(
+    intervals: &[&IntervalFacts],
+    plan: BootstrapPlan,
+    sessions: u64,
+    min_sessions: u64,
+) -> PairedQualityTest {
+    let over = |candidate| -> Vec<_> {
+        intervals
+            .iter()
+            .map(|interval| interval.outcome(candidate))
+            .collect()
+    };
+    let learned = over(Candidate::Learned);
+    let rules = over(Candidate::Fixed(Strategy::Rules));
+    let bounds = paired_bootstrap(&learned, &rules, plan);
+    let weighted = |side: &[Outcome]| side.iter().any(|outcome| outcome.weight > 0.0);
+    let result = if intervals.is_empty() {
+        TestResult::NotEvaluable("no interval in the set")
+    } else if sessions < min_sessions {
+        TestResult::NotEvaluable("the agreeing intervals span fewer than quality.min_sessions")
+    } else if !weighted(&learned) || !weighted(&rules) {
+        TestResult::NotEvaluable("a side has no agreeing interval with weight above zero")
+    } else if bounds.sparse {
+        TestResult::NotEvaluable(SPARSE)
+    } else {
+        bounds.lower.map_or(
+            TestResult::NotEvaluable("no bootstrap replicates"),
+            paired_quality_gate,
+        )
+    };
+    PairedQualityTest {
+        intervals: intervals.len(),
+        lower: bounds.lower,
         result,
     }
 }
@@ -454,11 +536,11 @@ impl PromotionSummary {
         let _ = writeln!(
             o,
             "1. quality, on the intervals where learned agreed with rules ({differed} of {} \
-             intervals differed): bootstrap lower bound, {ESTIMAND_LABEL}, {} against rules, \
-             {ESTIMAND_LABEL}, {} on the same {} intervals, less {QUALITY_ALLOWANCE:.2}: {}",
+             intervals differed): paired bootstrap lower bound of the per-interval difference, \
+             learned minus rules, {ESTIMAND_LABEL}, both sides over the same resampled {unit}, \
+             {} on the same {} intervals, against -{QUALITY_ALLOWANCE:.2}: {}",
             self.intervals,
             rate(q.lower),
-            rate(q.rate),
             q.intervals,
             q.result.label()
         );
