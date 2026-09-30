@@ -155,8 +155,16 @@ pub struct Candidate {
     /// `isl - p_hit * cached_prefix_tokens`.
     pub expected_prefill_tokens: f64,
 
-    /// Raw matched prefix tokens, before cache weighting. Observability only —
-    /// decisions use `expected_prefill_tokens`.
+    /// Prompt tokens this target is expected to serve from its cache.
+    ///
+    /// **Two producers, two meanings, one direction.** A local worker reports
+    /// the router's raw `longest_matched_tokens`. A frontier quote reports the
+    /// ledger's weighted count, `p_hit * cached_prefix_tokens`, floored, which is
+    /// never more than the raw prefix. The router decides on
+    /// `expected_prefill_tokens`, not this field. The learner's cache
+    /// correction reads it only as an upper bound on reuse, and also caps reuse
+    /// at the quote's own cached count, so either meaning keeps a corrected
+    /// quote at or above the original one.
     pub matched_prefix_tokens: u64,
 
     pub expected_ttft_ms: f64,

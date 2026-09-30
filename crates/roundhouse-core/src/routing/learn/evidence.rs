@@ -299,16 +299,22 @@ pub struct CostEvidence {
     pub correction: CostCorrection,
 }
 
-/// Whether the reuse correction moved the quote, and why not when it did not.
+/// Whether the reuse correction ran, and why not when it did not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CostCorrection {
+    /// The correction ran, and `adjusted_usd` is its result. That equals the
+    /// quote when nothing moved, or when moving would have lowered it.
     Applied,
     /// The target's measured pairs predicted no reuse, so there is no ratio.
     NoPredictedReuse,
-    /// Fewer measured pairs than `cache_min_samples`.
+    /// Fewer measured pairs than `cache_min_samples`. Also recorded for a
+    /// target the store view holds nothing for, and for zero pairs under a
+    /// configured minimum of zero: no samples is never a measurement.
     TooFewSamples,
-    /// A local target: its quote is the residency answer, not a ledger model.
+    /// A local target. Its quote is the residency answer, at the configured
+    /// capacity price when there is one, and it has no ledger model to
+    /// re-price a shortfall against.
     NotFrontier,
 }
 
@@ -329,7 +335,9 @@ pub enum LatencyTerm {
     /// The mean was added, in whole milliseconds.
     Applied { mean_ms: i64 },
     /// Fewer samples than `latency_min_samples`, so nothing was added and the
-    /// record says so rather than showing a zero that looks measured.
+    /// record says so rather than showing a zero that looks measured. Also
+    /// recorded for a target the store view holds nothing for, and for zero
+    /// samples under a configured minimum of zero.
     TooFewSamples,
 }
 
@@ -465,6 +473,17 @@ pub struct ReadView {
     /// The project's overhead from `TurnStarted` to the served `Routed`, the
     /// third term of the latency model.
     pub overhead: LatencySum,
+}
+
+impl ReadView {
+    /// The operational counters of `target`, found by its policy identity.
+    ///
+    /// Identity rather than ledger key, because the counters are per recipe
+    /// target: every worker of one local model shares one residual.
+    pub fn target(&self, target: &Target) -> Option<&TargetOps> {
+        let identity = target.policy_identity();
+        self.targets.iter().find(|ops| ops.target == identity)
+    }
 }
 
 /// Quality counts and Jev answers at one key.
