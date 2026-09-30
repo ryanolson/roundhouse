@@ -82,7 +82,10 @@ ssh -L 8080:localhost:8080 user@your-gpu-cluster-node
 **Goal:** Verify the end-to-end Shape A path is healthy and establish baseline cache% numbers.
 
 **Steps:**
-1. Replace `"model"` in `catalog.json` with the real NVIDIA model id.
+1. ~~Replace `"model"` in `catalog.json` with the real NVIDIA model id.~~ Done 2026-09-23:
+   `catalog.json` now names `aws/anthropic/bedrock-claude-opus-4-8` over the `anthropic_messages`
+   dialect and a `"providers"` entry for `nvidia` (the M10.1 provider-registry schema — see the
+   file's `$comment` and `README.md`).
 2. Run `python use-cases/cache-aware-routing/mint_keys.py`.
 3. Launch roundhouse on your laptop:
    ```bash

@@ -86,7 +86,7 @@ flowchart LR
 |---|---|---|---|---|
 | Real `LocalExecutor` not implemented | Not built | P1 | `crates/roundhouse-fleet/src/local.rs` — trait exists; only `EchoLocalExecutor` and mocks implement it | Phase 2 Rust work |
 | `roundhouse-server` binary does not wire `LocalFleet` | Not wired | P1 | `crates/roundhouse-server/src/main.rs` — `serve()` attaches no `EmbeddedFleet` | Phase 2 custom binary |
-| Dynamo worker not running + roundhouse not co-located on cluster | Needs deployment | P1 | GPU cluster node — requires etcd + nats, Dynamo from pinned rev `ac7b7513`, Qwen weights, roundhouse running on same node | Phase 2 cluster setup |
+| Dynamo worker not running + roundhouse not co-located on cluster | Needs deployment | P1 | GPU cluster node — requires etcd + nats, Dynamo from pinned rev `ac7b7513`, Qwen weights, roundhouse running on same node | Phase 2 cluster setup — **2026-09-23: Dynamo itself is now actually installed and serving on this box (see addendum below); the roundhouse-side co-location/wiring is still open** |
 | `correlaries: []` — savings dashboard shows $0 | Needs config | P1 | `use-cases/cache-aware-routing/catalog.json` | Phase 3 |
 | Placeholder pricing in `catalog.json` | Needs config | P1 | `use-cases/cache-aware-routing/catalog.json` | Phase 3 |
 | Only one user in `control-plane.json` (Tax B invisible) | Needs config | P2 | `use-cases/cache-aware-routing/control-plane.json` — add second user + key entry | Phase 1 |
@@ -164,3 +164,51 @@ flowchart TD
   style Corr fill:#e07c00,color:#fff
   style LocalEx fill:#9b2335,color:#fff
 ```
+
+---
+
+## 2026-09-23 addendum — Dynamo actually installed and serving, single-GPU topology
+
+Validated hands-on on a real GPU box (1× NVIDIA H100 80GB — **not** the ≥2-GPU cluster node
+`serve_model.sh`'s old defaults assumed):
+
+- **`deploy/docker-compose.yml` no longer exists** at pinned rev `ac7b7513790ef1d619b46f805aea03c9f21200ba`.
+  It moved to `dev/docker-compose.yml` (verified against a real clone checked out at that exact rev).
+  `serve_model.sh` and `PLAN.md` updated to the new path.
+- Dynamo's Python side installs cleanly via its own documented from-source flow (`docs/fern/pages/
+  developer-guide/advanced-customizations/building-from-source.md` in the pinned clone): `uv venv`,
+  `maturin develop --uv` in `lib/bindings/python` (builds `dynamo-kv-router`, `dynamo-runtime`, etc. —
+  ~3.5 min), `uv pip install -e lib/gpu_memory_service`, then `uv pip install -e '.[vllm]'` (pulls
+  torch 2.11.0 / vllm 0.26.0 / tilelang). `python -c "import dynamo.vllm"` succeeds afterward.
+  `libzmq3-dev` (plus Dynamo's own `build-essential libhwloc-dev libudev-dev pkg-config libclang-dev
+  protobuf-compiler python3-dev cmake`) had to be installed via `sudo apt install` first.
+- **Single-GPU topology**: `serve_model.sh`'s old defaults (`GPUS=0,1 TP=2`) assumed ≥2 GPUs. Changed
+  defaults to `GPUS=0 TP=1`, overridable for real multi-GPU nodes.
+- **CUDA 13 gotcha, hit and worked around before it even had a chance to bite**: this box's CUDA
+  toolkit is 13.0; the pinned Dynamo rev's own troubleshooting doc names an exact FlashInfer-sampler
+  JIT failure on CUDA 13 installs (torch pins runtime headers to 13.0, vLLM's `tilelang` pulls
+  `nvidia-cuda-nvcc` 13.2 — version-skewed). Worked around with `VLLM_USE_FLASHINFER_SAMPLER=0`,
+  now set (overridable) in `serve_model.sh`.
+- **32B vs 14B — 32B fits, no fallback needed.** `Qwen/Qwen2.5-Coder-32B-Instruct` (62 GB safetensors)
+  loaded and served at `TP=1` on the single H100 80GB with no OOM: weights took 61.04 GiB, vLLM's
+  default `gpu_memory_utilization=0.9`-derived budget left **9.97 GiB for KV cache → 40,832 KV
+  tokens** (1.25× concurrency at `max_model_len=32768`). Steady-state GPU memory after full warmup:
+  **~76.9 / 81.6 GB used, ~4.2 GB free** — tight but not exceeded. Dynamo reported "chat endpoints
+  enabled" / model registered, and a live smoke test against `dynamo.frontend`'s own OpenAI-compatible
+  endpoint confirmed a real completion:
+  ```
+  curl -s localhost:8000/v1/chat/completions -d '{"model":"Qwen/Qwen2.5-Coder-32B-Instruct",
+    "messages":[{"role":"user","content":"Say OK"}],"max_tokens":10}'
+  → {"choices":[{"message":{"content":"OK", ...}, "finish_reason":"stop", ...}], "usage":{...}}
+  ```
+  40,832 KV tokens is ample for this use case's actual demo shape (a ~4 KB / ~1000-token corpus, one
+  session at a time, 20 turns) even though it is tight for concurrent multi-session load — if a future
+  use case needs real concurrency at 32B, `Qwen/Qwen2.5-Coder-14B-Instruct` (documented fallback,
+  ~28 GB weights) is where the headroom comes back.
+- **What this does and does not close**: Dynamo (`dynamo.frontend` + `dynamo.vllm`) is now genuinely
+  installable and (pending the 32B/14B outcome above) serving real weights on real hardware, with
+  etcd + nats up via `dev/docker-compose.yml`. This closes the "Dynamo worker not running" half of
+  the P1 row above. It does **not** close "real `LocalExecutor` not implemented" or "`roundhouse-
+  server` binary does not wire `LocalFleet`" — those are still open, unbuilt, Rust-side gaps; nothing
+  in this session touched `crates/roundhouse-fleet/src/local.rs` or `crates/roundhouse-server/src/
+  main.rs`. roundhouse still cannot route a turn to this worker.

@@ -14,9 +14,13 @@
 #
 # Prereqs (on the GPU cluster node, inside the Dynamo container or venv where
 # `python -m dynamo.vllm` is importable):
-#   - Dynamo + vLLM installed (`pip install -e .` inside ai-dynamo/dynamo clone,
-#     or use the Dynamo runtime container).
-#   - etcd + nats running: `docker compose -f deploy/docker-compose.yml up -d`
+#   - Dynamo + vLLM installed (`uv pip install -e '.[vllm]'` inside an ai-dynamo/dynamo
+#     clone at the pinned rev -- see docs/fern/pages/developer-guide/advanced-customizations/
+#     building-from-source.md in that clone -- or use the Dynamo runtime container).
+#   - etcd + nats running: `docker compose -f dev/docker-compose.yml up -d`
+#     (2026-09-23: `deploy/docker-compose.yml` no longer exists at the pinned rev
+#     ac7b7513790ef1d619b46f805aea03c9f21200ba; the file moved to `dev/docker-compose.yml`.
+#     Verified against a real clone checked out at that rev.)
 #   - Weights downloaded: `./use-cases/cache-aware-routing/pull_model.sh pull`
 #   - huggingface-cli logged in if model is gated (Qwen Coder is public).
 #
@@ -33,8 +37,10 @@ set -euo pipefail
 
 # --- Configuration ----------------------------------------------------------
 
-# The coding-specialized local model. 32B in bf16 is ~64 GB of weights, so it does
-# not fit on one 80 GB GPU with any KV headroom — tensor-parallel across >=2.
+# The coding-specialized local model. 32B in bf16 is ~64 GB of weights, so on a
+# single 80 GB GPU it leaves little headroom for KV cache; 14B (~28 GB) is the
+# documented fallback if 32B's KV cache allocation fails at startup (OOM). See
+# GAPS.md's 2026-09-23 addendum for what was actually observed on a 1x H100 80GB box.
 MODEL="${MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct}"
 
 # MUST match roundhouse's WorkerRegistration.block_size when the local tier is wired.
@@ -43,8 +49,10 @@ MODEL="${MODEL:-Qwen/Qwen2.5-Coder-32B-Instruct}"
 BLOCK_SIZE="${BLOCK_SIZE:-64}"
 
 # GPUs and tensor-parallel width. TP must divide the GPU count you expose.
-GPUS="${GPUS:-0,1}"
-TP="${TP:-2}"
+# Defaults to a single GPU (TP=1) -- this use case has been run on a 1x H100 80GB
+# box. Override GPUS=0,1 TP=2 (or more) on a real multi-GPU cluster node.
+GPUS="${GPUS:-0}"
+TP="${TP:-1}"
 
 # Dynamo frontend (OpenAI-compatible) HTTP port — use this to smoke-test the model.
 HTTP_PORT="${DYN_HTTP_PORT:-8000}"
@@ -61,6 +69,15 @@ DYN_SYSTEM_PORT="${DYN_SYSTEM_PORT:-8081}"
 # Deterministic hashing for KV event IDs, so the hashes roundhouse computes over a
 # prompt match the ones the worker emits. agg_router.sh sets this for the same reason.
 export PYTHONHASHSEED=0
+
+# On a CUDA 13 install, vLLM's FlashInfer sampler JIT-compiles against
+# version-skewed headers (torch pins CUDA 13.0, vLLM's tilelang dep pulls
+# nvidia-cuda-nvcc 13.2) and aborts worker startup -- see the pinned Dynamo
+# rev's docs/fern/.../building-from-source.md#troubleshooting and
+# https://github.com/flashinfer-ai/flashinfer/issues/3493. Falls back to
+# vLLM's native sampler; unset this if your CUDA toolkit and torch's CUDA
+# runtime match exactly.
+export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
 # --- Serve ------------------------------------------------------------------
 
