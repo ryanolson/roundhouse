@@ -8,6 +8,7 @@ members = [
     "crates/roundhouse-fleet",
     "crates/roundhouse-mcp",
     "crates/roundhouse-relay",
+    "crates/roundhouse-sequence-id",
     "crates/roundhouse-store-redis",
     "crates/roundhouse-server",
     "crates/topham",
@@ -23,6 +24,7 @@ roundhouse-core = { path = "crates/roundhouse-core" }
 roundhouse-fleet = { path = "crates/roundhouse-fleet" }
 roundhouse-mcp = { path = "crates/roundhouse-mcp" }
 roundhouse-relay = { path = "crates/roundhouse-relay" }
+roundhouse-sequence-id = { path = "crates/roundhouse-sequence-id" }
 # The composition root, depended on *upwards* by `crates/topham`: the launcher
 # reads the two client-launch generators and the constants they need, and the
 # direction is the right one -- a launcher sits above the server it points a
@@ -96,6 +98,15 @@ getrandom = "0.3"
 # recorded in `control_config.rs`, not here, because that is where a future
 # reader would otherwise "fix" it.
 hex = "0.4"
+# The keyed digests of session and sequence identity
+# (`crates/roundhouse-sequence-id`): per-principal tip keys, the sequence digest
+# sent as `x-dynamo-session-id`, and the invalidation id. The RustCrypto crate of
+# the `sha2` family, so it shares `digest` 0.10 with the `sha2` pin below and
+# adds one small crate rather than a second hashing stack. HMAC rather than a
+# salted hash because the key is a deployment secret and the outputs are
+# compared across nodes: a salted SHA-256 over `secret || data` is extendable
+# where an HMAC is not.
+hmac = "0.12"
 serde = { version = "1", features = ["derive", "rc"] }
 # Default features, and one of the defaults is load-bearing: `preserve_order`
 # is OFF, so `serde_json::Map` is a `BTreeMap` and every `Value` renders in one

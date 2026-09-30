@@ -133,3 +133,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod chain_cost;

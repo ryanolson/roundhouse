@@ -560,6 +560,20 @@ impl From<DirectoryError> for ApiError {
     }
 }
 
+/// A label refusal, as the 422 this server has always sent for it.
+///
+/// `LabelError`'s texts are this server's bodies from before the derivation
+/// moved into `roundhouse-sequence-id`, verbatim, so a client that parses the
+/// refusal sees what it saw; the status and code are chosen here, because an
+/// HTTP status is the server's business and not the pure crate's. Only the
+/// Responses surface can be refused a label — the Messages label API returns
+/// no `Result` — so this is reached from `RequestContext::from_request` alone.
+impl From<roundhouse_sequence_id::LabelError> for ApiError {
+    fn from(error: roundhouse_sequence_id::LabelError) -> Self {
+        ApiError::unprocessable(error.to_string())
+    }
+}
+
 /// The auth vocabulary, in this transport's error shape.
 ///
 /// One body shape for every pre-stream refusal, whether it came from the key

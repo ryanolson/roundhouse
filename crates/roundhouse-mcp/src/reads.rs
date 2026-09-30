@@ -166,8 +166,8 @@ pub trait ControlReads: Send + Sync + 'static {
     ///
     ///    **That namespacing is the Responses surface's, and a Messages client
     ///    has no name that lands in it** (M12). A Messages session is keyed
-    ///    `anthropic_messages/<id>` (`messages_api::wire::session_key`), so a
-    ///    Claude Code model passing its own session id here resolves to
+    ///    `anthropic_messages/<id>` (`roundhouse_sequence_id::messages_label`),
+    ///    so a Claude Code model passing its own session id here resolves to
     ///    nothing and is refused as foreign rather than answered. That is why
     ///    (2) and (3) exist and why the tools' own `conversation` description
     ///    no longer invites a client to fill this in: on the Messages surface

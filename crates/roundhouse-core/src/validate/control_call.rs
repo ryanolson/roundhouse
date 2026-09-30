@@ -29,6 +29,7 @@
 //! every conversation holding a control call.
 
 use super::exchange::Exchange;
+use crate::ids::MESSAGES_DIALECT_NAMESPACE;
 
 /// The namespace codex flattens roundhouse's own MCP tools under.
 ///
@@ -129,14 +130,15 @@ impl ControlCallDialect {
     /// Which surface wrote the session under `session_key`.
     ///
     /// The Messages surface keys its sessions `…/anthropic_messages/<id>`
-    /// (`messages_api::wire::session_key`) and nothing else does, so the key is
+    /// (`roundhouse_sequence_id::messages_label`, scoped by
+    /// [`MESSAGES_DIALECT_NAMESPACE`]) and nothing else does, so the key is
     /// the one place the client's identity survives into a crate that cannot
     /// see either wire module. Read here rather than at each fold so there is
     /// one seam to correct if a third surface ever keys itself differently.
     pub fn of_session_key(session_key: &str) -> Self {
         if session_key
             .split('/')
-            .any(|segment| segment == MESSAGES_SESSION_SEGMENT)
+            .any(|segment| segment == MESSAGES_DIALECT_NAMESPACE)
         {
             Self::ClaudeMessages
         } else {
@@ -183,12 +185,6 @@ impl ControlCallDialect {
         }
     }
 }
-
-/// The session-key segment the Anthropic Messages surface stamps.
-///
-/// Spelled here rather than imported because the server names it a crate above;
-/// `messages_api::wire`'s own suite is what holds the two together.
-const MESSAGES_SESSION_SEGMENT: &str = "anthropic_messages";
 
 /// Whether this call is the agent talking to *us* rather than working on its
 /// task, as `dialect`'s client spells it.

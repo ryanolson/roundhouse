@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "roundhouse-sequence-id"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Session and sequence identity for Roundhouse: client detection, labels, client signals, and keyed digests"
+
+# Pure by construction: no store, no network, no clock, no environment, and no
+# async in the API. The server passes the deployment secret in as a value and
+# keeps everything that reads the process or the clock (`anonymous_key`,
+# `ControlPlane::qualify`) on its own side. Nothing below is here for I/O, and a
+# dependency that brought some would be the first sign the boundary moved.
+[dependencies]
+# `Item`, `Item::render`, the unkeyed chain, and the dialect namespace: one
+# spelling of each. Core brings `tokio` and `dynamo-kv-router` with it; this
+# crate uses neither.
+roundhouse-core = { workspace = true }
+# `HeaderMap`, the type axum re-exports. Declared literally as `roundhouse-mcp`
+# does, for the same reason: already in the tree, named here so the edge is
+# deliberate.
+http = "1"
+hex = { workspace = true }
+hmac = { workspace = true }
+# `metadata.user_id` parsing, the Codex turn metadata, and the canonical tools
+# JSON -- whose key order is sorted only because `preserve_order` is off
+# workspace-wide (see the root manifest's note on `serde_json`).
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

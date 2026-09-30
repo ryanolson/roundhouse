@@ -1,0 +1,474 @@
+{
+  "messages": [
+    {
+      "id": "messages/claude-2.1.251-turn-1/no-headers",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-1/headers-2.1.251#0",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-1/headers-2.1.251#1",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-1/headers-2.1.257#0",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-1/headers-2.1.257#1",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-1/headers-2.1.257-mcp#0",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-1/headers-2.1.257-mcp#1",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-2-continue/no-headers",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-2-continue/headers-2.1.251#0",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-2-continue/headers-2.1.251#1",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-2-continue/headers-2.1.257#0",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-2-continue/headers-2.1.257#1",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-2-continue/headers-2.1.257-mcp#0",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.251-turn-2-continue/headers-2.1.257-mcp#1",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-1/no-headers",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-1/headers-2.1.251#0",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-1/headers-2.1.251#1",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-1/headers-2.1.257#0",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-1/headers-2.1.257#1",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-1/headers-2.1.257-mcp#0",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-1/headers-2.1.257-mcp#1",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-2-continue/no-headers",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-2-continue/headers-2.1.251#0",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-2-continue/headers-2.1.251#1",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-2-continue/headers-2.1.257#0",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-2-continue/headers-2.1.257#1",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-2-continue/headers-2.1.257-mcp#0",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-2-continue/headers-2.1.257-mcp#1",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-3-continue/no-headers",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-3-continue/headers-2.1.251#0",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-3-continue/headers-2.1.251#1",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-3-continue/headers-2.1.257#0",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-3-continue/headers-2.1.257#1",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-3-continue/headers-2.1.257-mcp#0",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-3-continue/headers-2.1.257-mcp#1",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-1/no-headers",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-1/headers-2.1.251#0",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-1/headers-2.1.251#1",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-1/headers-2.1.257#0",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-1/headers-2.1.257#1",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-1/headers-2.1.257-mcp#0",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-1/headers-2.1.257-mcp#1",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-2-toolresult/no-headers",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-2-toolresult/headers-2.1.251#0",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-2-toolresult/headers-2.1.251#1",
+      "label": "anthropic_messages/e13acbde-ab70-46ff-b094-fd8ce95d286d"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-2-toolresult/headers-2.1.257#0",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-2-toolresult/headers-2.1.257#1",
+      "label": "anthropic_messages/c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-2-toolresult/headers-2.1.257-mcp#0",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-mcp-turn-2-toolresult/headers-2.1.257-mcp#1",
+      "label": "anthropic_messages/54269458-0325-4180-a52f-dfb60acbf63c"
+    },
+    {
+      "id": "messages/claude-2.1.257-turn-1-without-metadata/no-headers",
+      "label": null
+    }
+  ],
+  "responses": [
+    {
+      "id": "responses/thread-id-alone",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "thread-a",
+        "session_id": null,
+        "thread_id": "thread-a",
+        "window_id": null,
+        "prompt_cache_key": "acf44ce6e9934392197fe103b9de5d59cbe5852a40d3b222dd819f0f3c1779a2"
+      }
+    },
+    {
+      "id": "responses/session-id-alone",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "session-a",
+        "session_id": "session-a",
+        "thread_id": null,
+        "window_id": null,
+        "prompt_cache_key": "acf44ce6e9934392197fe103b9de5d59cbe5852a40d3b222dd819f0f3c1779a2"
+      }
+    },
+    {
+      "id": "responses/prompt-cache-key-alone",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "cache-a",
+        "session_id": null,
+        "thread_id": null,
+        "window_id": null,
+        "prompt_cache_key": "cache-a"
+      }
+    },
+    {
+      "id": "responses/thread-id-beats-session-id",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "thread-a",
+        "session_id": "session-a",
+        "thread_id": "thread-a",
+        "window_id": null,
+        "prompt_cache_key": "acf44ce6e9934392197fe103b9de5d59cbe5852a40d3b222dd819f0f3c1779a2"
+      }
+    },
+    {
+      "id": "responses/thread-id-beats-prompt-cache-key",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "thread-a",
+        "session_id": null,
+        "thread_id": "thread-a",
+        "window_id": null,
+        "prompt_cache_key": "cache-a"
+      }
+    },
+    {
+      "id": "responses/session-id-beats-prompt-cache-key",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "session-a",
+        "session_id": "session-a",
+        "thread_id": null,
+        "window_id": null,
+        "prompt_cache_key": "cache-a"
+      }
+    },
+    {
+      "id": "responses/all-three-rungs",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "thread-a",
+        "session_id": "session-a",
+        "thread_id": "thread-a",
+        "window_id": null,
+        "prompt_cache_key": "cache-a"
+      }
+    },
+    {
+      "id": "responses/window-id-is-not-a-name",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "cache-a",
+        "session_id": null,
+        "thread_id": null,
+        "window_id": "window-a",
+        "prompt_cache_key": "cache-a"
+      }
+    },
+    {
+      "id": "responses/padded-thread-id-is-not-trimmed",
+      "outcome": {
+        "result": "ok",
+        "conversation_key": "  thread-a  ",
+        "session_id": null,
+        "thread_id": "  thread-a  ",
+        "window_id": null,
+        "prompt_cache_key": "acf44ce6e9934392197fe103b9de5d59cbe5852a40d3b222dd819f0f3c1779a2"
+      }
+    },
+    {
+      "id": "responses/no-name",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "a `thread-id`, `session-id`, or `prompt_cache_key` is required to name the conversation"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/no-name-empty-prompt-cache-key",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "a `thread-id`, `session-id`, or `prompt_cache_key` is required to name the conversation"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/no-name-window-id-only",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "a `thread-id`, `session-id`, or `prompt_cache_key` is required to name the conversation"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/blank-thread-id",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`thread-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/empty-thread-id",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`thread-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/blank-session-id",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`session-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/blank-session-id-beside-valid-thread-id",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`session-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/blank-window-id",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`x-codex-window-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/non-ascii-thread-id",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`thread-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/non-ascii-session-id",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`session-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/non-ascii-window-id",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`x-codex-window-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/combined-invalid-session-thread-window",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`session-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    },
+    {
+      "id": "responses/combined-invalid-thread-and-window",
+      "outcome": {
+        "result": "err",
+        "status": 422,
+        "body": {
+          "error": {
+            "code": "invalid_request",
+            "message": "`thread-id` must be a non-empty ASCII header"
+          }
+        }
+      }
+    }
+  ]
+}

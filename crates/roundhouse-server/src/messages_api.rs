@@ -16,11 +16,12 @@
 //! **The session has no field to name itself in.** A Messages request body has
 //! no `prompt_cache_key`; what it has is an `x-claude-code-session-id` header
 //! (live at 2.1.247) and a `metadata.user_id` that has carried the session id in
-//! two different spellings across the versions in the wild. [`wire::session_key`]
-//! resolves them in the order plan R5 fixes, and everything downstream — the
-//! namespace qualification, the `Conversations` binding, the fork on prefix
-//! disagreement — is what the Responses surface already does with the key a
-//! client hands it, through the one function both call
+//! two different spellings across the versions in the wild.
+//! `roundhouse_sequence_id::messages_label` resolves them in the order plan R5 fixes
+//! (`claimed_label` is this surface's call into it), and everything
+//! downstream — the namespace qualification, the `Conversations` binding, the
+//! fork on prefix disagreement — is what the Responses surface already does
+//! with the key a client hands it, through the one function both call
 //! ([`prefix_admission::bind_prefix`](crate::prefix_admission)).
 //!
 //! **The client's parser is strict where the other one is forgiving.** Claude
@@ -81,6 +82,7 @@ use roundhouse_core::now_ms;
 use roundhouse_core::store::SessionStore;
 
 use roundhouse_fleet::WireProtocol;
+use roundhouse_sequence_id::messages_label;
 
 use crate::control_config::{AuthError, PlaneSource};
 use crate::conversations::Conversations;
@@ -98,7 +100,7 @@ pub mod wire;
 
 use emit::MessageEmission;
 use follower::{MessagesFollower, complete_message};
-use wire::{CreateMessageParams, canonicalize, session_key, turn_id_for};
+use wire::{CreateMessageParams, canonicalize, turn_id_for};
 
 /// The path the client posts a turn to.
 ///
@@ -369,7 +371,7 @@ where
     // Resolved before `bind` consumes it, and named here rather than inside the
     // bind so the anonymous arm is visible at the site that decides what a turn
     // belongs to rather than buried in a helper.
-    let cache_key = session_key(&headers, &params).unwrap_or_else(anonymous_key);
+    let cache_key = claimed_label(&headers, &params).unwrap_or_else(anonymous_key);
     let (session_id, input, _) = bind_prefix(
         &state.engine,
         &state.store,
@@ -529,6 +531,24 @@ where
 /// schema — so this is reached only by a hand-rolled request. Named rather than
 /// empty because the value ends up in a transcript.
 const UNDECLARED_MODEL: &str = "roundhouse-routed";
+
+/// The session this request names, or `None` for an anonymous turn.
+///
+/// One call into `roundhouse_sequence_id::messages_label`, which owns R5's
+/// rungs for this surface: the derivation lives in one crate beside the
+/// Responses reader, so the two surfaces cannot drift apart in modules that
+/// each treat the other's spelling as a detail. What stays here is only what
+/// reads the process — [`anonymous_key`] — which is why `None` comes back
+/// rather than a name. It cannot fail: a Messages request that names nothing
+/// is an anonymous turn, not a refusal.
+///
+/// A function rather than inline in the handler so the golden label capture
+/// (`request_context::label_golden`) runs this exact glue, the
+/// `metadata.user_id` extraction included, and not a parallel copy of it that
+/// could agree with the crate while the handler did not.
+pub(crate) fn claimed_label(headers: &HeaderMap, params: &CreateMessageParams) -> Option<String> {
+    messages_label(headers, params.user_id())
+}
 
 /// A fresh session name for a request that carried none.
 ///

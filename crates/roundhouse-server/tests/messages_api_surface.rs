@@ -67,11 +67,10 @@ use roundhouse_fleet::{
     EchoFrontierClient, FrontierChunk, FrontierClient, FrontierError, FrontierModelSpec,
     FrontierQuote, FrontierStream, LocalFleet, StaticFrontierCatalog, WireProtocol,
 };
+use roundhouse_sequence_id::messages_label;
 use roundhouse_server::claude_launch::ROUNDHOUSE_API_KEY_SENTINEL;
 use roundhouse_server::conversations::bound_session;
-use roundhouse_server::messages_api::wire::{
-    CreateMessageParams, canonicalize, is_budget_notice, session_key,
-};
+use roundhouse_server::messages_api::wire::{CreateMessageParams, canonicalize, is_budget_notice};
 use roundhouse_server::test_support::engine_over_echo;
 use roundhouse_server::{
     ControlPlane, ControlPlaneConfig, Conversations, DEFAULT_MCP_NAMESPACE, Engine, messages_router,
@@ -3569,7 +3568,7 @@ fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against(line:
     );
     // The session name the client gave, in the shape it gives it in.
     assert_eq!(
-        session_key(&HeaderMap::new(), &params),
+        messages_label(&HeaderMap::new(), params.user_id()),
         Some(line.named()),
         "the capture's `metadata.user_id` is a JSON object string, and the \
          name it yields lives in this dialect's own namespace (F6)"
@@ -3649,8 +3648,8 @@ fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_cha
     // And both turns name the same session, which is what makes the prefix
     // check reach the same log at all.
     assert_eq!(
-        session_key(&HeaderMap::new(), &parse(line.turn_one)),
-        session_key(&HeaderMap::new(), &parse(line.turn_two)),
+        messages_label(&HeaderMap::new(), parse(line.turn_one).user_id()),
+        messages_label(&HeaderMap::new(), parse(line.turn_two).user_id()),
     );
 }
 per_line_tests!(fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed);
