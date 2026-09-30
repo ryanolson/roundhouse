@@ -235,7 +235,7 @@ fn raw_partial_json(body: &str) -> String {
             continue;
         }
         if let StrictEvent::ContentBlockDelta {
-            delta: StrictDelta::InputJsonDelta { partial_json },
+            delta: StrictDelta::InputJson { partial_json },
             ..
         } = event
         {

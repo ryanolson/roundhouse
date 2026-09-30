@@ -19,7 +19,7 @@ use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::event::SessionEvent;
 use roundhouse_core::ids::TurnId;
 use roundhouse_core::item::{ItemContent, Role};
-use roundhouse_core::store::{Lease, MemoryStore, StoreError};
+use roundhouse_core::store::{MemoryStore, StoreError};
 use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
 
 use crate::engine::EngineConfig;
@@ -362,7 +362,7 @@ impl<S: SessionStore> Rig<S> {
             .map(|item| SessionEventKind::ItemAppended { item })
             .collect();
         self.store
-            .append_events(&lease, kinds)
+            .append_events(&lease, kinds, None)
             .await
             .expect("seed append");
     }
@@ -1170,8 +1170,23 @@ impl CountingStore {
     }
 }
 
+// `Delegating` is deliberately not `use`d in this file: fixtures throughout
+// call methods directly on a concrete double (`store.create_session(..)`),
+// and having both traits' same-named methods in scope at once would make
+// those calls ambiguous (E0034). Fully qualifying the trait here avoids that
+// without pushing disambiguation onto every call site instead.
 #[async_trait::async_trait]
-impl SessionStore for CountingStore {
+impl roundhouse_core::store::doubles::Delegating for CountingStore {
+    type Backend = MemoryStore;
+
+    fn backend(&self) -> &MemoryStore {
+        &self.inner
+    }
+
+    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
+        self.inner.is_leased(session_id).await
+    }
+
     async fn create_session(
         &self,
         session_id: &SessionId,
@@ -1179,35 +1194,6 @@ impl SessionStore for CountingStore {
     ) -> Result<bool, StoreError> {
         self.create_session_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.create_session(session_id, model_policy).await
-    }
-
-    async fn acquire_lease(
-        &self,
-        session_id: &SessionId,
-        node_id: &str,
-        ttl_ms: u64,
-    ) -> Result<Option<Lease>, StoreError> {
-        self.inner.acquire_lease(session_id, node_id, ttl_ms).await
-    }
-
-    async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
-        self.inner.renew_lease(lease, ttl_ms).await
-    }
-
-    async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
-        self.inner.release_lease(lease).await
-    }
-
-    async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
-        self.inner.is_leased(session_id).await
-    }
-
-    async fn append_events(
-        &self,
-        lease: &Lease,
-        kinds: Vec<SessionEventKind>,
-    ) -> Result<Vec<SessionEvent>, StoreError> {
-        self.inner.append_events(lease, kinds).await
     }
 
     async fn read_events(
@@ -1218,10 +1204,6 @@ impl SessionStore for CountingStore {
     ) -> Result<Vec<SessionEvent>, StoreError> {
         self.read_events_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.read_events(session_id, after_seq, limit).await
-    }
-
-    async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
-        self.inner.last_seq(session_id).await
     }
 }
 

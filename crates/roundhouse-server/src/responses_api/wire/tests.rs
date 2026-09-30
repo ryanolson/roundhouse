@@ -10,6 +10,7 @@
 //! the wire vocabulary itself (M17 review, F2).
 
 use super::*;
+use roundhouse_core::event::CacheReadSource;
 
 fn user(text: &str) -> Item {
     Item::user_text(text)
@@ -36,6 +37,7 @@ fn a_measured_cache_write_reaches_the_wire_and_an_unmeasured_one_stays_zero() {
     let anthropic = Usage {
         input_tokens: 9_512,
         cached_input_tokens: 9_000,
+        cache_read_source: CacheReadSource::Provider,
         cache_write_tokens: 500,
         output_tokens: 64,
         reasoning_tokens: 0,

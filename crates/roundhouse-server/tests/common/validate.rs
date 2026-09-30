@@ -29,6 +29,7 @@ use roundhouse_core::validate::{
 use roundhouse_fleet::FrontierModelSpec;
 
 use super::MINUTE;
+use roundhouse_core::event::CacheReadSource;
 
 /// A verdict that maps to `Continue`: the cheap default, and the one that lets
 /// a test assert "the turn ran exactly as it would have".
@@ -86,6 +87,7 @@ pub fn judge_usage() -> Usage {
         output_tokens: 47,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
+        cache_read_source: CacheReadSource::Provider,
     }
 }
 

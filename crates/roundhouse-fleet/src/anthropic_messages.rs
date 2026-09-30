@@ -34,6 +34,11 @@
 //!    *nothing* without an explicit breakpoint, so flat-string parity with the
 //!    Responses client would zero the provider cache discount on every Anthropic
 //!    turn — against the sentence this product is built to satisfy. Ruling R3.
+//!    Up to two markers ride the blocks: the penultimate one, and — when the
+//!    turn appended enough items to put the previous request's entry outside the
+//!    provider's [`cache_markers::CACHE_LOOKBACK_BLOCKS`] window — one back
+//!    where that entry lives. See [`cache_markers`] for the placement policy
+//!    itself.
 //! 5. **No route here follows a redirect, the stored one included.** The
 //!    Responses client keeps an ordinary redirect-following transport for its
 //!    own key; that is safe only because a stored OpenAI key rides
@@ -45,6 +50,7 @@
 //! first, and outbound credential headers are marked sensitive so `hyper` will
 //! not print them in its own diagnostics.
 
+mod cache_markers;
 mod stream;
 pub mod wire;
 
@@ -191,17 +197,73 @@ impl StoredAuthStyle {
 /// roughly a paragraph.
 pub const DEFAULT_MAX_TOKENS: u32 = 8192;
 
-/// How many `cache_control` breakpoints one Messages request may carry.
+/// The cache lifetime a `1h` marker asks for, in milliseconds. The only other
+/// lifetime the API offers is the default, which is the field omitted.
+const ONE_HOUR_MS: u64 = 3_600_000;
+
+/// Anthropic's own default lifetime, in milliseconds — what a marker with no
+/// `ttl` field at all means.
 ///
-/// **Anthropic's documented cap, and a hard 400 on the fifth.** It matters here
-/// because roundhouse is not the only author of this request: the tool
-/// definitions are forwarded from the client with their own breakpoints intact
-/// — Claude Code marks its last tool, which is how it caches a
-/// twenty-four-entry preamble — and the block breakpoint this client adds is
-/// therefore never the request's only one. A constant rather than a literal so
-/// the number and the reason it exists sit together; if Anthropic raises it,
-/// this is the line that moves.
-const MAX_CACHE_BREAKPOINTS: usize = 4;
+/// `pub(crate)` rather than private: `frontier::requested_cache_lifetime`
+/// needs the same number to decide whether an `InactivityDecay` ceiling
+/// still fits inside the wire's silent default.
+pub(crate) const DEFAULT_CACHE_TTL_MS: u64 = 300_000;
+
+/// The cache lifetimes Anthropic's Messages wire actually offers.
+///
+/// **Typed rather than a raw millisecond count**, so a catalog entry that
+/// declares a TTL neither spelling means is refused at the boundary instead
+/// of silently downgraded to the default the provider assumes when `ttl` is
+/// missing — see [`Self::from_ttl_ms`] and the catalog's
+/// `UnsupportedCacheLifetime` refusal. Every reader of
+/// [`FrontierQuote::cache_lifetime`](crate::frontier::FrontierQuote::cache_lifetime)
+/// matches both variants exhaustively, so a third lifetime this wire ever
+/// grew would fail to compile here rather than fall through a wildcard arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLifetime {
+    /// No `ttl` field at all — Anthropic's own five-minute default.
+    Default,
+    /// An explicit `1h` marker.
+    OneHour,
+}
+
+impl CacheLifetime {
+    /// The wire's own spelling, or `None` for the field omitted.
+    pub fn wire(self) -> Option<&'static str> {
+        match self {
+            CacheLifetime::Default => None,
+            CacheLifetime::OneHour => Some(wire::CACHE_TTL_1H),
+        }
+    }
+
+    /// Resolve a catalog's millisecond TTL into the wire's own vocabulary.
+    ///
+    /// `None` for any value neither spelling means — the catalog boundary
+    /// refuses that at load (`catalog_config.rs`'s `UnsupportedCacheLifetime`),
+    /// so a target that reaches a dispatch has already had this succeed once.
+    pub fn from_ttl_ms(ttl_ms: u64) -> Option<Self> {
+        match ttl_ms {
+            DEFAULT_CACHE_TTL_MS => Some(CacheLifetime::Default),
+            ONE_HOUR_MS => Some(CacheLifetime::OneHour),
+            _ => None,
+        }
+    }
+
+    /// A fresh `cache_control` breakpoint at this lifetime.
+    ///
+    /// The one place a fresh marker is built from a lifetime, so
+    /// [`AnthropicMessagesClient::body`] holds a typed `CacheLifetime` end to
+    /// end rather than lowering it to the wire's `Option` and re-matching
+    /// that. [`cache_markers::normalize_marker_lifetimes`] also decodes
+    /// `wire()` into a marker, but it rewrites a forwarded marker's `ttl`
+    /// field in place rather than constructing one.
+    pub(super) fn control(self) -> CacheControl {
+        match self.wire() {
+            Some(ttl) => CacheControl::ephemeral_for(ttl),
+            None => CacheControl::ephemeral(),
+        }
+    }
+}
 
 /// The dialect this client serializes. Anything else is refused rather than
 /// mis-serialized — see [`FrontierError::UnsupportedDialect`].
@@ -348,13 +410,22 @@ impl AnthropicMessagesClient {
         // resolving it first is what keeps the refusal ahead of the work rather
         // than beside it.
         let (tools, tool_choice) = quote.tools_for(SPOKEN)?;
+        // Tools and conversation markers share the target's cache lifetime.
+        let lifetime = quote.cache_lifetime;
+        // Tools precede messages, so shorter tool markers would violate the
+        // provider's TTL order. Matching the target also keeps its quoted
+        // lifetime consistent with the request.
+        let tools = tools.map(|mut tools| {
+            cache_markers::normalize_marker_lifetimes(&mut tools, lifetime);
+            tools
+        });
         // **How many `cache_control` breakpoints are already riding this
         // request before roundhouse adds its own.**
         //
         // Anthropic caps a request at four cache breakpoints and answers a
         // fifth with a 400 — and the tools are the one part of this body
         // roundhouse forwards rather than originates, so the client's own
-        // breakpoints ride along untouched. Claude Code sets one on its last
+        // breakpoint positions remain unchanged. Claude Code sets one on its last
         // tool; a client that sets four has spent the whole allowance, and the
         // block breakpoint below would be the fifth. Counting rather than
         // assuming, because "the client sends at most one" is a fact about one
@@ -364,40 +435,15 @@ impl AnthropicMessagesClient {
         // surface strips those, since roundhouse rebuilds every prompt from its
         // own log and a breakpoint from a different rendering names nothing in
         // this one.
-        let riding = breakpoints_in(tools.as_ref());
-        // **The breakpoint goes on the penultimate block, and nowhere else.**
-        //
-        // Anthropic caches nothing without an explicit `cache_control` marker —
-        // unlike the Responses API, where `prompt_cache_key` steers a request to
-        // a node that caches on its own. So a client that sent no breakpoint
-        // would get a 0% hit rate on every turn, and the router would keep
-        // pricing this target on a `CacheModel::Deterministic` prediction that
-        // nothing could fulfil. Routing on a predicted cache hit and then
-        // prompting in a way that defeats it is the failure this module's
-        // sibling doc names first.
-        //
-        // Penultimate rather than last, because a breakpoint caches everything
-        // *up to and including* the block it sits on. The final segment is this
-        // turn's new input — the part that by construction was not in the prefix
-        // last turn — so marking it would write a cache entry that the next turn
-        // cannot read, paying the write premium for nothing. Marking the one
-        // before it caches exactly the stable prefix.
-        //
-        // Fewer than two segments means there is no stable prefix to name yet:
-        // one block is the whole prompt, which is entirely this turn's input.
-        //
-        // And no breakpoint at all when the forwarded tools have already spent
-        // the request's allowance. **Yielding is the right way round**: the
-        // tools' own breakpoint caches the client's twenty-four-tool preamble,
-        // which is the largest stable block in the request and is warm on the
-        // provider's side either way, while ours caches a prefix we could
-        // re-mark on the next turn. Dropping theirs to keep ours would trade a
-        // bigger discount for a smaller one; sending both is a 400 that costs
-        // the turn.
-        let breakpoint = match riding + 1 <= MAX_CACHE_BREAKPOINTS {
-            true => segments.len().checked_sub(2),
-            false => None,
-        };
+        let riding = cache_markers::breakpoints_in(tools.as_ref());
+        // Where this request's own markers go — the whole placement policy,
+        // and why it is what it is, lives in `cache_markers` now: `plan()`
+        // takes the same four scalars the essay there is about, and its own
+        // table test pins the arithmetic. What stays here are the tests that
+        // are actually about the serialized body rather than the arithmetic:
+        // TTL normalization, the tool-marker allowance interaction, and the
+        // end-to-end lookback guard.
+        let plan = cache_markers::plan(segments.len(), riding, quote.previous_segment_count);
         // Built out of [`wire::ContentBlock`] rather than hand-written JSON,
         // because this is the one place roundhouse *originates* this wire's
         // vocabulary and R1's rule is "typed where roundhouse reads or
@@ -405,12 +451,17 @@ impl AnthropicMessagesClient {
         // `"type": "text"` that the module's pinning tests do not cover, and it
         // would keep spelling it after an upstream rename that turned those
         // tests red.
+        // Both block markers take the lifetime decided above, from the target's
+        // own catalog entry. They cache two stretches of one prefix for one
+        // target, so a longer lifetime on one of them would leave the router
+        // pricing warmth the other marker had already let expire.
+        let control = || lifetime.control();
         let content: Vec<ContentBlock> = segments
             .iter()
             .enumerate()
             .map(|(index, text)| ContentBlock::Text {
                 text: (*text).to_string(),
-                cache_control: (Some(index) == breakpoint).then(CacheControl::ephemeral),
+                cache_control: plan.contains(index).then(control),
                 extra: Extra::new(),
             })
             .collect();
@@ -440,7 +491,8 @@ impl AnthropicMessagesClient {
             // to it byte-exactly.
             "messages": [{ "role": "user", "content": content }],
         });
-        // **The client's tool definitions, verbatim and untouched.**
+        // **The client's tool definitions, verbatim but for the marker
+        // lifetimes normalized above.**
         //
         // This is the one part of a Messages request roundhouse forwards rather
         // than originates, and the asymmetry with the blocks above is the whole
@@ -747,6 +799,7 @@ fn redact_error(credential: &TurnCredential, error: FrontierError) -> FrontierEr
         | FrontierError::MalformedQuote(_)
         | FrontierError::UntranslatableTools { .. }
         | FrontierError::UnsupportedDialect { .. }
+        | FrontierError::UnsupportedCacheLifetime { .. }
         | FrontierError::Transport { .. }) => other,
     }
 }
@@ -756,33 +809,6 @@ fn sensitive(value: &str) -> Option<HeaderValue> {
     let mut value = HeaderValue::from_str(value).ok()?;
     value.set_sensitive(true);
     Some(value)
-}
-
-/// How many `cache_control` breakpoints the forwarded tools already carry.
-///
-/// **Counted structurally rather than by scanning the JSON text**, because a
-/// tool whose *description* mentions `cache_control` is an ordinary tool and a
-/// text scan would read it as a breakpoint and silently drop roundhouse's own —
-/// costing the prefix discount on every turn for a substring in a doc string.
-///
-/// Only the array's top level is counted, which is where the wire puts them: a
-/// tool definition's `input_schema` is the tool's own argument schema and
-/// nothing inside it is a cache breakpoint, so descending would count a
-/// property a client happened to name `cache_control`.
-fn breakpoints_in(tools: Option<&Value>) -> usize {
-    tools
-        .and_then(Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry
-                        .get("cache_control")
-                        .is_some_and(|control| !control.is_null())
-                })
-                .count()
-        })
-        .unwrap_or(0)
 }
 
 /// A base URL with any trailing slash removed, so `{base}/v1/messages` is one
@@ -820,6 +846,12 @@ mod tests {
             wire_protocol,
             prompt: prompt(),
             segment_boundaries: boundaries(),
+            // No prior dispatch on these fixtures; the tests that need one set
+            // it, the way they set tools.
+            previous_segment_count: None,
+            // And no declared lifetime: the TTL tests set it, so a marker
+            // carrying one is never an accident of the fixture.
+            cache_lifetime: CacheLifetime::Default,
             session_id: None,
             thread_id: None,
             prompt_cache_key: "sess_anthropic".into(),
@@ -847,6 +879,17 @@ mod tests {
             tools_dialect: Some(dialect),
             ..quote(TurnCredential::Absent, SPOKEN)
         }
+    }
+
+    /// A forwarded tool declaration already carrying a default-lifetime
+    /// `cache_control` marker, the shape every allowance/normalization test
+    /// below builds a toolbox out of.
+    fn marked_tool(name: &str) -> Value {
+        json!({
+            "name": name,
+            "input_schema": { "type": "object" },
+            "cache_control": { "type": "ephemeral" },
+        })
     }
 
     #[tokio::test]
@@ -1159,13 +1202,6 @@ mod tests {
     /// next turn while the tools' own breakpoint still warms the provider cache.
     #[test]
     fn a_toolbox_that_has_spent_the_breakpoint_allowance_costs_the_prefix_marker_not_the_turn() {
-        let marked = |name: &str| {
-            json!({
-                "name": name,
-                "input_schema": { "type": "object" },
-                "cache_control": { "type": "ephemeral" },
-            })
-        };
         let block_breakpoints = |body: &Value| {
             body["messages"][0]["content"]
                 .as_array()
@@ -1178,19 +1214,28 @@ mod tests {
         // CONTROL: three of the four spent leaves room for ours, so the marker
         // is still placed -- which is what proves the assertion below is about
         // the count and not about tools suppressing the breakpoint at all.
-        let three = declaring(SPOKEN, json!([marked("A"), marked("B"), marked("C")]), None);
+        let three = declaring(
+            SPOKEN,
+            json!([marked_tool("A"), marked_tool("B"), marked_tool("C")]),
+            None,
+        );
         let body = AnthropicMessagesClient::body(&three, "claude-sonnet").unwrap();
         assert_eq!(block_breakpoints(&body), 1);
         assert_eq!(
             body["tools"],
-            json!([marked("A"), marked("B"), marked("C")]),
+            json!([marked_tool("A"), marked_tool("B"), marked_tool("C")]),
             "the client's breakpoints ride out untouched either way"
         );
 
         // PROBE: the fourth is the client's, so ours would be the fifth.
         let four = declaring(
             SPOKEN,
-            json!([marked("A"), marked("B"), marked("C"), marked("D")]),
+            json!([
+                marked_tool("A"),
+                marked_tool("B"),
+                marked_tool("C"),
+                marked_tool("D")
+            ]),
             None,
         );
         let body = AnthropicMessagesClient::body(&four, "claude-sonnet").unwrap();
@@ -1202,7 +1247,12 @@ mod tests {
         );
         assert_eq!(
             body["tools"],
-            json!([marked("A"), marked("B"), marked("C"), marked("D")]),
+            json!([
+                marked_tool("A"),
+                marked_tool("B"),
+                marked_tool("C"),
+                marked_tool("D")
+            ]),
             "yielding must not mean editing the client's toolbox"
         );
 
@@ -1212,9 +1262,9 @@ mod tests {
         let prose = declaring(
             SPOKEN,
             json!([
-                marked("A"),
-                marked("B"),
-                marked("C"),
+                marked_tool("A"),
+                marked_tool("B"),
+                marked_tool("C"),
                 { "name": "D", "description": "set cache_control on the block",
                   "input_schema": { "type": "object" } },
             ]),
@@ -1222,31 +1272,6 @@ mod tests {
         );
         let body = AnthropicMessagesClient::body(&prose, "claude-sonnet").unwrap();
         assert_eq!(block_breakpoints(&body), 1);
-    }
-
-    #[test]
-    fn a_prompt_with_no_known_structure_is_one_block_and_carries_no_breakpoint() {
-        // The degenerate case: a quote built by a caller that knows nothing
-        // about item boundaries. One block, the whole prompt, and *no*
-        // breakpoint — with one block there is no stable prefix to name, and
-        // marking the only block would write a cache entry covering this turn's
-        // own input.
-        let mut quote = quote(TurnCredential::Absent, SPOKEN);
-        quote.segment_boundaries.clear();
-        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
-        let content = body["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["text"], json!(prompt()));
-        assert!(content[0].get("cache_control").is_none());
-
-        // Two segments is the smallest shape that has a prefix, and it gets one.
-        let mut two = quote.clone();
-        two.segment_boundaries = vec![SYSTEM.len()];
-        let body = AnthropicMessagesClient::body(&two, "claude-sonnet").unwrap();
-        let content = body["messages"][0]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 2);
-        assert_eq!(content[0]["cache_control"], json!({ "type": "ephemeral" }));
-        assert!(content[1].get("cache_control").is_none());
     }
 
     #[test]
@@ -1527,6 +1552,642 @@ mod tests {
         assert!(
             !std::ptr::eq(byok.client, seat.client),
             "a forwarded seat must not share a connection pool with a stored key"
+        );
+    }
+
+    /// One labelled block. Its text depends only on its own index, which is
+    /// what lets [`segments_of`] build "the same request, but with more
+    /// segments appended" instead of a differently-worded one.
+    fn labelled_segment(index: usize) -> String {
+        format!("<|item{index}|>content for item {index} ")
+    }
+
+    /// `n` segments and the boundary list that cuts the joined text at exactly
+    /// those seams.
+    ///
+    /// **A prompt of `n` segments is a byte-prefix of one of `n' > n`
+    /// segments**, and the first `n` boundaries agree between the two, because
+    /// each segment's bytes depend only on its own index and not on how many
+    /// segments follow it. That is the shape a real session has across two
+    /// requests to the same target: the earlier turns render identically and
+    /// only the newest one is appended.
+    fn segments_of(n: usize) -> (String, Vec<usize>) {
+        let mut prompt = String::new();
+        let mut boundaries = Vec::new();
+        for index in 0..n {
+            prompt.push_str(&labelled_segment(index));
+            if index + 1 < n {
+                boundaries.push(prompt.len());
+            }
+        }
+        (prompt, boundaries)
+    }
+
+    /// Every block index carrying a `cache_control` marker, in block order.
+    fn breakpoint_indices(body: &Value) -> Vec<usize> {
+        body["messages"][0]["content"]
+            .as_array()
+            .expect("blocks")
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.get("cache_control").is_some())
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// The end-to-end C2 guard for the lookback marker `cache_markers::plan`
+    /// derives from `previous_segment_count`. Anthropic's cache lookup checks
+    /// at most twenty block positions back from a breakpoint, counting the
+    /// breakpoint itself
+    /// (platform.claude.com/docs/en/build-with-claude/prompt-caching), so a
+    /// client that placed only the penultimate breakpoint would lose a
+    /// twenty-or-more-segment append's previous write even though the prefix
+    /// bytes it covers are still byte-identical. This pins that `body()` also
+    /// places the reach-back marker, so that write stays inside the window.
+    #[test]
+    fn a_long_append_keeps_the_previous_cache_write_inside_a_lookback_window() {
+        let (prompt1, boundaries1) = segments_of(6);
+        let quote1 = FrontierQuote {
+            prompt: prompt1.clone(),
+            segment_boundaries: boundaries1,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body1 = AnthropicMessagesClient::body(&quote1, "claude-sonnet").unwrap();
+        let p1 = breakpoint_indices(&body1)
+            .first()
+            .copied()
+            .expect("six segments have a stable prefix to mark");
+
+        // Twenty items later on the same target -- the smallest append the
+        // provider's window misses, so an off-by-one in the production constant
+        // turns this red. The first six segments
+        // are the same bytes at the same offsets, which is the premise the
+        // assertion below rests on -- checked explicitly rather than merely
+        // assumed from `segments_of`'s doc comment.
+        let (prompt2, boundaries2) = segments_of(6 + 20);
+        assert!(
+            prompt2.starts_with(&prompt1),
+            "the fixture's whole premise: the first six segments must be \
+             byte-identical between requests, or a real prefix cache could \
+             never have matched them either"
+        );
+        let quote2 = FrontierQuote {
+            prompt: prompt2,
+            segment_boundaries: boundaries2,
+            // The data flow under test: the ledger remembers that the
+            // previous dispatch to this target rendered six segments (and
+            // therefore marked block `p1 == cache_markers::penultimate(6)`),
+            // and the request built from that knowledge has to reach it.
+            previous_segment_count: Some(6),
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
+        let marked = breakpoint_indices(&body2);
+        assert!(
+            !marked.is_empty(),
+            "twenty-six segments still have a stable prefix"
+        );
+
+        // The previous write at block `p1` is reachable only from a breakpoint
+        // in `p1..=p1+19` -- Anthropic's documented twenty-block lookback,
+        // counting the breakpoint itself. Every marker is checked, not just the
+        // first: "some marker reaches it" is the claim, and reading only one of
+        // two would pass or fail on marker order rather than on reachability.
+        //
+        // A literal and not `CACHE_LOOKBACK_BLOCKS`: this is the provider's
+        // number, stated independently, so that a wrong production constant
+        // fails here instead of widening the window it is checked against.
+        assert!(
+            marked.iter().any(|q| *q >= p1 && *q - p1 <= 19),
+            "a twenty-segment append left every breakpoint of the second \
+             request at {marked:?}, none of them inside the documented \
+             twenty-block lookback from the previous write at block {p1} -- so \
+             the turn reads nothing from cache although the first six blocks \
+             are byte-identical"
+        );
+    }
+
+    /// A two-segment judge quote marks the system prefix and leaves the brief unmarked.
+    #[test]
+    fn a_side_calls_two_segment_quote_marks_its_stable_prefix() {
+        const PREFIX: &str = "a system prompt\n\n";
+        let quote = FrontierQuote {
+            prompt: format!("{PREFIX}a brief"),
+            segment_boundaries: vec![PREFIX.len()],
+            previous_segment_count: None,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![0],
+            "the stable half is block zero and the brief is block one"
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            json!(PREFIX),
+            "and the marked block is the prefix itself, separator included"
+        );
+    }
+
+    /// Every marker's `ttl`, in block order. `None` is the field omitted.
+    fn marker_ttls(body: &Value) -> Vec<Option<String>> {
+        body["messages"][0]["content"]
+            .as_array()
+            .expect("the request carries content blocks")
+            .iter()
+            .filter_map(|block| block.get("cache_control"))
+            .map(|control| {
+                control
+                    .get("ttl")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Every tool index carrying a `cache_control` marker, in tools order.
+    ///
+    /// The count and the positions are the client's own declaration, and
+    /// normalizing a lifetime must move neither: a marker that appeared, moved
+    /// or vanished would change which stretch of the request is cached and how
+    /// many of the four slots are spent.
+    fn tool_marker_indices(body: &Value) -> Vec<usize> {
+        body.get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tool)| tool.get("cache_control").is_some())
+                    .map(|(index, _)| index)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Every marker's `ttl` on the forwarded tools, in tools order — mirrors
+    /// [`marker_ttls`] for the other array a breakpoint can land in.
+    fn tool_marker_ttls(body: &Value) -> Vec<Option<String>> {
+        body.get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool.get("cache_control"))
+                    .map(|control| {
+                        control
+                            .get("ttl")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A marker's cache lifetime in seconds; the field omitted is Anthropic's
+    /// five-minute default, not zero.
+    fn ttl_seconds(ttl: &Option<String>) -> u32 {
+        match ttl.as_deref() {
+            Some("1h") => 3_600,
+            _ => 300,
+        }
+    }
+
+    /// A quote long enough that both breakpoints are placed, at `lifetime`.
+    ///
+    /// `previous_segment_count: Some(6)` names a previous dispatch of six
+    /// segments -- `cache_markers::penultimate(6) == Some(4)`, a gap of 25
+    /// blocks from this quote's own 29 and past `CACHE_LOOKBACK_BLOCKS`
+    /// (20), which is why `plan` places a marker at both blocks: block 4 is
+    /// far enough back that Anthropic's own cache lookup would not reach it
+    /// unasked.
+    fn quote_at_ttl(lifetime: CacheLifetime) -> FrontierQuote {
+        let (prompt, boundaries) = segments_of(6 + 25);
+        FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            previous_segment_count: Some(6),
+            cache_lifetime: lifetime,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        }
+    }
+
+    /// A target whose catalog entry declares an hour asks for an hour on both
+    /// markers — one lifetime per entry, or the router would price warmth a
+    /// shorter marker already let expire.
+    #[test]
+    fn a_one_hour_cache_model_requests_the_one_hour_ttl() {
+        let body =
+            AnthropicMessagesClient::body(&quote_at_ttl(CacheLifetime::OneHour), "claude-sonnet")
+                .unwrap();
+
+        let ttls = marker_ttls(&body);
+        assert_eq!(
+            ttls.len(),
+            2,
+            "the fixture must place both markers, or this asserts nothing about \
+             the second one: {ttls:?}"
+        );
+        assert!(
+            ttls.iter().all(|ttl| ttl.as_deref() == Some("1h")),
+            "every marker on a one-hour target carries the hour: {ttls:?}"
+        );
+    }
+
+    /// **CONTROL.** Five minutes is the field *omitted*, never `"5m"` — the
+    /// default a request gets, whether a target's catalog entry names it
+    /// explicitly or declares no lifetime at all. The two are one value,
+    /// [`CacheLifetime::Default`]: a marker with no `ttl` field is the wire's
+    /// own answer to both.
+    #[test]
+    fn a_five_minute_cache_model_keeps_the_default_marker() {
+        let body =
+            AnthropicMessagesClient::body(&quote_at_ttl(CacheLifetime::Default), "claude-sonnet")
+                .unwrap();
+
+        let ttls = marker_ttls(&body);
+        assert_eq!(ttls.len(), 2, "the fixture must place both markers");
+        assert!(
+            ttls.iter().all(Option::is_none),
+            "a five-minute target names no ttl at all: {ttls:?}"
+        );
+    }
+
+    /// **Ties `CacheLifetime` to the pinned wire vocabulary.** A third TTL
+    /// this dialect ever grew would land in `wire::SPEC_CACHE_CONTROL_TTLS`
+    /// first (the spec-pin test in `wire.rs` sees to that) and would have to
+    /// gain a `CacheLifetime` variant before anything could route on it --
+    /// this is the test that goes red the day those two sets disagree.
+    #[test]
+    fn every_cache_lifetime_speaks_a_spelling_the_spec_pins() {
+        use std::collections::HashSet;
+        // `Default`'s spelling is the field *omitted*, which is exactly what
+        // `wire::CACHE_TTL_5M` documents that omission as meaning -- so it is
+        // named here rather than read off `CacheLifetime::wire`, which
+        // answers `None` for it on purpose.
+        let ours: HashSet<&str> = [wire::CACHE_TTL_5M, CacheLifetime::OneHour.wire().unwrap()]
+            .into_iter()
+            .collect();
+        let spec: HashSet<&str> = wire::SPEC_CACHE_CONTROL_TTLS.into_iter().collect();
+        assert_eq!(
+            ours, spec,
+            "a lifetime this wire offers with no CacheLifetime variant would be silently \
+             unreachable; one this type claims that the wire does not offer would be \
+             refused by every catalog entry that names it"
+        );
+    }
+
+    /// A side call to an hour-long target asks for the hour on the one marker
+    /// it places -- the lifetime is the target's, not the call's kind.
+    #[test]
+    fn a_side_calls_marker_carries_its_targets_lifetime() {
+        const PREFIX: &str = "a system prompt\n\n";
+        for (lifetime, expected) in [
+            (CacheLifetime::OneHour, vec![Some("1h".to_string())]),
+            // The five-minute default is the field omitted, never `"5m"`.
+            (CacheLifetime::Default, vec![None]),
+        ] {
+            let quote = FrontierQuote {
+                prompt: format!("{PREFIX}a brief"),
+                segment_boundaries: vec![PREFIX.len()],
+                cache_lifetime: lifetime,
+                ..quote(TurnCredential::Absent, SPOKEN)
+            };
+            let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+            assert_eq!(marker_ttls(&body), expected, "{lifetime:?}");
+        }
+    }
+
+    /// Anthropic requires every `1h` marker to precede every shorter one, and
+    /// `tools` serializes ahead of `messages` — so a one-hour target that
+    /// upgrades this client's own block markers while forwarding the client's
+    /// default-ttl tool marker untouched emits the order the API forbids.
+    ///
+    /// Roundhouse owns the markers in the requests it builds, so the forwarded
+    /// marker adopts the target's lifetime rather than the turn being refused.
+    /// The lifetime is *all* that moves: the definition, its schema, and the
+    /// marker's position are the client's declaration and stay its own.
+    #[test]
+    fn an_hour_long_target_lifts_a_shorter_tool_marker_to_the_hour() {
+        let tool = json!({
+            "name": "A",
+            "description": "search",
+            "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } },
+            // Omitted ttl: a real client's default marker, never spelled "5m".
+            "cache_control": { "type": "ephemeral" },
+        });
+        let quote = FrontierQuote {
+            tools: Some(json!([tool])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(CacheLifetime::OneHour)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet")
+            .expect("a marker roundhouse can normalize is never a refusal");
+
+        let tool_ttls = tool_marker_ttls(&body);
+        let block_ttls = marker_ttls(&body);
+        assert!(
+            !tool_ttls.is_empty() && !block_ttls.is_empty(),
+            "the fixture must place both a tool marker and a block marker, or \
+             this asserts nothing about their relative order: tools={tool_ttls:?} \
+             blocks={block_ttls:?}"
+        );
+        assert!(
+            tool_ttls
+                .iter()
+                .chain(block_ttls.iter())
+                .all(|ttl| ttl.as_deref() == Some(wire::CACHE_TTL_1H)),
+            "one lifetime per request, the forwarded markers included: \
+             tools={tool_ttls:?} blocks={block_ttls:?}"
+        );
+
+        let seconds: Vec<u32> = tool_ttls
+            .iter()
+            .chain(block_ttls.iter())
+            .map(ttl_seconds)
+            .collect();
+        assert!(
+            seconds.windows(2).all(|pair| pair[0] >= pair[1]),
+            "provider order is tools then message content, and Anthropic \
+             requires ttl to never increase across that sequence: tools={tool_ttls:?} \
+             blocks={block_ttls:?} (seconds {seconds:?})"
+        );
+
+        assert_eq!(
+            tool_marker_indices(&body),
+            vec![0],
+            "normalizing a lifetime neither adds a marker nor moves one"
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "name": "A",
+                "description": "search",
+                "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } },
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+            }]),
+            "the ttl is the only field of the client's toolbox that moved"
+        );
+    }
+
+    /// The other direction: an hour the client asked for comes *down* to a
+    /// five-minute target's default — the field omitted, same as this
+    /// client's own block markers, and not the string `5m`.
+    ///
+    /// Not an ordering question — `tools` serialize first, so an hour ahead of
+    /// five minutes is already the order the API wants. It is a pricing one. The
+    /// catalog boundary holds a one-hour entry to the hour's write rate, twice
+    /// the input rate, precisely because a five-minute entry records 1.25 times;
+    /// a request that writes an hour-long entry against a five-minute entry is
+    /// billed at a rate the ledger never charges and the router never quoted.
+    /// The request asks for the lifetime its own price came from.
+    #[test]
+    fn a_five_minute_target_brings_an_hour_long_tool_marker_down_to_the_default() {
+        let quote = FrontierQuote {
+            tools: Some(json!([{
+                "name": "A",
+                "input_schema": { "type": "object" },
+                "cache_control": { "type": "ephemeral", "ttl": "1h" },
+            }])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(CacheLifetime::Default)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(tool_marker_indices(&body), vec![0]);
+        assert_eq!(
+            tool_marker_ttls(&body),
+            vec![None],
+            "five minutes is the field omitted, never the string `5m`"
+        );
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "the marker keeps its type and loses only the lifetime"
+        );
+        assert!(
+            marker_ttls(&body).iter().all(Option::is_none),
+            "and the blocks this client originates carry the same default"
+        );
+    }
+
+    /// **The slot-accounting guard.** Normalizing a lifetime changes no marker
+    /// count, so the allowance arithmetic decides exactly what it decided
+    /// before.
+    ///
+    /// Three riding markers is the discriminating case: one slot free, which the
+    /// penultimate block takes and the lookback marker does not. A normalizer
+    /// that added, dropped or doubled a marker would move this to `[4, 29]` or
+    /// to `[]` while the lifetimes still looked right.
+    #[test]
+    fn normalizing_three_riding_markers_leaves_the_block_allowance_unchanged() {
+        let quote = FrontierQuote {
+            tools: Some(json!([
+                marked_tool("A"),
+                marked_tool("B"),
+                marked_tool("C")
+            ])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(CacheLifetime::OneHour)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(
+            tool_marker_ttls(&body),
+            vec![
+                Some(wire::CACHE_TTL_1H.to_string()),
+                Some(wire::CACHE_TTL_1H.to_string()),
+                Some(wire::CACHE_TTL_1H.to_string())
+            ],
+            "every forwarded marker adopts the target's hour"
+        );
+        assert_eq!(tool_marker_indices(&body), vec![0, 1, 2]);
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![29],
+            "three riding markers still leave exactly one slot, and the \
+             penultimate block still takes it"
+        );
+    }
+
+    /// The same at the saturated boundary: four riding markers spend the
+    /// allowance whatever lifetime they carry, and this client still sends none
+    /// of its own.
+    #[test]
+    fn normalizing_four_riding_markers_still_spends_the_whole_allowance() {
+        let quote = FrontierQuote {
+            tools: Some(json!([
+                marked_tool("A"),
+                marked_tool("B"),
+                marked_tool("C"),
+                marked_tool("D")
+            ])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(CacheLifetime::OneHour)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(tool_marker_indices(&body), vec![0, 1, 2, 3]);
+        assert!(
+            tool_marker_ttls(&body)
+                .iter()
+                .all(|ttl| ttl.as_deref() == Some(wire::CACHE_TTL_1H)),
+            "{:?}",
+            tool_marker_ttls(&body)
+        );
+        assert_eq!(
+            breakpoint_indices(&body),
+            Vec::<usize>::new(),
+            "the allowance is spent; a fifth marker is a 400 whatever its \
+             lifetime"
+        );
+    }
+
+    /// **CONTROL.** A property a client happened to name `cache_control` inside
+    /// a tool's own argument schema is not a breakpoint, and normalization does
+    /// not descend into one.
+    ///
+    /// The same reasoning as [`cache_markers::breakpoints_in`]: only the array's
+    /// top level is where the wire puts a marker. Rewriting a `ttl` inside `input_schema`
+    /// would change what the client's tool accepts — a toolbox edit, which is
+    /// the one thing forwarding exists to avoid.
+    #[test]
+    fn a_schema_property_named_cache_control_is_neither_counted_nor_rewritten() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "cache_control": { "type": "object", "ttl": "1h" },
+            },
+        });
+        let quote = FrontierQuote {
+            tools: Some(json!([{
+                "name": "A",
+                "input_schema": schema.clone(),
+            }])),
+            tools_dialect: Some(SPOKEN),
+            ..quote_at_ttl(CacheLifetime::OneHour)
+        };
+
+        let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+
+        assert_eq!(
+            body["tools"][0]["input_schema"], schema,
+            "a schema is the tool's own argument vocabulary, never a marker"
+        );
+        assert_eq!(
+            tool_marker_indices(&body),
+            Vec::<usize>::new(),
+            "and it spends none of the request's four slots"
+        );
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![4, 29],
+            "so both of this client's own markers are still placed"
+        );
+    }
+
+    /// **CONTROL (fleet-redis-3), live.** Riding zero tool markers, a
+    /// six-segment dispatch marks its own penultimate block (index 4) -- the
+    /// ground truth the *next* request's `previous_segment_count` is supposed
+    /// to describe. `engine.rs` passes `last_segment_count` (6) straight
+    /// through, and `cache_markers::plan` derives the same block index from
+    /// it via `penultimate`, so the following long-append quote correctly
+    /// reaches back for it.
+    #[test]
+    fn a_history_with_no_riding_markers_marks_its_own_penultimate_block() {
+        let (prompt, boundaries) = segments_of(6);
+        let history = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body = AnthropicMessagesClient::body(&history, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![4],
+            "six segments, no riding markers: the penultimate block is marked"
+        );
+
+        let (prompt, boundaries) = segments_of(6 + 25);
+        let following = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            previous_segment_count: Some(6),
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body = AnthropicMessagesClient::body(&following, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![4, 29],
+            "the reach-back marker at 4 is correct: the history above wrote it"
+        );
+    }
+
+    /// **DEFECT (fleet-redis-3), CORRECTNESS, currently red -- ignored.**
+    ///
+    /// Riding four tool markers, the *same* six-segment dispatch places no
+    /// block marker at all -- the allowance is already spent (the four-marker
+    /// case `normalizing_four_riding_markers_still_spends_the_whole_allowance`
+    /// pins above). But `engine.rs` passes `last_segment_count` (6) to the
+    /// next request exactly as it does for the control above, and
+    /// `cache_markers::plan` has no way to learn from that count alone
+    /// whether a marker was actually placed there. The following quote is
+    /// therefore byte-identical to the control's, and reaches back for a
+    /// write that was never made.
+    #[test]
+    #[ignore = "fleet-redis-3: cache_markers::plan derives the previous block from a segment \
+                count alone; the ledger (`TargetState`, roundhouse-core) records no fact \
+                about whether the previous dispatch actually placed a block marker, so \
+                this history and the control above are indistinguishable to it. Fixing \
+                this needs a new ledger fact and is outside this crate set -- see the PR's \
+                fleet-redis-3 ruling"]
+    fn a_history_with_four_riding_markers_places_no_block_marker_the_next_quote_can_reach_back_for()
+    {
+        let (prompt, boundaries) = segments_of(6);
+        let history = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            ..declaring(
+                SPOKEN,
+                json!([
+                    marked_tool("A"),
+                    marked_tool("B"),
+                    marked_tool("C"),
+                    marked_tool("D")
+                ]),
+                None,
+            )
+        };
+        let body = AnthropicMessagesClient::body(&history, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            Vec::<usize>::new(),
+            "four riding markers already spent the allowance: nothing is written at block 4"
+        );
+
+        // Byte-identical to the control's following quote: `plan` cannot
+        // tell these two histories apart, because `previous_segment_count`
+        // is 6 either way.
+        let (prompt, boundaries) = segments_of(6 + 25);
+        let following = FrontierQuote {
+            prompt,
+            segment_boundaries: boundaries,
+            previous_segment_count: Some(6),
+            ..quote(TurnCredential::Absent, SPOKEN)
+        };
+        let body = AnthropicMessagesClient::body(&following, "claude-sonnet").unwrap();
+        assert_eq!(
+            breakpoint_indices(&body),
+            vec![29],
+            "block 4 was never written by the history above; the following quote \
+             must not reach back for a cache entry that does not exist"
         );
     }
 }

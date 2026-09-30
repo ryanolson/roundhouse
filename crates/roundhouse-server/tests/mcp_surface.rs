@@ -71,6 +71,7 @@ use roundhouse_server::{
 mod common;
 use common::codex::{assistant_message, function_call_output_item, request, user_message};
 use common::{BLOCK_SIZE, LOCAL_MODEL, MINUTE, admin_key, embedded_fleet, key, sha256_hex};
+use roundhouse_core::event::CacheReadSource;
 
 /// What each executor answers with, so a target is legible in the answer as
 /// well as in the log.
@@ -234,6 +235,7 @@ fn steer_record(directive: &str) -> ControlRecord {
             action: SteerAction::Steer {
                 directive: directive.to_string(),
             },
+            interval: None,
         },
     );
     record
@@ -276,6 +278,7 @@ impl Interjector for TestInterjector {
                 usage: Usage {
                     input_tokens: 96,
                     cached_input_tokens: 32,
+                    cache_read_source: CacheReadSource::Provider,
                     // Nothing was dispatched, so nothing was written into any
                     // provider's cache.
                     cache_write_tokens: 0,
@@ -323,6 +326,7 @@ impl FrontierClient for GatedFrontierClient {
             FRONTIER_ANSWER.to_string(),
             quote.prompt.len() as u64,
             0,
+            CacheReadSource::Provider,
             FRONTIER_ANSWER.len() as u64,
             0,
         ))

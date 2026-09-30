@@ -24,6 +24,13 @@
 //! precisely why the prompts — and not the crate — are the research output
 //! worth taking.
 
+/// What joins the system prompt and the brief into the one string a judge
+/// transport sends.
+///
+/// Defined beside the prompt so the transport and the review's prompt digest
+/// cannot disagree about the bytes a judge received.
+pub const PROMPT_SEPARATOR: &str = "\n\n";
+
 /// The file as it sits in the repository, attribution header and all.
 const FILE: &str = include_str!("prompts/judge-system-prompt.md");
 

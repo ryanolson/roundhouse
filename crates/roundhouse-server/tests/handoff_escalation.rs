@@ -17,7 +17,7 @@
 //! the expensive failure of this surface is a note riding a turn that did not
 //! earn one.
 //!
-//! Six ways a turn can *look* like a tier escalation without being one, one
+//! Seven ways a turn can *look* like a tier escalation without being one, one
 //! test each:
 //!
 //! | Case | What blocks the note | The check doing the blocking |
@@ -28,6 +28,7 @@
 //! | picked capable, key admits none of it | the capable model is not the one answering | capable-list membership |
 //! | no note configured | this deployment did not opt in | the config read |
 //! | no recipe on the project | there is no tier to have moved between | the `ctx.tiers` read |
+//! | cost-guarded de-escalation | a price is not a signal | `DecisionSource::is_signal_driven`'s exclusion of `CostGuard` |
 //!
 //! And one way it can look like *not* one while being one: a failover inside
 //! the escalating turn, which is the case the gate's placement above the
@@ -40,6 +41,7 @@ use async_trait::async_trait;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{TargetFilter, TurnPolicy};
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::{Item, ItemContent, Role};
 use roundhouse_core::routing::{
@@ -90,6 +92,30 @@ fn spec(provider: &str, quality_prior: f64) -> FrontierModelSpec {
 
 fn catalog() -> StaticFrontierCatalog {
     StaticFrontierCatalog::new(vec![spec(ALPHA, 0.95), spec(BETA, 0.90), spec(GAMMA, 0.60)])
+}
+
+/// [`spec`] priced for real, instead of [`ProviderPricing::free`] — the rate
+/// card every other fixture in this file uses so a decision is never
+/// contaminated by cost. The cost-guard case below is the one claim in this
+/// file a price has to be able to move, so it alone needs a catalog where two
+/// quotes can differ; [`frontier_spec`]'s default rate card (a real spread
+/// between the cached and uncached rate, under a deterministic five-minute
+/// cache) is what lets a warm target ever quote less than a cold one.
+fn priced_spec(provider: &str, quality_prior: f64) -> FrontierModelSpec {
+    FrontierModelSpec {
+        quality_prior,
+        base_ttft_ms: 1.0,
+        ttft_ms_per_uncached_token: 0.0,
+        ..frontier_spec(provider, "m", WireProtocol::OpenAiResponses)
+    }
+}
+
+fn priced_catalog() -> StaticFrontierCatalog {
+    StaticFrontierCatalog::new(vec![
+        priced_spec(ALPHA, 0.95),
+        priced_spec(BETA, 0.90),
+        priced_spec(GAMMA, 0.60),
+    ])
 }
 
 /// A transport that answers, and keeps every prompt it was handed.
@@ -157,6 +183,7 @@ impl FrontierClient for Recording {
                 "answered".into(),
                 quote.prompt.len() as u64,
                 0,
+                CacheReadSource::Provider,
                 8,
                 0,
             )),
@@ -219,7 +246,9 @@ struct Rig {
     store: Arc<MemoryStore>,
 }
 
-fn rig_of(clients: Vec<(&str, Arc<dyn FrontierClient>)>) -> Rig {
+/// [`rig_of`]'s engine wiring, parameterized on the catalog so the cost-guard
+/// case can price its providers for real without a second copy of it.
+fn rig_over(catalog: StaticFrontierCatalog, clients: Vec<(&str, Arc<dyn FrontierClient>)>) -> Rig {
     let store = Arc::new(MemoryStore::new());
     let registry = FrontierClients::keyed(
         clients
@@ -231,7 +260,7 @@ fn rig_of(clients: Vec<(&str, Arc<dyn FrontierClient>)>) -> Rig {
         Arc::clone(&store),
         ByteTokenizer,
         Arc::new(EchoLocalExecutor::new("local")) as Arc<dyn LocalExecutor>,
-        catalog(),
+        catalog,
         Arc::new(registry),
         Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new()))),
         EngineConfig {
@@ -243,6 +272,10 @@ fn rig_of(clients: Vec<(&str, Arc<dyn FrontierClient>)>) -> Rig {
         engine: Arc::new(engine),
         store,
     }
+}
+
+fn rig_of(clients: Vec<(&str, Arc<dyn FrontierClient>)>) -> Rig {
+    rig_over(catalog(), clients)
 }
 
 impl Rig {
@@ -735,5 +768,110 @@ async fn a_note_survives_a_failover_inside_the_escalating_turn() {
         "and the target that actually answered got it: the note must survive the \
          fall-forward, or a provider outage silently strips the one sentence the \
          escalation exists to send"
+    );
+}
+
+/// **The seventh case, and stage.rs's dominance guard (T4) from the engine's
+/// own seat.** A turn the guard redirects onto the capable tier for cost
+/// reasons is not a signal-driven escalation, and must not be narrated as
+/// one -- `DecisionSource::is_signal_driven` excludes `CostGuard` for exactly
+/// this reason, and only an engine-level probe can check that the exclusion
+/// actually stops the note from riding a real dispatch.
+///
+/// Two turns on one session, over [`priced_catalog`] rather than the free rate
+/// card every other case in this file uses: turn one is an ordinary ambiguous
+/// fall-open under `capable_first`, which lands on alpha and warms it (a real
+/// price spread and a five-minute deterministic cache are what let a warm
+/// quote ever undercut a cold one -- [`catalog`]'s free pricing cannot produce
+/// the inversion at all). `capable_first` rather than a signal that forces the
+/// tier is deliberate: `a_critical_session`'s `CRITICAL` result would still be
+/// inside the scorer's trailing window on turn two and force a second
+/// `Override`, which is the same hazard
+/// `only_the_first_capable_turn_of_a_run_narrates` names -- an ambiguous
+/// fall-open leaves nothing behind to re-trigger on.
+///
+/// Turn two switches the same session to `efficient_first`, where an ambiguous
+/// turn falls open onto the still-cold efficient tier (gamma) by default. But
+/// gamma's quote is priced entirely at the uncached rate while alpha's is
+/// mostly a cache read, and both candidates are quoted against the identical
+/// conversation length, so alpha's quote is strictly cheaper by exactly
+/// `cached_tokens * (write_rate - cached_rate)` -- positive the moment any
+/// prefix is warm. The guard takes the turn on that inversion, and the claim
+/// is that nothing about the request alpha receives says an escalation
+/// happened.
+#[tokio::test]
+async fn a_cost_guarded_turn_narrates_nothing() {
+    let alpha = Recording::answering();
+    let gamma = Recording::answering();
+    let rig = rig_over(
+        priced_catalog(),
+        vec![
+            (ALPHA, Arc::clone(&alpha) as Arc<dyn FrontierClient>),
+            (BETA, Recording::answering() as Arc<dyn FrontierClient>),
+            (GAMMA, Arc::clone(&gamma) as Arc<dyn FrontierClient>),
+        ],
+    );
+
+    let session_id = SessionId::generate();
+    rig.engine.create_session(&session_id).await.unwrap();
+
+    let warm_up = rig
+        .engine
+        .run_turn(
+            &session_id,
+            TurnId::new("t0"),
+            ask(),
+            &narrating(PickerMode::CapableFirst),
+        )
+        .await
+        .expect("turn one dispatches");
+    let first = warm_up.decision.expect("a dispatched turn records one");
+    assert_eq!(
+        (&first.target, first.source),
+        (&target(ALPHA), Some(DecisionSource::Ambiguous)),
+        "turn one must fall open onto alpha with nothing signal-driven behind \
+         it, or there is nothing warm for the guard to have priced cheap next \
+         time, and no isolation from the escalating case: {}",
+        first.rationale
+    );
+
+    let guarded = rig
+        .engine
+        .run_turn(
+            &session_id,
+            TurnId::new("t1"),
+            ask(),
+            &narrating(PickerMode::EfficientFirst),
+        )
+        .await
+        .expect("turn two dispatches");
+    let second = guarded.decision.expect("a dispatched turn records one");
+    assert_eq!(
+        (&second.target, second.source),
+        (&target(ALPHA), Some(DecisionSource::CostGuard)),
+        "an ambiguous turn falls open onto the efficient tier by default, so \
+         landing on alpha again must be the guard reading the warm quote and \
+         not a second escalation: {}",
+        second.rationale
+    );
+
+    assert!(
+        gamma.prompts().is_empty(),
+        "the guard fires before dispatch: the efficient head it displaced must \
+         never see the turn it was priced against"
+    );
+
+    let prompts = alpha.prompts();
+    assert_eq!(prompts.len(), 2, "alpha served both turns");
+    assert!(
+        !prompts[0].contains(HANDOFF_MARKER),
+        "turn one is an ambiguous fall-open and narrates nothing, same as \
+         `an_ambiguous_turn_on_the_capable_tier_narrates_nothing`"
+    );
+    assert!(
+        !prompts[1].contains(HANDOFF_MARKER),
+        "a price is not a signal: the guarded turn must carry no handoff note \
+         either, the same promise `DecisionSource::is_signal_driven` makes by \
+         excluding `CostGuard` from its set"
     );
 }

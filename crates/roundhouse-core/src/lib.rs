@@ -13,6 +13,7 @@
 //! the state machine stays testable without a GPU, a network, or a provider
 //! account.
 
+pub mod classify;
 pub mod context;
 pub mod contract_macro;
 pub mod control;

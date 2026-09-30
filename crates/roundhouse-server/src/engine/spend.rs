@@ -33,7 +33,7 @@
 //! was told yes about turns that were over.
 
 use roundhouse_core::context::Tokenizer;
-use roundhouse_core::control::{GrantRequest, SettledSpend, Settlement, TurnBudget};
+use roundhouse_core::control::{GrantRequest, SettledSpend, Settlement, SettlementKey, TurnBudget};
 use roundhouse_core::ids::ResponseId;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{Candidate, Target};
@@ -42,6 +42,8 @@ use roundhouse_core::store::SessionStore;
 
 use crate::control_config::Admission;
 use crate::engine::{Engine, EngineError};
+#[cfg(test)]
+use roundhouse_core::event::CacheReadSource;
 
 /// How long a grant's hold outlives the turn that took it.
 ///
@@ -170,8 +172,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         self.spend
             .settle_grant(Settlement {
                 principal: admission.principal.clone(),
-                session_id: session.session_id().clone(),
-                seq: settlement.seq,
+                // A serving turn, so the session's own watermark: turns are
+                // serialized per session and each settles before the next is
+                // admitted, which is the ascending order a watermark needs.
+                key: SettlementKey::SessionWatermark {
+                    session_id: session.session_id().clone(),
+                    seq: settlement.seq,
+                },
                 response_id: settlement.response_id.clone(),
                 actual_usd: match settlement.budget_draw {
                     // The log says this turn was decided when the project had
@@ -320,6 +327,7 @@ mod tests {
         Usage {
             input_tokens: 0,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens: 1_000_000,
             reasoning_tokens: 0,
@@ -516,6 +524,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
         Usage {
             input_tokens: 0,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens: 1_000_000,
             reasoning_tokens: 0,
@@ -595,6 +604,8 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
             .record_routing(
                 &response_id,
                 DecisionRecord {
+                    selection: None,
+                    local_quote_skipped: None,
                     chosen: Target::Frontier {
                         provider: "anthropic".into(),
                         model: "claude".into(),

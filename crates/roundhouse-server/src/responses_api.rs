@@ -770,11 +770,21 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
             // client's wire: a side call is money nobody asked us to spend and
             // a verdict is a decision, and neither is an answer to the turn
             // being streamed.
+            // The background classification kinds belong to no response for
+            // the same reason and one more: they describe a turn that has
+            // already terminated, so claiming one would reopen a finished
+            // stream.
             SessionEventKind::SessionCreated { .. }
             | SessionEventKind::Routed { .. }
             | SessionEventKind::SideCallCompleted { .. }
             | SessionEventKind::SideCallAbandoned { .. }
             | SessionEventKind::ValidationDecided { .. }
+            | SessionEventKind::ClassificationRequested { .. }
+            | SessionEventKind::ClassificationRecorded { .. }
+            // A settlement repair is the same case again, one step further
+            // out: it is about this deployment's accounting for a call
+            // that is already over, and belongs to no response.
+            | SessionEventKind::ClassificationSettlementRepaired { .. }
             | SessionEventKind::Error { .. } => false,
         }
     }
@@ -1050,6 +1060,14 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
             | SessionEventKind::SideCallCompleted { .. }
             | SessionEventKind::SideCallAbandoned { .. }
             | SessionEventKind::ValidationDecided { .. }
+            // The two background classification kinds are the same case one
+            // step further out: they describe a turn that has already ended.
+            | SessionEventKind::ClassificationRequested { .. }
+            | SessionEventKind::ClassificationRecorded { .. }
+            // A settlement repair is the same case again, one step further
+            // out: it is about this deployment's accounting for a call
+            // that is already over, and belongs to no response.
+            | SessionEventKind::ClassificationSettlementRepaired { .. }
             | SessionEventKind::Error { .. } => Step::Continue,
         }
     }

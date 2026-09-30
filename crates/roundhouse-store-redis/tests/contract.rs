@@ -4,13 +4,17 @@
 //! M3: the full store contract against a real Redis, plus the adversarial
 //! cases only a real backend can exercise.
 //!
-//! The macro invocation below is the milestone's headline: the *same* eleven
+//! The macro invocation below is the milestone's headline: the *same*
 //! assertions that judge `MemoryStore` now judge this store, which is what
 //! turns "the backends are interchangeable" from prose into a build step. The
 //! tests after it are Redis-specific: races between separate connections,
 //! real TTL expiry on the Redis clock, and recovery after the store's
 //! connection is killed — behaviors the in-memory store cannot exhibit and
 //! the shared suite therefore cannot check.
+//!
+//! Each suite test connects under its own fresh namespace. The learning index
+//! is one set of keys per namespace, so under the shared default every run
+//! would lengthen the next run's permanent-index passes.
 //!
 //! Gating is the same as `read_path.rs`: `#[ignore]` because it is the one
 //! skip the harness reports, opted into with `--include-ignored`, and a
@@ -21,10 +25,11 @@ mod common;
 use common::{assert_covers_every_variant, connect_from_env, every_event_kind, lease_key, rig};
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::store::{SessionStore, StoreError};
+use roundhouse_store_redis::test_support::{connect_in, fresh_namespace};
 
 roundhouse_core::store_contract_suite!(
     ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored",
-    connect_from_env().await
+    connect_in(fresh_namespace()).await
 );
 
 /// Every event kind through the *real* append path. `read_path.rs` proves the
@@ -44,7 +49,7 @@ async fn every_event_kind_survives_the_fenced_append() {
         .unwrap()
         .unwrap();
 
-    let appended = rig.store.append_events(&lease, kinds).await.unwrap();
+    let appended = rig.store.append_events(&lease, kinds, None).await.unwrap();
     assert_eq!(
         rig.store.read_events(&sid, 0, 100).await.unwrap(),
         appended,
@@ -124,7 +129,7 @@ async fn concurrent_batches_interleave_without_tearing() {
                         message: format!("{task}:{batch}:{line}"),
                     })
                     .collect();
-                store.append_events(&lease, kinds).await.unwrap();
+                store.append_events(&lease, kinds, None).await.unwrap();
             }
         }
     }));
@@ -193,7 +198,8 @@ async fn a_lease_really_expires_on_the_redis_clock() {
                 &short,
                 vec![SessionEventKind::Error {
                     message: "no".into()
-                }]
+                }],
+                None
             )
             .await,
         Err(StoreError::LeaseLost { .. })

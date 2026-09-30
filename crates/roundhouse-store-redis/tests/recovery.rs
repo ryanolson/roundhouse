@@ -38,6 +38,7 @@ async fn the_store_survives_its_connection_being_killed() {
             vec![SessionEventKind::Error {
                 message: "one".into(),
             }],
+            None,
         )
         .await
         .unwrap();
@@ -63,6 +64,7 @@ async fn the_store_survives_its_connection_being_killed() {
                 vec![SessionEventKind::Error {
                     message: "two".into(),
                 }],
+                None,
             )
             .await
         {

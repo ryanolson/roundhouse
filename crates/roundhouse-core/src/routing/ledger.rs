@@ -342,6 +342,22 @@ pub struct TargetState {
     /// Prompt length of that call, and therefore the longest prefix that could
     /// still be warm.
     pub last_prefix_tokens: u64,
+    /// How many conversation items that call rendered, and therefore how many
+    /// content blocks a block-slicing client cut it into.
+    ///
+    /// **Blocks rather than tokens, because a provider's cache lookup is
+    /// bounded in block positions.** Anthropic reads at most twenty blocks back
+    /// from a breakpoint, so a client that marks only the penultimate block of
+    /// a much longer prompt names a position the previous write cannot be
+    /// reached from — a miss on bytes that are still identical. The count is
+    /// what a later request needs to work out where that write landed, and it
+    /// reaches the wire as `FrontierQuote::previous_segment_count`.
+    ///
+    /// `#[serde(default)]` so a ledger snapshot written before this field
+    /// existed still loads, and reads as "no block structure known" — which
+    /// costs exactly the single-marker behaviour that was there before.
+    #[serde(default)]
+    pub last_segment_count: u64,
 }
 
 /// One recorded dispatch, projected from the session event log.
@@ -382,12 +398,20 @@ impl CacheLedger {
     }
 
     /// Record a dispatch. Called as the session projects its event log.
-    pub fn record(&mut self, target: &Target, at_ms: u64, isl_tokens: u64) {
+    ///
+    /// `segment_count` is the number of conversation items the dispatch
+    /// rendered — the second half of "what we last sent", and the half a
+    /// block-slicing wire needs. It is taken from the log at the `Routed` fold
+    /// and carried here, not re-read at the terminal fold: by then the output
+    /// items of the same turn have been appended, and a count read there would
+    /// describe a longer prompt than the one the provider cached.
+    pub fn record(&mut self, target: &Target, at_ms: u64, isl_tokens: u64, segment_count: u64) {
         self.state.insert(
             target.ledger_key(),
             TargetState {
                 last_call_at_ms: at_ms,
                 last_prefix_tokens: isl_tokens,
+                last_segment_count: segment_count,
             },
         );
     }
@@ -435,7 +459,7 @@ impl CacheLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::Accounting;
+    use crate::event::{Accounting, CacheReadSource};
 
     const MINUTE: u64 = 60_000;
 
@@ -476,6 +500,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         };
         // 0.1 M * 3.75 + 0.6 M * 0.3 + 0.3 M * 3.0 = 0.375 + 0.18 + 0.90
         assert!((CLAUDE.price(&measured) - 1.455).abs() < 1e-9);
@@ -507,6 +532,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         };
         // 0.4 M * 3.75 + 0.6 M * 0.3 — unchanged from before M11.0.
         assert!((CLAUDE.price(&unmeasured) - 1.68).abs() < 1e-9);
@@ -544,6 +570,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         };
         let price = CLAUDE.price(&broken);
         assert!(price > 0.0, "a call cannot cost less than nothing: {price}");
@@ -571,6 +598,7 @@ mod tests {
             output_tokens: 0,
             reasoning_tokens: 0,
             accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
         };
         // A short prompt under the cacheable minimum (nothing measured), a long
         // one written whole, and one that was partly written — all three
@@ -652,7 +680,7 @@ mod tests {
             CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
             ProviderPricing::free(),
         );
-        ledger.record(&target, 0, 4_000);
+        ledger.record(&target, 0, 4_000, 0);
 
         // Prompt shrank below what we last sent; only the overlap can be warm.
         assert_eq!(
@@ -687,7 +715,7 @@ mod tests {
         assert!((cold - (100_000.0 * 3.75e-6 + 500.0 * 15e-6)).abs() < 1e-9);
 
         // Seen a minute ago with a 100k prefix: reads at the cached rate.
-        ledger.record(&target, 0, 100_000);
+        ledger.record(&target, 0, 100_000, 0);
         let warm = ledger.estimate_cost_usd(&target, MINUTE, 100_000, 500);
         assert!((warm - (100_000.0 * 0.3e-6 + 500.0 * 15e-6)).abs() < 1e-9);
         assert!(warm < cold, "a warm prefix must be cheaper than a cold one");
@@ -702,7 +730,7 @@ mod tests {
             CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
             ProviderPricing::free(),
         );
-        ledger.record(&target, 0, 50_000);
+        ledger.record(&target, 0, 50_000, 0);
         assert!(ledger.expected_cached_tokens(&target, MINUTE, 50_000) > 0.0);
 
         ledger.invalidate();
@@ -718,7 +746,7 @@ mod tests {
             CacheModel::Deterministic { ttl_ms: 5 * MINUTE },
             ProviderPricing::free(),
         );
-        ledger.record(&target, 0, 10_000);
+        ledger.record(&target, 0, 10_000, 0);
 
         assert_eq!(
             ledger.expected_cached_tokens(&target, 4 * MINUTE, 10_000),

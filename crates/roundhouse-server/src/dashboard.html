@@ -380,6 +380,64 @@ that the API does not have, so a hard refresh loses nothing.
     </div>
   </section>
 
+  <!-- Evaluation spend is its own section rather than a column on the tables
+       above, because it is priced by a different authority: a classifier call
+       carries the amount it was priced at, under the rate card its own
+       reservation recorded, so correcting the catalog moves every figure above
+       and leaves these exactly where they are. A column would invite the sum
+       the section heading below has to label. -->
+  <section class="card">
+    <h2>Evaluation spend</h2>
+    <p class="note">
+      What this deployment spent classifying its own turns, so it can route
+      better. Priced by the rate card each call recorded — not by the catalog the
+      figures above use — and it is our own arithmetic over usage a service
+      reported, never a bill anyone issued.
+    </p>
+    <p class="note">
+      The combined figure is what left the building: hosted serving plus
+      classifier calls. It is not all of what serving costs. A turn our own fleet
+      answered bills nobody and costs GPU time, and a turn on a forwarded
+      subscription seat was charged to somebody else's plan — neither has a
+      per-token price this page could state without inventing one, so both are
+      named here and priced nowhere.
+    </p>
+    <div class="split">
+      <div class="split-item">
+        <div class="split-label">Classifier cost <span class="chip">observed</span></div>
+        <div class="split-value" id="eval-cost">$0.00</div>
+        <div class="split-note" id="eval-cost-note"></div>
+      </div>
+      <div class="split-item">
+        <div class="split-label">Serving and evaluation <span class="chip">two price bases</span></div>
+        <div class="split-value" id="eval-combined">$0.00</div>
+        <div class="split-note" id="eval-combined-note"></div>
+      </div>
+      <div class="split-item">
+        <div class="split-label">Settlement <span class="chip">ledger</span></div>
+        <div class="split-value" id="eval-settled">$0.00</div>
+        <div class="split-note" id="eval-settled-note"></div>
+      </div>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Asked</th>
+            <th>Answered by</th>
+            <th class="num">Calls</th>
+            <th class="num">Measured</th>
+            <th class="num">Usage unknown</th>
+            <th class="num">Refused</th>
+            <th class="num">Tokens</th>
+            <th class="num">Cost</th>
+          </tr>
+        </thead>
+        <tbody id="evaluation-models"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="card">
     <h2>Local models and their correlaries</h2>
     <p class="note">
@@ -638,6 +696,75 @@ that the API does not have, so a hard refresh loses nothing.
     }
   }
 
+  // Every basis string printed below is the one the document was served with,
+  // never a literal here: a second copy on the page is a second claim about how
+  // a number was priced, and the two would drift the first time one moved.
+  const costLabel = (value) => String(value).replaceAll("_", " ");
+
+  function renderEvaluation(data) {
+    $("eval-cost").textContent = usd(data.evaluation.measured_usd);
+    $("eval-cost-note").textContent =
+      `${nf.format(data.evaluation.measured_calls)} of ${nf.format(data.evaluation.results)} results measured`
+      + ` · ${tokens(data.evaluation.tokens.total)} tokens · priced by ${costLabel(data.evaluation.price_basis)}`;
+
+    $("eval-combined").textContent = usd(data.observed_cost.total_usd);
+    // Which half is short is the part a reader acts on: an unpriced serving row
+    // is a rate card to go and fix, a pending classifier call is not, and GPU
+    // time is not a gap anyone closes — it is simply outside what a per-token
+    // catalog can say.
+    const short = [];
+    if (data.observed_cost.evaluation_incomplete) short.push("evaluation");
+    if (data.observed_cost.serving_gaps.unpriced_models > 0) short.push("unpriced serving rows");
+    if (data.observed_cost.serving_gaps.estimated_calls > 0) short.push("unreported serving calls");
+    if (data.observed_cost.serving_gaps.local_calls > 0) short.push("local GPU time, never priced");
+    $("eval-combined-note").textContent =
+      `${usd(data.observed_cost.serving_usd)} serving (${costLabel(data.observed_cost.serving_basis)})`
+      + ` + ${usd(data.observed_cost.evaluation_usd)} evaluation (${costLabel(data.observed_cost.evaluation_basis)})`
+      + ` · covers ${costLabel(data.observed_cost.covers)}`
+      + (data.observed_cost.incomplete ? ` · incomplete: ${short.join(", ")}` : "");
+
+    // Keep recorded cost visible while ledger acknowledgement is unresolved.
+    $("eval-settled").textContent = usd(data.evaluation.settlement.committed_usd);
+    $("eval-settled-note").textContent =
+      `${nf.format(data.evaluation.settlement.acknowledged_calls)} settles acknowledged`
+      + `, ${nf.format(data.evaluation.settlement.repaired_calls)} of them by repair`
+      + ` · ${nf.format(data.evaluation.settlement.unconfirmed_calls)} unconfirmed, worth `
+      + usd(data.evaluation.settlement.unconfirmed_usd);
+
+    const body = $("evaluation-models");
+    body.textContent = "";
+    const rows = data.evaluation.models;
+    if (!rows.length) {
+      body.appendChild(emptyRow(8, "Nothing has been classified yet."));
+      return;
+    }
+    for (const m of rows) {
+      const tr = document.createElement("tr");
+      tr.appendChild(cell(esc(m.requested_model), "name"));
+      // Absent, empty and "nobody was asked" all reach here as null. The refused
+      // column beside it is what tells the third apart from the first two.
+      tr.appendChild(cell(
+        m.reported_model
+          ? esc(m.reported_model)
+          : '<span class="dim">unknown</span><span class="sub">none reported</span>'));
+      tr.appendChild(cell(nf.format(m.calls), "num"));
+      tr.appendChild(cell(nf.format(m.measured_calls), "num"));
+      tr.appendChild(cell(
+        m.unknown_usage_calls > 0
+          ? `${nf.format(m.unknown_usage_calls)}<span class="sub">cost unknown</span>`
+          : '<span class="dim">—</span>',
+        "num"));
+      tr.appendChild(cell(
+        m.refused_calls > 0
+          ? `${nf.format(m.refused_calls)}<span class="sub">nothing sent</span>`
+          : '<span class="dim">—</span>',
+        "num"));
+      tr.appendChild(cell(tokens(m.tokens.total), "num"));
+      tr.appendChild(cell(usd(m.measured_usd), "num"));
+      body.appendChild(tr);
+    }
+  }
+
   function emptyRow(span, text) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
@@ -682,15 +809,60 @@ that the API does not have, so a hard refresh loses nothing.
         no correlary</strong>, so ${unpriced.length === 1 ? "its" : "their"} traffic contributes
         nothing to the savings figure. See the correlary table below.`);
     }
-    // Priceable tokens only. A row whose traffic was all forwarded seats bills
-    // nothing *correctly*, and telling an operator to go and fix a rate card
-    // for it would send them after a file that is not the explanation.
-    const freeHosted = data.models.filter(
-      (m) => m.mode === "frontier" && priceable(m) > 0 && m.billed_usd === 0);
-    if (freeHosted.length) {
-      notes.push(`<strong>${freeHosted.length} hosted model${freeHosted.length === 1 ? "" : "s"}
-        served tokens at no cost</strong>, which almost always means a missing rate card
-        rather than a free provider: ${esc(freeHosted.map((m) => m.provider + "/" + m.model).join(", "))}.`);
+    // The document's own answer, never the row's dollars. A rate card priced
+    // at zero on purpose pays out exactly what no rate card pays out, and so
+    // does a full rate card whose priced axes this row's traffic missed — so
+    // the money cannot tell the one row somebody has to go and write an entry
+    // for from the two that are already right.
+    //
+    // Priceable tokens only, for the same reason: a row whose traffic was all
+    // forwarded seats bills nothing *correctly*, and sending an operator after
+    // a rate card for it would send them after a file that is not the
+    // explanation.
+    const unratedHosted = data.models.filter(
+      (m) => m.mode === "frontier" && priceable(m) > 0 && m.priced_by_catalog === false);
+    if (unratedHosted.length) {
+      notes.push(`<strong>${unratedHosted.length} hosted model${unratedHosted.length === 1 ? " has" : "s have"}
+        no entry in the price catalog</strong>, so ${unratedHosted.length === 1 ? "its" : "their"} tokens
+        are counted here and the money they really billed is published as zero — an understatement of
+        the serving total by an amount this page cannot name. Write a rate card for:
+        ${esc(unratedHosted.map((m) => m.provider + "/" + m.model).join(", "))}.`);
+    }
+    // Missing results and usage do not establish a zero-cost call.
+    if (data.evaluation.cost_incomplete) {
+      notes.push(`<strong>Evaluation cost is incomplete</strong>:
+        ${nf.format(data.evaluation.pending)} classifier call${data.evaluation.pending === 1 ? " has" : "s have"}
+        no result in the log and ${nf.format(data.evaluation.unknown_usage_calls)} came back without usage,
+        so the figure includes only recorded costs. Calls refused before HTTP are counted separately:
+        ${nf.format(data.evaluation.refused_calls)}.`);
+    }
+    // Said once, on the deployment it matters to. A fleet serving most of its
+    // own traffic has a small combined cost *because* the work went to its own
+    // GPUs, and a reader who took that figure for the whole bill would draw the
+    // strongest possible conclusion from the number least able to support it.
+    if (data.observed_cost.serving_gaps.local_calls > 0) {
+      notes.push(`<strong>${nf.format(data.observed_cost.serving_gaps.local_calls)} calls were served by
+        our own fleet</strong>, which bills nobody. Their GPU time is a real cost and this page does not
+        price it: the combined figure covers ${esc(costLabel(data.observed_cost.covers))} and nothing else. What
+        those turns <em>would</em> have cost hosted is the routing saving above, which is a
+        counterfactual rather than a bill.`);
+    }
+    if (data.evaluation.settlement.unconfirmed_calls > 0) {
+      notes.push(`<strong>${nf.format(data.evaluation.settlement.unconfirmed_calls)} evaluation settlements
+        are unconfirmed</strong>, worth ${usd(data.evaluation.settlement.unconfirmed_usd)}. Nobody
+        acknowledged the settle — the ledger refused, was unreachable, or answered too late — which is
+        not the same as knowing the charge is absent. Recorded usage and cost remain visible.
+        A repair resolves the acknowledgement without adding another charge.`);
+    }
+    const unbooked = data.evaluation.unbooked.duplicate_results
+      + data.evaluation.unbooked.unattributed_results
+      + data.evaluation.unbooked.unmatched_repairs;
+    if (unbooked > 0) {
+      notes.push(`<strong>${nf.format(unbooked)} classification events were not booked</strong>:
+        ${nf.format(data.evaluation.unbooked.duplicate_results)} delivered again for a call already
+        settled, ${nf.format(data.evaluation.unbooked.unattributed_results)} answering no outstanding
+        intent, ${nf.format(data.evaluation.unbooked.unmatched_repairs)} repairing no open settlement.
+        These events did not add cost. The counts alone do not explain repeated or unmatched events.`);
     }
     if (seatTotal(data) > 0) {
       notes.push(`<strong>${tokens(seatTotal(data))} tokens were served through forwarded
@@ -762,6 +934,7 @@ that the API does not have, so a hard refresh loses nothing.
     renderModes(data.serving_modes, data.tokens.total);
     renderModels(data.models);
     renderProviders(data.providers);
+    renderEvaluation(data);
     renderCorrelaries(data.models);
 
     const from = data.first_event_at_ms;

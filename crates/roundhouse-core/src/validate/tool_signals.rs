@@ -281,7 +281,10 @@ static NUMERIC_FAILURE_KEYWORDS: &[&str] = &["failed", "failure", "failures", "e
 /// Every field is a fact about the session's own log, computable with no model
 /// call — which is what lets a signal built on it be *tested* rather than
 /// approximated, the same property the trigger's other four have.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Serialized because a routing decision records the signals it was taken on
+/// (`routing::selection::LocalFeatures`): re-running the extractor at read time
+/// would score an old turn on a later build's reading of the same exchanges.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolSignals {
     /// Max severity across the recent window of tool results: `0.0` clean,
     /// [`SOFT`], [`HARD`], [`CRITICAL`]. Windowed rather than last-only so an

@@ -404,8 +404,6 @@ static CONTROL_TOOL: LazyLock<ControlTool> = LazyLock::new(|| {
     }
 });
 
-/// How long a single `claude -p` may take before the test kills it.
-
 /// The header Relay's transparent-run credential rides on
 /// (`provider_auth.rs`'s `TRANSPARENT_PROXY_CREDENTIAL_HEADER`).
 ///

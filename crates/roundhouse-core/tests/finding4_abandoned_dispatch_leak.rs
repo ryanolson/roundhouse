@@ -16,6 +16,7 @@
 //! `crates/roundhouse-core/src/metrics/mod.rs`, returning `self.pending.len()`.
 //! It reads a field and changes no behavior.
 
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{Accounting, IncompleteReason, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::metrics::MetricsFold;
@@ -38,6 +39,8 @@ fn hosted() -> Target {
 
 fn decision(chosen: Target) -> DecisionRecord {
     DecisionRecord {
+        selection: None,
+        local_quote_skipped: None,
         chosen: chosen.clone(),
         rationale: "cheapest viable".into(),
         policy: "test".into(),
@@ -86,6 +89,7 @@ fn usage(input: u64, output: u64) -> Usage {
         output_tokens: output,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
+        cache_read_source: CacheReadSource::Unreported,
     }
 }
 

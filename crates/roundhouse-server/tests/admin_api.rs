@@ -780,7 +780,6 @@ async fn revoking_a_key_stops_it_within_one_cache_ttl() {
 /// `state.directory.snapshot(at_ms)` back to two separate
 /// `state.directory.plane(at_ms)` / `.view(at_ms)` calls would compile and
 /// pass every other test here.
-
 /// R2 (thermo-nuclear review, M8), reproduced at the HTTP boundary: nothing
 /// else in this suite drives the real router with a write timed to land
 /// between `budget_view`'s plane read and its listing read, so a regression

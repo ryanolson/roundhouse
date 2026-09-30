@@ -738,7 +738,12 @@ mod tests {
     /// neighbour's traffic can land at any point while it holds the counter
     /// uncontended, not only during whatever window this test happens to be
     /// in.
-    static REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    ///
+    /// Waiting for this lock must yield to the runtime because each test holds
+    /// the guard across Redis calls. The guard spans the whole test to prevent
+    /// another test from changing its counters.
+    static REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     /// M13.1 review F7's other half, held as a premise rather than assumed:
     /// **a window's four sum fields move as a set.**
@@ -753,9 +758,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
     async fn a_windows_four_sum_fields_move_as_a_set() {
-        let _serialized = REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serialized = REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME.lock().await;
 
         let url = std::env::var("ROUNDHOUSE_TEST_REDIS_URL")
             .expect("--include-ignored asks for the real backend; set ROUNDHOUSE_TEST_REDIS_URL");
@@ -872,9 +875,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
     async fn would_exceed_worst_case_seven_day_decay_reads_six_bucket_chunks() {
-        let _serialized = REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _serialized = REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME.lock().await;
 
         let url = std::env::var("ROUNDHOUSE_TEST_REDIS_URL")
             .expect("--include-ignored asks for the real backend; set ROUNDHOUSE_TEST_REDIS_URL");

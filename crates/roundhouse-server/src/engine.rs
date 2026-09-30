@@ -31,7 +31,9 @@ use roundhouse_core::control::{
     Billing, CredentialError, FairUseError, FairUseLedger, MemoryFairUseLedger, MemorySpendLedger,
     SpendError, SpendLedger, TurnCredential, TurnPolicy,
 };
-use roundhouse_core::event::{Accounting, IncompleteReason, SessionObserver, Usage};
+use roundhouse_core::event::{
+    Accounting, CacheReadSource, IncompleteReason, SessionObserver, Usage,
+};
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId};
 use roundhouse_core::interject::{Interjection, InterjectionContext, Interjector};
 use roundhouse_core::item::{Item, canonical_arguments};
@@ -39,12 +41,12 @@ use roundhouse_core::metrics::MetricsRecorder;
 use roundhouse_core::now_ms;
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, Candidate, Decision, DecisionRecord, DecisionSource,
-    DispatchAttempt, RoutingContext, RoutingError, RoutingPolicy, Target, Tier, TierRecipe,
-    TurnSignals,
+    DispatchAttempt, LocalQuoteSkip, RoutingContext, RoutingError, RoutingPolicy,
+    SelectionSnapshot, Target, Tier, TierRecipe,
 };
 use roundhouse_core::session::{Session, SessionError, SessionState, TurnAdmission};
 use roundhouse_core::store::SessionStore;
-use roundhouse_core::validate::{ControlCallDialect, SideCall, exchanges};
+use roundhouse_core::validate::{ControlCallDialect, SideCall};
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
     FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog, WireProtocol,
@@ -53,11 +55,16 @@ use roundhouse_mcp::ControlStore;
 use serde_json::Value;
 use tokio::time::Instant;
 
+use crate::classify_runtime::ClassificationRuntime;
 use crate::control_config::Admission;
 
+mod classification;
 mod control;
 mod fair_use;
+mod selection;
 pub(crate) mod spend;
+
+use selection::SelectionInputs;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -446,6 +453,13 @@ impl LocalExecutor for EchoLocalExecutor {
     }
 }
 
+/// The latency floor a local worker is quoted at before prefill, in ms.
+///
+/// Named rather than written twice, because a deployment can set it — see
+/// `catalog_config` — and a config loader whose "unset" default drifted from
+/// this one would change every local quote on a file nobody edited.
+pub const DEFAULT_LOCAL_BASE_TTFT_MS: f64 = 60.0;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Identity presented to the session lease.
@@ -460,7 +474,21 @@ pub struct EngineConfig {
     /// Capability of the local model relative to the frontier catalog.
     pub local_quality_prior: f64,
     /// Latency floor attributed to a local worker before prefill.
+    ///
+    /// Deployment-settable, like the slope below: the catalog carries both, so
+    /// the local curve and the hosted ones it is compared against are written
+    /// in one file. See `catalog_config::engine_config`.
     pub local_base_ttft_ms: f64,
+    /// Slope from the residency answer's `effective_prefill_tokens` to a TTFT
+    /// term, the local mirror of a frontier spec's `ttft_ms_per_uncached_token`.
+    ///
+    /// A slope is a measured property of a deployment's prefill rate --
+    /// configuration, not a guess -- so the default is `0.0`, which reproduces
+    /// the old flat `local_base_ttft_ms` quote exactly for every deployment
+    /// that has not measured one. A deployment that has measured one writes
+    /// `1000 / tokens_per_second` into its catalog; see
+    /// `catalog_config::engine_config`.
+    pub local_ttft_ms_per_prefill_token: f64,
     pub expected_output_tokens: u32,
     /// Bounds the model work of a single turn.
     ///
@@ -494,7 +522,8 @@ impl Default for EngineConfig {
             local_model: "local".to_string(),
             routing_group: "default".to_string(),
             local_quality_prior: 0.6,
-            local_base_ttft_ms: 60.0,
+            local_base_ttft_ms: DEFAULT_LOCAL_BASE_TTFT_MS,
+            local_ttft_ms_per_prefill_token: 0.0,
             expected_output_tokens: 256,
             turn_deadline_ms: 120_000,
             arm_salt: String::new(),
@@ -627,6 +656,8 @@ impl Failed {
             Usage {
                 input_tokens: isl_tokens,
                 cached_input_tokens: 0,
+                // Inferred, so nothing here is a cache observation either.
+                cache_read_source: CacheReadSource::Unreported,
                 cache_write_tokens: 0,
                 output_tokens: 0,
                 reasoning_tokens: 0,
@@ -869,9 +900,29 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// so `fair_use_refusal` warns once per outage rather than once per
     /// refused turn. See its own doc for why (M13.1 review F4).
     fair_use_unreachable_warned: std::sync::atomic::AtomicBool,
+    /// Background turn classification, when a deployment configured it.
+    ///
+    /// **`None` is the shipped state and costs one `Option` check per turn.**
+    /// An always-present runtime with a disabled adapter would have been tidier
+    /// and would have put a semaphore, a result map and a sweep task in every
+    /// deployment that never opted in.
+    ///
+    /// The engine owns both ends of it: this turn's writer drains whatever
+    /// finished since the last one, and — once the turn has terminated — records
+    /// the intent to classify it. The drain is on the path to first token, but
+    /// costs at most one store round trip whatever it finds — see
+    /// [`Engine::deliver_classifier_output`], which batches every result and
+    /// repair a turn drains into one commit rather than paying for each
+    /// separately. Recording the intent to classify is not: it runs after
+    /// the terminal event, ahead of the lease being handed back.
+    classifier: Option<Arc<ClassificationRuntime<T>>>,
 }
 
-impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
+/// `'static` since the classification runtime: a background worker outlives the
+/// turn that spawned it, so the tokenizer it quotes with has to outlive the
+/// borrow too. Every tokenizer this workspace has is an owned value with no
+/// borrows in it, so the bound costs nothing a caller has to satisfy.
+impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// An engine whose whole catalog dispatches through one transport.
     ///
     /// The shape a test with an echo stub means, and the shape
@@ -938,6 +989,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             turn_gates: Mutex::new(HashMap::new()),
             unread_recipe: std::sync::Once::new(),
             fair_use_unreachable_warned: std::sync::atomic::AtomicBool::new(false),
+            classifier: None,
         }
     }
 
@@ -1005,6 +1057,18 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// consults this field on every turn either way.
     pub fn with_interjector(mut self, interjector: Arc<dyn Interjector>) -> Self {
         self.interjector = interjector;
+        self
+    }
+
+    /// Classify turns in the background through `classifier`.
+    ///
+    /// A builder for [`Self::with_fleet`]'s reason, and the default is a real
+    /// absence rather than a disabled instance — see [`Self::classifier`].
+    /// `classify_runtime::compose` is what the composition root builds one with,
+    /// and it only ever returns `Some` for a deployment whose configuration file
+    /// says `enabled`.
+    pub fn with_classifier(mut self, classifier: Arc<ClassificationRuntime<T>>) -> Self {
+        self.classifier = Some(classifier);
         self
     }
 
@@ -1127,6 +1191,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 .await?;
         }
 
+        // Before `input` is moved into `begin_turn` below — see
+        // `Engine::classification_before_turn` for why.
+        let classification = self.classification_before_turn(&mut session, &input).await;
+
         // `started`, not `admission`: the caller's [`Admission`] is who may
         // spend and on what, and this one is whether the log accepted the turn
         // at all. Two unrelated questions that used to share a name because
@@ -1207,14 +1275,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // turn, spent or not, is the cheapest possible way to make the
                 // ledger row and the log row name one string — and a turn that
                 // never checks simply never uses it.
+                //
+                // Fresh on every pass, which the settle depends on: a check
+                // settles once per id and forever, so a re-admitted turn gets a
+                // new identity rather than one the ledger has already closed.
                 side_call: SideCall {
                     session_id,
                     id: &side_call_id,
-                    // The log position this turn is being checked at: after its
-                    // own `TurnStarted` and before anything the check can
-                    // cause, so it rises with every turn and a replay computes
-                    // the same number. It is the settle's idempotency key.
-                    at_seq: session.last_seq(),
                     principal: &admission.principal,
                     budget: admission.budget.as_ref(),
                 },
@@ -1414,6 +1481,26 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 }
             }
         };
+        // **The turn is over, and this is where the next turn's features are
+        // bought.** After the terminal event, so nothing here can delay an
+        // answer; before the lease is handed back, so the durable intent is
+        // written by the writer that already holds it. See
+        // `Engine::classification_after_turn` for why the request is
+        // conditional on this turn's own decision and the repair scheduling
+        // beside it is not.
+        let settled_decision = match &settled {
+            Ok((_, _, Some(decision))) => Some(decision),
+            _ => None,
+        };
+        self.classification_after_turn(
+            &mut session,
+            &response_id,
+            admission,
+            classification,
+            settled_decision,
+        )
+        .await;
+
         // Money after the log, always: the settle is priced from the terminal
         // event's own usage, so it cannot run until that event exists, and a
         // ledger that moved first would charge for turns whose commit then
@@ -1487,16 +1574,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             .await
             .map_err(Failed::before_output)?;
 
-        // One fold for both targets: a response is a stream of deltas, and each
-        // one becomes durable as it arrives rather than at the end. That is
-        // what lets a successor resume a half-written answer, and what makes
-        // TTFT a measured quantity — the first `OutputTextDelta.at_ms` in the
-        // log minus the `Routed.at_ms` before it — instead of the model's own
-        // estimate of itself. On a turn that fell forward, "the `Routed` before
-        // it" is the *last* one, which is the dispatch that answered: the right
-        // reading, since the time a dead provider took to fail is on that
-        // provider's own attempt row rather than charged to the model that
-        // eventually spoke.
+        // Durable deltas let a successor resume a partial answer and let metrics
+        // reproduce first-output latency from the log. R21 measures from turn
+        // start, so the serving target's row includes routing and failover delay.
+        // This interval excludes work before the start event and delivery after
+        // the delta append. It does not measure the provider's own service time.
         // Everything said, for the caller; and the run not yet committed as an
         // item, for the log. **Two accumulators rather than one**, because a
         // tool call commits the run ahead of it and the two questions then have
@@ -1658,6 +1740,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 FrontierChunk::Done {
                     input_tokens,
                     cached_input_tokens,
+                    cache_read_source,
                     cache_write_tokens,
                     output_tokens,
                     reasoning_tokens,
@@ -1690,6 +1773,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         output_tokens,
                         reasoning_tokens,
                         accounting: Accounting::Reported,
+                        // A reported call can still say nothing about its
+                        // cache, so this rides in from the decoder rather than
+                        // being inferred from `accounting`.
+                        cache_read_source,
                     });
                     // Non-retracting, matching the dispatch decoders' own rule:
                     // a later frame that names no reason cannot erase one an
@@ -1905,6 +1992,8 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // one: a cached count invented here would understate what the next
             // turn has to prefill.
             cached_input_tokens: 0,
+            // No provider spoke, so the zero above is an absence.
+            cache_read_source: CacheReadSource::Unreported,
             // And nothing was written into one either, for the same reason:
             // there was no provider call to write it.
             cache_write_tokens: 0,
@@ -1952,6 +2041,9 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         Usage {
             input_tokens: isl_tokens as u64,
             cached_input_tokens: 0,
+            // Nothing local bears on what a remote cache did, so this zero is
+            // an absence rather than a measured miss.
+            cache_read_source: CacheReadSource::Unreported,
             cache_write_tokens: 0,
             output_tokens: self.tokenizer.encode(text).len() as u64 + tool_call_output_tokens,
             // Thinking is not recoverable from the visible text: a provider
@@ -1999,29 +2091,23 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             ) as usize;
         let turn_index = session.turn_index().saturating_sub(1);
 
-        // What the session's own tools have been doing, for the tier scorer.
-        //
-        // **Derived here rather than carried in state**, and that is the whole
-        // of S1: the extractor runs over the committed exchanges, which is the
-        // same projection `Evidence::of` hands the validate loop, so a
-        // successor that picks this session up scores the turn identically.
-        // Nothing is stored, nothing is asked of a model, and a deployment with
-        // no recipe pays one walk of the fold's item list for a value no policy
-        // reads.
-        //
-        // Computed unconditionally rather than behind `admission.tiers.is_some()`
-        // so there is one code path: an empty session yields the default
-        // signals, the scorer returns zero, and the picker's default takes the
-        // turn — which is exactly what `None` would have done, through the
-        // arithmetic instead of through a branch.
-        let signals = TurnSignals::from_exchanges(
-            &exchanges(&session.state().items),
-            ControlCallDialect::of_session_key(session.session_id().as_str()),
-        );
+        // What may be said about this turn, and the objective and
+        // classification window it is decided under — see
+        // `Engine::selection_inputs`. None of it depends on a candidate, a
+        // quote or a dispatch.
+        let SelectionInputs {
+            features,
+            objective,
+            classifications,
+        } = self.selection_inputs(session, turn_index);
 
         // --- price every option -------------------------------------------
-        let local_quote = match &self.fleet {
-            Some(fleet) => {
+        //
+        // See `Engine::local_quote_skip` for why an HTTP round trip is worth
+        // making or is not.
+        let local_quote_skipped = self.local_quote_skip(declarations, admission);
+        let local_quote = match (&self.fleet, &local_quote_skipped) {
+            (Some(fleet), None) => {
                 self.bounded(
                     deadline_at,
                     fleet.price(&FleetQuery::for_buffer(
@@ -2034,7 +2120,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 )
                 .await?
             }
-            None => None,
+            _ => None,
         };
 
         let mut candidates: Vec<Candidate> = Vec::new();
@@ -2042,6 +2128,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             candidates.push(quote.to_candidate(
                 self.config.local_quality_prior,
                 self.config.local_base_ttft_ms,
+                self.config.local_ttft_ms_per_prefill_token,
             ));
         }
         candidates.extend(self.frontier_catalog.quote(
@@ -2053,39 +2140,24 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
 
         // --- a tool-declaring turn cannot go to a local worker ---------------
         //
-        // **M11.2a's F2, and it is a routing fact rather than a dispatch one.**
-        // [`LocalExecutor::execute`] takes prompt token ids and an output cap
-        // and nothing else — this build has no way to tell a locally served
-        // model about a toolbox at all — and [`LocalExecution::text`] is a plain
-        // `String`, structurally incapable of carrying a call back. So a turn
-        // that declares tools and lands local is answered in prose, reports
-        // `end_turn` as if it had finished normally, and signals the loss
-        // nowhere: the client's agent loop simply stops working, which is the
-        // one failure shape this codebase treats as worse than an error.
-        //
-        // Excluded *here*, before the policy filter, and that placement is the
-        // same argument the credential filter makes twenty lines down: a
-        // candidate that could never have served this turn must not sit in
-        // `considered` either, or the dashboard prices a counterfactual saving
-        // against a target the turn could not have used. It is a *reachability*
-        // exclusion in the sense `TurnPolicy::permits` means — the same answer
-        // on every tool-declaring turn of every session — not a this-turn one.
-        //
-        // The alternative deliberately not taken: rendering a textual toolbox
-        // into the local prompt and parsing calls back out of the model's prose.
-        // That is a real design with a real cost — a second, weaker tool
-        // protocol whose failures look like bad answers — and it belongs to
-        // whichever milestone decides local models should be agentic, not to a
-        // review fix.
-        let excluded_local = match declarations.declares_tools() {
-            true => {
-                let before = candidates.len();
-                candidates.retain(|candidate| !candidate.target.is_local());
-                before - candidates.len()
-            }
-            false => 0,
-        };
-        if excluded_local > 0 && candidates.is_empty() {
+        // The exclusion itself lives in `local_quote_can_matter` (M11.2a's
+        // F2): its tool arm is checked before its policy arm, so `local_quote`
+        // above is never fetched when this turn declares tools and no local
+        // candidate ever reaches `candidates` for a turn like this one — see
+        // that function's doc for why the order is load-bearing and not just
+        // tidy. `debug_assert!` rather than a retain: a retain here would be
+        // filtering a set that is already structurally empty, which gives a
+        // reader false comfort that a second line of defence exists.
+        debug_assert!(
+            !declarations.declares_tools()
+                || candidates
+                    .iter()
+                    .all(|candidate| !candidate.target.is_local()),
+            "a tool-declaring turn must never carry a local candidate -- \
+             local_quote_skip's tool arm is checked before its policy arm"
+        );
+        let local_withheld_by_tools = local_quote_skipped == Some(LocalQuoteSkip::ToolsDeclared);
+        if local_withheld_by_tools && candidates.is_empty() {
             // Nothing hosted was quoted and local was all there was. Its own
             // error rather than `NoCandidates` or a served prose turn, because
             // the two things an operator needs are in it: that this turn
@@ -2093,7 +2165,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // cannot carry them. A promptless-local tool turn is not a served
             // turn; it is a wrong answer wearing one.
             return Err(EngineError::NoToolCapableTarget {
-                tools: declared_tool_count(&declarations),
+                tools: declared_tool_count(declarations),
                 why: "every candidate this deployment quoted is a local worker".to_string(),
             }
             .into());
@@ -2318,7 +2390,7 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     budget: &budget,
                     // Derived above from the committed log. `Some` on every
                     // turn including the first, whose signals are simply empty.
-                    signals: Some(&signals),
+                    signals: Some(&features.signals),
                     // The project's recipe, resolved at admission beside the
                     // policy. `None` on every project that configured none,
                     // which is what makes the stage router a no-op for them.
@@ -2333,10 +2405,10 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             // straight to the spend ledger — where the real answer is that this
             // deployment has no tool-capable capacity left, budget or no budget.
             // Restated rather than replaced, so both facts survive.
-            .map_err(|error| match (excluded_local, &error) {
-                (1.., EngineError::Routing(RoutingError::NoViableCandidate { budget_state })) => {
+            .map_err(|error| match (local_withheld_by_tools, &error) {
+                (true, EngineError::Routing(RoutingError::NoViableCandidate { budget_state })) => {
                     EngineError::NoToolCapableTarget {
-                        tools: declared_tool_count(&declarations),
+                        tools: declared_tool_count(declarations),
                         why: format!(
                             "the local pool this turn would otherwise have degraded to cannot \
                              carry a toolbox, and the budget state is {budget_state:?}"
@@ -2350,12 +2422,21 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // local worker" is exactly the question a decision record exists to
         // answer, and the honest answer is not "the router preferred it".
         let mut decision = decision;
-        if excluded_local > 0 {
+        if local_withheld_by_tools {
             decision
                 .rationale
                 .push_str(roundhouse_core::routing::TOOL_TURN_EXCLUDES_LOCAL);
         }
         let decision = decision;
+
+        // Selection runs once. Failover records retain its original inputs and
+        // fallback plan while recording their own target and attempt history.
+        let selection = Box::new(SelectionSnapshot::of(
+            &decision,
+            features,
+            classifications,
+            Some(objective),
+        ));
 
         // --- the handoff gate's second half (S6) ------------------------------
         //
@@ -2557,6 +2638,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                         // nothing earlier: see the loop's own comment on why a
                         // cumulative list would report one dead provider as four.
                         attempts: preceding.take().into_iter().collect(),
+                        // Why the local fleet was never asked, on the turns it
+                        // was not: the difference between a fleet this router
+                        // turned down and one it never consulted.
+                        local_quote_skipped,
+                        // The same snapshot on every record of this turn. The
+                        // inputs, the plan, the admitted pool and the branch are
+                        // facts about the *selection*, which happened once —
+                        // they do not become new facts because a provider was
+                        // down. The three fields above it are the ones that
+                        // describe this dispatch and they stay per-record.
+                        selection: Some(selection.clone()),
                     },
                 )
                 .await?;
@@ -2578,6 +2670,20 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // saw and subtract a prefill it never did (F4).
                     conversation_tokens,
                     deadline_at,
+                    // How many items the *previous* dispatch to this target
+                    // rendered — the raw ledger fact, not `n - 2`. Deriving
+                    // the marked block from it is `cache_markers::plan`'s job
+                    // now (roundhouse-fleet), through the same `penultimate`
+                    // it uses for the current request, so the two placements
+                    // cannot drift apart the way an engine-side `n - 2` and a
+                    // fleet-side `n - 2` once could. Read after
+                    // `record_routing` above and still the previous turn's
+                    // state, because the ledger folds a dispatch at its terminal
+                    // event and not at `Routed`.
+                    session
+                        .ledger()
+                        .state_for(&target)
+                        .map(|state| state.last_segment_count as usize),
                     declarations,
                 )
                 .await
@@ -2683,6 +2789,14 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
         // worker is sent the prompt buffer alone; see the call site (F4).
         conversation_tokens: usize,
         deadline_at: Instant,
+        // How many items this target's previous dispatch rendered, if the
+        // ledger remembers one — a ledger fact, not a guess about where that
+        // dispatch placed a marker; `cache_markers::plan` (roundhouse-fleet)
+        // derives the block index from it. Resolved by the caller rather
+        // than here: `connect` holds no session, and the value is a fact
+        // about *this* target, so the failover loop re-derives it for every
+        // attempt.
+        previous_segment_count: Option<usize>,
         // What the client declared, for the dialects that can express it.
         //
         // **Only the frontier arm below reads it, and that is two separate
@@ -2730,6 +2844,19 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                 // has to arrive in the quote or not at all.
                 let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
                     ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+                })?;
+                // Resolved before the quote is built: a catalog TTL or decay
+                // ceiling the wire cannot honor is a configuration mistake
+                // `CatalogConfig` already refuses at boot for a real
+                // deployment, so this is a terminal, not-worth-a-failover
+                // mistake exactly like an unresolvable target above.
+                // `EngineError::Frontier` wants the wide `FrontierError`, so
+                // the resolver's narrower refusal is restated through
+                // `cache_lifetime_error` first.
+                let cache_lifetime = spec.requested_cache_lifetime().map_err(|error| {
+                    ConnectFailure::terminal(EngineError::Frontier(
+                        spec.cache_lifetime_error(error),
+                    ))
                 })?;
                 // One call, so the offsets and the string they index into are
                 // the same render rather than two that could disagree.
@@ -2784,6 +2911,17 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
                     // the one part of this prompt that is new this turn and
                     // must not be inside the block a breakpoint caches.
                     segment_boundaries,
+                    // **How many items the *previous* request to this same
+                    // target rendered**, so a client whose provider only
+                    // looks a bounded distance back from a marker can still
+                    // reach that entry after a long append. Derived per
+                    // attempt at the call site from the ledger, because a
+                    // failover target has its own history and inheriting the
+                    // first choice's would name a count nothing ever wrote.
+                    previous_segment_count,
+                    // Use the ledger's catalog entry rather than a second TTL
+                    // setting, through the one reader the side call also uses.
+                    cache_lifetime,
                     session_id: request_context.and_then(|context| context.session_id.clone()),
                     thread_id: request_context.and_then(|context| context.thread_id.clone()),
                     prompt_cache_key: request_context
@@ -2915,6 +3053,11 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
             outcome.text,
             isl_tokens as u64,
             cached as u64,
+            // `Derived`, not `Provider`: this count is the router's own
+            // `effective_prefill_tokens` subtracted from its own ISL, so it
+            // prices correctly and measures nothing. Checking it against the
+            // quote it came from would be checking a number against itself.
+            CacheReadSource::Derived,
             outcome.output_tokens,
             outcome.reasoning_tokens,
         ))

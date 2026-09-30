@@ -20,6 +20,8 @@ pub mod anthropic_messages;
 pub mod frontier;
 pub mod local;
 pub mod openai_responses;
+/// TypeSafe transport for the server's opt-in background classification runtime.
+pub mod typesafe;
 pub mod usage;
 
 /// The Anthropic client's own `DEFAULT_API_BASE` and `DEFAULT_PASS_THROUGH_BASE`
@@ -31,8 +33,8 @@ pub use anthropic_messages::{
     ANTHROPIC_VERSION, AnthropicMessagesClient, DEFAULT_MAX_TOKENS, DEFAULT_MESSAGES_PATH,
 };
 pub use frontier::{
-    EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
-    FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog,
+    CacheLifetimeError, EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients,
+    FrontierError, FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog,
 };
 pub use local::{
     EmbeddedFleet, FleetError, FleetQuery, LocalFleet, LocalQuote, Reservation, WorkerRegistration,

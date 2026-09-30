@@ -257,6 +257,8 @@ One axis, filled in two ways (`rh:crates/roundhouse-core/src/routing/mod.rs:4-22
 - **Query cost:** block+sequence hashes, **never token ids** — "for a 100k-token context, the difference between shipping a 400 KB array and a few kilobytes". `rh:crates/roundhouse-fleet/src/local.rs:37-42`, `:84-119`; `rh:README.md:86-90`.
 - **Not measured:** `expected_ttft_ms` for local candidates is a static config constant `local_base_ttft_ms` (`rh:crates/roundhouse-server/src/engine.rs:1058-1064`), and `quality_prior` is "configuration, not measurement" (`rh:crates/roundhouse-core/src/metrics/pricing.rs:54-60`).
 
+[2026-09-19: C5 now computes the local quote as base plus effective prefill tokens times a configurable slope. Commit `3b21e98` loads both values from the catalog into `EngineConfig`. The default slope is 0.0 until a deployment supplies a measurement. The current server binary does not attach a local fleet. These changes do not establish observed production TTFT.]
+
 ### 3.4 Side-by-side
 
 | Signal | GAIE EPP (historical) | Dynamo KV-router | Roundhouse |

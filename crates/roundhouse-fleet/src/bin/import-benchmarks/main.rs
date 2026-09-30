@@ -54,9 +54,10 @@
 //!
 //! The fragment carries model identity and `quality_prior` and nothing else;
 //! the attribution OpenRouter requires when this data is republished lives in
-//! the provenance file alone, because a catalog entry is `deny_unknown_fields`
-//! and an attribution field on it would be a schema this project invented for
-//! somebody else's data. **So: republishing any number derived from an imported
+//! the provenance file alone, because every field on a catalog entry is
+//! required and an attribution field on it would be a schema this project
+//! invented for somebody else's data, forced onto every catalog in
+//! existence. **So: republishing any number derived from an imported
 //! `quality_prior` means shipping the paired provenance file's citation with
 //! it.** That is not an abstract obligation — roundhouse's own savings
 //! dashboard is such a republication, since the routing saving is priced

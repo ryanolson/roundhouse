@@ -226,7 +226,7 @@ mod tests {
     use crate::control::budget::{Allocation, Budget, BudgetWindow, DEFAULT_WARN_AT, Exhaustion};
     use crate::control::credential::Secret;
     use crate::control::spend::{
-        BudgetTerms, GrantRequest, MemorySpendLedger, Settlement, SpendLedger,
+        BudgetTerms, GrantRequest, MemorySpendLedger, Settlement, SettlementKey, SpendLedger,
     };
     use crate::control::{Principal, ProjectId};
     use crate::ids::{ResponseId, SessionId};
@@ -271,8 +271,7 @@ mod tests {
         ledger
             .settle_grant(Settlement {
                 principal,
-                session_id,
-                seq: 3,
+                key: SettlementKey::SessionWatermark { session_id, seq: 3 },
                 response_id,
                 actual_usd: counts.drawn_usd(Payer::User, spend),
                 window: BudgetWindow::Total,

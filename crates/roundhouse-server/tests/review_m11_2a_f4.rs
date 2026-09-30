@@ -61,6 +61,7 @@ use roundhouse_core::control::{
     Allocation, BalanceQuery, Budget, BudgetTerms, BudgetWindow, DEFAULT_WARN_AT, Exhaustion,
     MemorySpendLedger, Principal, SpendLedger,
 };
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::SessionEventKind;
 use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
@@ -166,6 +167,7 @@ impl FrontierClient for HonestBillingClient {
             self.reply.clone(),
             true_input_tokens,
             0,
+            CacheReadSource::Provider,
             self.reply.len() as u64,
             0,
         ))
@@ -298,7 +300,7 @@ async fn a_longer_conversation_does_change_isl_tokens_and_cost() {
             &long,
             TurnId::new("t1"),
             TurnInput {
-                items: vec![Item::user_text(&"word ".repeat(4_000))],
+                items: vec![Item::user_text("word ".repeat(4_000))],
                 ..turn_input(None)
             },
             &open,

@@ -53,6 +53,7 @@ const FAMILY_FILES: &[&str] = &[
     "src/fair_use.rs",
     "src/correlation.rs",
     "src/directory.rs",
+    "src/scripts/learning.rs",
 ];
 
 /// Every `fn <name>(` a family file defines outside its own `#[cfg(test)]`
@@ -161,6 +162,33 @@ fn every_key_function_calls_the_shared_builder() {
          hand-formatted one that happened to match today's shape:\n\n{}",
         offenders.join("\n\n")
     );
+}
+
+/// A file can sit in `FAMILY_FILES` and be scanned for nothing. That is the
+/// present shape of `src/scripts/learning.rs`: its three `*_key` functions
+/// are inlined into `IndexKeys::new`, so the row names the file as covered
+/// but `scan_key_function_names` finds zero `fn ..._key(` in it, and
+/// `every_key_function_calls_the_shared_builder` would pass vacuously over
+/// the one family whose keys are per namespace rather than per session.
+/// This asserts the scan itself is never empty for a listed file, so an
+/// inert row fails loudly instead of looking like coverage.
+#[test]
+fn every_family_file_yields_at_least_one_key_function() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+    for file in FAMILY_FILES {
+        let path = Path::new(manifest_dir).join(file);
+        let src = fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
+        let names = scan_key_function_names(&src);
+        assert!(
+            !names.is_empty(),
+            "{file} is listed in FAMILY_FILES but scan_key_function_names found no \
+             `fn ..._key(` in it — either it builds no keys of its own (drop it from \
+             FAMILY_FILES) or its key functions are inlined somewhere the scan cannot \
+             see (restore them as named `fn ..._key` functions, per the key-builder \
+             convention)"
+        );
+    }
 }
 
 /// M14.2 review, F7 correction: the module-doc table in `src/lib.rs`

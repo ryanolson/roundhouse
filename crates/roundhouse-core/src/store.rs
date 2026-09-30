@@ -14,17 +14,41 @@
 //! two must agree on is executable rather than prose: `store::contract` holds
 //! the trait's guarantees as a generic test suite, and every backend —
 //! including the memory one — is judged by that identical suite.
+//!
+//! `store::doubles` is the other side of the same coin: not a backend the
+//! contract suite judges, but the shared shapes every test-only
+//! [`SessionStore`] fixture across the workspace is built from — a read-only
+//! replay over a fixed log, and a `Delegating` trait a sabotaging double
+//! implements so that forwarding the methods it does not sabotage is
+//! inherited rather than retyped.
+//!
+//! The store also keeps the source half of learning discovery (`learning`):
+//! an append may carry a [`LearningMark`], and the same atomic, fenced step
+//! that writes the events records it. That index is deliberately unwired —
+//! `Session::commit` passes no mark until a later slice projects learner
+//! entries from the log (`agent-docs/DRAFT-online-routing-learner.md` §11.7;
+//! of that draft only this mechanism, L3b, is accepted, per §21). The contract
+//! suite pins its guarantees now so the learner can be built on them.
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod contract;
+#[cfg(any(test, feature = "test-support"))]
+pub mod doubles;
+mod learning;
+
+pub use learning::{
+    ClearOutcome, LearningCursor, LearningMark, LearningPage, MarkedSession, RequeueOutcome,
+};
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+use crate::control::ProjectId;
 use crate::event::{SessionEvent, SessionEventKind};
 use crate::ids::SessionId;
 use crate::now_ms;
@@ -38,6 +62,28 @@ pub enum StoreError {
     LeaseLost {
         session_id: SessionId,
         node_id: String,
+    },
+    /// The mark names no event of its batch. Refused before any write.
+    #[error(
+        "learning mark for session `{session_id}` names event {event_index} of a \
+         {batch_len}-event batch"
+    )]
+    InvalidLearningMark {
+        session_id: SessionId,
+        event_index: usize,
+        batch_len: usize,
+    },
+    /// The session is already marked for another project. Refused before any
+    /// write: a learner session belongs to one project for life, and moving
+    /// its mark would let one project's recovery deliver another's entries.
+    #[error(
+        "session `{session_id}` is marked for learning in project `{marked}`; \
+         refusing a mark for project `{requested}`"
+    )]
+    LearningProjectMismatch {
+        session_id: SessionId,
+        marked: ProjectId,
+        requested: ProjectId,
     },
     #[error("backend failure: {0}")]
     Backend(#[from] anyhow::Error),
@@ -138,10 +184,21 @@ pub trait SessionStore: Send + Sync + 'static {
     /// its heartbeat renews the record while every append continues to go
     /// through the original handle. An implementation that instead rejected a
     /// stale-looking handle would fail every append made during a long turn.
+    ///
+    /// With a `mark`, the same atomic step also records the sequence it
+    /// assigned to the marked event as the session's latest learning mark and
+    /// makes the session pending. A fenced or refused append writes neither
+    /// events nor mark. An out-of-range mark fails with
+    /// [`StoreError::InvalidLearningMark`] before the store is consulted; a
+    /// session already marked for another project fails with
+    /// [`StoreError::LearningProjectMismatch`] after the fence check. The
+    /// store keeps a project fixed once set, but it cannot check the project
+    /// against the session's principal — that is the caller's word.
     async fn append_events(
         &self,
         lease: &Lease,
         kinds: Vec<SessionEventKind>,
+        mark: Option<LearningMark>,
     ) -> Result<Vec<SessionEvent>, StoreError>;
 
     /// Read events with `seq > after_seq`, oldest first.
@@ -154,6 +211,55 @@ pub trait SessionStore: Send + Sync + 'static {
 
     /// Highest assigned sequence number, or 0 for an empty session.
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError>;
+
+    /// Drop the session's pending membership if its current mark is at or
+    /// below `confirmed_through`, a watermark the learner store confirmed.
+    /// The permanent mark stays.
+    ///
+    /// The predicate, not a token, is what makes a late clear safe: a mark
+    /// written after the delivery being confirmed has a higher sequence, so a
+    /// delayed clear, a retried one, or one from a node that lost its lease
+    /// cannot remove it. Takes no lease and appends nothing. Consults only
+    /// the index, so a session that was never created reads as
+    /// [`ClearOutcome::Unmarked`].
+    async fn clear_learning_mark(
+        &self,
+        session_id: &SessionId,
+        confirmed_through: u64,
+    ) -> Result<ClearOutcome, StoreError>;
+
+    /// Make the session pending again if its current mark is still
+    /// `mark_seq` — the audit's repair after the learner store lost what an
+    /// earlier clear confirmed. A mismatch changes nothing: any newer mark was
+    /// made pending by the append that wrote it.
+    async fn requeue_learning(
+        &self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<RequeueOutcome, StoreError>;
+
+    /// One page of pending sessions, in session id byte order after `after`.
+    ///
+    /// Examines at most `limit` pending members and returns those marked at
+    /// least `idle_for_ms` ago by the store's own clock — the clock that
+    /// stamped the marks, so a node clock that runs behind cannot hide every
+    /// session. The cursor moves past every examined member, idle or not; see
+    /// the `learning` module doc for what a pass guarantees.
+    async fn pending_learning(
+        &self,
+        after: Option<&LearningCursor>,
+        idle_for_ms: u64,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError>;
+
+    /// One page of every session ever marked, in session id byte order after
+    /// `after`, whether pending or not. For the audit and offline
+    /// enumeration: the permanent marks outlive every clear.
+    async fn learning_sessions(
+        &self,
+        after: Option<&LearningCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -183,13 +289,21 @@ impl SessionRecord {
     }
 }
 
+/// Everything a [`MemoryStore`] holds, under one lock: that one lock is what
+/// makes a marked append write its events and its mark in one step.
+#[derive(Default)]
+struct MemoryState {
+    sessions: HashMap<SessionId, SessionRecord>,
+    learning: learning::MemoryIndex,
+}
+
 /// Non-durable [`SessionStore`] for tests and single-process runs.
 ///
 /// Lease semantics are modelled faithfully — including expiry and takeover —
 /// so failover logic can be tested without standing up Redis.
 #[derive(Default, Clone)]
 pub struct MemoryStore {
-    sessions: Arc<RwLock<HashMap<SessionId, SessionRecord>>>,
+    state: Arc<RwLock<MemoryState>>,
 }
 
 impl MemoryStore {
@@ -201,7 +315,7 @@ impl MemoryStore {
     /// without waiting out a TTL.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn expire_lease_now(&self, session_id: &SessionId) {
-        if let Some(record) = self.sessions.write().await.get_mut(session_id)
+        if let Some(record) = self.state.write().await.sessions.get_mut(session_id)
             && let Some(lease) = record.lease.as_mut()
         {
             lease.expires_at_ms = 0;
@@ -216,11 +330,11 @@ impl SessionStore for MemoryStore {
         session_id: &SessionId,
         model_policy: &str,
     ) -> Result<bool, StoreError> {
-        let mut sessions = self.sessions.write().await;
-        if sessions.contains_key(session_id) {
+        let mut state = self.state.write().await;
+        if state.sessions.contains_key(session_id) {
             return Ok(false);
         }
-        sessions.insert(
+        state.sessions.insert(
             session_id.clone(),
             SessionRecord {
                 _model_policy: model_policy.to_string(),
@@ -236,8 +350,9 @@ impl SessionStore for MemoryStore {
         node_id: &str,
         ttl_ms: u64,
     ) -> Result<Option<Lease>, StoreError> {
-        let mut sessions = self.sessions.write().await;
-        let record = sessions
+        let mut state = self.state.write().await;
+        let record = state
+            .sessions
             .get_mut(session_id)
             .ok_or_else(|| StoreError::SessionNotFound(session_id.clone()))?;
 
@@ -263,8 +378,9 @@ impl SessionStore for MemoryStore {
     }
 
     async fn renew_lease(&self, lease: &Lease, ttl_ms: u64) -> Result<Option<Lease>, StoreError> {
-        let mut sessions = self.sessions.write().await;
-        let record = sessions
+        let mut state = self.state.write().await;
+        let record = state
+            .sessions
             .get_mut(&lease.session_id)
             .ok_or_else(|| StoreError::SessionNotFound(lease.session_id.clone()))?;
 
@@ -283,8 +399,8 @@ impl SessionStore for MemoryStore {
     }
 
     async fn release_lease(&self, lease: &Lease) -> Result<(), StoreError> {
-        let mut sessions = self.sessions.write().await;
-        if let Some(record) = sessions.get_mut(&lease.session_id)
+        let mut state = self.state.write().await;
+        if let Some(record) = state.sessions.get_mut(&lease.session_id)
             && record.is_current_tenure(lease)
         {
             record.lease = None;
@@ -293,8 +409,9 @@ impl SessionStore for MemoryStore {
     }
 
     async fn is_leased(&self, session_id: &SessionId) -> Result<bool, StoreError> {
-        let sessions = self.sessions.read().await;
-        let record = sessions
+        let state = self.state.read().await;
+        let record = state
+            .sessions
             .get(session_id)
             .ok_or_else(|| StoreError::SessionNotFound(session_id.clone()))?;
         // Expiry, not just presence: a record left behind by a node that died
@@ -311,8 +428,13 @@ impl SessionStore for MemoryStore {
         &self,
         lease: &Lease,
         kinds: Vec<SessionEventKind>,
+        mark: Option<LearningMark>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        let mut sessions = self.sessions.write().await;
+        if let Some(mark) = &mark {
+            mark.check_against(&lease.session_id, kinds.len())?;
+        }
+        let mut state = self.state.write().await;
+        let MemoryState { sessions, learning } = &mut *state;
         let record = sessions
             .get_mut(&lease.session_id)
             .ok_or_else(|| StoreError::SessionNotFound(lease.session_id.clone()))?;
@@ -324,8 +446,12 @@ impl SessionStore for MemoryStore {
                 node_id: lease.node_id.clone(),
             });
         }
+        if let Some(mark) = &mark {
+            learning.check_project(&lease.session_id, mark.project())?;
+        }
 
         let at_ms = now_ms();
+        let first_seq = record.events.len() as u64 + 1;
         let mut appended = Vec::with_capacity(kinds.len());
         for kind in kinds {
             let seq = record.events.len() as u64 + 1;
@@ -338,6 +464,10 @@ impl SessionStore for MemoryStore {
             record.events.push(event.clone());
             appended.push(event);
         }
+        if let Some(mark) = mark {
+            let seq = first_seq + mark.event_index() as u64;
+            learning.record(&lease.session_id, mark, seq, at_ms);
+        }
         Ok(appended)
     }
 
@@ -347,8 +477,9 @@ impl SessionStore for MemoryStore {
         after_seq: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>, StoreError> {
-        let sessions = self.sessions.read().await;
-        let record = sessions
+        let state = self.state.read().await;
+        let record = state
+            .sessions
             .get(session_id)
             .ok_or_else(|| StoreError::SessionNotFound(session_id.clone()))?;
         Ok(record
@@ -361,11 +492,61 @@ impl SessionStore for MemoryStore {
     }
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
-        let sessions = self.sessions.read().await;
-        let record = sessions
+        let state = self.state.read().await;
+        let record = state
+            .sessions
             .get(session_id)
             .ok_or_else(|| StoreError::SessionNotFound(session_id.clone()))?;
         Ok(record.events.last().map_or(0, |event| event.seq))
+    }
+
+    async fn clear_learning_mark(
+        &self,
+        session_id: &SessionId,
+        confirmed_through: u64,
+    ) -> Result<ClearOutcome, StoreError> {
+        Ok(self
+            .state
+            .write()
+            .await
+            .learning
+            .clear(session_id, confirmed_through))
+    }
+
+    async fn requeue_learning(
+        &self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<RequeueOutcome, StoreError> {
+        Ok(self
+            .state
+            .write()
+            .await
+            .learning
+            .requeue(session_id, mark_seq))
+    }
+
+    async fn pending_learning(
+        &self,
+        after: Option<&LearningCursor>,
+        idle_for_ms: u64,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError> {
+        // `now_ms` is the clock this store stamped the marks with.
+        let cutoff = now_ms().checked_sub(idle_for_ms);
+        self.state
+            .read()
+            .await
+            .learning
+            .pending_page(after, cutoff, limit)
+    }
+
+    async fn learning_sessions(
+        &self,
+        after: Option<&LearningCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError> {
+        Ok(self.state.read().await.learning.marked_page(after, limit))
     }
 }
 

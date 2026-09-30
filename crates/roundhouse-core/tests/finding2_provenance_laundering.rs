@@ -14,6 +14,7 @@
 //! Uses only the public API of `roundhouse-core`. No library source was
 //! modified to make this test possible.
 
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{Accounting, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::metrics::pricing::{ReferenceModel, ShadowPricing};
@@ -42,6 +43,7 @@ fn reported(input: u64, cached: u64, output: u64) -> Usage {
         output_tokens: output,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
+        cache_read_source: CacheReadSource::Unreported,
     }
 }
 
@@ -90,6 +92,8 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
             SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    selection: None,
+                    local_quote_skipped: None,
                     chosen: frontier(),
                     rationale: "test".into(),
                     policy: "test".into(),

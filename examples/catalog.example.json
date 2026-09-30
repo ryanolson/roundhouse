@@ -68,7 +68,16 @@
     "two different `provider` entries -- directly as \"openai\", or, as written",
     "here, through \"openrouter\" -- which the catalog treats as two independent",
     "prices and two independent (provider, model) identities, never one deduplicated",
-    "against the other."
+    "against the other.",
+    "local_base_ttft_ms and local_ttft_ms_per_prefill_token are the local mirror of",
+    "every entry's base_ttft_ms and ttft_ms_per_uncached_token above, and they are in",
+    "this file so both halves of one comparison are written in one place. The slope",
+    "is milliseconds per effective prefill token: measure your workers' prefill rate",
+    "and write 1000 / tokens_per_second. It is left at 0.0 below because this file",
+    "has no measurement to report and an invented one is worse than none -- a made-up",
+    "latency loses real turns to a hosted model. At 0.0 a local worker is quoted the",
+    "flat floor however much prefill the Dynamo residency answer says it faces, which",
+    "is what every deployment quoted before these fields existed."
   ],
 
   "providers": {
@@ -217,5 +226,8 @@
   ],
 
   "default_local_quality": 0.5,
-  "capability_band": 0.10
+  "capability_band": 0.10,
+
+  "local_base_ttft_ms": 60.0,
+  "local_ttft_ms_per_prefill_token": 0.0
 }

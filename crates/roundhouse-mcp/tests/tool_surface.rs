@@ -2089,8 +2089,10 @@ async fn f7_a_latest_session_the_store_has_closed_is_refused_by_name() {
 /// neither double had a store that could fail; the fake can be asked now.
 #[tokio::test]
 async fn a_store_outage_reached_through_a_thread_id_is_not_an_unknown_correlator() {
-    let mut deployment = FakeDeployment::default();
-    deployment.store_outage = Some("redis connection reset".to_string());
+    let deployment = FakeDeployment {
+        store_outage: Some("redis connection reset".to_string()),
+        ..FakeDeployment::default()
+    };
     let (surface, _store) = deployment.surface();
 
     let refused = call_in_thread(&surface, &ada(), "status", json!({}), "sess_1").await;

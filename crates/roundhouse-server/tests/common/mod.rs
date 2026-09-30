@@ -58,6 +58,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use futures::StreamExt;
 
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_fleet::{
     EmbeddedFleet, FrontierChunk, FrontierClient, FrontierError, FrontierQuote, FrontierStream,
     KvRouterConfig, SelectionServiceBuilder, StaticFrontierCatalog, WireProtocol,
@@ -259,6 +260,7 @@ impl FrontierClient for ScriptedFrontierClient {
             reply.clone(),
             quote.prompt.len() as u64,
             0,
+            CacheReadSource::Provider,
             reply.len() as u64,
             0,
         ))
@@ -367,6 +369,7 @@ impl FrontierClient for ToolCallingFrontierClient {
         chunks.push(Ok(FrontierChunk::Done {
             input_tokens: quote.prompt.len() as u64,
             cached_input_tokens: 0,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 0,
             output_tokens,
             reasoning_tokens: 0,

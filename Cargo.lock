@@ -4792,6 +4792,7 @@ dependencies = [
  "dynamo-tokens",
  "futures",
  "hex",
+ "roundhouse-core",
  "serde",
  "serde_json",
  "sha2",

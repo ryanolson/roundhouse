@@ -24,7 +24,7 @@ use common::raw_from_env;
 use roundhouse_core::control::spend::contract::{assert_usd, fresh_principal, terms};
 use roundhouse_core::control::{
     Allocation, Balance, BalanceQuery, BudgetTerms, GrantRequest, MemorySpendLedger, Principal,
-    Settlement, SpendLedger,
+    Settlement, SettlementKey, SpendLedger,
 };
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_store_redis::RedisSpendLedger;
@@ -250,8 +250,10 @@ async fn open_grant_and_settle_grant_are_single_round_trips() {
         ledger
             .settle_grant(Settlement {
                 principal: principal.clone(),
-                session_id: session.clone(),
-                seq: attempt + 1,
+                key: SettlementKey::SessionWatermark {
+                    session_id: session.clone(),
+                    seq: attempt + 1,
+                },
                 response_id: ResponseId::new(format!("settle-probe-{attempt}")),
                 actual_usd: 0.5,
                 window: terms.budget.window,
@@ -312,8 +314,10 @@ async fn the_two_backends_agree_on_a_grant_settle_replay_sequence() {
         ledger
             .settle_grant(Settlement {
                 principal: ada.clone(),
-                session_id: session_a.clone(),
-                seq: 1,
+                key: SettlementKey::SessionWatermark {
+                    session_id: session_a.clone(),
+                    seq: 1,
+                },
                 response_id: ResponseId::new("r1"),
                 actual_usd: 2.0,
                 window: terms.budget.window,
@@ -326,8 +330,10 @@ async fn the_two_backends_agree_on_a_grant_settle_replay_sequence() {
         ledger
             .settle_grant(Settlement {
                 principal: ada.clone(),
-                session_id: session_a.clone(),
-                seq: 1,
+                key: SettlementKey::SessionWatermark {
+                    session_id: session_a.clone(),
+                    seq: 1,
+                },
                 response_id: ResponseId::new("r1"),
                 actual_usd: 2.0,
                 window: terms.budget.window,
@@ -335,12 +341,43 @@ async fn the_two_backends_agree_on_a_grant_settle_replay_sequence() {
             })
             .await
             .unwrap();
+        // An evaluation call under the same membership, and its duplicate. The
+        // second mode is in this op log for the reason the first is: a Lua
+        // `SADD` and a Rust `HashSet::insert` are two implementations of one
+        // rule, and the balance below is where they have to agree.
+        ledger
+            .open_grant(GrantRequest {
+                principal: ada.clone(),
+                session_id: session_a.clone(),
+                response_id: ResponseId::new("eval_1"),
+                requested_usd: 1.0,
+                ttl_ms: 60_000,
+                terms: terms.clone(),
+                now_ms: 0,
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            ledger
+                .settle_grant(Settlement {
+                    principal: ada.clone(),
+                    key: SettlementKey::OncePerCall,
+                    response_id: ResponseId::new("eval_1"),
+                    actual_usd: 0.75,
+                    window: terms.budget.window,
+                    now_ms: 0,
+                })
+                .await
+                .unwrap();
+        }
         // The overcommit case: settling above the hold.
         ledger
             .settle_grant(Settlement {
                 principal: bob.clone(),
-                session_id: session_b.clone(),
-                seq: 1,
+                key: SettlementKey::SessionWatermark {
+                    session_id: session_b.clone(),
+                    seq: 1,
+                },
                 response_id: ResponseId::new("r2"),
                 actual_usd: 9.0,
                 window: terms.budget.window,

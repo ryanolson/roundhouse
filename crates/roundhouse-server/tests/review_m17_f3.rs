@@ -65,6 +65,7 @@ use roundhouse_server::{ControlPlane, Conversations, EchoLocalExecutor, Engine, 
 mod common;
 use common::codex::{frames, request, user_message};
 use common::{config, frontier_catalog};
+use roundhouse_core::event::CacheReadSource;
 
 /// The namespace an upstream names an MCP call under, per R-N6 — the same
 /// literal `steering_emission.rs`'s `NAMESPACE` uses for the *inbound* half of
@@ -97,6 +98,7 @@ impl FrontierClient for NamespacedToolCallFrontier {
             Ok(FrontierChunk::Done {
                 input_tokens: quote.prompt.len() as u64,
                 cached_input_tokens: 0,
+                cache_read_source: CacheReadSource::Provider,
                 cache_write_tokens: 0,
                 output_tokens: arguments.len() as u64,
                 reasoning_tokens: 0,

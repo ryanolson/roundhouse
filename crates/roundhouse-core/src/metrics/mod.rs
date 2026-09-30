@@ -52,6 +52,39 @@
 //! [`SettledSpend`](crate::control::SettledSpend) states at the ledger, kept
 //! here by [`Billing`](crate::control::Billing) travelling in the log and by
 //! this projection pricing only what it marks as billable.
+//!
+//! ## The other economy
+//!
+//! [`MetricsSnapshot::evaluation`] is what this deployment spent *classifying*
+//! its own turns, and it is on its own axis because it is priced by a different
+//! authority: a classifier call carries the amount it was priced at, under the
+//! rate card its own reservation recorded, so a corrected catalog reprices the
+//! three figures above and leaves it exactly where it was. Adding it into
+//! [`Savings`] would put a number no serving rate card produced into the column
+//! the savings claim is computed from.
+//!
+//! [`MetricsSnapshot::observed_cost`] is the one field that adds the two, and it
+//! publishes both bases beside the sum rather than quietly merging them. It is
+//! a spend figure and never a saving: [`Savings::total_usd`] remains cache plus
+//! routing savings, which is a different question with a different answer.
+//!
+//! **It is also not all economic cost, and it says so.** What it covers is
+//! money that left the building —
+//! [`OBSERVED_COST_SCOPE`] names it on the wire. Two kinds of traffic are
+//! counted everywhere else here and priced nowhere, so the total passes over
+//! both: a turn our own fleet answered, and a turn on a forwarded subscription
+//! seat. Neither has a per-token price this projection could state without
+//! inventing one, so both are published as counts —
+//! [`ServingCostGaps::local_calls`] and [`MetricsSnapshot::seat_tokens`].
+//!
+//! Only the first makes the total *incomplete*, and the difference is whose
+//! money it is: GPU time is this deployment's cost, paid in hardware rather than
+//! in invoices, while a seat's tokens were charged to the caller's own
+//! subscription. So a deployment serving most of its own traffic reports a small
+//! combined cost *and* an incomplete one — the honest pair, because the first
+//! number is true and would be the most misleading figure on the page without
+//! the second — while a pass-through deployment reports a small one that is
+//! complete, since nothing it paid for is missing.
 
 //! ## Layout
 //!
@@ -62,9 +95,19 @@
 //! module keeps only the vocabulary all three share and the live recorder that
 //! drives them, and re-exports the rest so callers see one surface.
 
+pub(crate) mod cache_evidence;
+pub(crate) mod evaluation;
 pub mod fold;
 pub mod pricing;
 pub mod snapshot;
+pub(crate) mod timing;
+
+#[cfg(test)]
+mod cache_reuse_evidence_tests;
+#[cfg(test)]
+mod first_output_snapshot_tests;
+#[cfg(test)]
+mod turn_elapsed_snapshot_tests;
 
 use std::sync::{Arc, RwLock};
 
@@ -81,8 +124,12 @@ pub use pricing::{
     ShadowPricing, TokenShape,
 };
 pub use snapshot::{
-    Coverage, MetricsConfig, MetricsSnapshot, ModelAccounting, ModelMetrics, ProviderMetrics,
-    Rollup, Savings, ServingModeMetrics, TokenBreakdown,
+    CacheReuseEvidence, Coverage, EVALUATION_PRICE_BASIS, EvaluationMetrics,
+    EvaluationModelMetrics, EvaluationSettlement, EvaluationTokens, EvaluationUnbooked,
+    FIRST_OUTPUT_BASIS, IntervalMetric, MetricsConfig, MetricsSnapshot, ModelAccounting,
+    ModelMetrics, OBSERVED_CACHE_BASIS, OBSERVED_COST_SCOPE, ObservedCost, PREDICTED_CACHE_BASIS,
+    ProviderMetrics, Rollup, SERVING_PRICE_BASIS, Savings, ServingCostGaps, ServingModeMetrics,
+    TURN_ELAPSED_BASIS, TokenBreakdown,
 };
 
 /// The provider name local targets are grouped under.
@@ -270,7 +317,7 @@ mod tests {
         output_per_mtok_usd: 15.0,
     };
 
-    fn config() -> MetricsConfig {
+    pub(super) fn config() -> MetricsConfig {
         MetricsConfig::new(
             ShadowPricing::new(vec![ReferenceModel {
                 provider: "anthropic".into(),
@@ -283,7 +330,7 @@ mod tests {
         .with_default_local_quality(0.6)
     }
 
-    fn snapshot(fold: &MetricsFold) -> MetricsSnapshot {
+    pub(super) fn snapshot(fold: &MetricsFold) -> MetricsSnapshot {
         MetricsSnapshot::build(fold, Scope::Deployment, &config(), 9_999)
     }
 
@@ -538,6 +585,8 @@ mod tests {
         log.push(SessionEventKind::Routed {
             response_id: response_id.clone(),
             decision: DecisionRecord {
+                selection: None,
+                local_quote_skipped: None,
                 chosen: frontier("anthropic", "claude"),
                 rationale: "test".into(),
                 policy: "test".into(),
@@ -588,6 +637,8 @@ mod tests {
         log.push(SessionEventKind::Routed {
             response_id: response_id.clone(),
             decision: DecisionRecord {
+                selection: None,
+                local_quote_skipped: None,
                 chosen: frontier("anthropic", "claude"),
                 rationale: "test".into(),
                 policy: "test".into(),

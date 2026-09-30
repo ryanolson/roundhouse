@@ -70,6 +70,8 @@
 
 pub mod admin_api;
 pub mod catalog_config;
+pub mod classify_config;
+pub mod classify_runtime;
 pub mod claude_launch;
 pub mod codex_launch;
 pub mod control_config;
@@ -90,9 +92,12 @@ pub mod shared_backend;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod tokenizer;
+pub mod typesafe_shadow;
 
 pub use admin_api::admin_router;
 pub use catalog_config::{CatalogConfig, CatalogError};
+pub use classify_config::{CLASSIFY_VAR, ClassifyConfig, ClassifyConfigError};
+pub use classify_runtime::{ClassificationRuntime, RuntimeLimits, Supervisor};
 pub use claude_launch::{ClaudeAuthKind, ClaudeEnv, ClaudeLaunch, ClaudeLaunchError};
 pub use codex_launch::{CodexAuthKind, CodexLaunch};
 pub use control_config::{

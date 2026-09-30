@@ -13,6 +13,21 @@
 //! | `rh:v1:sess:{<session_id>}:lease` | hash | holder `node_id` + fencing token, expiry enforced by Redis `PEXPIRE` |
 //! | `rh:v1:sess:{<session_id>}:log` | stream | one entry per event, explicit id `<seq>-0` |
 //!
+//! The same family also holds the learning index — one set of keys per
+//! namespace, not per session (`scripts::learning` has their layout):
+//!
+//! | Key | Type | Holds |
+//! |---|---|---|
+//! | `rh:v1:sess:learning:marks` | hash | session id → latest mark, permanent |
+//! | `rh:v1:sess:learning:marked` | sorted set | every session ever marked, permanent |
+//! | `rh:v1:sess:learning:pending` | sorted set | sessions whose mark is not confirmed delivered |
+//!
+//! Those keys carry no hash tag, because no one slot can hold them beside
+//! every session's keys. An append that carries a learning mark therefore
+//! touches six keys across slots and is single-node only; an unmarked append,
+//! the only kind the session layer makes today, still touches just its three
+//! tagged keys.
+//!
 //! `rh` is the default [`KeyNamespace`] (`keys`), `v1` is this family's own
 //! [`keys::KeyFamily::version`] and `sess` is its [`keys::KeyFamily::name`]
 //! — see [`keys`] for the one function every family builds its keys from
@@ -77,7 +92,7 @@ pub use correlation::RedisCorrelationMaps;
 pub use directory::RedisDocumentStore;
 pub use fair_use::RedisFairUseLedger;
 pub use keys::{EmptyNamespace, KeyNamespace};
-pub use spend::RedisSpendLedger;
+pub use spend::{RedisSpendLedger, SpendPurpose};
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::streams::StreamRangeReply;
@@ -87,7 +102,12 @@ use uuid::Uuid;
 use roundhouse_core::event::{SessionEvent, SessionEventKind};
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::now_ms;
-use roundhouse_core::store::{Lease, SessionStore, StoreError};
+use std::num::NonZeroUsize;
+
+use roundhouse_core::store::{
+    ClearOutcome, LearningCursor, LearningMark, LearningPage, Lease, RequeueOutcome, SessionStore,
+    StoreError,
+};
 
 // ---------------------------------------------------------------------------
 // One `connect`, for every Redis family this crate serves
@@ -246,7 +266,8 @@ impl RedisSessionStore {
 }
 
 // The braces are a Redis Cluster hash tag. Every key for one session hashes to
-// one slot, which keeps the lease-fenced append single-slot scriptable. The
+// one slot, which keeps the unmarked lease-fenced append single-slot
+// scriptable (a marked one also touches the learning index below). The
 // keys are an internal storage detail. Feature-gated test helpers expose them
 // only to the external wire-format tests that write raw Redis data.
 fn meta_key(namespace: &KeyNamespace, session_id: &SessionId) -> String {
@@ -469,7 +490,11 @@ impl SessionStore for RedisSessionStore {
         &self,
         lease: &Lease,
         kinds: Vec<SessionEventKind>,
+        mark: Option<LearningMark>,
     ) -> Result<Vec<SessionEvent>, StoreError> {
+        if let Some(mark) = &mark {
+            mark.check_against(&lease.session_id, kinds.len())?;
+        }
         let token_text = lease.fencing_token.simple().to_string();
         let identity = scripts::LeaseIdentity::new(&lease.node_id, &token_text);
         let payloads: Vec<String> = kinds
@@ -478,6 +503,14 @@ impl SessionStore for RedisSessionStore {
                 serde_json::to_string(kind).expect("event kinds are plain data and serialize")
             })
             .collect();
+        // Built only for a marked append: the unmarked one is the turn path
+        // and never touches the index.
+        let mark_args = mark.as_ref().map(|mark| scripts::MarkArgs {
+            index_keys: scripts::learning::IndexKeys::new(&self.namespace),
+            session_id: lease.session_id.as_str(),
+            event_index: mark.event_index(),
+            project: mark.project().as_str(),
+        });
 
         let outcome = self
             .scripts
@@ -487,7 +520,10 @@ impl SessionStore for RedisSessionStore {
                 &lease_key(&self.namespace, &lease.session_id),
                 &log_key(&self.namespace, &lease.session_id),
                 identity,
-                &payloads,
+                scripts::AppendBatch {
+                    kind_payloads: &payloads,
+                    mark: mark_args,
+                },
             )
             .await?;
 
@@ -513,6 +549,15 @@ impl SessionStore for RedisSessionStore {
             }),
             scripts::AppendOutcome::NoSession => {
                 Err(StoreError::SessionNotFound(lease.session_id.clone()))
+            }
+            scripts::AppendOutcome::ProjectMismatch { marked } => {
+                Err(StoreError::LearningProjectMismatch {
+                    session_id: lease.session_id.clone(),
+                    marked: marked.into(),
+                    requested: mark
+                        .map(|mark| mark.project().clone())
+                        .expect("only a marked append checks the project"),
+                })
             }
         }
     }
@@ -591,6 +636,72 @@ impl SessionStore for RedisSessionStore {
             )));
         }
         Ok(last)
+    }
+
+    async fn clear_learning_mark(
+        &self,
+        session_id: &SessionId,
+        confirmed_through: u64,
+    ) -> Result<ClearOutcome, StoreError> {
+        let index = scripts::learning::IndexKeys::new(&self.namespace);
+        self.scripts
+            .learning
+            .clear(
+                &mut self.conn.clone(),
+                &index,
+                session_id,
+                confirmed_through,
+            )
+            .await
+    }
+
+    async fn requeue_learning(
+        &self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<RequeueOutcome, StoreError> {
+        let index = scripts::learning::IndexKeys::new(&self.namespace);
+        self.scripts
+            .learning
+            .requeue(&mut self.conn.clone(), &index, session_id, mark_seq)
+            .await
+    }
+
+    async fn pending_learning(
+        &self,
+        after: Option<&LearningCursor>,
+        idle_for_ms: u64,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError> {
+        let index = scripts::learning::IndexKeys::new(&self.namespace);
+        self.scripts
+            .learning
+            .page(
+                &mut self.conn.clone(),
+                &index,
+                scripts::learning::PageOf::Pending { idle_for_ms },
+                after,
+                limit,
+            )
+            .await
+    }
+
+    async fn learning_sessions(
+        &self,
+        after: Option<&LearningCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError> {
+        let index = scripts::learning::IndexKeys::new(&self.namespace);
+        self.scripts
+            .learning
+            .page(
+                &mut self.conn.clone(),
+                &index,
+                scripts::learning::PageOf::Marked,
+                after,
+                limit,
+            )
+            .await
     }
 }
 

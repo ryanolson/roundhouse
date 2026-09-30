@@ -170,7 +170,7 @@ pub const OPAQUE_RESPONSE_CONTENT_BLOCKS: [&str; 8] = [
 pub const CACHE_CONTROL_EPHEMERAL: &str = "ephemeral";
 /// The default cache lifetime, and what an omitted `ttl` means.
 pub const CACHE_TTL_5M: &str = "5m";
-/// The extended cache lifetime, gated behind `extended-cache-ttl-2025-04-11`.
+/// The extended cache lifetime, asked for by this field alone.
 pub const CACHE_TTL_1H: &str = "1h";
 
 /// The `type` a [`Message`] carries.
@@ -516,8 +516,14 @@ pub struct Usage {
     #[serde(default, deserialize_with = "count")]
     pub cache_creation_input_tokens: u64,
     /// Tokens served from the cache. The quantity the whole system maximizes.
-    #[serde(default, deserialize_with = "count")]
-    pub cache_read_input_tokens: u64,
+    ///
+    /// `Option` rather than a defaulted count, and that is the one field here
+    /// where absent and zero are different answers: a defaulted zero makes a
+    /// provider that said nothing about its cache indistinguishable from one
+    /// reporting a cold prefix. `None` covers both an omitted field and an
+    /// explicit `null`.
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
     /// The 5m/1h split of `cache_creation_input_tokens`.
     ///
     /// Typed here and carried nowhere downstream yet, deliberately: roundhouse's
@@ -541,7 +547,7 @@ impl Usage {
     /// difference decides whether a `Done` is emitted at all.
     pub fn reported_any_input(&self) -> bool {
         self.input_tokens > 0
-            || self.cache_read_input_tokens > 0
+            || self.cache_read_input_tokens.unwrap_or(0) > 0
             || self.cache_creation_input_tokens > 0
     }
 }
@@ -588,10 +594,10 @@ pub struct CacheControl {
     /// before it arrives as a type here.
     #[serde(rename = "type")]
     pub kind: String,
-    /// `5m` (the default) or `1h`. `None` means the field is omitted, which is
-    /// *not* the same as sending `"5m"`: the extended-TTL beta must be enabled
-    /// for the field to be accepted at all, so an omitted `ttl` is the only form
-    /// that is valid without it.
+    /// `5m` (the default) or `1h`. `None` means the field is omitted, which the
+    /// API reads as the default — the one-hour duration is documented as this
+    /// field alone, with no header beside it
+    /// (platform.claude.com/docs/en/build-with-claude/prompt-caching).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<String>,
     #[serde(flatten)]
@@ -599,8 +605,7 @@ pub struct CacheControl {
 }
 
 impl CacheControl {
-    /// A breakpoint with no explicit TTL: five minutes, and valid without any
-    /// beta header.
+    /// A breakpoint at the default lifetime: five minutes, with no `ttl` field.
     pub fn ephemeral() -> Self {
         Self {
             kind: CACHE_CONTROL_EPHEMERAL.to_string(),
@@ -609,9 +614,11 @@ impl CacheControl {
         }
     }
 
-    /// A breakpoint at a named TTL. Requires `extended-cache-ttl-2025-04-11`
-    /// upstream for anything but the default, which is why the caller has to ask
-    /// for it by name rather than getting one from [`Self::ephemeral`].
+    /// A breakpoint at a named TTL, today `1h`.
+    ///
+    /// Separate from [`Self::ephemeral`] because a named lifetime is priced
+    /// differently — an hour-long write costs twice the input rate — so a
+    /// caller asks for one deliberately rather than inheriting it.
     pub fn ephemeral_for(ttl: impl Into<String>) -> Self {
         Self {
             ttl: Some(ttl.into()),
@@ -914,7 +921,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(usage.input_tokens, 12);
-        assert_eq!(usage.cache_read_input_tokens, 9_000);
+        assert_eq!(usage.cache_read_input_tokens, Some(9_000));
         assert_eq!(usage.cache_creation_input_tokens, 500);
         let breakdown = usage.cache_creation.clone().expect("the breakdown parsed");
         assert_eq!(breakdown.ephemeral_5m_input_tokens, 200);
@@ -1071,8 +1078,8 @@ mod tests {
             set(vocabulary(&pin, "cache_control_ttl")),
         );
 
-        // The default breakpoint omits `ttl` entirely, and that is not the same
-        // as sending "5m": the field itself requires the extended-TTL beta.
+        // The default breakpoint omits `ttl` entirely, which is the shape every
+        // request had before the field existed.
         let default = serde_json::to_value(CacheControl::ephemeral()).unwrap();
         assert_eq!(default, serde_json::json!({ "type": "ephemeral" }));
         assert_eq!(

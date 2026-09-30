@@ -172,12 +172,26 @@ impl LocalQuote {
     /// Local execution is priced at zero dollars: its cost is capacity, already
     /// captured by `expected_prefill_tokens` and `load`. Mixing an amortized
     /// GPU cost in here would double-count.
-    pub fn to_candidate(&self, quality_prior: f64, ttft_ms: f64) -> Candidate {
+    ///
+    /// TTFT is `base_ttft_ms` plus the residency answer's own
+    /// `effective_prefill_tokens` times a per-token slope, mirroring how a
+    /// frontier quote turns its uncached tokens into a TTFT term. A cold
+    /// local target that must actually prefill is not free just because the
+    /// dollar cost is zero -- without this term it carried no time penalty at
+    /// all and would out-race a frontier quote on latency it could not
+    /// deliver.
+    pub fn to_candidate(
+        &self,
+        quality_prior: f64,
+        base_ttft_ms: f64,
+        ttft_ms_per_prefill_token: f64,
+    ) -> Candidate {
         Candidate {
             target: self.target(),
             expected_prefill_tokens: self.effective_prefill_tokens as f64,
             matched_prefix_tokens: self.longest_matched_tokens as u64,
-            expected_ttft_ms: ttft_ms,
+            expected_ttft_ms: base_ttft_ms
+                + self.effective_prefill_tokens as f64 * ttft_ms_per_prefill_token,
             expected_cost_usd: 0.0,
             quality_prior,
             load: self.load,
@@ -549,7 +563,7 @@ mod tests {
             load: Some(24_000.0),
         };
 
-        let candidate = quote.to_candidate(0.6, 90.0);
+        let candidate = quote.to_candidate(0.6, 90.0, 0.0);
         assert_eq!(candidate.expected_prefill_tokens, 512.0);
         assert_eq!(
             candidate.expected_cost_usd, 0.0,
@@ -564,6 +578,52 @@ mod tests {
                 dp_rank: 0,
                 model: "llama".into()
             }
+        );
+    }
+
+    fn quote_with_prefill(effective_prefill_tokens: usize) -> LocalQuote {
+        LocalQuote {
+            selection_id: "s1".into(),
+            worker_id: 7,
+            dp_rank: 0,
+            endpoint: "http://w7:8000".into(),
+            model_name: "llama".into(),
+            effective_prefill_tokens,
+            longest_matched_tokens: 0,
+            isl_tokens: 4_096,
+            load: None,
+        }
+    }
+
+    #[test]
+    fn a_local_candidate_ttft_rises_with_effective_prefill_tokens() {
+        let warm = quote_with_prefill(100);
+        let cold = quote_with_prefill(900);
+        let per_token = 0.5;
+
+        let warm_ttft = warm.to_candidate(0.6, 60.0, per_token).expected_ttft_ms;
+        let cold_ttft = cold.to_candidate(0.6, 60.0, per_token).expected_ttft_ms;
+
+        assert_eq!(
+            cold_ttft - warm_ttft,
+            (900 - 100) as f64 * per_token,
+            "the ttft delta between two quotes must track the slope times the \
+             difference in effective prefill tokens exactly, not just move in \
+             the right direction"
+        );
+    }
+
+    #[test]
+    fn a_zero_slope_reproduces_the_flat_quote() {
+        let cold = quote_with_prefill(10_000);
+
+        let candidate = cold.to_candidate(0.6, 60.0, 0.0);
+
+        assert_eq!(
+            candidate.expected_ttft_ms, 60.0,
+            "a zero per-token slope must reproduce the old flat base_ttft_ms \
+             quote exactly, regardless of how much prefill the residency \
+             answer reports"
         );
     }
 }

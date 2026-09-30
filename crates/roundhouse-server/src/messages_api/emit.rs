@@ -59,6 +59,8 @@ use roundhouse_core::event::{IncompleteReason, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, TurnId};
 use roundhouse_core::item::{Item, ItemContent};
 
+#[cfg(test)]
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_fleet::anthropic_messages::wire::{
     ApiError as WireError, BlockDelta, ContentBlock, Extra, MESSAGE_TYPE, Message,
     MessageDeltaBody, StopReason, StreamEvent, Usage as WireUsage,
@@ -289,13 +291,20 @@ fn wire_usage(usage: &Usage, output_tokens: u64) -> WireUsage {
             .input_tokens
             .saturating_sub(read)
             .saturating_sub(written),
-        cache_read_input_tokens: read,
+        // `Some` even when our own provenance is `Unreported`, so the bytes
+        // this surface emits are exactly what they were. What roundhouse should
+        // tell its own client when it never learned the count is a separate
+        // question from what it may measure internally.
+        cache_read_input_tokens: Some(read),
         cache_creation_input_tokens: written,
         output_tokens,
-        // The 5m/1h split behind `extended-cache-ttl-2025-04-11`. Roundhouse's
-        // `Usage` does not carry the lifetime a write was made under, so the
-        // breakdown would have to be invented; absent is the reading that says
-        // "not measured" rather than "measured as zero on both".
+        // The `ephemeral_5m_input_tokens`/`ephemeral_1h_input_tokens` split of
+        // `cache_creation_input_tokens`, spelled by the `ttl` on the
+        // `cache_control` marker that wrote it -- see `CacheControl`'s doc.
+        // Roundhouse's `Usage` does not carry the lifetime a write was made
+        // under, so the breakdown would have to be invented; absent is the
+        // reading that says "not measured" rather than "measured as zero on
+        // both".
         cache_creation: None,
         extra: Extra::new(),
     }
@@ -669,6 +678,12 @@ impl MessageEmission {
             | SessionEventKind::SideCallCompleted { .. }
             | SessionEventKind::SideCallAbandoned { .. }
             | SessionEventKind::ValidationDecided { .. }
+            // The three background classification kinds are the same case one
+            // step further out: they describe a turn that has already ended,
+            // and the repair describes only this deployment's accounting for it.
+            | SessionEventKind::ClassificationRequested { .. }
+            | SessionEventKind::ClassificationRecorded { .. }
+            | SessionEventKind::ClassificationSettlementRepaired { .. }
             | SessionEventKind::Error { .. } => (Vec::new(), Step::Continue),
         }
     }
@@ -1127,6 +1142,7 @@ mod tests {
         let usage = Usage {
             input_tokens: 9_512,
             cached_input_tokens: 9_000,
+            cache_read_source: CacheReadSource::Provider,
             cache_write_tokens: 500,
             output_tokens: 64,
             reasoning_tokens: 0,

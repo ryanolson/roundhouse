@@ -52,6 +52,7 @@
 //! `PooledUsage` and `price_pooled` as the fix; nothing was widened merely to
 //! make these tests possible.
 
+use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::event::{Accounting, SessionEvent, SessionEventKind, Usage};
 use roundhouse_core::ids::{ResponseId, SessionId, TurnId};
 use roundhouse_core::metrics::pricing::{ReferenceModel, ShadowPricing};
@@ -94,6 +95,7 @@ fn call(uncached: u64, write: u64) -> Usage {
         output_tokens: 0,
         reasoning_tokens: 0,
         accounting: Accounting::Reported,
+        cache_read_source: CacheReadSource::Unreported,
     }
 }
 
@@ -138,6 +140,8 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
             SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    selection: None,
+                    local_quote_skipped: None,
                     chosen: frontier(),
                     rationale: "test".into(),
                     policy: "test".into(),
@@ -208,10 +212,10 @@ fn pooling_per_call_prices_a_measured_and_an_unmeasured_turn_additively() {
     let price_b = CLAUDE.price(&b);
     // 1,000 uncached tokens, nothing measured -> whole share at the write
     // rate: 1,000 * 3.75e-6.
-    assert!((price_a - 0.00_375).abs() < 1e-9, "price_a = {price_a}");
+    assert!((price_a - 0.00375).abs() < 1e-9, "price_a = {price_a}");
     // 2,000 uncached tokens, all 2,000 measured as a write -> the same write
     // rate, nothing left over for the plain rate: 2,000 * 3.75e-6.
-    assert!((price_b - 0.00_750).abs() < 1e-9, "price_b = {price_b}");
+    assert!((price_b - 0.00750).abs() < 1e-9, "price_b = {price_b}");
     let sum_of_prices = price_a + price_b;
 
     // **The pot the fold now keeps.** Each call's cache-write share is decided
@@ -239,7 +243,7 @@ fn pooling_per_call_prices_a_measured_and_an_unmeasured_turn_additively() {
     summed.add(&b);
     let price_of_sum = CLAUDE.price(&summed);
     assert!(
-        (sum_of_prices - price_of_sum - 0.00_075).abs() < 1e-9,
+        (sum_of_prices - price_of_sum - 0.00075).abs() < 1e-9,
         "summing the Usage before pricing must still understate the per-turn total by \
          exactly $0.000750 here: price(a) + price(b) = ${sum_of_prices:.6}, \
          price(a + b) = ${price_of_sum:.6}. If this now agrees, the conservative \

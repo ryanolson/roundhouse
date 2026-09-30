@@ -12,11 +12,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::classify::{ClassificationIntent, ClassificationRecord, ClassificationSettlementRepair};
 use crate::control::Principal;
 use crate::ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 use crate::item::Item;
 use crate::routing::{DecisionRecord, DispatchAttempt, Target};
-use crate::validate::{Arm, SteerAction, TriggerRecord, Verdict};
+use crate::validate::{Arm, IntervalReview, SteerAction, TriggerRecord, Verdict};
 
 /// Token accounting for one completed model call.
 ///
@@ -78,6 +79,50 @@ pub struct Usage {
     /// broken. Marking the call keeps that gap visible as a gap.
     #[serde(default)]
     pub accounting: Accounting,
+    /// Where [`Self::cached_input_tokens`] came from.
+    ///
+    /// Separate from [`Self::accounting`] because a provider can report usage
+    /// and say nothing about its cache: both wire decoders fill the count in
+    /// with a zero when the field is absent, so the number alone cannot tell a
+    /// cold prefix from a silent upstream. Anything that divides it needs this
+    /// to know which it has.
+    ///
+    /// `#[serde(default)]` to [`CacheReadSource::Unreported`], which is the
+    /// right reading of every log written before this field existed rather than
+    /// a placeholder: those counts really did come through an `unwrap_or(0)`.
+    /// It loses real measurements on historical logs, which is the conservative
+    /// direction — absent evidence, never invented evidence.
+    #[serde(default)]
+    pub cache_read_source: CacheReadSource,
+}
+
+/// Where a [`Usage::cached_input_tokens`] count came from.
+///
+/// Ordered weakest to strongest, which is what [`Usage::add`] merges on: a
+/// total is only a provider measurement if every call in it was.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheReadSource {
+    /// No independent cache measurement is recorded. This includes historical
+    /// records whose counts have no provenance, even when those counts are positive.
+    #[default]
+    Unreported,
+    /// Roundhouse computed the count itself.
+    ///
+    /// The local path, whose cache credit is the router's own expected prefill
+    /// handed back by the engine. Real enough to price, and not an independent
+    /// observation of anything — an error term against the quote it came from
+    /// is zero by construction.
+    Derived,
+    /// The provider stated the count, a stated zero included.
+    Provider,
+}
+
+impl CacheReadSource {
+    /// Whether this count can be read as a measurement of a provider's cache.
+    pub fn is_measured(&self) -> bool {
+        matches!(self, CacheReadSource::Provider)
+    }
 }
 
 /// Where a [`Usage`]'s counts came from.
@@ -127,6 +172,20 @@ impl Usage {
     /// `u64::MAX` would report a near-zero total for the busiest deployment on
     /// the fleet, which is the one case where the number matters most.
     pub fn add(&mut self, other: &Usage) {
+        // An all-default addend is the identity, on either side: it has no
+        // counts to add and no provenance to degrade `self` with. Without
+        // this, `empty` below is read off `self` and not `other`, so a
+        // zero-usage call folded in *after* a real measurement is compared
+        // against an accumulator that is no longer default and taints its
+        // provenance down through `min` instead of being ignored -- the same
+        // two calls would then land on two different totals depending only
+        // on which order they arrived in.
+        if *other == Self::default() {
+            return;
+        }
+        // Only a default accumulator can adopt provenance. A zero input count
+        // can still accompany unreported cache tokens.
+        let empty = *self == Self::default();
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.cached_input_tokens = self
             .cached_input_tokens
@@ -142,6 +201,12 @@ impl Usage {
         if other.accounting == Accounting::Estimated {
             self.accounting = Accounting::Estimated;
         }
+        // The same degradation, on the same argument: a total whose cache count
+        // is part measurement and part fill-in is not a measurement.
+        self.cache_read_source = match empty {
+            true => other.cache_read_source,
+            false => self.cache_read_source.min(other.cache_read_source),
+        };
     }
 }
 
@@ -441,6 +506,45 @@ pub enum SessionEventKind {
         arm: Arm,
         outcome: ValidationOutcome,
     },
+    /// A classifier call this deployment has committed to making.
+    ///
+    /// **Written before any HTTP, and never replayed into a second call.** The
+    /// intent is what makes a crash mid-call recoverable as *knowledge* rather
+    /// than as silence: a successor folding this log finds an intent with no
+    /// result and records that the answer, and its cost, are unknown. Buying the
+    /// answer again would be a second charge for a question already paid for.
+    ///
+    /// Carries no `response_id` on purpose, like the three validate-loop kinds:
+    /// nobody asked for this call, it emits no item, and a client's stream must
+    /// not carry this deployment's own bookkeeping.
+    ClassificationRequested {
+        record: ClassificationIntent,
+    },
+    /// What a classifier call produced, delivered by a later turn's writer.
+    ///
+    /// **The sequence this lands at is the availability time.** A classification
+    /// of turn 3 that arrives during turn 9 becomes a feature at turn 9 and can
+    /// never reach turn 5's decision record, which is what stops a late answer
+    /// being backdated into evidence that was frozen before it existed.
+    ClassificationRecorded {
+        record: ClassificationRecord,
+    },
+    /// An evaluation settlement nobody had confirmed, resolved against the
+    /// ledger.
+    ///
+    /// **The event that makes a lost acknowledgement recoverable rather than
+    /// permanent.** A classifier call whose settle failed leaves a result
+    /// saying the charge is unconfirmed and a hold that will lapse; without
+    /// this, every replay of that log reaches the same conclusion forever and
+    /// the money is simply gone. With it, a successor re-drives the exact
+    /// settlement the log describes and records that it got an answer.
+    ///
+    /// **It resolves, it does not re-classify.** The [`ClassificationRecord`]
+    /// it names is untouched, no new classification becomes available, and no
+    /// decision's features move — see [`ClassificationSettlementRepair`].
+    ClassificationSettlementRepaired {
+        record: ClassificationSettlementRepair,
+    },
     Error {
         message: String,
     },
@@ -503,6 +607,15 @@ pub enum ValidationOutcome {
         /// which happened. A log that recorded only taken actions could not
         /// answer the counterfactual the Shadow arm exists to measure.
         action: SteerAction,
+        /// The decisions this review covered and the label it gives them.
+        ///
+        /// `None` on every judged outcome written before interval coverage
+        /// existed. Such a review still moves the checkpoint, and labels
+        /// nothing: what it saw was never recorded.
+        ///
+        /// Boxed so the common absent case costs one pointer on every event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interval: Option<Box<IntervalReview>>,
     },
 }
 
@@ -725,6 +838,15 @@ impl SessionEvent {
             | SessionEventKind::SideCallCompleted { .. }
             | SessionEventKind::SideCallAbandoned { .. }
             | SessionEventKind::ValidationDecided { .. }
+            // The three classification kinds answer `None` for the same reason
+            // the three above them do, and with one extra: a classification is
+            // *about* a turn that has already terminated, so claiming its
+            // response id would reopen a finished stream on every surface. A
+            // repair is further out still — it is about this deployment's
+            // accounting rather than about any turn.
+            | SessionEventKind::ClassificationRequested { .. }
+            | SessionEventKind::ClassificationRecorded { .. }
+            | SessionEventKind::ClassificationSettlementRepaired { .. }
             | SessionEventKind::Error { .. } => None,
         }
     }
@@ -850,6 +972,85 @@ mod tests {
         };
         saturating.add(&written);
         assert_eq!(saturating.cache_write_tokens, u64::MAX);
+    }
+
+    /// A cache count with no `input_tokens` still degrades a later add: the
+    /// `empty` gate compares the whole accumulator against `Self::default()`,
+    /// not just `input_tokens`, so this addend is not mistaken for a fresh one.
+    #[test]
+    fn an_unreported_cache_count_with_no_input_tokens_still_taints_the_total() {
+        let mut total = Usage::default();
+        total.add(&Usage {
+            cached_input_tokens: 10,
+            cache_read_source: CacheReadSource::Unreported,
+            ..Usage::default()
+        });
+        total.add(&Usage {
+            input_tokens: 100,
+            cache_read_source: CacheReadSource::Provider,
+            ..Usage::default()
+        });
+        assert_eq!(total.cached_input_tokens, 10);
+        assert_ne!(
+            total.cache_read_source,
+            CacheReadSource::Provider,
+            "10 cached tokens arrived under Unreported; the total must not read \
+             as a provider measurement"
+        );
+    }
+
+    /// Control for the test above: two ordinary provider-measured calls still
+    /// merge to `Provider`, so the gate above is not simply broken end to end.
+    #[test]
+    fn an_all_provider_aggregate_keeps_provider_provenance() {
+        let mut total = Usage::default();
+        total.add(&Usage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            cache_read_source: CacheReadSource::Provider,
+            ..Usage::default()
+        });
+        total.add(&Usage {
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            cache_read_source: CacheReadSource::Provider,
+            ..Usage::default()
+        });
+        assert_eq!(total.cache_read_source, CacheReadSource::Provider);
+    }
+
+    /// A zero-usage call -- a cancelled response, a side call that reported
+    /// nothing -- must be the identity for `add` whichever side it lands on:
+    /// a measurement folded in before a default addend must keep its own
+    /// provenance rather than have `min` taint it down to `Unreported`.
+    #[test]
+    fn an_all_default_addend_does_not_change_the_order_dependent_result() {
+        let measured = Usage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            cache_read_source: CacheReadSource::Provider,
+            ..Usage::default()
+        };
+
+        let mut default_first = Usage::default();
+        default_first.add(&Usage::default());
+        default_first.add(&measured);
+
+        let mut default_second = Usage::default();
+        default_second.add(&measured);
+        default_second.add(&Usage::default());
+
+        assert_eq!(
+            default_first.cache_read_source,
+            CacheReadSource::Provider,
+            "a zero-usage call folded in first must not taint the provenance \
+             of the one real measurement"
+        );
+        assert_eq!(
+            default_second.cache_read_source, default_first.cache_read_source,
+            "the same two calls in the other order must land on the same \
+             provenance"
+        );
     }
 
     #[test]

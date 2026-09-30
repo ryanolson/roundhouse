@@ -643,6 +643,8 @@ events already in the log — the fold's first read of a text delta against
 the turn's start — as a per-target latency column carrying its basis, under
 the same fold-equivalence test the other columns answer to.
 
+[2026-09-19: `765daf2` implements the first-output interval in per-model metrics JSON. Its basis is `turn_start_to_first_output`, from the start event to the first nonempty durable text delta. Missing observations have no mean. Backward timestamps count as rejected. Replay and scoped totals have regression coverage. The HTML dashboard and deployment persistence remain separate work.]
+
 **R22 — the deployment aggregate keeps identity until the sum.** Of the
 three shapes the evidence priced, one is forbidden by the surface's own
 contract (a poll must not cost the store a replay, and no session census
