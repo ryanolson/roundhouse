@@ -1,0 +1,24 @@
+[book]
+title = "Roundhouse"
+authors = ["Roundhouse contributors"]
+language = "en"
+src = "src"
+
+[build]
+# A chapter listed in SUMMARY.md but missing on disk is an error, not an empty page.
+create-missing = false
+
+[output.html]
+# GitHub Pages serves this project site under /roundhouse/.
+site-url = "/roundhouse/"
+git-repository-url = "https://github.com/ryanolson/roundhouse"
+edit-url-template = "https://github.com/ryanolson/roundhouse/edit/main/docs/{path}"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.linkcheck]
+follow-web-links = false
