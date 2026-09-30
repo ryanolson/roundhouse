@@ -6,8 +6,9 @@
 //!
 //! **Labels are part of the number.** Every weighted figure is printed with
 //! [`ESTIMAND_LABEL`], every figure about the served `rules` route with
-//! [`FACTUAL_LABEL`], and every figure that counts or resamples clusters with
-//! the cluster unit's name. The text names no other estimand, so no reader
+//! [`FACTUAL_LABEL`], every figure priced or timed from recorded plan quotes
+//! with `corrected quote estimate` (see [`super::promotion`]), and every
+//! figure that counts or resamples clusters with the cluster unit's name. The text names no other estimand, so no reader
 //! can take an interval-local weight for the value of running a candidate end
 //! to end.
 //!
@@ -26,61 +27,15 @@ use super::estimate::{
     factual,
 };
 use super::extract::{Cause, Evidence, Stratum, StratumSpend};
+use super::promotion::PromotionSummary;
 use super::source::Census;
 use super::{
-    ArtifactPrior, COST_REDUCTION, CalibrationConfig, Candidate, ClusterUnit, ESTIMAND_LABEL,
-    FACTUAL_LABEL, QUALITY_ALLOWANCE,
+    ArtifactPrior, CalibrationConfig, Candidate, ClusterUnit, ESTIMAND_LABEL, FACTUAL_LABEL,
 };
 use crate::control::ProjectId;
 use crate::metrics::TierAgreement;
 use crate::routing::learn::artifact::Artifact;
 use crate::routing::learn::{EpochId, Strategy, Units};
-
-/// One ruled test's result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestResult {
-    Pass,
-    Fail,
-    /// The inputs the test compares do not exist, for the reason given.
-    NotEvaluable(&'static str),
-}
-
-impl TestResult {
-    pub fn label(self) -> String {
-        match self {
-            TestResult::Pass => "pass".to_owned(),
-            TestResult::Fail => "fail".to_owned(),
-            TestResult::NotEvaluable(reason) => format!("not evaluable ({reason})"),
-        }
-    }
-
-    pub fn passed(self) -> bool {
-        self == TestResult::Pass
-    }
-}
-
-/// Ruling 13's three tests for the learned candidate, and the session count.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PromotionSummary {
-    /// The candidate's bootstrap lower bound at least the `rules` factual rate
-    /// less [`QUALITY_ALLOWANCE`].
-    pub quality: TestResult,
-    /// The candidate's estimated cost at least [`COST_REDUCTION`] below the
-    /// `rules` factual cost.
-    pub cost: TestResult,
-    /// The candidate's p50 first output from turn start within the limit.
-    pub latency: TestResult,
-    /// Clusters with at least one eligible interval.
-    pub sessions: u64,
-    pub min_sessions: u64,
-    pub latency_limit_ms: u64,
-}
-
-impl PromotionSummary {
-    pub fn all_pass(&self) -> bool {
-        self.quality.passed() && self.cost.passed() && self.latency.passed()
-    }
-}
 
 /// Everything the report prints.
 #[derive(Debug, Clone, PartialEq)]
@@ -143,23 +98,7 @@ impl Report {
             .map(|interval| interval.outcome(Candidate::Fixed(Strategy::Rules)))
             .collect();
         let rules = factual(&rules_outcomes);
-        let mut clusters: Vec<usize> = evidence.intervals.iter().map(|i| i.cluster).collect();
-        clusters.sort_unstable();
-        clusters.dedup();
-        let learned = &estimates[0].1;
-        let promotion = PromotionSummary {
-            quality: quality_test(learned, &rules),
-            cost: cost_test(learned, &rules),
-            latency: match learned.p50_first_output_ms {
-                _ if learned.weighted == 0 => TestResult::NotEvaluable(NO_SUPPORT),
-                Some(p50) if p50 <= config.latency_limit_ms => TestResult::Pass,
-                Some(_) => TestResult::Fail,
-                None => TestResult::NotEvaluable("no first-output sample has weight"),
-            },
-            sessions: clusters.len() as u64,
-            min_sessions: config.quality.min_sessions,
-            latency_limit_ms: config.latency_limit_ms,
-        };
+        let promotion = PromotionSummary::build(config, evidence);
         Report {
             project: config.project.clone(),
             manifest_digest: artifact.manifest_digest().to_owned(),
@@ -169,7 +108,7 @@ impl Report {
             census: census.clone(),
             accepted_reviews: evidence.accepted_reviews,
             eligible_intervals: evidence.intervals.len(),
-            eligible_clusters: clusters.len() as u64,
+            eligible_clusters: promotion.sessions,
             exclusions: Cause::ALL
                 .iter()
                 .map(|cause| (*cause, evidence.exclusions.get(cause).copied().unwrap_or(0)))
@@ -204,41 +143,6 @@ impl Report {
     }
 }
 
-const NO_SUPPORT: &str = "the candidate has no interval with weight above zero; \
-                          where no turn explored, a candidate that differs from the \
-                          served route has zero weight";
-
-fn quality_test(learned: &Estimate, rules: &Factual) -> TestResult {
-    if learned.weighted == 0 {
-        return TestResult::NotEvaluable(NO_SUPPORT);
-    }
-    match (learned.bootstrap.lower, rules.positive_rate) {
-        (Some(lower), Some(rate)) if lower >= rate - QUALITY_ALLOWANCE => TestResult::Pass,
-        (Some(_), Some(_)) => TestResult::Fail,
-        (None, _) => TestResult::NotEvaluable("no bootstrap replicates"),
-        (_, None) => TestResult::NotEvaluable("rules served no eligible interval"),
-    }
-}
-
-fn cost_test(learned: &Estimate, rules: &Factual) -> TestResult {
-    match (learned.cost, rules.cost) {
-        (CostEstimate::Priced(candidate), CostEstimate::Priced(rules)) => {
-            if candidate <= rules * (1.0 - COST_REDUCTION) {
-                TestResult::Pass
-            } else {
-                TestResult::Fail
-            }
-        }
-        (CostEstimate::NoSupport, _) => TestResult::NotEvaluable(NO_SUPPORT),
-        (CostEstimate::Unpriced, _) | (_, CostEstimate::Unpriced) => TestResult::NotEvaluable(
-            "a weighted interval has an unpriced turn: a local dispatch records no rate card",
-        ),
-        (_, CostEstimate::NoSupport) => {
-            TestResult::NotEvaluable("rules served no eligible interval")
-        }
-    }
-}
-
 fn rate(value: Option<f64>) -> String {
     value.map_or_else(|| "none".to_owned(), |value| format!("{value:.4}"))
 }
@@ -246,8 +150,8 @@ fn rate(value: Option<f64>) -> String {
 fn cost(value: CostEstimate) -> String {
     match value {
         CostEstimate::Priced(usd) => format!("${usd:.6}"),
-        CostEstimate::Unpriced => "unpriced (a weighted interval has a turn \
-                                   with no recorded rate card)"
+        CostEstimate::Unpriced => "unpriced (a weighted interval has a turn with no \
+                                   rate card, a local dispatch, or usage Roundhouse estimated)"
             .to_owned(),
         CostEstimate::NoSupport => "no support".to_owned(),
     }
@@ -255,6 +159,10 @@ fn cost(value: CostEstimate) -> String {
 
 fn millis(value: Option<u64>) -> String {
     value.map_or_else(|| "none".to_owned(), |ms| format!("{ms} ms"))
+}
+
+fn sampled(sampled: usize, turns: usize) -> String {
+    format!("{sampled} of {turns} turns sampled")
 }
 
 impl Report {
@@ -357,11 +265,16 @@ impl Report {
             let _ = writeln!(
                 o,
                 "{level:.0}% bootstrap interval, {ESTIMAND_LABEL}, clustered by {unit}: \
-                 [{}, {}], {} of {} replicates held no weight",
+                 [{}, {}], {} of {} replicates held no weight{}",
                 rate(estimate.bootstrap.lower),
                 rate(estimate.bootstrap.upper),
                 estimate.bootstrap.undefined,
-                bootstrap.resamples
+                bootstrap.resamples,
+                if estimate.bootstrap.sparse {
+                    ", more than the lower tail, so the lower bound is filler"
+                } else {
+                    ""
+                }
             );
             let _ = writeln!(
                 o,
@@ -370,26 +283,28 @@ impl Report {
             );
             let _ = writeln!(
                 o,
-                "effective sample size: {:.2} intervals",
+                "effective sample size, {ESTIMAND_LABEL}: {:.2} intervals",
                 estimate.effective_sample_size
             );
             let _ = writeln!(
                 o,
-                "support census: {} of {} intervals have logging probability above zero \
-                 for every candidate action; {} have zero logging probability",
+                "support census, {ESTIMAND_LABEL}: {} of {} intervals have logging \
+                 probability above zero for every candidate action; {} have zero logging \
+                 probability",
                 estimate.supported,
                 estimate.intervals,
                 estimate.intervals - estimate.supported
             );
             let _ = writeln!(
                 o,
-                "cost per interval, {ESTIMAND_LABEL}: {}",
+                "measured cost per interval, {ESTIMAND_LABEL}: {}",
                 cost(estimate.cost)
             );
             let _ = writeln!(
                 o,
-                "p50 first output from turn start, {ESTIMAND_LABEL}: {}",
-                millis(estimate.p50_first_output_ms)
+                "measured p50 first output from turn start, {ESTIMAND_LABEL}: {}, {}",
+                millis(estimate.p50_first_output_ms),
+                sampled(estimate.sampled_turns, estimate.turns)
             );
         }
 
@@ -408,16 +323,17 @@ impl Report {
         );
         let _ = writeln!(
             o,
-            "cost per interval, {FACTUAL_LABEL}: {}",
+            "measured cost per interval, {FACTUAL_LABEL}: {}",
             cost(rules.cost)
         );
         let _ = writeln!(
             o,
-            "p50 first output from turn start, {FACTUAL_LABEL}: {}",
-            millis(rules.p50_first_output_ms)
+            "p50 first output from turn start, {FACTUAL_LABEL}: {}, {}",
+            millis(rules.p50_first_output_ms),
+            sampled(rules.sampled_turns, rules.turns)
         );
 
-        self.render_promotion(o);
+        self.promotion.render(o, unit);
         self.render_spend(o);
         self.render_agreement(o);
 
@@ -453,59 +369,6 @@ impl Report {
             }
         }
         out
-    }
-
-    fn render_promotion(&self, o: &mut String) {
-        let unit = self.unit.label();
-        let promotion = &self.promotion;
-        let learned = self.estimate(Candidate::Learned);
-        let _ = writeln!(o);
-        let _ = writeln!(
-            o,
-            "## Promotion summary (ruling 13, for the learned candidate; the owner approves \
-             each promotion)"
-        );
-        let _ = writeln!(
-            o,
-            "1. quality: bootstrap lower bound, {ESTIMAND_LABEL}, {} against the rules \
-             {FACTUAL_LABEL} positive rate {} less {QUALITY_ALLOWANCE:.2}: {}",
-            rate(learned.and_then(|estimate| estimate.bootstrap.lower)),
-            rate(self.rules.positive_rate),
-            promotion.quality.label()
-        );
-        let _ = writeln!(
-            o,
-            "2. cost: cost per interval, {ESTIMAND_LABEL}, {} against the rules \
-             {FACTUAL_LABEL} {}, at least {:.0}% lower: {}",
-            learned.map_or_else(|| "none".to_owned(), |estimate| cost(estimate.cost)),
-            cost(self.rules.cost),
-            COST_REDUCTION * 100.0,
-            promotion.cost.label()
-        );
-        let _ = writeln!(
-            o,
-            "3. latency: p50 first output from turn start, {ESTIMAND_LABEL}, {} against \
-             latency_limit_ms {}: {}",
-            millis(learned.and_then(|estimate| estimate.p50_first_output_ms)),
-            promotion.latency_limit_ms,
-            promotion.latency.label()
-        );
-        let _ = writeln!(
-            o,
-            "{unit} with an eligible interval: {} against quality.min_sessions {}: {}",
-            promotion.sessions,
-            promotion.min_sessions,
-            if promotion.sessions >= promotion.min_sessions {
-                "met"
-            } else {
-                "not met"
-            }
-        );
-        let _ = writeln!(
-            o,
-            "all three ruled tests pass: {}",
-            if promotion.all_pass() { "yes" } else { "no" }
-        );
     }
 
     fn render_spend(&self, o: &mut String) {

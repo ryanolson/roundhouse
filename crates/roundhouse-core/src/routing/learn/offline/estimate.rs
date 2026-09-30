@@ -56,6 +56,11 @@ pub fn trajectory_supported(turns: &[TurnTrace]) -> bool {
 
 /// A dollar figure, or the statement that it has none.
 ///
+/// One turn's or one interval's figure. [`CostEstimate`] is the figure of an
+/// estimate over many intervals, and is not this type because it has a third
+/// answer this one never has: [`CostEstimate::NoSupport`], no interval to
+/// average. Folding that into `Money` would let a turn claim it.
+///
 /// **Unpriced is never zero.** A local dispatch records no rate card, and a
 /// frontier record without one predates the field; a `0.0` for either would
 /// make the route look free, which is the direction the owner's cost rule
@@ -81,6 +86,8 @@ impl Money {
 pub struct Outcome {
     /// Its cluster, as an index into the manifest's clusters.
     pub cluster: usize,
+    /// Its covered turns.
+    pub turns: usize,
     pub positive: bool,
     /// [`trajectory_weight`] of its turns for the candidate.
     pub weight: f64,
@@ -121,6 +128,12 @@ pub struct Bootstrap {
     /// candidate's interval widens rather than drops the replicates that would
     /// have said so.
     pub undefined: u32,
+    /// More replicates held no weight than the lower tail has places, so the
+    /// lower bound is one of those fillers rather than an estimate. A test
+    /// that reads the bound then has no support to read, and says `not
+    /// evaluable`: comparing the filler would turn sparse support into a
+    /// `fail` that no data showed.
+    pub sparse: bool,
 }
 
 /// The weighted dollar figure of a candidate.
@@ -154,6 +167,10 @@ pub struct Estimate {
     pub cost: CostEstimate,
     /// The weighted lower median of first output from turn start.
     pub p50_first_output_ms: Option<u64>,
+    /// Turns of weighted intervals with a first-output sample, and all turns
+    /// of weighted intervals: how much of the p50 was measured.
+    pub sampled_turns: usize,
+    pub turns: usize,
     pub bootstrap: Bootstrap,
 }
 
@@ -197,6 +214,11 @@ pub fn estimate(outcomes: &[Outcome], plan: BootstrapPlan) -> Estimate {
                 .iter()
                 .map(|ms| (*ms, outcome.weight))
         })),
+        sampled_turns: weighted
+            .iter()
+            .map(|outcome| outcome.first_output_ms.len())
+            .sum(),
+        turns: weighted.iter().map(|outcome| outcome.turns).sum(),
         bootstrap: bootstrap(outcomes, plan),
     }
 }
@@ -226,6 +248,9 @@ pub struct Factual {
     pub positive_rate: Option<f64>,
     pub cost: CostEstimate,
     pub p50_first_output_ms: Option<u64>,
+    /// Served turns with a first-output sample, and all served turns.
+    pub sampled_turns: usize,
+    pub turns: usize,
 }
 
 /// The factual figures over the outcomes the candidate matched on every turn,
@@ -259,6 +284,11 @@ pub fn factual(outcomes: &[Outcome]) -> Factual {
                 .iter()
                 .flat_map(|outcome| outcome.first_output_ms.iter().map(|ms| (*ms, 1.0))),
         ),
+        sampled_turns: served
+            .iter()
+            .map(|outcome| outcome.first_output_ms.len())
+            .sum(),
+        turns: served.iter().map(|outcome| outcome.turns).sum(),
     }
 }
 
@@ -326,7 +356,10 @@ pub fn bootstrap_replicates(outcomes: &[Outcome], plan: BootstrapPlan) -> Vec<Op
 ///
 /// The lower bound is the replicate at index `floor(0.025 B)` in ascending
 /// order, and the upper the one at `ceil(0.975 B) - 1`. A replicate with no
-/// weight counts as `0.0` for the lower bound and `1.0` for the upper.
+/// weight counts as `0.0` for the lower bound and `1.0` for the upper, never
+/// as the point estimate: that would narrow the interval by exactly the
+/// replicates that say the data is thin. When those fillers reach the lower
+/// index, the bound is [`Bootstrap::sparse`].
 pub fn bootstrap(outcomes: &[Outcome], plan: BootstrapPlan) -> Bootstrap {
     let replicates = bootstrap_replicates(outcomes, plan);
     if replicates.is_empty() {
@@ -334,6 +367,7 @@ pub fn bootstrap(outcomes: &[Outcome], plan: BootstrapPlan) -> Bootstrap {
             lower: None,
             upper: None,
             undefined: 0,
+            sparse: false,
         };
     }
     let undefined = replicates.iter().filter(|value| value.is_none()).count() as u32;
@@ -357,6 +391,7 @@ pub fn bootstrap(outcomes: &[Outcome], plan: BootstrapPlan) -> Bootstrap {
         lower: Some(lows[low_at]),
         upper: Some(highs[high_at]),
         undefined,
+        sparse: undefined as usize > low_at,
     }
 }
 

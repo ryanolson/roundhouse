@@ -20,6 +20,7 @@ use super::Strategy;
 use super::evidence::{Draw, GateResult, PlanEvidence};
 use crate::ids::{ResponseId, SessionId};
 use crate::routing::Target;
+use crate::session::same_route;
 
 /// The version tag the exploration hash input opens with.
 ///
@@ -72,8 +73,8 @@ impl Draw {
 ///
 /// **Strictly cheaper.** Exploration exists to find a cheaper route that
 /// holds quality; a member at the reference's price would spend a quality
-/// bypass to learn nothing about cost. It also keeps every member's first
-/// target distinct from the reference's, which [`propensity`] relies on.
+/// bypass to learn nothing about cost. [`propensity`] does not rely on it:
+/// it sums over every way the served route could have been chosen.
 ///
 /// **Every hard constraint**, by [`PlanEvidence::meets_hard`], the predicate
 /// the exploit path uses.
@@ -99,6 +100,12 @@ pub fn eligible(plans: &[PlanEvidence], reference: &PlanEvidence) -> Vec<Strateg
 /// explores and serves each member with probability `1 / |set|`, so a target
 /// that is the first target of two members has twice that share.
 ///
+/// **Targets are compared by [`same_route`]**, the rule credit and the
+/// offline calibrator match a served target by. Two workers of one local
+/// model are one route there, so they are one route here: comparing with
+/// `==` would record half the probability for a route two members share on
+/// different workers, and the calibrator would weight that turn double.
+///
 /// `set` must be non-empty; a turn that could not explore served its target
 /// with probability 1 and does not call this.
 pub fn propensity(
@@ -113,10 +120,10 @@ pub fn propensity(
         .filter(|member| {
             plans
                 .iter()
-                .any(|plan| plan.strategy == **member && &plan.first == served)
+                .any(|plan| plan.strategy == **member && same_route(&plan.first, served))
         })
         .count();
-    let exploit = if default == Some(served) {
+    let exploit = if default.is_some_and(|default| same_route(default, served)) {
         1.0 - rate
     } else {
         0.0

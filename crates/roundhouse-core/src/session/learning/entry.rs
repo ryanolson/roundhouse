@@ -155,3 +155,22 @@ impl LearningCauses {
         *counter += 1;
     }
 }
+
+/// Sums the counts field by field, so a reader over many sessions (the
+/// offline calibrator) adds folds without naming each cause twice.
+impl std::ops::AddAssign for LearningCauses {
+    fn add_assign(&mut self, other: LearningCauses) {
+        let LearningCauses {
+            unknown_label,
+            failover_in_interval,
+            missing_row,
+            mixed_epoch,
+            other_credit_revision,
+        } = other;
+        self.unknown_label += unknown_label;
+        self.failover_in_interval += failover_in_interval;
+        self.missing_row += missing_row;
+        self.mixed_epoch += mixed_epoch;
+        self.other_credit_revision += other_credit_revision;
+    }
+}

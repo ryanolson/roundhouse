@@ -18,9 +18,9 @@ use roundhouse_core::routing::learn::offline::estimate::{
     bootstrap_replicates, estimate, trajectory_probability, trajectory_weight, weighted_p50,
 };
 use roundhouse_core::routing::learn::offline::{
-    ArtifactPrior, BootstrapPlan, Calibrated, CalibrationConfig, Candidate, Cause, CostEstimate,
-    DriftCheck, ESTIMAND_LABEL, Evidence, Money, Outcome, QualityMinimum, SessionLog, Source,
-    SplitMix64, TestResult, TurnTrace, assemble, sidecar_bytes,
+    ArtifactPrior, BootstrapPlan, CORRECTED_QUOTE_LABEL, Calibrated, CalibrationConfig, Candidate,
+    Cause, CostEstimate, DriftCheck, ESTIMAND_LABEL, Evidence, Money, Outcome, QualityMinimum,
+    SessionLog, Source, SplitMix64, TestResult, TurnTrace, assemble, sidecar_bytes,
 };
 use roundhouse_core::routing::learn::{
     Artifact, Draw, ExplorationEvidence, LearnedChoice, Strategy, StrategySet, epoch_of,
@@ -77,11 +77,13 @@ const CARD: ProviderPricing = ProviderPricing {
     output_per_mtok_usd: 15.0,
 };
 
-/// A shadow session of one-turn intervals, one per label, priced at [`CARD`].
+/// A shadow session of one-turn intervals, one per label, priced at [`CARD`],
+/// with every plan's quote corrected ($0.01 and 800 ms on `opus`, $0.001 and
+/// 600 ms on `haiku`).
 fn shadow(id: &str, labels: &[bool]) -> Script {
     let mut script = Script::named(id);
     for positive in labels {
-        let turn = script.turn(Spec::new().rate_card(CARD).decision());
+        let turn = script.turn(corrected(Spec::new()).rate_card(CARD).decision());
         script.review(&[&turn], verdict(*positive));
     }
     script
@@ -114,6 +116,13 @@ fn ab_spec(served_a: bool) -> Spec {
     } else {
         spec.chosen(opus()).exploration(exploration(0.9))
     }
+}
+
+/// Every plan of the fixture's default targets with its quote corrected.
+fn corrected(spec: Spec) -> Spec {
+    spec.corrected(Strategy::Rules, 0.01, 800.0)
+        .corrected(Strategy::Efficient, 0.001, 600.0)
+        .corrected(Strategy::Capable, 0.01, 800.0)
 }
 
 fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
@@ -402,6 +411,7 @@ fn the_conditional_interval_value_is_labeled_as_such_and_never_as_session_value(
     {
         assert!(
             line.contains(ESTIMAND_LABEL)
+                || line.contains(CORRECTED_QUOTE_LABEL)
                 || line.contains("factual")
                 || line.contains("classifier"),
             "an unlabeled number: {line}"
@@ -531,6 +541,7 @@ fn the_screen_exclusions_equal_the_session_folds_causes() {
 fn outcome(cluster: usize, positive: bool) -> Outcome {
     Outcome {
         cluster,
+        turns: 1,
         positive,
         weight: 1.0,
         supported: true,
@@ -642,7 +653,7 @@ fn an_unpriced_local_plan_is_reported_as_unpriced_never_zero() {
     assert_eq!(learned.cost, CostEstimate::Unpriced);
     assert_eq!(calibrated.report.rules.cost, CostEstimate::Unpriced);
     assert!(matches!(
-        calibrated.report.promotion.cost,
+        calibrated.report.promotion.cost.result,
         TestResult::NotEvaluable(_)
     ));
     let text = calibrated.report.render();
@@ -699,38 +710,48 @@ fn the_promotion_summary_states_each_of_the_three_ruled_tests_and_its_result() {
     let two = shadow("acme/ada/two#g0", &[true]);
     let calibrated = run(&[&one, &two]);
     let promotion = calibrated.report.promotion;
-    // In shadow with nothing passing, the learned candidate is `rules` on
-    // every turn: the same quality and latency, and no cost saving.
-    assert_eq!(promotion.quality, TestResult::Pass);
-    assert_eq!(promotion.cost, TestResult::Fail);
-    assert_eq!(promotion.latency, TestResult::Pass);
-    assert_eq!((promotion.sessions, promotion.min_sessions), (2, 2));
+    // In shadow with nothing passing, the learned choice is `rules` on every
+    // turn: every interval agrees, quality and latency hold, and the
+    // corrected quotes show no cost saving.
+    assert_eq!((promotion.agreeing, promotion.intervals), (3, 3));
+    assert_eq!(promotion.quality_agreeing.result, TestResult::Pass);
+    assert_eq!(promotion.quality_full.result, TestResult::Pass);
+    assert_eq!(promotion.cost.result, TestResult::Fail);
+    assert_eq!(promotion.latency.result, TestResult::Pass);
+    assert_eq!(promotion.latency.p50_ms, Some(800));
+    assert_eq!(
+        (promotion.agreeing_sessions, promotion.min_sessions),
+        (2, 2)
+    );
+    assert!(!promotion.promotable());
     let text = calibrated.report.render();
-    assert!(line_with(&text, "1. quality:").ends_with(": pass"));
+    assert!(line_with(&text, "1. quality").ends_with(": pass"));
     assert!(line_with(&text, "2. cost:").ends_with(": fail"));
     assert!(line_with(&text, "3. latency:").ends_with(": pass"));
     assert!(line_with(&text, "quality.min_sessions 2").ends_with(": met"));
-    assert_eq!(
-        line_with(&text, "all three"),
-        "all three ruled tests pass: no"
-    );
+    assert!(line_with(&text, "promotion to live").contains("): no;"));
+    assert!(line_with(&text, "M11 binding tests").ends_with(": fail"));
+    assert!(!text.contains("all three"), "the unstaged verdict is gone");
 
     let tight = CalibrationConfig {
         latency_limit_ms: 10,
         ..config()
     };
     let calibrated = run_with(&tight, &[&one, &two]);
-    assert_eq!(calibrated.report.promotion.latency, TestResult::Fail);
+    assert_eq!(calibrated.report.promotion.latency.result, TestResult::Fail);
     assert!(line_with(&calibrated.report.render(), "3. latency:").ends_with(": fail"));
 }
 
-/// A learned candidate that differs from `rules` in shadow has no support: the
-/// report says the tests cannot be evaluated rather than inventing a number.
+/// A learned candidate that differs from `rules` in shadow has no weight, so
+/// no quality support: the quality tests say they cannot be evaluated rather
+/// than inventing a number. Cost and latency are still read, from the
+/// corrected quotes of the plan the learner chose (the owner's ruling of
+/// 2026-09-29), on every interval.
 #[test]
-fn a_shadow_candidate_that_differs_from_rules_is_not_evaluable() {
+fn a_shadow_candidate_that_differs_from_rules_is_priced_from_quotes_but_not_quality_gated() {
     let mut script = Script::named("acme/ada/one#g0");
     let turn = script.turn(
-        Spec::new()
+        corrected(Spec::new())
             .passing(Strategy::Efficient, 0.001)
             .choice(LearnedChoice::Exploit {
                 strategy: Strategy::Efficient,
@@ -742,13 +763,20 @@ fn a_shadow_candidate_that_differs_from_rules_is_not_evaluable() {
     let learned = calibrated.report.estimate(Candidate::Learned).unwrap();
     assert_eq!(learned.weighted, 0);
     assert_eq!(calibrated.evidence.intervals[0].turns[0].learned, haiku());
-    for test in [
-        calibrated.report.promotion.quality,
-        calibrated.report.promotion.cost,
-        calibrated.report.promotion.latency,
-    ] {
-        assert!(matches!(test, TestResult::NotEvaluable(_)), "{test:?}");
+    let promotion = calibrated.report.promotion;
+    assert_eq!(promotion.agreeing, 0);
+    for test in [promotion.quality_agreeing, promotion.quality_full] {
+        assert!(
+            matches!(test.result, TestResult::NotEvaluable(_)),
+            "{test:?}"
+        );
     }
+    assert_eq!(promotion.quality_full.learned_supported, 0);
+    assert_eq!(promotion.cost.learned, CostEstimate::Priced(0.001));
+    assert_eq!(promotion.cost.rules, CostEstimate::Priced(0.01));
+    assert_eq!(promotion.cost.result, TestResult::Pass);
+    assert_eq!(promotion.latency.p50_ms, Some(600));
+    assert!(!promotion.promotable(), "no agreeing interval, no quality");
 }
 
 /// Every number that depends on the cluster unit carries its name, so a later

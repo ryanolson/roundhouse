@@ -19,7 +19,9 @@
 //! every such number and never names any other value, because an
 //! interval-local weight cannot estimate the value of running a candidate for
 //! a whole conversation (draft 14.3, the reviewer's 0.75 against 1.0).
-//! Numbers about the `rules` route itself are labeled `factual`.
+//! Numbers about the `rules` route itself are labeled `factual`, and numbers
+//! priced or timed from recorded plan quotes are labeled
+//! [`CORRECTED_QUOTE_LABEL`].
 //!
 //! **The mechanics are plan section 4's.** The evaluation unit is an accepted
 //! interval with a `Positive` or `Negative` label, no failover, and learned
@@ -46,13 +48,15 @@
 //! Submodules: [`source`] reads the stores, [`extract`] turns logs into
 //! intervals, [`estimate`] holds the arithmetic, [`drift`] compares a
 //! point-in-time copy of the learner store, [`write`] writes the artifact and
-//! the sidecar, [`report`] renders the report, and [`dump`] is the read-only
-//! in-memory source a fixture run reads.
+//! the sidecar, [`promotion`] holds ruling 13's tests as the owner staged
+//! them on 2026-09-29, [`report`] renders the report, and [`dump`] is the
+//! read-only in-memory source a fixture run reads.
 
 pub mod drift;
 pub mod dump;
 pub mod estimate;
 pub mod extract;
+pub mod promotion;
 pub mod report;
 pub mod source;
 pub mod write;
@@ -73,9 +77,14 @@ pub use estimate::{
     TurnTrace,
 };
 pub use extract::{
-    Cause, Evidence, IntervalFacts, SessionEntries, Stratum, StratumSpend, TurnFacts, replays,
+    Cause, Evidence, IntervalFacts, PlanQuote, SessionEntries, Stratum, StratumSpend, TurnFacts,
+    replays,
 };
-pub use report::{PromotionSummary, Report, TestResult};
+pub use promotion::{
+    CostTest, LatencyTest, PromotionSummary, QualityTest, QuoteCensus, TestResult, corrected_cost,
+    corrected_first_output, cost_gate, quality_gate, quality_test,
+};
+pub use report::Report;
 pub use source::{
     Calibrated, Census, CutoffEntry, ENUMERATION_PAGE, InputManifest, SessionLog, Source, assemble,
     calibrate, log_digest, read_source,
@@ -87,6 +96,11 @@ pub const ESTIMAND_LABEL: &str = "conditional interval value";
 
 /// The label every number about the served `rules` route carries.
 pub const FACTUAL_LABEL: &str = "factual";
+
+/// The label every number priced or timed from recorded plan quotes carries
+/// (the owner's ruling of 2026-09-29): a prediction corrected by measured
+/// residuals, never a measurement.
+pub const CORRECTED_QUOTE_LABEL: &str = "corrected quote estimate";
 
 /// Ruling 13: the candidate's positive-rate lower bound may be at most this far
 /// below the `rules` rate.

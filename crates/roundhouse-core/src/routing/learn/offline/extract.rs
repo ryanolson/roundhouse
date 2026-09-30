@@ -20,13 +20,14 @@ use super::estimate::{Money, Outcome, TurnTrace, trajectory_supported, trajector
 use super::source::SessionLog;
 use super::{ArtifactPrior, CalibrationConfig, Candidate};
 use crate::classify::EvaluationSpend;
-use crate::event::{SessionEvent, SessionEventKind, Usage, ValidationOutcome};
+use crate::event::{Accounting, SessionEvent, SessionEventKind, Usage, ValidationOutcome};
 use crate::ids::{ResponseId, SessionId, SideCallId};
 use crate::metrics::TierAgreement;
 use crate::metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, Scope, ShadowPricing};
 use crate::routing::learn::policy::exploit_order;
 use crate::routing::learn::{
-    ActiveMode, EpochId, LearnedChoice, LearnedEvidence, LearnedInput, LevelKey, Strategy, Units,
+    ActiveMode, CostEvidence, EpochId, LearnedChoice, LearnedEvidence, LearnedInput, LevelKey,
+    Strategy, TtftEvidence, Units,
 };
 use crate::routing::{DecisionRecord, SelectorBranch, Target};
 use crate::session::{
@@ -77,6 +78,12 @@ pub struct TurnFacts {
     /// What `live` without exploration would have served: the exploit
     /// strategy's first target, else the `rules` one.
     pub learned: Target,
+    /// The strategy whose plan `learned` is: the exploit strategy, else
+    /// `rules`.
+    pub learned_strategy: Strategy,
+    /// Each recorded plan's quote with its M3 corrections, in recorded order:
+    /// what a corrected quote estimate prices a strategy's action from.
+    pub quotes: Vec<PlanQuote>,
     /// Every first target the logging policy could have served on this turn:
     /// its default (the `rules` target in `shadow`, the exploit-else-`rules`
     /// target in `live`) and, when the turn could explore, every member's.
@@ -84,8 +91,17 @@ pub struct TurnFacts {
     /// First output from turn start, on a completed turn with a first output
     /// after this dispatch and a quote for its target (the turns M5 samples).
     pub first_output_ms: Option<u64>,
-    /// The terminal usage at the dispatch's recorded rate card.
+    /// The terminal usage at the dispatch's recorded rate card; unpriced for
+    /// a local dispatch and for usage Roundhouse estimated.
     pub cost: Money,
+}
+
+/// One plan's recorded quote, as the M3 corrections left it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlanQuote {
+    pub strategy: Strategy,
+    pub cost: CostEvidence,
+    pub ttft: TtftEvidence,
 }
 
 impl TurnFacts {
@@ -100,6 +116,11 @@ impl TurnFacts {
                 .find(|(planned, _)| *planned == strategy)
                 .map(|(_, first)| first),
         }
+    }
+
+    /// The recorded quote of `strategy`'s plan on this turn.
+    pub fn quote(&self, strategy: Strategy) -> Option<&PlanQuote> {
+        self.quotes.iter().find(|quote| quote.strategy == strategy)
     }
 
     pub fn trace(&self, candidate: Candidate) -> TurnTrace {
@@ -134,6 +155,7 @@ impl IntervalFacts {
             .map(|turn| turn.trace(candidate))
             .collect();
         Outcome {
+            turns: self.turns.len(),
             cluster: self.cluster,
             positive: self.positive,
             weight: trajectory_weight(&traces),
@@ -266,7 +288,7 @@ impl Evidence {
         let replay = SessionState::replay_learning(&log.events);
         let index = LogIndex::of(&log.events);
         self.accepted_reviews += replay.reviews.len() as u64;
-        add_causes(&mut self.fold_causes, replay.causes);
+        self.fold_causes += replay.causes;
 
         for review in &replay.reviews {
             let rows: Vec<Option<LearningRow>> = review
@@ -342,14 +364,6 @@ impl Evidence {
             targets,
         });
     }
-}
-
-fn add_causes(sum: &mut LearningCauses, causes: LearningCauses) {
-    sum.unknown_label += causes.unknown_label;
-    sum.failover_in_interval += causes.failover_in_interval;
-    sum.missing_row += causes.missing_row;
-    sum.mixed_epoch += causes.mixed_epoch;
-    sum.other_credit_revision += causes.other_credit_revision;
 }
 
 /// The learned evidence on a decision, when it has any.
@@ -478,9 +492,9 @@ impl<'a> LogIndex<'a> {
             return None;
         }
         let rules = &evidence.plan(Strategy::Rules)?.first;
-        let learned_first = exploit_order(&evidence.plans)
-            .first()
-            .map_or(rules, |&at| &evidence.plans[at].first);
+        let exploit = exploit_order(&evidence.plans).first().copied();
+        let learned_first = exploit.map_or(rules, |at| &evidence.plans[at].first);
+        let learned_strategy = exploit.map_or(Strategy::Rules, |at| evidence.plans[at].strategy);
         let default = match evidence.mode {
             ActiveMode::Shadow => rules,
             ActiveMode::Live => learned_first,
@@ -513,11 +527,17 @@ impl<'a> LogIndex<'a> {
                 _ => None,
             }
         });
+        // Estimated usage leaves cached input at zero, since no local
+        // evidence says what a remote cache did, so pricing it as measured
+        // overprices every turn that read from cache. It is unpriced rather
+        // than a third arm, because no priced comparison may read it.
         let cost = match (
             timeline.and_then(|timeline| timeline.usage.as_ref()),
             decision.rate_card,
         ) {
-            (Some(usage), Some(card)) if !decision.chosen.is_local() => {
+            (Some(usage), Some(card))
+                if !decision.chosen.is_local() && usage.accounting == Accounting::Reported =>
+            {
                 Money::Priced(card.price(usage))
             }
             _ => Money::Unpriced,
@@ -531,6 +551,16 @@ impl<'a> LogIndex<'a> {
                 .map(|plan| (plan.strategy, plan.first.clone()))
                 .collect(),
             learned: learned_first.clone(),
+            learned_strategy,
+            quotes: evidence
+                .plans
+                .iter()
+                .map(|plan| PlanQuote {
+                    strategy: plan.strategy,
+                    cost: plan.cost,
+                    ttft: plan.ttft,
+                })
+                .collect(),
             logged,
             first_output_ms,
             cost,

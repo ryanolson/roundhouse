@@ -102,6 +102,11 @@ pub struct Spec {
     pub propensity: f64,
     /// Strategies whose plan passed the gate, at the corrected cost given.
     pub passing: Vec<(Strategy, f64)>,
+    /// Strategies whose recorded quote the M3 terms corrected: the cost
+    /// correction `Applied` at the dollars given, and both latency terms
+    /// `Applied` with the first output given. Every other plan records
+    /// `TooFewSamples`, which a corrected quote estimate cannot use.
+    pub corrected: Vec<(Strategy, f64, f64)>,
     pub rate_card: Option<ProviderPricing>,
 }
 
@@ -125,6 +130,7 @@ impl Spec {
             exploration: None,
             propensity: 1.0,
             passing: Vec::new(),
+            corrected: Vec::new(),
             rate_card: None,
         }
     }
@@ -146,6 +152,13 @@ impl Spec {
 
     pub fn passing(mut self, strategy: Strategy, adjusted_usd: f64) -> Self {
         self.passing.push((strategy, adjusted_usd));
+        self
+    }
+
+    /// `strategy`'s plan quoted at `usd` and `first_output_ms`, with every M3
+    /// term applied.
+    pub fn corrected(mut self, strategy: Strategy, usd: f64, first_output_ms: f64) -> Self {
+        self.corrected.push((strategy, usd, first_output_ms));
         self
     }
 
@@ -204,6 +217,21 @@ impl Spec {
                 if let Some((_, usd)) = self.passing.iter().find(|(pass, _)| pass == strategy) {
                     plan.gate.result = GateResult::Pass;
                     plan.cost.adjusted_usd = *usd;
+                }
+                if let Some((_, usd, ms)) =
+                    self.corrected.iter().find(|(named, ..)| named == strategy)
+                {
+                    plan.cost = CostEvidence {
+                        quoted_usd: *usd,
+                        adjusted_usd: *usd,
+                        correction: CostCorrection::Applied,
+                    };
+                    plan.ttft = TtftEvidence {
+                        quoted_ms: *ms,
+                        adjusted_ms: *ms,
+                        residual: LatencyTerm::Applied { mean_ms: 0 },
+                        overhead: LatencyTerm::Applied { mean_ms: 0 },
+                    };
                 }
                 plan
             })

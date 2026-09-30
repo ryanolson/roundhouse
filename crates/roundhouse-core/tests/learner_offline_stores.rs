@@ -131,6 +131,60 @@ async fn unreadable_index_members_are_counted_as_an_exclusion_cause() {
     );
 }
 
+/// A session store double whose index pages list sessions against byte
+/// order, the order a store with another index layout may use.
+struct Reversed(MemoryStore);
+
+#[async_trait]
+impl Delegating for Reversed {
+    type Backend = MemoryStore;
+
+    fn backend(&self) -> &MemoryStore {
+        &self.0
+    }
+
+    async fn learning_sessions(
+        &self,
+        after: Option<&LearningCursor>,
+        limit: NonZeroUsize,
+    ) -> Result<LearningPage, StoreError> {
+        let mut page = self.0.learning_sessions(after, limit).await?;
+        page.sessions.reverse();
+        page.unreadable.reverse();
+        Ok(page)
+    }
+}
+
+/// `read_source` sorts what enumeration returns, so the logs, the manifest
+/// and every byte after them are in byte order of the session ids whatever
+/// order the index answered in. The byte-identity test sorts its own logs, so
+/// it cannot hold this.
+#[tokio::test]
+async fn read_source_reads_sessions_in_byte_order_whatever_the_index_order() {
+    let a = learned("acme/ada/a#g0", &[true]);
+    let b = learned("acme/ada/b#g0", &[true]);
+    let c = learned("acme/ada/c#g0", &[true]);
+    let store = Reversed(store_with(&[&a, &b, &c]).await);
+    let forward = store
+        .0
+        .learning_sessions(None, NonZeroUsize::new(16).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(forward.sessions.len(), 3);
+    let source = read_source(&store, &ProjectId::new("acme"), None)
+        .await
+        .unwrap();
+    let read: Vec<&SessionId> = source.logs.iter().map(|log| &log.session).collect();
+    assert_eq!(read, vec![&a.session, &b.session, &c.session]);
+    let pinned: Vec<&SessionId> = source
+        .input
+        .sessions
+        .iter()
+        .map(|pin| &pin.session)
+        .collect();
+    assert_eq!(pinned, read);
+}
+
 /// A session store double that counts every call that writes, leases, or
 /// touches the pending set.
 struct Watched {
