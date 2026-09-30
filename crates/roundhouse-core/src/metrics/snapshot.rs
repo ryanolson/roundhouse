@@ -14,9 +14,12 @@
 //! to be local *and* to have been billed is a row that can lie about the one
 //! number this whole feature exists to report.
 
+mod agreement;
 mod columns;
 mod cost;
 mod local;
+
+pub use agreement::{TierAgreement, TierDisagreements};
 
 pub use columns::{
     CacheReuseEvidence, FIRST_OUTPUT_BASIS, IntervalMetric, OBSERVED_CACHE_BASIS,
@@ -837,7 +840,7 @@ impl MetricsSnapshot {
 
         // Off the same scope the rows came from, so a tenant's document carries
         // its own evaluation spend and its neighbours' is unreachable from it.
-        let evaluation = EvaluationMetrics::build(&fold.evaluation(scope));
+        let evaluation = EvaluationMetrics::build(&fold.evaluation(scope), &fold.agreement(scope));
         // Added here and in no other place. `frontier_spend_usd` already holds
         // every judge side call, on the model row that billed it, so an
         // evaluation call that had also been folded as a side call would charge

@@ -186,7 +186,7 @@ async fn a_body_over_the_transport_bound_is_refused_before_the_hold() {
 async fn prior_classifications_reach_the_service_as_metadata() {
     use roundhouse_core::classify::{
         AvailableClassification, ClassificationRef, ContextDependence, Graded, TAXONOMY_VERSION,
-        TurnClassification, TurnComplexity, TurnIntent,
+        TierChoice, TurnClassification, TurnComplexity, TurnIntent,
     };
 
     let (addr, up) = upstream(ANSWER).await;
@@ -214,6 +214,10 @@ async fn prior_classifications_reach_the_service_as_metadata() {
                 value: ContextDependence::SelfContained,
                 confidence: 0.7,
             },
+            tier: Some(Graded {
+                value: TierChoice::Capable,
+                confidence: 0.7,
+            }),
         },
     }];
     let projection = shadow.projection(&capture(), &prior, &[]).expect("it fits");

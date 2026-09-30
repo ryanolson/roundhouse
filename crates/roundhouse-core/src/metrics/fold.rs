@@ -41,6 +41,7 @@ use crate::event::{
     ValidationOutcome,
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
+use crate::metrics::agreement::{AgreementCounts, AgreementFold};
 use crate::metrics::cache_evidence::CacheEvidence;
 use crate::metrics::evaluation::{EvaluationFold, EvaluationView};
 use crate::metrics::pricing::TokenShape;
@@ -557,6 +558,10 @@ pub struct MetricsFold {
     /// and must never reach a serving row. See [`super::evaluation`], which
     /// documents its own retention.
     evaluation: EvaluationFold,
+    /// The served tier against the classifier's tier pick, beside the
+    /// evaluation fold because it books only results that fold accepted. See
+    /// [`super::agreement`], which documents its own bound.
+    agreement: AgreementFold,
 }
 
 /// The volume figures a snapshot carries that are not per-model.
@@ -724,6 +729,8 @@ impl MetricsFold {
                         .declared_baseline
                         .observe(named);
                 }
+                self.agreement
+                    .routed(&event.session_id, response_id, decision);
                 self.pending.insert(
                     response_id.clone(),
                     Pending {
@@ -914,6 +921,17 @@ impl MetricsFold {
                     .abandoned_side_calls += 1;
             }
             SessionEventKind::ValidationDecided { arm, outcome, .. } => {
+                // The label a review gave the turns it covered, for the
+                // agreement join. Taken as written: the session's own review
+                // tracker verifies membership, and this projection has no copy
+                // of the spans it would verify against.
+                if let ValidationOutcome::Judged {
+                    interval: Some(review),
+                    ..
+                } = outcome
+                {
+                    self.agreement.reviewed(&event.session_id, &payer, review);
+                }
                 let tally = self
                     .validations
                     .entry(payer)
@@ -958,11 +976,19 @@ impl MetricsFold {
             // savings claim is computed from. The payer is the session's, from
             // its `SessionCreated` above, and never anything the classifier
             // record carries.
+            // The agreement join follows the evaluation join rather than
+            // keeping one of its own: a result delivered twice, or one naming
+            // an intent it does not answer, is refused there, and booking its
+            // tier answer anyway would count one classification twice.
             SessionEventKind::ClassificationRequested { record } => {
-                self.evaluation.requested(&event.session_id, &payer, record);
+                if self.evaluation.requested(&event.session_id, &payer, record) {
+                    self.agreement.requested(&event.session_id, &payer, record);
+                }
             }
             SessionEventKind::ClassificationRecorded { record } => {
-                self.evaluation.recorded(&event.session_id, &payer, record);
+                if self.evaluation.recorded(&event.session_id, &payer, record) {
+                    self.agreement.recorded(&event.session_id, &payer, record);
+                }
             }
             SessionEventKind::ClassificationSettlementRepaired { record } => {
                 self.evaluation.repaired(&event.session_id, &payer, record);
@@ -1142,6 +1168,14 @@ impl MetricsFold {
     /// is how the two would eventually be summed.
     pub(super) fn evaluation(&self, scope: Scope<'_>) -> EvaluationView {
         self.evaluation.tally(scope)
+    }
+
+    /// The served tier against the classifier's tier pick, in one scope.
+    ///
+    /// Scoped through the same [`Scope`] for [`Self::validation_tally`]'s
+    /// reason.
+    pub(super) fn agreement(&self, scope: Scope<'_>) -> AgreementCounts {
+        self.agreement.tally(scope)
     }
 
     /// Side calls made and abandoned, in one scope.

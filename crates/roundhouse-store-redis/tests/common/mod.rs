@@ -26,7 +26,7 @@ pub mod fair_use;
 use roundhouse_core::classify::{
     ClassificationIntent, ClassificationOutcome, ClassificationRecord,
     ClassificationSettlementRepair, ClassifierIdentity, ContextDependence, EvaluationSpend,
-    EvaluationUsage, Graded, ReservationRecord, SettlementAck, TAXONOMY_VERSION,
+    EvaluationUsage, Graded, ReservationRecord, SettlementAck, TAXONOMY_VERSION, TierChoice,
     TurnClassification, TurnComplexity, TurnIntent,
 };
 use roundhouse_core::control::{BudgetState, BudgetWindow, Principal};
@@ -356,6 +356,10 @@ pub fn every_event_kind() -> Vec<SessionEventKind> {
                             value: ContextDependence::Recent,
                             confidence: 0.5,
                         },
+                        tier: Some(Graded {
+                            value: TierChoice::Capable,
+                            confidence: 0.7,
+                        }),
                     },
                     spend: EvaluationSpend::Measured {
                         granted_usd: 0.0004,

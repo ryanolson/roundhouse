@@ -509,6 +509,22 @@ mod tests {
         panic!("`{name}`'s body never closes its own braces")
     }
 
+    /// Whether `body` reads `object.field` as a whole token.
+    ///
+    /// A substring match is satisfied by a longer name that merely starts with
+    /// the one wanted — `a.disagree` by `a.disagreements`, `a.agree` by
+    /// `data.agree` — so a tile that dropped the field would still pass. Both
+    /// ends are checked against JavaScript identifier characters.
+    fn reads_field(body: &str, object: &str, field: &str) -> bool {
+        let is_ident = |ch: char| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$';
+        let needle = format!("{object}.{field}");
+        body.match_indices(&needle).any(|(at, _)| {
+            let before = body[..at].chars().next_back();
+            let after = body[at + needle.len()..].chars().next();
+            !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+        })
+    }
+
     /// The page reads only fields the document publishes, under those names.
     ///
     /// The one failure this catches is silent in both directions: a renamed JSON
@@ -604,6 +620,35 @@ mod tests {
                 "the evaluation table publishes `{field}` and does not render it"
             );
             assert!(row.get(field).is_some(), "the row lost `{field}`: {row}");
+        }
+
+        // The agreement tile reads its block off bound locals as well, so its
+        // fields are named here: every count the document publishes is one
+        // the tile prints, or a disagreement's review label goes unseen.
+        let agreement = &json["evaluation"]["agreement"];
+        let tile = function_body(DASHBOARD_HTML, "renderAgreement");
+        assert!(
+            evaluation_table.contains("renderAgreement(data.evaluation.agreement)"),
+            "the evaluation panel must render the agreement block"
+        );
+        for field in ["answered", "agree", "disagree", "not_comparable"] {
+            assert!(agreement.get(field).is_some(), "no `{field}`: {agreement}");
+            assert!(reads_field(tile, "a", field), "the tile drops `{field}`");
+        }
+        for field in [
+            "jev_capable_served_efficient",
+            "jev_efficient_served_capable",
+            "positive",
+            "negative",
+            "unknown",
+            "unlabeled",
+            "evicted",
+        ] {
+            assert!(
+                agreement["disagreements"].get(field).is_some(),
+                "no `disagreements.{field}`: {agreement}"
+            );
+            assert!(reads_field(tile, "d", field), "the tile drops `{field}`");
         }
 
         // A serving row states whether the catalog priced it, and the page

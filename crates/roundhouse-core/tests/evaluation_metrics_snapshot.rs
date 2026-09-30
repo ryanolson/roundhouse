@@ -337,6 +337,7 @@ fn classification() -> TurnClassification {
             value: ContextDependence::Recent,
             confidence: 0.7,
         },
+        tier: None,
     }
 }
 

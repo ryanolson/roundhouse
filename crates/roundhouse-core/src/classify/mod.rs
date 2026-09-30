@@ -10,7 +10,7 @@
 //! is the frontier review interval (`PLAN-routing-strategy-bandit.md`), and it is
 //! a different thing arriving on a different event.
 //!
-//! ## Why a taxonomy rather than a tier
+//! ## Why a taxonomy, and a tier beside it
 //!
 //! The adapter that shipped first asked one question — capable or efficient —
 //! which is a *routing* answer wearing a classification's clothes: it names the
@@ -19,12 +19,19 @@
 //! turn and leave the mapping to code, which is the same rule
 //! [`validate::brief`](crate::validate::brief) holds for the judge.
 //!
-//! Each axis offers `unknown` as a real option, and that is deliberate: a
-//! classifier that cannot tell must be able to say so. It is **not** the same
+//! Taxonomy 2 asks the tier question again, *beside* the three axes and in the
+//! same request, for a different job: it is the classifier's own pick, recorded
+//! so the metrics document can say how often the served tier agreed with it
+//! (2026-09-28 addendum, "Jev as a scout"). It describes the work, never a
+//! model, and it replaces none of the axes. See [`TierChoice`].
+//!
+//! Each taxonomy axis offers `unknown` as a real option, and that is deliberate:
+//! a classifier that cannot tell must be able to say so. It is **not** the same
 //! state as a call that produced no usable answer set — that one is
 //! [`ClassificationOutcome::Unusable`] and carries no classification at all.
 //! Collapsing the two would read "the model could not tell" and "nobody asked"
 //! as one fact, and a feature built from the pair would learn from the wrong one.
+//! The tier question offers only its two tiers; see [`TierChoice`] for why.
 //!
 //! ## Versions on every record
 //!
@@ -43,19 +50,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::BudgetWindow;
 use crate::ids::ResponseId;
+use crate::routing::Tier;
 use crate::routing::ledger::ProviderPricing;
 
 pub use projection::{ProjectionCaps, PromptOrigin, TurnProjection};
 
 /// The revision of the option sets below and of what each option means.
-pub const TAXONOMY_VERSION: u32 = 1;
+///
+/// Revision 2 added the tier question ([`TierChoice`]). A revision-1 record
+/// carries no tier answer and decodes with [`TurnClassification::tier`] unset.
+pub const TAXONOMY_VERSION: u32 = 2;
 
 /// One axis of the taxonomy: the key it is asked under, and its options.
 ///
-/// **A trait rather than three hand-written enums, one per axis.** "Every
+/// **A trait rather than hand-written enums, one per axis.** "Every taxonomy
 /// axis offers `unknown`" and "every option label round-trips" are properties
-/// one test can assert once, over all three axis types, instead of three
-/// times against three near-identical bodies.
+/// one test can assert once, over every axis type, instead of once per axis
+/// against near-identical bodies.
 ///
 /// **`OPTIONS` is the one table each axis itself writes, not three.** It is
 /// the single place a label, its rubric and the variant it parses to are
@@ -237,6 +248,64 @@ impl ClassificationAxis for ContextDependence {
     ];
 }
 
+/// Which tier of work the classifier would give the turn.
+///
+/// **The one routing-shaped question, asked about the work and never about a
+/// model.** The three axes above describe the turn and leave the mapping to
+/// code; this one asks the classifier to make the mapping itself, so that the
+/// served tier can be compared with it (2026-09-28 addendum, "Jev as a scout").
+/// The rubric describes kinds of work, and no option names a model, a target
+/// or a price: the 2026-09-17 ruling, section 2, allowed exactly this question
+/// on that condition.
+///
+/// **No `unknown` option, unlike the axes above.** The question is a choice
+/// between the two tiers a recipe has, and a third answer would have no tier to
+/// compare against. A classifier that cannot tell still has to pick, and its
+/// confidence says how sure it was.
+///
+/// **A scout, never a reward.** Nothing reads this answer as evidence that a
+/// route was good. It is compared with the served tier in the metrics document,
+/// and the frontier review stays the only quality signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierChoice {
+    /// Work that needs careful reasoning.
+    Capable,
+    /// Routine, well-specified work.
+    Efficient,
+}
+
+impl TierChoice {
+    /// The recipe tier this answer names.
+    pub fn tier(self) -> Tier {
+        match self {
+            Self::Capable => Tier::Capable,
+            Self::Efficient => Tier::Efficient,
+        }
+    }
+}
+
+impl ClassificationAxis for TierChoice {
+    const KEY: &'static str = "tier";
+    const INSTRUCTIONS: &'static str =
+        "Does this turn need careful reasoning, or is it routine work with a clear path?";
+    const OPTIONS: &'static [(Self, &'static str, &'static str)] = &[
+        (
+            Self::Capable,
+            "capable",
+            "Careful multi-step reasoning: an ambiguous or open-ended request, a subtle \
+             failure to diagnose, or a change whose approach has to be worked out and \
+             checked across several places",
+        ),
+        (
+            Self::Efficient,
+            "efficient",
+            "Routine, well-specified work: a small or mechanical change, a direct \
+             question, or a step whose approach is already clear from the request",
+        ),
+    ];
+}
+
 /// One axis's answer and the statistic the classifier published about it.
 ///
 /// `confidence` is an observation about a distribution and never a measure of
@@ -256,6 +325,13 @@ pub struct TurnClassification {
     pub intent: Graded<TurnIntent>,
     pub complexity: Graded<TurnComplexity>,
     pub context_dependence: Graded<ContextDependence>,
+    /// Which tier the classifier would give the turn. See [`TierChoice`].
+    ///
+    /// Always set under taxonomy 2, where a reply without it is unusable, and
+    /// `None` on every record written under taxonomy 1. Skipped on the wire
+    /// when absent, so those records keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<Graded<TierChoice>>,
 }
 
 /// What a classifier call billed, as the service reported it.

@@ -217,6 +217,10 @@ async fn a_settle_that_never_answers_leaves_the_measured_spend_unconfirmed() {
                     value: ContextDependence::Recent,
                     confidence: 0.55
                 },
+                tier: Some(Graded {
+                    value: TierChoice::Capable,
+                    confidence: 0.7,
+                }),
             },
             spend: EvaluationSpend::Measured {
                 usage: EvaluationUsage {

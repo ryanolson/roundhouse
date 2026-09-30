@@ -418,6 +418,11 @@ that the API does not have, so a hard refresh loses nothing.
         <div class="split-value" id="eval-settled">$0.00</div>
         <div class="split-note" id="eval-settled-note"></div>
       </div>
+      <div class="split-item">
+        <div class="split-label">Tier agreement <span class="chip">not a quality score</span></div>
+        <div class="split-value" id="eval-agreement">—</div>
+        <div class="split-note" id="eval-agreement-note"></div>
+      </div>
     </div>
     <div class="scroll">
       <table>
@@ -763,6 +768,8 @@ that the API does not have, so a hard refresh loses nothing.
       + ` · ${nf.format(data.evaluation.settlement.unconfirmed_calls)} unconfirmed, worth `
       + usd(data.evaluation.settlement.unconfirmed_usd);
 
+    renderAgreement(data.evaluation.agreement);
+
     const body = $("evaluation-models");
     body.textContent = "";
     const rows = data.evaluation.models;
@@ -795,6 +802,27 @@ that the API does not have, so a hard refresh loses nothing.
       tr.appendChild(cell(usd(m.measured_usd), "num"));
       body.appendChild(tr);
     }
+  }
+
+  // How often the served tier matched the classifier's pick. Agreement is not
+  // correctness, so each disagreement is shown with what the covering review
+  // said, which is the only quality signal on this page.
+  function renderAgreement(a) {
+    if (a.answered === 0) {
+      $("eval-agreement").textContent = "—";
+      $("eval-agreement-note").textContent = "No tier answers yet.";
+      return;
+    }
+    const d = a.disagreements;
+    $("eval-agreement").textContent = `${nf.format(a.agree)} of ${nf.format(a.answered)}`;
+    $("eval-agreement-note").textContent =
+      `${nf.format(a.disagree)} disagreed`
+      + ` (${nf.format(d.jev_capable_served_efficient)} picked capable, served efficient;`
+      + ` ${nf.format(d.jev_efficient_served_capable)} picked efficient, served capable)`
+      + ` · reviews of those: ${nf.format(d.positive)} positive, ${nf.format(d.negative)} negative,`
+      + ` ${nf.format(d.unknown)} unknown, ${nf.format(d.unlabeled)} not yet reviewed`
+      + (d.evicted > 0 ? ` (${nf.format(d.evicted)} no longer tracked)` : "")
+      + (a.not_comparable > 0 ? ` · ${nf.format(a.not_comparable)} with no served tier to compare` : "");
   }
 
   function emptyRow(span, text) {

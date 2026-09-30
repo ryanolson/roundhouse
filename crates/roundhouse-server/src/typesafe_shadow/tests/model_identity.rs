@@ -57,7 +57,8 @@ async fn the_service_reported_model_identity_must_survive_into_the_durable_recor
         r#"{{"model":"{REPORTED_MODEL}","answers":{{
   "intent":{{"type":"choice","choice":"implement","probabilities":{{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05}},"confidence":0.82}},
   "complexity":{{"type":"choice","choice":"involved","probabilities":{{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1}},"confidence":0.61}},
-  "context_dependence":{{"type":"choice","choice":"recent","probabilities":{{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1}},"confidence":0.55}}
+  "context_dependence":{{"type":"choice","choice":"recent","probabilities":{{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1}},"confidence":0.55}},
+  "tier":{{"type":"choice","choice":"capable","probabilities":{{"capable":0.7,"efficient":0.3}},"confidence":0.7}}
 }},"usage":{{"input_tokens":312,"output_tokens":48}}}}"#
     );
     let (addr, up) = upstream(Box::leak(answer.into_boxed_str())).await;
@@ -132,7 +133,8 @@ async fn malformed_model_metadata_does_not_discard_reported_usage() {
     const ANSWER_MALFORMED_MODEL: &str = r#"{"model":42,"answers":{
   "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
   "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
-  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55},
+  "tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.7,"efficient":0.3},"confidence":0.7}
 },"usage":{"input_tokens":312,"output_tokens":48}}"#;
     let (addr, up) = upstream(ANSWER_MALFORMED_MODEL).await;
     let credential = credential();
@@ -168,7 +170,8 @@ async fn an_echoed_synthetic_credential_never_reaches_the_durable_record() {
         r#"{{"model":"{KEY}","answers":{{
   "intent":{{"type":"choice","choice":"implement","probabilities":{{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05}},"confidence":0.82}},
   "complexity":{{"type":"choice","choice":"involved","probabilities":{{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1}},"confidence":0.61}},
-  "context_dependence":{{"type":"choice","choice":"recent","probabilities":{{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1}},"confidence":0.55}}
+  "context_dependence":{{"type":"choice","choice":"recent","probabilities":{{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1}},"confidence":0.55}},
+  "tier":{{"type":"choice","choice":"capable","probabilities":{{"capable":0.7,"efficient":0.3}},"confidence":0.7}}
 }},"usage":{{"input_tokens":312,"output_tokens":48}}}}"#
     );
     let (addr, up) = upstream(Box::leak(answer.into_boxed_str())).await;
@@ -203,5 +206,6 @@ async fn an_echoed_synthetic_credential_never_reaches_the_durable_record() {
 const ANSWER_NO_MODEL_FIELD: &str = r#"{"answers":{
   "intent":{"type":"choice","choice":"implement","probabilities":{"implement":0.5,"diagnose":0.2,"explain":0.1,"review":0.1,"operate":0.05,"unknown":0.05},"confidence":0.82},
   "complexity":{"type":"choice","choice":"involved","probabilities":{"trivial":0.1,"routine":0.2,"involved":0.5,"deep":0.1,"unknown":0.1},"confidence":0.61},
-  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55}
+  "context_dependence":{"type":"choice","choice":"recent","probabilities":{"self_contained":0.2,"recent":0.5,"deep":0.2,"unknown":0.1},"confidence":0.55},
+  "tier":{"type":"choice","choice":"capable","probabilities":{"capable":0.7,"efficient":0.3},"confidence":0.7}
 },"usage":{"input_tokens":312,"output_tokens":48}}"#;

@@ -40,7 +40,8 @@ use roundhouse_core::classify::{
     AvailableClassification, ClassificationAxis, ClassificationIntent, ClassificationOutcome,
     ClassificationRecord, ClassifierIdentity, ContextDependence, EvaluationSpend, EvaluationUsage,
     FundingRefusal, Graded, PriorTurnMetadata, ProjectionCaps, ReservationRecord, SettlementAck,
-    TAXONOMY_VERSION, TurnClassification, TurnComplexity, TurnIntent, UnconfirmedSettlement,
+    TAXONOMY_VERSION, TierChoice, TurnClassification, TurnComplexity, TurnIntent,
+    UnconfirmedSettlement,
 };
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::{
@@ -243,12 +244,17 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         &self.config
     }
 
-    /// The questions this module asks: one per taxonomy axis, in one request.
+    /// The questions this module asks: one per taxonomy axis and the tier
+    /// question, in one request.
     ///
-    /// **About the turn, never about the models.** No option here is a model id,
-    /// a tier or a price — the same rule `validate::brief` holds for the judge,
-    /// and for the same reason: the routing question is asked exactly once, of
-    /// code. What comes back describes the work, and a selector maps it.
+    /// **About the work, never about the models.** No option or rubric here
+    /// names a model id, a target or a price — the same rule `validate::brief`
+    /// holds for the judge. The three taxonomy axes describe the turn and leave
+    /// the mapping to code. The tier question ([`TierChoice`]) asks which tier
+    /// of *work* the turn is, `capable` or `efficient`, with a rubric that
+    /// describes kinds of work: the 2026-09-17 ruling, section 2, allowed
+    /// exactly that question. Its answer is compared with the served tier on
+    /// the metrics document and never routes a turn or rewards one.
     ///
     /// Built from the axis definitions rather than written out, so a new option
     /// is added in one place and the request, the parser and the durable record
@@ -270,6 +276,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
             axis::<TurnIntent>(),
             axis::<TurnComplexity>(),
             axis::<ContextDependence>(),
+            axis::<TierChoice>(),
         ])
     }
 
@@ -614,12 +621,13 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         }
     }
 
-    /// Every axis, or nothing.
+    /// Every axis and the tier answer, or nothing.
     ///
     /// **All or nothing, deliberately.** A partial taxonomy is not a weaker
     /// classification, it is a different one: a record missing its context axis
     /// would be indistinguishable from one whose context axis is `unknown`, and
-    /// those are the two states this vocabulary exists to keep apart.
+    /// those are the two states this vocabulary exists to keep apart. Under
+    /// taxonomy 2 the tier answer is part of the set.
     fn read(answers: &BTreeMap<String, ChoiceAnswer>) -> Option<TurnClassification> {
         fn axis<A: ClassificationAxis>(
             answers: &BTreeMap<String, ChoiceAnswer>,
@@ -635,6 +643,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
             intent: axis::<TurnIntent>(answers)?,
             complexity: axis::<TurnComplexity>(answers)?,
             context_dependence: axis::<ContextDependence>(answers)?,
+            tier: Some(axis::<TierChoice>(answers)?),
         })
     }
 
