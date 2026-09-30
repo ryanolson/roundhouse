@@ -404,12 +404,15 @@ async fn a_tier_turn_commits_the_features_the_selector_actually_saw() {
     // --- the recipe -------------------------------------------------------
     let evidence = stage_evidence(&selection);
     assert_eq!(
-        evidence.capable,
+        evidence.recipe.capable,
         vec![format!("{PRIMARY}/m"), format!("{SECONDARY}/m")]
     );
-    assert_eq!(evidence.efficient, vec![format!("{THRIFTY}/m")]);
-    assert_eq!(evidence.picker, PickerMode::EfficientFirst);
-    assert_eq!(evidence.confidence_threshold, DEFAULT_CONFIDENCE_THRESHOLD);
+    assert_eq!(evidence.recipe.efficient, vec![format!("{THRIFTY}/m")]);
+    assert_eq!(evidence.recipe.picker, PickerMode::EfficientFirst);
+    assert_eq!(
+        evidence.recipe.confidence_threshold,
+        DEFAULT_CONFIDENCE_THRESHOLD
+    );
     assert_eq!(evidence.pick.tier, Tier::Capable);
     assert_eq!(evidence.pick.source, DecisionSource::Dimensions);
     assert!(
@@ -734,26 +737,26 @@ async fn a_later_turn_under_a_changed_recipe_leaves_the_earlier_record_alone() {
     // The first turn still carries the first turn's recipe.
     let first_evidence = stage_evidence(&first);
     assert_eq!(
-        first_evidence.capable,
+        first_evidence.recipe.capable,
         vec![format!("{PRIMARY}/m"), format!("{SECONDARY}/m")],
         "the recipe in force when this turn was routed, not the one in force \
          when the log is read"
     );
-    assert_eq!(first_evidence.picker, PickerMode::EfficientFirst);
+    assert_eq!(first_evidence.recipe.picker, PickerMode::EfficientFirst);
     assert_eq!(
-        first_evidence.confidence_threshold,
+        first_evidence.recipe.confidence_threshold,
         DEFAULT_CONFIDENCE_THRESHOLD
     );
 
     // And the second carries the second's, so neither is a shared default.
     let second_evidence = stage_evidence(&second);
-    assert_eq!(second_evidence.capable, vec![format!("{THRIFTY}/m")]);
+    assert_eq!(second_evidence.recipe.capable, vec![format!("{THRIFTY}/m")]);
     assert_eq!(
-        second_evidence.efficient,
+        second_evidence.recipe.efficient,
         vec![format!("{SECONDARY}/m"), format!("{PRIMARY}/m")]
     );
-    assert_eq!(second_evidence.picker, PickerMode::CapableFirst);
-    assert_eq!(second_evidence.confidence_threshold, 0.95);
+    assert_eq!(second_evidence.recipe.picker, PickerMode::CapableFirst);
+    assert_eq!(second_evidence.recipe.confidence_threshold, 0.95);
 
     // The features moved with the turn, not with the reader.
     assert_eq!(first.features.turn_index, 0);

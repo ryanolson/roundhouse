@@ -31,6 +31,7 @@
 //! absorbs its pre-alpha churn: `Algorithm::route`'s return type and the
 //! `Step`/`Driver` vocabulary each changed shape during one week of 2026-08.
 
+pub mod learn;
 pub mod ledger;
 pub mod policy;
 pub mod selection;
@@ -42,8 +43,9 @@ pub use ledger::{
 };
 pub use policy::{AffinityPolicy, EscalationPolicy};
 pub use selection::{
-    AffinityEvidence, FEATURE_EXTRACTOR_REVISION, LocalFeatures, SelectionSnapshot, SelectorBranch,
-    SelectorSnapshot, StageEvidence, StageOutcome,
+    AffinityEvidence, FEATURE_EXTRACTOR_REVISION, LEARNED_SELECTOR_REVISION, LocalFeatures,
+    RecipeEvidence, SelectionSnapshot, SelectorBranch, SelectorSnapshot, StageEvidence,
+    StageOutcome,
 };
 pub use stage::{
     DecisionSource, Pick, PickerMode, StagePolicy, Tier, TierRecipe, TierRecipeError, TurnSignals,
@@ -346,7 +348,7 @@ impl<'a> Admitted<'a> {
     /// be asking two callers to disclaim a concept they do not have.
     ///
     /// **`source` is derived from `evidence`, not a separate argument.**
-    /// [`StageEvidence::source`] is the one place that rule lives; taking a
+    /// [`StageOutcome::source`] is the one place that rule lives; taking a
     /// `DecisionSource` here as well would let a caller pass one that
     /// disagrees with the evidence recorded beside it.
     ///

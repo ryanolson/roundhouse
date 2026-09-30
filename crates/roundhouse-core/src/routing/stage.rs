@@ -118,7 +118,9 @@ pub const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.5;
 /// Two, not three, and that is upstream's shape rather than a simplification of
 /// it: the axis is "is this turn worth the capable model", which has one answer
 /// and its negation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
     Efficient,
@@ -182,7 +184,8 @@ impl PickerMode {
 /// fall-open ([`Self::Ambiguous`]) is not — narrating one would tell a model the
 /// cheap tier had been stalling on a turn where nothing said it was.
 /// [`Self::CostGuard`] is the second non-narrating source, for the same reason:
-/// it reaches the capable tier on price, not on trouble.
+/// it reaches the capable tier on price, not on trouble. [`Self::Strategy`] is
+/// the third: a learned strategy forced the tier, and no signal said anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionSource {
@@ -201,6 +204,10 @@ pub enum DecisionSource {
     /// capable one served. See `StagePolicy::resolve` for why a cheaper
     /// capable candidate dominates.
     CostGuard,
+    /// A learned serving strategy forced the tier: always efficient or always
+    /// capable, whatever the signals said. See
+    /// [`learn::Strategy::pick`](super::learn::Strategy::pick).
+    Strategy,
 }
 
 impl DecisionSource {
@@ -211,6 +218,7 @@ impl DecisionSource {
             DecisionSource::Dimensions => "dimensions",
             DecisionSource::Ambiguous => "ambiguous",
             DecisionSource::CostGuard => "cost_guard",
+            DecisionSource::Strategy => "strategy",
         }
     }
 
@@ -225,6 +233,11 @@ impl DecisionSource {
     /// land a turn on the capable tier: the signals picked the *cheap* tier and
     /// a quote redirected it, so a note claiming the previous model had been in
     /// trouble would be telling the capable model something nothing measured.
+    ///
+    /// [`Self::Strategy`] is outside it for the same reason: a strategy that
+    /// always picks capable reaches the capable tier on every turn it serves,
+    /// and narrating that would tell the model the cheap tier had been in
+    /// trouble on turns where no signal fired.
     pub fn is_signal_driven(self) -> bool {
         matches!(self, DecisionSource::Override | DecisionSource::Dimensions)
     }
@@ -707,11 +720,11 @@ impl StagePolicy {
     /// What narrowing the picked tier against the admitted pool comes to.
     ///
     /// **Pure, and returns the outcome rather than a tuple of locals for
-    /// `choose` to rebuild it from.** Reassigned locals, a shadow-recorded
+    /// `route_pick` to rebuild it from.** Reassigned locals, a shadow-recorded
     /// `source` and `displaced`, and a boolean gating the guard are four
     /// pieces of state a reader would have to check still agreed by the time
     /// the rationale and the evidence each read their own subset of them.
-    /// `Resolved` is the one place that agreement is structural: `choose`
+    /// `Resolved` is the one place that agreement is structural: `route_pick`
     /// reads fields off a single returned value instead.
     ///
     /// **Three straight-line returns, not a tuple assembled up front and
@@ -772,7 +785,7 @@ impl StagePolicy {
             {
                 // The prices live in the log line and never in the rationale:
                 // the rationale is republished into the calling model's own
-                // context by `explain_last_route` (see `choose`'s `format!`).
+                // context by `explain_last_route` (see `route_pick`'s `format!`).
                 tracing::debug!(
                     displaced = %head.target.policy_identity(),
                     displaced_cost_usd = head.expected_cost_usd,
@@ -937,7 +950,6 @@ impl RoutingPolicy for StagePolicy {
         // empties, and the overflow valve -- is the shared code every policy
         // reaches.
         let admitted = ctx.admissible(None)?;
-        let pool = admitted.pool();
 
         // Absent signals are the first turn of a session, and they score to the
         // picker default through the ordinary arithmetic rather than through a
@@ -945,9 +957,35 @@ impl RoutingPolicy for StagePolicy {
         // no depth, so the scorer returns zero and the fall-open takes it.
         let signals = ctx.signals.cloned().unwrap_or_default();
         let pick = pick_tier(&signals, recipe.picker(), recipe.confidence_threshold());
+        Self::route_pick(recipe, pick, &admitted)
+    }
+}
 
+impl StagePolicy {
+    /// Turn a tier pick into a plan over one admitted pool: the served target
+    /// and its ordered fallbacks.
+    ///
+    /// **Everything after the pick, and nothing before it.** [`Self::choose`]
+    /// is admission, then [`pick_tier`], then this; a learned strategy is
+    /// admission, then its own pick, then this. One function is what keeps the
+    /// recipe order, the dominance cost guard, its fallback order, and
+    /// degrade-to-local identical for every strategy: a second copy of the
+    /// routing for a forced pick would be a second rule that drifts, and the
+    /// learner's quality evidence for a strategy is only evidence about the
+    /// plan this function builds.
+    ///
+    /// Admission is the caller's, taken once, so every strategy of one turn is
+    /// planned over the same pool and the same budget state. `pick.source`
+    /// travels into the evidence unchanged, which is how a forced pick keeps
+    /// its [`DecisionSource::Strategy`] and stays out of the handoff note.
+    pub fn route_pick(
+        recipe: &TierRecipe,
+        pick: Pick,
+        admitted: &Admitted<'_>,
+    ) -> Result<Decision, RoutingError> {
+        let pool = admitted.pool();
         let (served, outcome, ordered, guarded) = match Self::resolve(recipe, pick, pool) {
-            Resolved::Degrade => return Self::degrade_past_the_recipe(recipe, pick, &admitted),
+            Resolved::Degrade => return Self::degrade_past_the_recipe(recipe, pick, admitted),
             Resolved::Tier {
                 served,
                 outcome,
@@ -956,7 +994,7 @@ impl RoutingPolicy for StagePolicy {
             } => (served, outcome, ordered, guarded),
         };
         // The evidence is built once and read from, rather than a `source`
-        // recomputed here beside it: `StageEvidence::source` is the rule's one
+        // recomputed here beside it: `StageOutcome::source` is the rule's one
         // home, so `Decision.source` (set inside `decide_staged`, below) and
         // the rationale's own `by {}` cannot come to name two different
         // things. `None` is unreachable on this path in practice --

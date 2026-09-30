@@ -9,7 +9,7 @@
 //! different times:
 //!
 //! - the **served tier**, on the turn's last `Routed`, as the recipe tier of the
-//!   dispatched target ([`StageEvidence::tier_of`]);
+//!   dispatched target ([`SelectorBranch::tier_of`](crate::routing::SelectorBranch::tier_of));
 //! - the **classifier's pick**, on a `ClassificationRecorded` a later turn's
 //!   writer delivers;
 //! - the **review label**, on a `ValidationDecided` whose interval covers the
@@ -50,7 +50,7 @@ use crate::classify::{ClassificationIntent, ClassificationRecord, TierChoice};
 use crate::control::PrincipalKey;
 use crate::ids::{ResponseId, SessionId};
 use crate::metrics::fold::Scope;
-use crate::routing::{DecisionRecord, SelectorBranch, Tier};
+use crate::routing::{DecisionRecord, Tier};
 use crate::session::MAX_REVIEW_DECISIONS;
 use crate::validate::{IntervalLabel, IntervalReview};
 
@@ -334,8 +334,5 @@ impl AgreementFold {
 /// recipe made.
 fn served_tier(decision: &DecisionRecord) -> Option<Tier> {
     let selector = decision.selection.as_ref()?.selector.as_ref()?;
-    match &selector.branch {
-        SelectorBranch::Stage(evidence) => evidence.tier_of(&decision.chosen),
-        SelectorBranch::Affinity(_) | SelectorBranch::EscalationAudit { .. } => None,
-    }
+    selector.branch.tier_of(&decision.chosen)
 }
