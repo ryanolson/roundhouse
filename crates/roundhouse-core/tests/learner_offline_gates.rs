@@ -21,8 +21,8 @@ use roundhouse_core::routing::learn::offline::{
     Source, TestResult, assemble, corrected_cost, corrected_first_output, paired_quality,
 };
 use roundhouse_core::routing::learn::{
-    CostCorrection, CostEvidence, Draw, ExplorationEvidence, LatencyTerm, LearnedChoice, Strategy,
-    StrategySet, TtftEvidence,
+    CostCorrection, CostEvidence, Draw, ExplorationEvidence, LatencyTerm, LearnedChoice,
+    OnInfeasible, Strategy, StrategySet, TtftEvidence,
 };
 use roundhouse_core::session::MAX_REVIEW_TURNS;
 
@@ -155,6 +155,7 @@ fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
 
 fn exploration(rate: f64, set: Vec<Strategy>) -> ExplorationEvidence {
     ExplorationEvidence {
+        on_infeasible: Some(OnInfeasible::ServeRules),
         draw: Draw { rate, member: 0 },
         possible: true,
         set,
@@ -163,42 +164,48 @@ fn exploration(rate: f64, set: Vec<Strategy>) -> ExplorationEvidence {
 
 /// A `live` turn where nothing passes, so the learned choice is `rules` on
 /// `opus`; explored, it served `efficient` on `haiku`, and neither side has
-/// weight.
+/// weight. `efficient` is priced below `rules`, so the set is
+/// `[efficient, rules]`.
 fn agreeing_live(explored: bool) -> Spec {
-    let spec = Spec::new().live().propensity(0.5);
+    let set = vec![Strategy::Efficient, Strategy::Rules];
+    let spec = Spec::new()
+        .live()
+        .priced(Strategy::Efficient, 0.005)
+        .propensity(0.5);
     if explored {
         spec.chosen(haiku())
             .choice(LearnedChoice::Explore {
                 strategy: Strategy::Efficient,
                 member: 0,
             })
-            .exploration(exploration(0.0, vec![Strategy::Efficient]))
+            .exploration(exploration(0.0, set))
     } else {
-        spec.chosen(opus())
-            .exploration(exploration(0.9, vec![Strategy::Efficient]))
+        spec.chosen(opus()).exploration(exploration(0.9, set))
     }
 }
 
 /// A `live` turn where `efficient` passes, so the learned choice is `haiku`.
-/// Served, only learned has weight. Explored to `capable` on `opus`, the
-/// `rules` target, only `rules` has weight.
+/// Served, only learned has weight. Explored to `rules` on `opus`, only
+/// `rules` has weight. `rules` and `capable` both cost less than the $0.02
+/// exploit, so the set is `[rules, capable]`.
 fn diverging_live(explored: bool) -> Spec {
+    let set = vec![Strategy::Rules, Strategy::Capable];
     let spec = Spec::new().live().passing(Strategy::Efficient, 0.02);
     if explored {
         spec.chosen(opus())
             .propensity(0.05)
             .choice(LearnedChoice::Explore {
-                strategy: Strategy::Capable,
+                strategy: Strategy::Rules,
                 member: 0,
             })
-            .exploration(exploration(0.0, vec![Strategy::Capable]))
+            .exploration(exploration(0.0, set))
     } else {
         spec.chosen(haiku())
             .propensity(0.95)
             .choice(LearnedChoice::Exploit {
                 strategy: Strategy::Efficient,
             })
-            .exploration(exploration(0.9, vec![Strategy::Capable]))
+            .exploration(exploration(0.9, set))
     }
 }
 
@@ -529,7 +536,7 @@ fn a_trajectory_weight_that_is_not_finite_is_excluded_by_its_cause() {
                 Spec::new()
                     .live()
                     .propensity(1e-5)
-                    .exploration(exploration(0.9, vec![Strategy::Efficient]))
+                    .exploration(exploration(0.9, vec![Strategy::Rules]))
                     .decision(),
             )
         })

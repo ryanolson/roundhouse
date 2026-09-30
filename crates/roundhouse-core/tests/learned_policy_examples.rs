@@ -342,8 +342,9 @@ fn row_8_without_exploration_the_route_is_rules() {
 }
 
 /// The added row, exploration: cold start on a reviewed session with a draw
-/// below the rate. The one cheaper unproven strategy, `efficient`, serves,
-/// and the record carries the draw, the set and the propensity.
+/// below the rate. The set is the one cheaper unproven strategy,
+/// `efficient`, then `rules` (the 2026-09-30 ruling); member 0 serves, and
+/// the record carries the draw, the set and the propensity, `rate / 2`.
 #[test]
 fn row_9_a_reviewed_cold_start_can_explore_the_cheaper_strategy() {
     let rig = rig();
@@ -359,7 +360,7 @@ fn row_9_a_reviewed_cold_start_can_explore_the_cheaper_strategy() {
     );
     let exploration = record.exploration.as_ref().unwrap();
     assert!(exploration.possible);
-    assert_eq!(exploration.set, vec![Strategy::Efficient]);
+    assert_eq!(exploration.set, vec![Strategy::Efficient, Strategy::Rules]);
     assert_eq!(exploration.draw, go(4));
-    assert!((record.propensity - RATE).abs() < 1e-12);
+    assert!((record.propensity - RATE / 2.0).abs() < 1e-12);
 }

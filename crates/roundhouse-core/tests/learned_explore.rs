@@ -8,7 +8,8 @@
 //! target, and only when the draw is below the rate. It then serves a member
 //! of the exploration set, chosen uniformly: an `Unproven` strategy whose
 //! first target meets every hard constraint and costs strictly less than the
-//! reference. The record carries the probability that the turn served its
+//! reference, or `rules` whenever its first target meets every hard
+//! constraint (the 2026-09-30 ruling). The record carries the probability that the turn served its
 //! first target, summed over every way the policy could have served it, which
 //! is what the offline calibrator weights by.
 
@@ -252,14 +253,10 @@ fn an_exploring_turn_serves_only_a_cheaper_unproven_member_that_meets_every_hard
         go(0),
     );
     let decision = rig.chosen(&slowed);
-    assert!(!explored(&decision));
-    assert!(
-        evidence(&decision)
-            .exploration
-            .as_ref()
-            .unwrap()
-            .set
-            .is_empty()
+    assert_eq!(
+        evidence(&decision).exploration.as_ref().unwrap().set,
+        vec![Strategy::Rules],
+        "only `rules` explores"
     );
     assert_eq!(decision.target, large());
 
@@ -277,7 +274,10 @@ fn an_exploring_turn_serves_only_a_cheaper_unproven_member_that_meets_every_hard
         vec![hosted(large(), 0.0, 800.0), hosted(medium(), 0.0, 600.0)],
     );
     let decision = even.chosen(&Turn::new(exploring(LearnerMode::Live), cold(), go(0)));
-    assert!(!explored(&decision));
+    assert_eq!(
+        evidence(&decision).exploration.as_ref().unwrap().set,
+        vec![Strategy::Rules]
+    );
     assert_eq!(decision.target, large());
 
     // Cheaper, but over the grant once corrected. Both targets are quoted warm
@@ -336,14 +336,10 @@ fn a_below_floor_strategy_is_never_explored() {
             ..Turn::new(exploring(LearnerMode::Live), cold(), go(member))
         };
         let decision = rig.chosen(&turn);
-        assert!(!explored(&decision));
-        assert!(
-            evidence(&decision)
-                .exploration
-                .as_ref()
-                .unwrap()
-                .set
-                .is_empty()
+        assert_eq!(
+            evidence(&decision).exploration.as_ref().unwrap().set,
+            vec![Strategy::Rules],
+            "only `rules` explores"
         );
         assert_eq!(decision.target, large());
     }
@@ -473,4 +469,266 @@ fn the_propensity_counts_members_by_route_not_by_worker() {
     assert!(close(explored, RATE), "explored: {explored}");
     let stayed = propensity(&plans, &set, &small(), Some(&other_worker), RATE);
     assert!(close(stayed, 1.0 - RATE + RATE), "stayed: {stayed}");
+}
+
+/// `efficient` passes on `local/small`, so the exploit target ($0) is not the
+/// `rules` route (`frontier/large`, $0.01). No member is cheaper than a $0
+/// exploit, so the M4 set is empty, and `rules` joins it alone. `targets`
+/// adds operational counters, such as a slow residual.
+fn diverging_rig(targets: Vec<roundhouse_core::routing::learn::TargetOps>) -> (Rig, Turn) {
+    let rig = Rig::new(PickerMode::CapableFirst, section_7_8_pool());
+    let probe = Turn::new(exploring(LearnerMode::Live), cold(), STAY);
+    let key = rig.input(&probe).key(KeyLevel::L2);
+    let view = read(
+        vec![level(key, &[(Strategy::Efficient, PASS)], none())],
+        targets,
+    );
+    (rig, Turn { view, ..probe })
+}
+
+fn close(left: f64, right: f64) -> bool {
+    (left - right).abs() < 1e-12
+}
+
+/// The 2026-09-30 owner ruling: `rules` joins the live exploration set, so a
+/// turn whose learned choice differs from `rules` serves the `rules` route
+/// with probability `rate`. Before the ruling this turn had an empty set and
+/// could not explore at all; it now changes route on a draw below the rate,
+/// which is the ruled intent.
+#[test]
+fn a_diverging_live_turn_that_draws_rules_serves_the_rules_route() {
+    let (rig, base) = diverging_rig(Vec::new());
+    let rules_route = rig.rules().target;
+    assert_eq!(rules_route, large());
+
+    let decision = rig.chosen(&Turn {
+        draw: go(0),
+        ..Turn::new(base.terms.clone(), base.view.clone(), STAY)
+    });
+    let record = evidence(&decision);
+    assert_eq!(
+        record.exploration.as_ref().unwrap().set,
+        vec![Strategy::Rules]
+    );
+    assert_eq!(
+        record.choice,
+        LearnedChoice::Explore {
+            strategy: Strategy::Rules,
+            member: 0
+        }
+    );
+    assert_eq!(decision.target, rules_route);
+    // Only the `rules` member serves `frontier/large`, and the exploit
+    // target is `local/small`: `rate * 1/1`.
+    assert!(close(record.propensity, RATE), "{}", record.propensity);
+
+    // A draw at the rate serves the exploit, which is now logged at
+    // `1 - rate`, not 1: the turn could have served `rules` instead.
+    let stay = rig.chosen(&Turn::new(base.terms.clone(), base.view.clone(), STAY));
+    assert_eq!(stay.target, small());
+    assert_eq!(
+        evidence(&stay).choice,
+        LearnedChoice::Exploit {
+            strategy: Strategy::Efficient
+        }
+    );
+    assert!(close(evidence(&stay).propensity, 1.0 - RATE));
+}
+
+/// When the exploit target is already the `rules` route, exploring `rules`
+/// serves that same route, and the recorded probability counts both ways:
+/// `(1 - rate) + rate * sharing / |set|`. Here `rules` passes and is the
+/// exploit on `frontier/large`, `efficient` is a cheaper unproven member on
+/// `local/small`, and the set is `[efficient, rules]`: `0.95 + 0.05 / 2`.
+#[test]
+fn a_live_turn_whose_exploit_is_rules_records_the_shared_probability() {
+    let rig = Rig::new(PickerMode::CapableFirst, section_7_8_pool());
+    let probe = Turn::new(exploring(LearnerMode::Live), cold(), STAY);
+    let key = rig.input(&probe).key(KeyLevel::L2);
+    let view = read(
+        vec![level(
+            key,
+            &[(Strategy::Rules, PASS), (Strategy::Efficient, UNPROVEN)],
+            none(),
+        )],
+        Vec::new(),
+    );
+    let turn = |draw| Turn::new(exploring(LearnerMode::Live), view.clone(), draw);
+    let shared = (1.0 - RATE) + RATE * 1.0 / 2.0;
+
+    let stay = rig.chosen(&turn(STAY));
+    let record = evidence(&stay);
+    assert_eq!(
+        record.exploration.as_ref().unwrap().set,
+        vec![Strategy::Efficient, Strategy::Rules]
+    );
+    assert_eq!(
+        record.choice,
+        LearnedChoice::Exploit {
+            strategy: Strategy::Rules
+        }
+    );
+    assert_eq!(stay.target, large());
+    assert!(close(record.propensity, shared), "{}", record.propensity);
+    assert!(close(record.propensity, 0.975));
+
+    // Exploring `rules` (member 1) serves the same route at the same
+    // probability; exploring `efficient` (member 0) is `rate / 2`.
+    let explored = rig.chosen(&turn(go(1)));
+    assert_eq!(
+        evidence(&explored).choice,
+        LearnedChoice::Explore {
+            strategy: Strategy::Rules,
+            member: 1
+        }
+    );
+    assert_eq!(explored.target, large());
+    assert!(close(evidence(&explored).propensity, shared));
+    let other = rig.chosen(&turn(go(0)));
+    assert_eq!(other.target, small());
+    assert!(close(evidence(&other).propensity, RATE / 2.0));
+
+    // Sharing counts routes: with `efficient` moved onto `frontier/large`
+    // too, both members serve the exploit route, `0.95 + 0.05 * 2/2`.
+    use roundhouse_core::routing::learn::explore::propensity;
+    let mut plans = record.plans.clone();
+    plans
+        .iter_mut()
+        .find(|plan| plan.strategy == Strategy::Efficient)
+        .unwrap()
+        .first = large();
+    let set = [Strategy::Efficient, Strategy::Rules];
+    let both = propensity(&plans, &set, &large(), Some(&large()), RATE);
+    assert!(close(both, 1.0), "{both}");
+}
+
+/// `rules` joins only when its first target meets every hard constraint, by
+/// the predicate the other members use. Here `frontier/large` is over the
+/// latency limit once its residual applies, so `rules` fails it, the set is
+/// empty, and the turn cannot explore.
+#[test]
+fn a_rules_plan_that_fails_a_hard_constraint_never_joins_the_set() {
+    let (rig, base) = diverging_rig(vec![slow(&large())]);
+    let decision = rig.chosen(&Turn {
+        draw: go(0),
+        ..Turn::new(base.terms.clone(), base.view.clone(), STAY)
+    });
+    let record = evidence(&decision);
+    assert!(!record.plan(Strategy::Rules).unwrap().meets_hard());
+    assert!(record.exploration.as_ref().unwrap().possible);
+    assert!(record.exploration.as_ref().unwrap().set.is_empty());
+    assert!(!explored(&decision));
+    assert_eq!(decision.target, small());
+    assert_eq!(record.propensity, 1.0);
+}
+
+/// The ruling widens the set, not the fence: a `shadow` turn whose learned
+/// choice differs from `rules` still never explores, and an unreviewed one
+/// neither.
+#[test]
+fn rules_in_the_set_does_not_open_shadow_or_unreviewed_turns() {
+    let (rig, base) = diverging_rig(Vec::new());
+    let shadow = rig.chosen(&Turn::new(
+        exploring(LearnerMode::Shadow),
+        base.view.clone(),
+        go(0),
+    ));
+    assert_eq!(shadow.target, rig.rules().target);
+    let record = evidence(&shadow);
+    assert!(!explored(&shadow));
+    assert!(!record.exploration.as_ref().unwrap().possible);
+    assert!(record.exploration.as_ref().unwrap().set.is_empty());
+    assert_eq!(record.propensity, 1.0);
+
+    let unreviewed = rig.chosen(&Turn {
+        arm: None,
+        ..Turn::new(base.terms.clone(), base.view.clone(), go(0))
+    });
+    assert!(!explored(&unreviewed));
+    assert_eq!(unreviewed.target, small());
+    assert_eq!(evidence(&unreviewed).propensity, 1.0);
+}
+
+/// The owner's ruling of 2026-09-30 on `refuse`: `rules` joins the set only
+/// on a turn where some strategy passes. A `refuse` turn that nothing passes
+/// is refused exactly as before `rules` joined: with no cheaper unproven
+/// member it is refused on every draw, and with one it explores only that
+/// member, so a draw that would name `rules` in a two-member set serves the
+/// member instead. Under `serve_rules` the route is `rules` either way, so
+/// `rules` joins and the probability is 1.
+#[test]
+fn a_refuse_turn_nothing_passes_never_explores_rules() {
+    use roundhouse_core::routing::learn::OnInfeasible;
+    let rig = Rig::new(PickerMode::CapableFirst, section_7_8_pool());
+    let terms = |on_infeasible| LearnerTerms {
+        on_infeasible,
+        ..exploring(LearnerMode::Live)
+    };
+
+    // `local/small` over the latency limit: `efficient` is not a member, and
+    // nothing passes on a cold read.
+    let slowed = read(Vec::new(), vec![slow(&small())]);
+    for draw in [
+        STAY,
+        go(0),
+        go(1),
+        go(u64::MAX),
+        Draw {
+            rate: 0.0,
+            member: 7,
+        },
+    ] {
+        let turn = Turn::new(terms(OnInfeasible::Refuse), slowed.clone(), draw);
+        assert!(rig.choose(&turn).is_err(), "{draw:?} must refuse");
+    }
+
+    // Cold: `efficient` is a cheaper unproven member, so the set is
+    // `[efficient]`, not `[efficient, rules]`, and member draw 1 serves it.
+    let cold_turn = |draw| Turn::new(terms(OnInfeasible::Refuse), cold(), draw);
+    assert!(rig.choose(&cold_turn(STAY)).is_err(), "a stay draw refuses");
+    let explored_member = rig.chosen(&cold_turn(go(1)));
+    assert_eq!(explored_member.target, small());
+    let record = evidence(&explored_member);
+    let exploration = record.exploration.as_ref().unwrap();
+    assert_eq!(exploration.set, vec![Strategy::Efficient]);
+    assert_eq!(exploration.on_infeasible, Some(OnInfeasible::Refuse));
+    assert!(close(record.propensity, RATE), "{}", record.propensity);
+
+    let serve = rig.chosen(&Turn::new(
+        terms(OnInfeasible::ServeRules),
+        slowed.clone(),
+        go(0),
+    ));
+    assert_eq!(serve.target, large());
+    assert!(explored(&serve));
+    assert_eq!(
+        evidence(&serve).exploration.as_ref().unwrap().set,
+        vec![Strategy::Rules]
+    );
+    assert!(close(evidence(&serve).propensity, 1.0));
+}
+
+/// The same ruling's other half: a `refuse` turn where some strategy passes
+/// keeps `rules` in the set. `efficient` passes on `local/small`, the learned
+/// choice differs from `rules`, and a draw below the rate serves
+/// `frontier/large` at `rate * 1/1`.
+#[test]
+fn a_refuse_turn_with_a_passing_strategy_keeps_rules_in_the_set() {
+    use roundhouse_core::routing::learn::OnInfeasible;
+    let (rig, base) = diverging_rig(Vec::new());
+    let terms = LearnerTerms {
+        on_infeasible: OnInfeasible::Refuse,
+        ..base.terms.clone()
+    };
+    let decision = rig.chosen(&Turn::new(terms.clone(), base.view.clone(), go(0)));
+    let record = evidence(&decision);
+    assert_eq!(
+        record.exploration.as_ref().unwrap().set,
+        vec![Strategy::Rules]
+    );
+    assert_eq!(decision.target, large());
+    assert!(close(record.propensity, RATE), "{}", record.propensity);
+    let stay = rig.chosen(&Turn::new(terms, base.view.clone(), STAY));
+    assert_eq!(stay.target, small());
+    assert!(close(evidence(&stay).propensity, 1.0 - RATE));
 }

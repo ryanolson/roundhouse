@@ -26,6 +26,7 @@ use crate::event::{Accounting, SessionEvent, SessionEventKind, Usage, Validation
 use crate::ids::{ResponseId, SessionId, SideCallId};
 use crate::metrics::TierAgreement;
 use crate::metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, Scope, ShadowPricing};
+use crate::routing::learn::explore::eligible;
 use crate::routing::learn::policy::exploit_order;
 use crate::routing::learn::{
     ActiveMode, CostEvidence, EpochId, LearnedChoice, LearnedEvidence, LearnedInput, LevelKey,
@@ -416,7 +417,14 @@ pub(super) fn learned(decision: &DecisionRecord) -> Option<&LearnedEvidence> {
 /// - an exploit choice is the first of the recorded plans' exploit order, and
 ///   a `ConstraintUnmet` choice has none;
 /// - an explored member is the recorded draw modulo the recorded set, and
-///   names the chosen strategy.
+///   names the chosen strategy;
+/// - the recorded set is the set [`eligible`] derives from the recorded
+///   plans and `on_infeasible` when the turn could explore, and empty when
+///   it could not. A record written under another set rule (before `rules`
+///   joined the set on 2026-09-30, say) logged its turn under probabilities
+///   this build's policy would not assign, so it does not replay. Neither
+///   does a record without `on_infeasible`: its set rule is unknown, so its
+///   set cannot be re-derived.
 ///
 /// **The exploration rate is not recorded**, so a rate draw on its own cannot
 /// be re-checked; what the record pins exactly is what is checked. A turn
@@ -429,6 +437,19 @@ pub fn replays(evidence: &LearnedEvidence, decision: &DecisionRecord) -> bool {
     }
     if !same_route(&evidence.served_plan().first, &decision.chosen) {
         return false;
+    }
+    if let Some(exploration) = &evidence.exploration {
+        let Some(on_infeasible) = exploration.on_infeasible else {
+            return false;
+        };
+        let rule = if exploration.possible {
+            eligible(&evidence.plans, on_infeasible)
+        } else {
+            Vec::new()
+        };
+        if exploration.set != rule {
+            return false;
+        }
     }
     let arena = evidence
         .exploration

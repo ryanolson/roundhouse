@@ -33,15 +33,16 @@ const CARD: ProviderPricing = ProviderPricing {
 /// One reviewed shadow session: turns that start, dispatch after `overhead`
 /// ms, speak `to_output` ms after the start, and complete.
 fn session(id: &str, turns: &[(u64, u64, bool)]) -> Script {
+    scripted(id, turns, &Spec::new().rate_card(CARD))
+}
+
+/// [`session`], each turn routed by `spec`.
+fn scripted(id: &str, turns: &[(u64, u64, bool)], spec: &Spec) -> Script {
     let mut script = Script::named(id);
     let mut clock = 100_000;
     for (overhead, to_output, positive) in turns {
         let mut turn = script.begin_at(clock);
-        script.route_at(
-            &mut turn,
-            clock + overhead,
-            Spec::new().rate_card(CARD).decision(),
-        );
+        script.route_at(&mut turn, clock + overhead, spec.decision());
         script.delta_at(&turn, clock + to_output, "answer");
         script.complete_at(&turn, clock + to_output + 400, measured(600));
         script.intent(&turn);
@@ -92,6 +93,11 @@ fn fixture(dir: &Path) -> PathBuf {
         serde_json::to_vec_pretty(&dump(&scripts)).unwrap(),
     )
     .unwrap();
+    manifest(dir)
+}
+
+/// The manifest that calibrates `dir`'s `dump.json`.
+fn manifest(dir: &Path) -> PathBuf {
     let manifest = dir.join("manifest.json");
     std::fs::write(
         &manifest,
@@ -215,4 +221,73 @@ async fn a_redis_source_names_its_url_variable_and_never_the_url() {
         format!("{error:#}").contains("ROUNDHOUSE_M10_UNSET_URL_VARIABLE"),
         "{error:#}"
     );
+}
+
+/// **The claim.** A dump holding one record whose exploration predates
+/// `on_infeasible` (2026-09-30) still calibrates. That record's set rule was
+/// not recorded, so its interval is excluded as a replay mismatch, and the
+/// valid session beside it still counts. A decode failure would instead
+/// refuse the whole dump for one old record.
+#[tokio::test]
+async fn a_dump_with_a_record_from_before_on_infeasible_still_calibrates() {
+    let dir = tempfile::tempdir().unwrap();
+    // A turn that could not explore: its set is empty under any set rule, so
+    // only the missing field can keep it from replaying.
+    let exploration = serde_json::from_value(serde_json::json!({
+        "draw": { "rate": 0.5, "member": 3 },
+        "possible": false,
+        "set": [],
+        "on_infeasible": "serve_rules",
+    }))
+    .unwrap();
+    let scripts = [
+        session("acme/ada/refactor#g0", &[(120, 900, true)]),
+        scripted(
+            "acme/bob/tests#g0",
+            &[(200, 2_300, true)],
+            &Spec::new().rate_card(CARD).exploration(exploration),
+        ),
+    ];
+    let calibrate = |json: &serde_json::Value, out: &str| {
+        std::fs::write(dir.path().join("dump.json"), json.to_string()).unwrap();
+        let (manifest, out) = (manifest(dir.path()), dir.path().join(out));
+        async move {
+            let written = run(&manifest, &out, 1, "host")
+                .await
+                .expect("one old record does not refuse the dump");
+            std::fs::read_to_string(&written.report).unwrap()
+        }
+    };
+    let mut json = serde_json::to_value(dump(&scripts)).unwrap();
+
+    // The control: with the field, both sessions replay.
+    let report = calibrate(&json, "with").await;
+    assert!(
+        report.contains("sessions (sequence key) with an eligible interval: 2"),
+        "{report}"
+    );
+    assert!(report.contains("- record does not replay: 0"), "{report}");
+
+    assert_eq!(strip(&mut json, "on_infeasible"), 1, "one record wrote it");
+    let report = calibrate(&json, "without").await;
+    assert!(
+        report.contains("sessions (sequence key) with an eligible interval: 1"),
+        "{report}"
+    );
+    assert!(report.contains("- record does not replay: 1"), "{report}");
+}
+
+/// Remove every `key` field anywhere in `value`, returning how many.
+fn strip(value: &mut serde_json::Value, key: &str) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            let here = usize::from(map.remove(key).is_some());
+            here + map
+                .values_mut()
+                .map(|child| strip(child, key))
+                .sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter_mut().map(|child| strip(child, key)).sum(),
+        _ => 0,
+    }
 }

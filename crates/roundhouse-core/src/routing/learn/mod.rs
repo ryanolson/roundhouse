@@ -180,8 +180,9 @@ pub enum StrategySetError {
 /// The configured strategies, in the configured order.
 ///
 /// **The order is configuration, not presentation:** it breaks cost ties
-/// between passing strategies and orders the exploration set. It is kept as
-/// written, never sorted.
+/// between passing strategies and orders the exploration set's cheaper
+/// members, ahead of a `rules` that joins only as the baseline
+/// ([`explore::eligible`]). It is kept as written, never sorted.
 ///
 /// **`rules` is always present.** It is what `shadow` mode serves and what an
 /// infeasible turn falls back to, so a list without it has no answer for either

@@ -52,7 +52,7 @@ fn path_of(file: &tempfile::TempPath) -> String {
 
 fn valid_artifact() -> tempfile::TempPath {
     artifact_file(
-        r#"{"schema_revision":1,"input_revision":1,"selector_revision":2,"stage_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":["rules","capable"],"prior":[],"manifest_digest":"00","source_commit":"test"}"#,
+        r#"{"schema_revision":1,"input_revision":1,"selector_revision":3,"stage_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":["rules","capable"],"prior":[],"manifest_digest":"00","source_commit":"test"}"#,
     )
 }
 

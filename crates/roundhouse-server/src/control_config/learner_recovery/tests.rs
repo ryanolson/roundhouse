@@ -20,7 +20,7 @@ use crate::control_config::{
 
 /// A zero-prior artifact for `rules, capable`, written to a fresh file.
 pub(crate) fn artifact_file() -> String {
-    let bytes = r#"{"schema_revision":1,"input_revision":1,"selector_revision":2,"stage_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":["rules","capable"],"prior":[],"manifest_digest":"00","source_commit":"test"}"#;
+    let bytes = r#"{"schema_revision":1,"input_revision":1,"selector_revision":3,"stage_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":["rules","capable"],"prior":[],"manifest_digest":"00","source_commit":"test"}"#;
     let path = std::env::temp_dir().join(format!(
         "roundhouse-learner-recovery-{}.json",
         uuid::Uuid::new_v4()

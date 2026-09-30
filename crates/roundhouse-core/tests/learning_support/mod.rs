@@ -30,7 +30,7 @@ use roundhouse_core::routing::learn::{
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, Candidate, DecisionRecord, DecisionSource, DispatchAttempt,
     LocalFeatures, Pick, PickerMode, ProviderPricing, RecipeEvidence, SelectionSnapshot,
-    SelectorSnapshot, StageOutcome, Target, Tier, TurnSignals,
+    SelectorBranch, SelectorSnapshot, StageOutcome, Target, Tier, TurnSignals,
 };
 use roundhouse_core::session::{LearningEntry, SessionState};
 use roundhouse_core::store::doubles::ReplayLog;
@@ -111,6 +111,13 @@ pub struct Spec {
     /// after `corrected`.
     pub quotes: Vec<(Strategy, CostEvidence, TtftEvidence)>,
     pub rate_card: Option<ProviderPricing>,
+    /// Strategies whose plan records the adjusted cost given, gate and
+    /// correction unchanged: how a fixture makes an unproven plan cheaper
+    /// than the reference, so the exploration rule admits it. Applied
+    /// before `corrected` and `quotes`, which override it.
+    pub priced: Vec<(Strategy, f64)>,
+    /// Strategies whose plan fails the grant, a hard constraint.
+    pub over_grant: Vec<Strategy>,
 }
 
 impl Spec {
@@ -136,6 +143,8 @@ impl Spec {
             corrected: Vec::new(),
             quotes: Vec::new(),
             rate_card: None,
+            priced: Vec::new(),
+            over_grant: Vec::new(),
         }
     }
 
@@ -169,6 +178,16 @@ impl Spec {
     /// `strategy`'s plan recorded with exactly `cost` and `ttft`.
     pub fn quote(mut self, strategy: Strategy, cost: CostEvidence, ttft: TtftEvidence) -> Self {
         self.quotes.push((strategy, cost, ttft));
+        self
+    }
+
+    pub fn priced(mut self, strategy: Strategy, adjusted_usd: f64) -> Self {
+        self.priced.push((strategy, adjusted_usd));
+        self
+    }
+
+    pub fn over_grant(mut self, strategy: Strategy) -> Self {
+        self.over_grant.push(strategy);
         self
     }
 
@@ -228,6 +247,9 @@ impl Spec {
                     plan.gate.result = GateResult::Pass;
                     plan.cost.adjusted_usd = *usd;
                 }
+                if let Some((_, usd)) = self.priced.iter().find(|(named, _)| named == strategy) {
+                    plan.cost.adjusted_usd = *usd;
+                }
                 if let Some((_, usd, ms)) =
                     self.corrected.iter().find(|(named, ..)| named == strategy)
                 {
@@ -248,6 +270,9 @@ impl Spec {
                 {
                     plan.cost = *cost;
                     plan.ttft = *ttft;
+                }
+                if self.over_grant.contains(strategy) {
+                    plan.grant = GrantCheck::Exceeds;
                 }
                 plan
             })
@@ -331,6 +356,19 @@ fn plan(strategy: Strategy, first: Target) -> PlanEvidence {
             level: None,
             result: GateResult::Unproven,
         },
+    }
+}
+
+/// The learned evidence a fixture decision records.
+pub fn learned_evidence(decision: &DecisionRecord) -> &LearnedEvidence {
+    let selector = decision
+        .selection
+        .as_deref()
+        .and_then(|selection| selection.selector.as_ref())
+        .expect("a learned decision records its selector");
+    match &selector.branch {
+        SelectorBranch::Learned(evidence) => evidence,
+        other => panic!("expected a learned branch, got {other:?}"),
     }
 }
 

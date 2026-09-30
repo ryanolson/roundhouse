@@ -339,13 +339,15 @@ mod tests {
     /// ```text
     /// a = sha256(b"golden artifact bytes").hexdigest()
     /// c = "roundhouse-learner-epoch-v1\nartifact=" + a
-    ///     + "\nstrategies=rules,efficient,capable\ninput=1\nselector=2\nstage=1\ncredit=1\n"
+    ///     + "\nstrategies=rules,efficient,capable\ninput=1\nselector=3\nstage=1\ncredit=1\n"
     /// sha256(c).hexdigest()[:32]
     /// ```
     ///
-    /// Recomputed on 2026-09-30 for `LEARNED_SELECTOR_REVISION` 2 (the M10
-    /// round-2 `NoPredictedReuse` reprice); the prior digest was
-    /// `a0a82da1b79e03319379c3cd5223efad`, under `selector=1`.
+    /// Recomputed on 2026-09-30 for `LEARNED_SELECTOR_REVISION` 3 (`rules`
+    /// joins the live exploration set). The digest under `selector=2` (the
+    /// M10 round-2 `NoPredictedReuse` reprice) was
+    /// `eee5455dd9af28118f894e0fdec917f9`, and under `selector=1`
+    /// `a0a82da1b79e03319379c3cd5223efad`.
     #[test]
     fn the_epoch_matches_a_golden_digest() {
         let strategies = StrategySet::new(vec![
@@ -356,7 +358,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             epoch_of(b"golden artifact bytes", &strategies).to_string(),
-            "eee5455dd9af28118f894e0fdec917f9"
+            "10ec3614d0d7ce2f80574c77e8f1500e"
         );
     }
 
@@ -417,23 +419,28 @@ mod tests {
         assert!(Artifact::parse(once.as_bytes()).is_ok());
     }
 
-    /// An artifact calibrated before the M10 round-2 `NoPredictedReuse`
-    /// reprice (`LEARNED_SELECTOR_REVISION` 1) is refused rather than read
-    /// under today's pricing: its prior counted turns under the old,
-    /// unadjusted cost, which now feeds the constraints and the choice
-    /// differently.
+    /// An artifact calibrated under an earlier selector rule is refused
+    /// rather than read under today's: revision 1 predates the M10 round-2
+    /// `NoPredictedReuse` reprice, and revision 2 predates `rules` joining
+    /// the live exploration set (2026-09-30), so its records logged turns
+    /// under propensities this build does not assign.
     #[test]
     fn an_artifact_written_under_the_prior_selector_revision_is_refused() {
-        let stale = file(r#"["rules","capable"]"#, "[]")
-            .replace(r#""selector_revision":2"#, r#""selector_revision":1"#);
-        assert_eq!(
-            Artifact::parse(stale.as_bytes()),
-            Err(ArtifactError::Revision {
-                which: "selector",
-                found: 1,
-                expected: LEARNED_SELECTOR_REVISION,
-            })
-        );
+        assert_eq!(LEARNED_SELECTOR_REVISION, 3);
+        for found in [1, 2] {
+            let stale = file(r#"["rules","capable"]"#, "[]").replace(
+                r#""selector_revision":3"#,
+                &format!(r#""selector_revision":{found}"#),
+            );
+            assert_eq!(
+                Artifact::parse(stale.as_bytes()),
+                Err(ArtifactError::Revision {
+                    which: "selector",
+                    found,
+                    expected: LEARNED_SELECTOR_REVISION,
+                })
+            );
+        }
     }
 
     #[test]

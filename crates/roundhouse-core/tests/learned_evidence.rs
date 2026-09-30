@@ -19,8 +19,8 @@ use roundhouse_core::routing::learn::{
     ActiveMode, Band, CacheReuse, CostCorrection, CostEvidence, Draw, EpochId, ExplorationEvidence,
     GateEvidence, GateResult, GrantCheck, JevCounts, KeyLevel, LatencySum, LatencyTerm,
     LearnedChoice, LearnedEvidence, LearnedEvidenceError, LearnedEvidenceParts, LearnedInput,
-    LevelView, PlanEvidence, PriorBand, ReadFailure, ReadView, StoreRead, Strategy, StrategyCounts,
-    StrategySetError, TargetOps, TtftEvidence, Unmet,
+    LevelView, OnInfeasible, PlanEvidence, PriorBand, ReadFailure, ReadView, StoreRead, Strategy,
+    StrategyCounts, StrategySetError, TargetOps, TtftEvidence, Unmet,
 };
 use roundhouse_core::routing::{
     AffinityEvidence, Candidate, DecisionRecord, DecisionSource, LocalFeatures, Pick, PickerMode,
@@ -173,6 +173,7 @@ fn parts(mode: ActiveMode, choice: LearnedChoice) -> LearnedEvidenceParts {
         ],
         choice,
         exploration: Some(ExplorationEvidence {
+            on_infeasible: Some(OnInfeasible::ServeRules),
             draw: Draw {
                 rate: 0.75,
                 member: 17,
@@ -349,6 +350,72 @@ fn a_record_without_learned_evidence_still_decodes() {
         other => panic!("expected the stage branch, got {other:?}"),
     }
     assert_eq!(selection.source(), Some(DecisionSource::Override));
+}
+
+/// **The claim.** A `Routed` record whose exploration predates
+/// `on_infeasible` (2026-09-30) still decodes. The field is the set rule the
+/// calibrator re-derives a set by, so such a record cannot replay, but that is
+/// refused per interval (`ReplayMismatch`). A decode failure instead would
+/// make the whole log unreadable, to the Redis reader and to a dump alike.
+#[test]
+fn a_learned_record_without_on_infeasible_still_decodes() {
+    let event = SessionEventKind::Routed {
+        response_id: ResponseId::new("resp_1"),
+        decision: record(
+            "luna",
+            SelectorSnapshot::learned(evidence(
+                ActiveMode::Live,
+                LearnedChoice::Explore {
+                    strategy: Strategy::Efficient,
+                    member: 0,
+                },
+            )),
+            "learned".into(),
+        ),
+    };
+    let mut json = serde_json::to_value(&event).expect("serializes");
+    assert_eq!(
+        strip(&mut json, "on_infeasible"),
+        1,
+        "the fixture wrote the field this test removes, once"
+    );
+    let decoded: SessionEventKind =
+        serde_json::from_value(json).expect("a record from before on_infeasible reads");
+    let SessionEventKind::Routed { decision, .. } = &decoded else {
+        unreachable!("the decode kept the kind")
+    };
+    let branch = &decision
+        .selection
+        .as_ref()
+        .unwrap()
+        .selector
+        .as_ref()
+        .unwrap()
+        .branch;
+    let SelectorBranch::Learned(learned) = branch else {
+        panic!("expected the learned branch, got {branch:?}")
+    };
+    let exploration = learned
+        .exploration
+        .as_ref()
+        .expect("the exploration is kept");
+    assert_eq!(exploration.on_infeasible, None, "no rule is assigned");
+    assert_eq!(exploration.set, vec![Strategy::Efficient]);
+}
+
+/// Remove every `key` field anywhere in `value`, returning how many.
+fn strip(value: &mut serde_json::Value, key: &str) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            let here = usize::from(map.remove(key).is_some());
+            here + map
+                .values_mut()
+                .map(|child| strip(child, key))
+                .sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter_mut().map(|child| strip(child, key)).sum(),
+        _ => 0,
+    }
 }
 
 /// **The claim.** The learned rationale names the strategy, the tier, the

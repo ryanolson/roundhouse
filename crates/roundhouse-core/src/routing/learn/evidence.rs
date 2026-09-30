@@ -20,7 +20,7 @@ use std::ops::Deref;
 use serde::{Deserialize, Serialize, Serializer};
 
 use super::input::{KeyLevel, LearnedInput, LevelKey};
-use super::{ActiveMode, EpochId, Strategy, StrategySet, StrategySetError};
+use super::{ActiveMode, EpochId, OnInfeasible, Strategy, StrategySet, StrategySetError};
 use crate::routing::Target;
 use crate::routing::selection::{RecipeEvidence, StageEvidence, StageOutcome};
 use crate::routing::stage::{DecisionSource, Pick, Tier};
@@ -451,8 +451,29 @@ pub struct ExplorationEvidence {
     pub draw: Draw,
     /// Whether this turn could explore at all.
     pub possible: bool,
-    /// The exploration set, in configured strategy order.
+    /// The exploration set: the cheaper unproven members in configured
+    /// strategy order, then `rules` when it is not already one (see
+    /// [`eligible`](super::explore::eligible)). Empty when the turn could
+    /// not explore.
     pub set: Vec<Strategy>,
+    /// The project's `on_infeasible` when the turn was decided.
+    ///
+    /// **Recorded because the set depends on it** (the owner's ruling of
+    /// 2026-09-30): under `refuse`, `rules` joins only when some strategy
+    /// passes. Without it, the calibrator could not re-derive the set of a
+    /// turn that nothing passed, and could not tell a `refuse` record from a
+    /// `serve_rules` one.
+    ///
+    /// **`None` only on a record written before the field existed**; the
+    /// policy always writes it. Optional so that such a record still decodes:
+    /// a required field would fail the decode, and one undecodable event makes
+    /// the whole log unreadable, to the Redis reader and to a dump alike.
+    /// Replay refuses the record's interval instead
+    /// ([`replays`](super::offline::extract::replays)), since the set rule it
+    /// was drawn under is unknown. A non-optional default would assign a rule
+    /// nobody recorded, and a set that happened to match it would replay.
+    #[serde(default)]
+    pub on_infeasible: Option<OnInfeasible>,
 }
 
 /// The deterministic exploration draw, recorded so replay never draws again.

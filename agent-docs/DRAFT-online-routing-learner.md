@@ -238,7 +238,7 @@ Owner question 1 decides which values are authorized.
 
 Exploration of an `Unproven` strategy is also a quality bypass. It exists only if the owner authorizes it (question 1). The mechanism, if authorized, is:
 
-- The exploration set holds `Unproven` strategies whose first targets satisfy constraints 1 to 3. Each one costs strictly less than the reference target. The reference is the exploit target, or the `rules` target when there is no exploit strategy.
+- The exploration set holds `Unproven` strategies whose first targets satisfy constraints 1 to 3. Each one costs strictly less than the reference target. The reference is the exploit target, or the `rules` target when there is no exploit strategy. (Amended 2026-09-30 by owner ruling: in `live`, `rules` also joins the set when its first target meets every hard constraint, exempt from the `Unproven` and cheaper conditions. See `PLAN-online-routing-learner.md` section 9.)
 - The engine computes a draw from SHA-256 over `"{LEARNER_DRAW_VERSION}\nrouting-explore\nsalt={salt}\nsession={session_id}\nresponse={response_id}\n"`. The salt is the control-plane `arm_salt`. The `routing-explore` domain separates this stream from `Arm::for_session`, as section 4 of the bandit plan requires.
 - The policy explores only in `live` mode and only on a session whose validation arm consults the judge. The draw must also be below `exploration_rate`.
 - The mechanism does not yet define which member of the set an exploring turn serves. This brief proposes no distribution over the members. Uniform choice is not a default. The distribution is part of owner question 1.

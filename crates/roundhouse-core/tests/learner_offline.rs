@@ -23,7 +23,8 @@ use roundhouse_core::routing::learn::offline::{
     SessionLog, Source, SplitMix64, TestResult, TurnTrace, assemble, sidecar_bytes,
 };
 use roundhouse_core::routing::learn::{
-    Artifact, Draw, ExplorationEvidence, LearnedChoice, Strategy, StrategySet, epoch_of,
+    Artifact, Draw, ExplorationEvidence, LearnedChoice, OnInfeasible, Strategy, StrategySet,
+    epoch_of,
 };
 use roundhouse_core::routing::{ProviderPricing, Target};
 use roundhouse_core::session::Exclusion;
@@ -91,7 +92,9 @@ fn shadow(id: &str, labels: &[bool]) -> Script {
 
 /// A live turn of the reviewer's uniform A/B logger: A is `haiku`, which only
 /// `efficient` plans, and B is `opus`, the `rules` target. Each side is served
-/// with probability one half.
+/// with probability one half. `efficient` is priced below `rules`, so the
+/// exploration rule's set is `[efficient, rules]`, which the record must name
+/// to replay.
 fn ab_spec(served_a: bool) -> Spec {
     let spec = Spec::new()
         .live()
@@ -100,11 +103,13 @@ fn ab_spec(served_a: bool) -> Spec {
             (Strategy::Efficient, haiku()),
             (Strategy::Capable, opus()),
         ])
+        .priced(Strategy::Efficient, 0.005)
         .propensity(0.5);
     let exploration = |rate: f64| ExplorationEvidence {
+        on_infeasible: Some(OnInfeasible::ServeRules),
         draw: Draw { rate, member: 0 },
         possible: true,
-        set: vec![Strategy::Efficient],
+        set: vec![Strategy::Efficient, Strategy::Rules],
     };
     if served_a {
         spec.chosen(haiku())
@@ -258,6 +263,7 @@ fn replay_equivalence_fails_on_a_changed_draw() {
                 (Strategy::Efficient, haiku()),
                 (Strategy::Capable, opus()),
             ])
+            .priced(Strategy::Efficient, 0.005)
             .chosen(haiku())
             .propensity(0.025)
             .choice(LearnedChoice::Explore {
@@ -265,12 +271,13 @@ fn replay_equivalence_fails_on_a_changed_draw() {
                 member: 0,
             })
             .exploration(ExplorationEvidence {
+                on_infeasible: Some(OnInfeasible::ServeRules),
                 draw: Draw {
                     rate: 0.01,
                     member: draw_member,
                 },
                 possible: true,
-                set: vec![Strategy::Efficient, Strategy::Capable],
+                set: vec![Strategy::Efficient, Strategy::Rules],
             })
             .decision()
     };
@@ -479,12 +486,14 @@ fn intervals_are_excluded_by_cause_and_the_counts_are_reported() {
     // Three matched turns whose propensities multiply to below the smallest
     // float: the weight of a candidate that matched them is not finite.
     let exploration = ExplorationEvidence {
+        on_infeasible: Some(OnInfeasible::ServeRules),
         draw: Draw {
             rate: 0.9,
             member: 0,
         },
         possible: true,
-        set: vec![Strategy::Efficient],
+        // Nothing is cheaper than `rules` here, so the set is `rules` alone.
+        set: vec![Strategy::Rules],
     };
     let tiny: Vec<Turn> = (0..3)
         .map(|_| {
