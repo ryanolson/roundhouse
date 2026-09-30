@@ -54,7 +54,19 @@ pub const STAGE_SELECTOR_REVISION: u32 = 1;
 /// interpretation under this constant's own doc, not just of a caller. An
 /// artifact or a stored record written under revision 1 is refused rather
 /// than re-read under the new pricing.
-pub const LEARNED_SELECTOR_REVISION: u32 = 2;
+///
+/// **Bumped to `3` on 2026-09-30** (the owner's ruling that `rules` joins the
+/// live exploration set): `explore::eligible` now appends the `rules` plan,
+/// so a `live` turn logs `rules` with probability above zero wherever the
+/// learned choice differs. That is the exploration rule this constant names.
+/// The draw's hash encoding did not change, so `LEARNER_DRAW_VERSION` stays
+/// `v1`: the same draw now indexes a different set. Revision 2 had not
+/// shipped, but it merges separately from this change, and one
+/// number naming two set rules is what a revision exists to prevent. The
+/// calibrator also re-derives each record's set from its plans (the
+/// `offline::extract::replays` check), so a record written under the old set
+/// rule fails replay whatever revision it carries.
+pub const LEARNED_SELECTOR_REVISION: u32 = 3;
 
 /// What the extractor computed for this turn, and where in the log it read to.
 ///

@@ -554,9 +554,17 @@ async fn row_8_without_exploration_serving_produced_state_serves_the_rules_route
 }
 
 /// The exploration row. A live project that explores, on a reviewed session,
-/// with `efficient` unproven and cheaper than the exploit target: the turn
-/// serves `small`, and the record's draw is the one the salt, the session and
-/// the recorded response give, and its propensity is the policy's own.
+/// with `efficient` unproven and cheaper than the exploit target: the set is
+/// `efficient`, then `rules` (the 2026-09-30 ruling), and the turn serves the
+/// member its draw names. The record's draw is the one the salt, the session
+/// and the recorded response give, and its propensity is the policy's own.
+///
+/// The response id is random, so either member can be drawn. Turns run on
+/// fresh sessions until both members have served (at most 32, which misses
+/// one with probability 2^-31), and each checks its own route and
+/// probability: `rate / 2` for `small`, which only `efficient` serves, and
+/// `(1 - rate) + rate / 2` for `large`, which the `rules` member and the
+/// exploit share.
 #[tokio::test]
 async fn an_explored_turn_records_its_draw_member_and_propensity() {
     let rig = Rig::new(RigConfig::default());
@@ -576,47 +584,54 @@ async fn an_explored_turn_records_its_draw_member_and_propensity() {
         exploration: Some(ExplorationTerms { rate: RATE }),
         ..live()
     };
-    let session = SessionId::new("scout/ada/explore");
-    let result = rig
-        .turn(
-            &session,
-            "t1",
-            &reviewed(admission("scout", Some(exploring.clone()))),
-        )
-        .await
-        .expect("served");
-    let decision = result.decision.expect("routed");
-    assert_eq!(
-        decision.target,
-        small(),
-        "the cheaper unproven member serves"
-    );
+    let mut seen = [false; 2];
+    for attempt in 0..32 {
+        let session = SessionId::new(format!("scout/ada/explore{attempt}"));
+        let result = rig
+            .turn(
+                &session,
+                "t1",
+                &reviewed(admission("scout", Some(exploring.clone()))),
+            )
+            .await
+            .expect("served");
+        let decision = result.decision.expect("routed");
 
-    let record = rig.last_learned(&session).await;
-    assert_eq!(
-        record.choice,
-        LearnedChoice::Explore {
-            strategy: Strategy::Efficient,
-            member: 0
+        let record = rig.last_learned(&session).await;
+        let exploration = record.exploration.clone().expect("the project explores");
+        assert!(exploration.possible);
+        assert_eq!(exploration.set, vec![Strategy::Efficient, Strategy::Rules]);
+        assert_eq!(
+            exploration.draw,
+            Draw::for_turn(rig::SALT, &session, &result.response_id),
+            "the draw is recomputable from the salt, the session and the response"
+        );
+        let member = exploration.draw.member % 2;
+        let (strategy, served, probability) = match member {
+            0 => (Strategy::Efficient, small(), RATE / 2.0),
+            _ => (Strategy::Rules, large(), (1.0 - RATE) + RATE / 2.0),
+        };
+        assert_eq!(
+            record.choice,
+            LearnedChoice::Explore { strategy, member },
+            "the drawn member serves"
+        );
+        assert_eq!(decision.target, served);
+        let expected = explore::propensity(
+            &record.plans,
+            &exploration.set,
+            &served,
+            Some(&large()),
+            RATE,
+        );
+        assert_eq!(record.propensity, expected);
+        assert!((record.propensity - probability).abs() < 1e-12);
+        seen[member as usize] = true;
+        if seen == [true, true] {
+            break;
         }
-    );
-    let exploration = record.exploration.clone().expect("the project explores");
-    assert!(exploration.possible);
-    assert_eq!(exploration.set, vec![Strategy::Efficient]);
-    assert_eq!(
-        exploration.draw,
-        Draw::for_turn(rig::SALT, &session, &result.response_id),
-        "the draw is recomputable from the salt, the session and the response"
-    );
-    let expected = explore::propensity(
-        &record.plans,
-        &exploration.set,
-        &small(),
-        Some(&large()),
-        RATE,
-    );
-    assert_eq!(record.propensity, expected);
-    assert!((record.propensity - RATE).abs() < 1e-12);
+    }
+    assert_eq!(seen, [true, true], "both members served within 32 turns");
 
     // Control: the same state on a session no judge reviews never explores.
     let session = SessionId::new("scout/ada/unreviewed");

@@ -16,8 +16,9 @@
 
 use sha2::{Digest, Sha256};
 
-use super::Strategy;
 use super::evidence::{Draw, GateResult, PlanEvidence};
+use super::policy::exploit_order;
+use super::{OnInfeasible, Strategy};
 use crate::ids::{ResponseId, SessionId};
 use crate::routing::Target;
 use crate::session::same_route;
@@ -64,9 +65,17 @@ impl Draw {
     }
 }
 
-/// The exploration set: every `Unproven` strategy whose first target meets
-/// every hard constraint and costs strictly less than `reference`'s, in
-/// configured order.
+/// The exploration set of a turn that could explore: every `Unproven`
+/// strategy whose first target meets every hard constraint and costs strictly
+/// less than the reference, in configured order, then `rules` when its first
+/// target meets every hard constraint and it is not already a member.
+///
+/// **The reference is the exploit plan**, the head of `policy::exploit_order`,
+/// or the `rules` plan when nothing passes. Derived here from the plans alone, so the policy that
+/// draws from the set and the calibrator that checks a record's set
+/// (`offline::extract::replays`) read one rule: two spellings would agree
+/// until one changed, and a record would then replay against a set no build
+/// drew from.
 ///
 /// **Unproven, not below the floor.** Reviews already put a `BelowFloor`
 /// strategy under the floor, and exploring it would buy evidence that exists.
@@ -76,10 +85,38 @@ impl Draw {
 /// bypass to learn nothing about cost. [`propensity`] does not rely on it:
 /// it sums over every way the served route could have been chosen.
 ///
+/// **`rules` joins exempt from both filters** (the owner's ruling of
+/// 2026-09-30). It is not a probe for a cheaper route but the baseline every
+/// candidate is compared with: without it, `rules` has zero logging
+/// probability wherever the learned choice differs, and the binding M11
+/// quality comparison (test 1b) can never be evaluated there. So it joins
+/// whether it passed, is unproven or sits below the floor, and whatever it
+/// costs against the exploit. It is placed last so that the members before
+/// it keep their configured order and their member indices; when the M4
+/// filters already admit it, it keeps its place and is not listed twice,
+/// since [`propensity`] counts members and a repeat would inflate its share.
+///
 /// **Every hard constraint**, by [`PlanEvidence::meets_hard`], the predicate
-/// the exploit path uses.
-pub fn eligible(plans: &[PlanEvidence], reference: &PlanEvidence) -> Vec<Strategy> {
-    plans
+/// the exploit path uses, for `rules` too: a `rules` plan over the grant or
+/// the latency limit never explores, as no other member does.
+///
+/// **Under `refuse`, `rules` joins only when some strategy passes** (the
+/// owner's ruling of 2026-09-30). A `refuse` project has chosen to fail a
+/// turn nothing passes rather than serve `rules` unvalidated; letting the
+/// baseline in by exploration would serve exactly that turn at the rate.
+/// Such a turn is refused as before `rules` joined, unless a cheaper
+/// unproven member explores. Under `serve_rules` a turn nothing passes serves
+/// `rules` anyway, so `rules` joins there too.
+///
+/// Changing this rule is a new
+/// [`LEARNED_SELECTOR_REVISION`](crate::routing::LEARNED_SELECTOR_REVISION).
+pub fn eligible(plans: &[PlanEvidence], on_infeasible: OnInfeasible) -> Vec<Strategy> {
+    let rules = plans.iter().find(|plan| plan.strategy == Strategy::Rules);
+    let exploit = exploit_order(plans).first().map(|&at| &plans[at]);
+    let Some(reference) = exploit.or(rules) else {
+        return Vec::new();
+    };
+    let mut set: Vec<Strategy> = plans
         .iter()
         .filter(|plan| {
             plan.gate.result == GateResult::Unproven
@@ -87,7 +124,12 @@ pub fn eligible(plans: &[PlanEvidence], reference: &PlanEvidence) -> Vec<Strateg
                 && plan.cost.adjusted_usd < reference.cost.adjusted_usd
         })
         .map(|plan| plan.strategy)
-        .collect()
+        .collect();
+    let baseline = exploit.is_some() || on_infeasible == OnInfeasible::ServeRules;
+    if baseline && rules.is_some_and(PlanEvidence::meets_hard) && !set.contains(&Strategy::Rules) {
+        set.push(Strategy::Rules);
+    }
+    set
 }
 
 /// The probability that a turn which could explore over `set` served

@@ -210,11 +210,7 @@ impl LearnedPolicy {
             .iter()
             .any(|candidate| !candidate.target.is_local());
 
-        let Plans {
-            plans,
-            rules_at,
-            rules,
-        } = Planner {
+        let Plans { plans, rules } = Planner {
             recipe,
             rules_pick,
             admitted: &admitted,
@@ -235,13 +231,14 @@ impl LearnedPolicy {
         .plan_all()?;
 
         let order = exploit_order(&plans);
-        let reference = order.first().copied().unwrap_or(rules_at);
 
         // Ruling 8: live only, a reviewed session only, a frontier target in
         // the pool, and a read that gave gate results to explore on. The
         // arena is the rate and the set, and exists only when a turn could
         // explore and something is eligible, so the draw and the propensity
-        // read one guard.
+        // read one guard. The set holds `rules` whenever its plan meets every
+        // hard constraint, so a turn with no cheaper unproven member can
+        // still explore it.
         let rate = terms.exploration.map(|exploration| exploration.rate);
         let possible = mode == ActiveMode::Live
             && turn.arm.is_some_and(Arm::consults_judge)
@@ -249,7 +246,7 @@ impl LearnedPolicy {
             && failure.is_none();
         let arena = rate
             .filter(|_| possible)
-            .map(|rate| (rate, eligible(&plans, &plans[reference])))
+            .map(|rate| (rate, eligible(&plans, terms.on_infeasible)))
             .filter(|(_, set)| !set.is_empty());
         let explored = arena
             .as_ref()
@@ -295,6 +292,7 @@ impl LearnedPolicy {
             exploration: rate.map(|_| ExplorationEvidence {
                 draw: turn.draw,
                 possible,
+                on_infeasible: terms.on_infeasible,
                 set: arena.map(|(_, set)| set).unwrap_or_default(),
             }),
             propensity,
@@ -327,7 +325,6 @@ struct Planner<'a> {
 /// are never read; `shadow` and `serve_rules` serve the `rules` one whole.
 struct Plans {
     plans: Vec<PlanEvidence>,
-    rules_at: usize,
     rules: Decision,
 }
 
@@ -339,17 +336,12 @@ impl Planner<'_> {
         for &strategy in strategies {
             let (plan, decision) = self.plan(strategy)?;
             if strategy == Strategy::Rules {
-                rules = Some((plans.len(), decision));
+                rules = Some(decision);
             }
             plans.push(plan);
         }
-        let (rules_at, rules) =
-            rules.ok_or_else(|| policy_bug("a strategy set always holds `rules`"))?;
-        Ok(Plans {
-            plans,
-            rules_at,
-            rules,
-        })
+        let rules = rules.ok_or_else(|| policy_bug("a strategy set always holds `rules`"))?;
+        Ok(Plans { plans, rules })
     }
 
     /// One strategy's plan, its corrections, its hard constraints and its

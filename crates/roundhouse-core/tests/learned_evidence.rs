@@ -19,8 +19,8 @@ use roundhouse_core::routing::learn::{
     ActiveMode, Band, CacheReuse, CostCorrection, CostEvidence, Draw, EpochId, ExplorationEvidence,
     GateEvidence, GateResult, GrantCheck, JevCounts, KeyLevel, LatencySum, LatencyTerm,
     LearnedChoice, LearnedEvidence, LearnedEvidenceError, LearnedEvidenceParts, LearnedInput,
-    LevelView, PlanEvidence, PriorBand, ReadFailure, ReadView, StoreRead, Strategy, StrategyCounts,
-    StrategySetError, TargetOps, TtftEvidence, Unmet,
+    LevelView, OnInfeasible, PlanEvidence, PriorBand, ReadFailure, ReadView, StoreRead, Strategy,
+    StrategyCounts, StrategySetError, TargetOps, TtftEvidence, Unmet,
 };
 use roundhouse_core::routing::{
     AffinityEvidence, Candidate, DecisionRecord, DecisionSource, LocalFeatures, Pick, PickerMode,
@@ -173,6 +173,7 @@ fn parts(mode: ActiveMode, choice: LearnedChoice) -> LearnedEvidenceParts {
         ],
         choice,
         exploration: Some(ExplorationEvidence {
+            on_infeasible: OnInfeasible::ServeRules,
             draw: Draw {
                 rate: 0.75,
                 member: 17,

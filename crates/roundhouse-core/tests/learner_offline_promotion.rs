@@ -18,16 +18,17 @@ use learning_support::*;
 use roundhouse_core::control::ProjectId;
 use roundhouse_core::event::{Accounting, Usage};
 use roundhouse_core::routing::ProviderPricing;
+use roundhouse_core::routing::learn::explore::propensity;
 use roundhouse_core::routing::learn::offline::estimate::{
     BOOTSTRAP_LEVEL, bootstrap, bootstrap_replicates, estimate, paired_bootstrap, paired_replicates,
 };
 use roundhouse_core::routing::learn::offline::{
-    ArtifactPrior, BootstrapPlan, COST_REDUCTION, Calibrated, CalibrationConfig, Candidate,
+    ArtifactPrior, BootstrapPlan, COST_REDUCTION, Calibrated, CalibrationConfig, Candidate, Cause,
     DriftCheck, Evidence, Money, Outcome, QUALITY_ALLOWANCE, QualityMinimum, SessionLog, Source,
     TestResult, assemble, cost_gate, paired_quality_gate, quality_gate, quality_test,
 };
 use roundhouse_core::routing::learn::{
-    Draw, ExplorationEvidence, LearnedChoice, Strategy, StrategySet,
+    Draw, ExplorationEvidence, LearnedChoice, OnInfeasible, Strategy, StrategySet,
 };
 
 fn config(min_sessions: u64) -> CalibrationConfig {
@@ -448,15 +449,19 @@ fn the_agreeing_quality_test_below_min_sessions_is_not_evaluable() {
     );
 }
 
-/// A `live` turn with exploration possible over `efficient`, at propensity
-/// 0.5. Nothing passes, so the learned choice is `rules` on `opus`; an
-/// explored turn served `efficient` on `haiku` instead.
+/// A `live` turn with exploration possible over `efficient` and `rules`, at
+/// propensity 0.5. Nothing passes, so the learned choice is `rules` on
+/// `opus`; an explored turn served `efficient` on `haiku` instead.
 fn live_turn(explored: bool) -> Spec {
-    let spec = Spec::new().live().propensity(0.5);
+    let spec = Spec::new()
+        .live()
+        .priced(Strategy::Efficient, 0.005)
+        .propensity(0.5);
     let exploration = |rate: f64| ExplorationEvidence {
+        on_infeasible: OnInfeasible::ServeRules,
         draw: Draw { rate, member: 0 },
         possible: true,
-        set: vec![Strategy::Efficient],
+        set: vec![Strategy::Efficient, Strategy::Rules],
     };
     if explored {
         spec.chosen(haiku())
@@ -642,4 +647,243 @@ fn the_paired_test_without_support_or_on_sparse_support_is_not_evaluable() {
         matches!(test.result, TestResult::NotEvaluable(reason) if reason.contains("filler")),
         "{test:?}"
     );
+}
+
+/// The ruled exploration rate the `rules`-exploration fixture logs at.
+const LIVE_RATE: f64 = 0.05;
+
+/// A `live` turn whose learned choice differs from `rules`: `efficient`
+/// passes at $0.005 on `haiku`, below every other plan, so no strategy is a
+/// cheaper unproven member and the exploration set is `set`. Under the
+/// 2026-09-30 rule that set is `[rules]`, since `rules` meets every hard
+/// constraint. Served, the turn is the exploit at `1 - rate`; explored, it
+/// is `rules` on `opus` at `rate * 1/1`.
+fn diverging_live_turn(explored: bool, set: Vec<Strategy>) -> Spec {
+    let spec = Spec::new().live().passing(Strategy::Efficient, 0.005);
+    let exploration = |rate: f64| ExplorationEvidence {
+        on_infeasible: OnInfeasible::ServeRules,
+        draw: Draw { rate, member: 0 },
+        possible: true,
+        set: set.clone(),
+    };
+    if explored {
+        spec.chosen(opus())
+            .propensity(LIVE_RATE)
+            .choice(LearnedChoice::Explore {
+                strategy: Strategy::Rules,
+                member: 0,
+            })
+            .exploration(exploration(0.0))
+    } else {
+        spec.chosen(haiku())
+            .propensity(1.0 - LIVE_RATE)
+            .choice(LearnedChoice::Exploit {
+                strategy: Strategy::Efficient,
+            })
+            .exploration(exploration(0.9))
+    }
+}
+
+/// One `live` session of one-turn diverging intervals, each
+/// `(explored, positive)`, every turn recording `set`.
+fn diverging_live_session(id: &str, intervals: &[(bool, bool)], set: &[Strategy]) -> Script {
+    let mut script = Script::named(id);
+    for (explored, positive) in intervals {
+        let turn = script.turn(diverging_live_turn(*explored, set.to_vec()).decision());
+        script.review(&[&turn], if *positive { on_track() } else { off_track() });
+    }
+    script
+}
+
+/// Twenty `live` sessions where the learned choice differs from `rules` on
+/// every turn: three served intervals and one that explored `rules`, with a
+/// negative on every fourth session's explored interval.
+fn rules_explored_fixture(set: &[Strategy]) -> Vec<Script> {
+    (0..20)
+        .map(|at| {
+            diverging_live_session(
+                &format!("acme/ada/live{at:02}#g0"),
+                &[
+                    (false, true),
+                    (false, true),
+                    (false, true),
+                    (true, at % 4 != 0),
+                ],
+                set,
+            )
+        })
+        .collect()
+}
+
+/// The owner's 2026-09-30 ruling exists for this: with `rules` in the live
+/// exploration set, `rules` has logging probability above zero on every
+/// diverging interval, so test 1b, the binding M11 comparison, is evaluable.
+/// The recorded propensities are the policy's own formula over the recorded
+/// set.
+#[test]
+fn test_1b_is_evaluable_on_live_intervals_that_explored_rules() {
+    let served = diverging_live_turn(false, vec![Strategy::Rules]);
+    let explored = diverging_live_turn(true, vec![Strategy::Rules]);
+    for (spec, served_route) in [(&served, haiku()), (&explored, opus())] {
+        let decision = spec.decision();
+        let evidence = learned_evidence(&decision);
+        let expected = propensity(
+            &evidence.plans,
+            &evidence.exploration.as_ref().unwrap().set,
+            &served_route,
+            Some(&haiku()),
+            LIVE_RATE,
+        );
+        assert!((evidence.propensity - expected).abs() < 1e-12, "{expected}");
+    }
+
+    let calibrated = run(&config(20), &rules_explored_fixture(&[Strategy::Rules]));
+    let promotion = &calibrated.report.promotion;
+    assert_eq!(calibrated.evidence.intervals.len(), 80);
+    assert_eq!(
+        calibrated.evidence.exclusions.get(&Cause::ReplayMismatch),
+        None
+    );
+    assert_eq!(promotion.agreeing, 0, "every interval diverges");
+    let full = &promotion.quality_full;
+    assert_eq!(
+        (full.intervals, full.learned_supported, full.rules_supported),
+        (80, 80, 80)
+    );
+    assert!(
+        matches!(full.result, TestResult::Pass | TestResult::Fail),
+        "{full:?}"
+    );
+    // learned: 60 positive served intervals; rules: 15 of 20 explored.
+    let rules = calibrated
+        .report
+        .estimate(Candidate::Fixed(Strategy::Rules))
+        .unwrap();
+    assert_eq!(rules.snips, Some(0.75));
+    assert_eq!(full.result, TestResult::Pass, "{full:?}");
+    let text = calibrated.report.render();
+    let line = line_with(&text, "1b. quality");
+    assert!(line.contains("rules on 80 of 80"), "{line}");
+
+    // The support guard stays: where `rules` fails a hard constraint it is
+    // not in the set, has zero logging probability, and 1b is not
+    // evaluable.
+    let over: Vec<Script> = (0..20)
+        .map(|at| {
+            let mut script = Script::named(&format!("acme/ada/over{at:02}#g0"));
+            let turn = script.turn(
+                // An empty set cannot explore, so the exploit is served
+                // with probability 1.
+                diverging_live_turn(false, Vec::new())
+                    .over_grant(Strategy::Rules)
+                    .propensity(1.0)
+                    .decision(),
+            );
+            script.review(&[&turn], on_track());
+            script
+        })
+        .collect();
+    let calibrated = run(&config(20), &over);
+    assert_eq!(calibrated.evidence.intervals.len(), 20, "these replay");
+    let full = &calibrated.report.promotion.quality_full;
+    assert_eq!(full.rules_supported, 0);
+    assert!(
+        matches!(full.result, TestResult::NotEvaluable(reason) if reason.contains("rules has zero logging probability")),
+        "{full:?}"
+    );
+}
+
+/// A learned record written under the M4 set rule, before `rules` joined,
+/// does not replay: its recorded set is not the set the rule derives from
+/// its own recorded plans, so its interval is excluded as `record does not
+/// replay`, never weighted under a set the policy no longer draws from.
+#[test]
+fn a_record_from_the_old_set_rule_does_not_replay() {
+    // Under the M4 rule this turn's set was empty: nothing is cheaper than
+    // the $0.005 exploit, and `rules` was never added. An empty set cannot
+    // have explored, so every turn served the exploit, which that build
+    // logged at probability 1.
+    let old: Vec<Script> = (0..20)
+        .map(|at| {
+            let mut script = Script::named(&format!("acme/ada/old{at:02}#g0"));
+            let turn = script.turn(
+                diverging_live_turn(false, Vec::new())
+                    .propensity(1.0)
+                    .decision(),
+            );
+            script.review(&[&turn], on_track());
+            script
+        })
+        .collect();
+    let calibrated = run(&config(20), &old);
+    assert_eq!(
+        calibrated.evidence.exclusions.get(&Cause::ReplayMismatch),
+        Some(&20)
+    );
+    assert!(calibrated.evidence.intervals.is_empty());
+    assert!(matches!(
+        calibrated.report.promotion.quality_full.result,
+        TestResult::NotEvaluable(_)
+    ));
+}
+
+/// A `live` turn nothing passes, explored to the cheaper unproven
+/// `efficient` on `haiku` under `on_infeasible`, recording `set`.
+fn nothing_passes_explored(on_infeasible: OnInfeasible, set: Vec<Strategy>) -> Script {
+    let spec = Spec::new()
+        .live()
+        .priced(Strategy::Efficient, 0.005)
+        .chosen(haiku())
+        .propensity(LIVE_RATE / set.len() as f64)
+        .choice(LearnedChoice::Explore {
+            strategy: Strategy::Efficient,
+            member: 0,
+        })
+        .exploration(ExplorationEvidence {
+            on_infeasible,
+            draw: Draw {
+                rate: 0.0,
+                member: 0,
+            },
+            possible: true,
+            set,
+        });
+    let mut script = Script::named(&format!(
+        "acme/ada/{on_infeasible:?}{}#g0",
+        spec.exploration.as_ref().unwrap().set.len()
+    ));
+    let turn = script.turn(spec.decision());
+    script.review(&[&turn], on_track());
+    script
+}
+
+/// Replay applies the owner's `refuse` ruling of 2026-09-30 through the same
+/// rule the policy draws from: on a `refuse` turn that nothing passes,
+/// `rules` is never a member, so a record whose set holds it does not replay.
+/// The set without it does, and under `serve_rules` the set with it does.
+#[test]
+fn a_refuse_record_nothing_passes_with_rules_in_its_set_does_not_replay() {
+    let with_rules = vec![Strategy::Efficient, Strategy::Rules];
+    let without = vec![Strategy::Efficient];
+    for (on_infeasible, set, replays) in [
+        (OnInfeasible::Refuse, with_rules.clone(), false),
+        (OnInfeasible::Refuse, without.clone(), true),
+        (OnInfeasible::ServeRules, with_rules, true),
+        (OnInfeasible::ServeRules, without, false),
+    ] {
+        let calibrated = run(
+            &config(1),
+            &[nothing_passes_explored(on_infeasible, set.clone())],
+        );
+        assert_eq!(
+            calibrated.evidence.intervals.len(),
+            usize::from(replays),
+            "{on_infeasible:?} {set:?}"
+        );
+        assert_eq!(
+            calibrated.evidence.exclusions.get(&Cause::ReplayMismatch),
+            (!replays).then_some(&1),
+            "{on_infeasible:?} {set:?}"
+        );
+    }
 }
