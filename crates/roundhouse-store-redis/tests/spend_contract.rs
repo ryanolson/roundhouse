@@ -28,6 +28,7 @@ use roundhouse_core::control::{
 };
 use roundhouse_core::ids::{ResponseId, SessionId};
 use roundhouse_store_redis::RedisSpendLedger;
+use roundhouse_store_redis::test_support::monitor::{ForeignTraffic, commands_naming, round_trips};
 use roundhouse_store_redis::test_support::{spend_holds_key, url_from_env};
 
 roundhouse_core::spend_ledger_contract_suite!(
@@ -157,115 +158,73 @@ async fn a_sub_dollar_grant_is_not_truncated_to_zero() {
     );
 }
 
-/// Counts `EVAL`/`EVALSHA` calls between two `CONFIG RESETSTAT`-bounded
-/// points on the *server*, since the `redis` crate's `ConnectionManager`
-/// exposes no per-call counter of its own — and takes the minimum over
-/// several attempts rather than trusting any single one, because that
-/// server-wide counter is shared with every other test in this binary
-/// running concurrently against the same Redis. See the comment at the
-/// first measurement loop for why the minimum is still the right answer.
+/// Counts the commands each operation sends, by `MONITOR` filtered on this
+/// test's own project id, while another client runs scripts continuously
+/// beside it.
+///
+/// Not `INFO commandstats`: its counters are server-wide, and no number of
+/// back-to-back attempts gets one that no neighbour overlapped
+/// (`test_support::monitor` has the detail). The foreign traffic is here so this
+/// test proves its count is its own on every run, rather than only on the
+/// runs where the scheduler happens to put a busy neighbour beside it.
+///
+/// Each operation runs once before it is measured. The first call of a script
+/// on a server that has not cached it costs a second `EVALSHA` (the
+/// `NOSCRIPT` retry), and that one-off is not what "one round trip" claims.
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn open_grant_and_settle_grant_are_single_round_trips() {
     let ledger = connect_spend_from_env().await;
-    let mut raw = raw_from_env().await;
     let principal = fresh_principal("ada");
+    let project = principal.project.as_str().to_owned();
     let terms = pooled_terms(1_000.0);
     let session = SessionId::new(format!("sess_{}", principal.user));
+    let grant = |response: &str| GrantRequest {
+        principal: principal.clone(),
+        session_id: session.clone(),
+        response_id: ResponseId::new(response),
+        requested_usd: 1.0,
+        ttl_ms: 60_000,
+        terms: terms.clone(),
+        now_ms: 0,
+    };
+    let settle = |response: &str, seq: u64| Settlement {
+        principal: principal.clone(),
+        key: SettlementKey::SessionWatermark {
+            session_id: session.clone(),
+            seq,
+        },
+        response_id: ResponseId::new(response),
+        actual_usd: 0.5,
+        window: terms.budget.window,
+        now_ms: 0,
+    };
 
-    async fn eval_calls_since_reset(raw: &mut redis::aio::MultiplexedConnection) -> u64 {
-        let info: String = redis::cmd("INFO")
-            .arg("commandstats")
-            .query_async(raw)
-            .await
-            .unwrap();
-        info.lines()
-            .filter_map(|line| {
-                line.strip_prefix("cmdstat_eval:calls=")
-                    .or_else(|| line.strip_prefix("cmdstat_evalsha:calls="))
-            })
-            .filter_map(|rest| rest.split(',').next())
-            .filter_map(|n| n.parse::<u64>().ok())
-            .sum()
-    }
+    ledger.open_grant(grant("warm")).await.unwrap();
+    ledger.settle_grant(settle("warm", 1)).await.unwrap();
 
-    async fn reset_stats(raw: &mut redis::aio::MultiplexedConnection) {
-        let _: () = redis::cmd("CONFIG")
-            .arg("RESETSTAT")
-            .query_async(raw)
-            .await
-            .unwrap();
-    }
+    let traffic = ForeignTraffic::start().await;
 
-    // `INFO commandstats` is server-wide, so a shared test Redis makes any
-    // *single* measurement unreliable: another test's own script call can
-    // land in the sliver of time between `CONFIG RESETSTAT` and the `INFO`
-    // read around it. That noise is one-directional — it can only add calls
-    // this test did not make, never hide the one it did — so the true answer
-    // is the minimum across several independent attempts: the attempt that
-    // happened not to race anyone, which a handful of tries makes
-    // overwhelmingly likely to occur at least once.
-    const ATTEMPTS: u64 = 10;
-
-    let mut min_grant_calls = u64::MAX;
-    for attempt in 0..ATTEMPTS {
-        reset_stats(&mut raw).await;
-        ledger
-            .open_grant(GrantRequest {
-                principal: principal.clone(),
-                session_id: session.clone(),
-                response_id: ResponseId::new(format!("grant-probe-{attempt}")),
-                requested_usd: 1.0,
-                ttl_ms: 60_000,
-                terms: terms.clone(),
-                now_ms: 0,
-            })
-            .await
-            .unwrap();
-        min_grant_calls = min_grant_calls.min(eval_calls_since_reset(&mut raw).await);
-    }
+    let (granted, executed) = commands_naming(&project, ledger.open_grant(grant("probe"))).await;
+    granted.unwrap();
     assert_eq!(
-        min_grant_calls, 1,
-        "open_grant checks and debits both ceilings in one script"
+        round_trips(&executed),
+        ["EVALSHA"],
+        "open_grant checks and debits both ceilings in one script: {executed:?}"
     );
 
-    let mut min_settle_calls = u64::MAX;
-    for attempt in 0..ATTEMPTS {
-        // Opening the grant is outside the measurement window; only the
-        // settle itself is timed.
-        ledger
-            .open_grant(GrantRequest {
-                principal: principal.clone(),
-                session_id: session.clone(),
-                response_id: ResponseId::new(format!("settle-probe-{attempt}")),
-                requested_usd: 1.0,
-                ttl_ms: 60_000,
-                terms: terms.clone(),
-                now_ms: 0,
-            })
-            .await
-            .unwrap();
-
-        reset_stats(&mut raw).await;
-        ledger
-            .settle_grant(Settlement {
-                principal: principal.clone(),
-                key: SettlementKey::SessionWatermark {
-                    session_id: session.clone(),
-                    seq: attempt + 1,
-                },
-                response_id: ResponseId::new(format!("settle-probe-{attempt}")),
-                actual_usd: 0.5,
-                window: terms.budget.window,
-                now_ms: 0,
-            })
-            .await
-            .unwrap();
-        min_settle_calls = min_settle_calls.min(eval_calls_since_reset(&mut raw).await);
-    }
+    let (settled, executed) =
+        commands_naming(&project, ledger.settle_grant(settle("probe", 2))).await;
+    settled.unwrap();
     assert_eq!(
-        min_settle_calls, 1,
-        "settle_grant releases the hold and applies the spend in one script"
+        round_trips(&executed),
+        ["EVALSHA"],
+        "settle_grant releases the hold and applies the spend in one script: {executed:?}"
+    );
+
+    assert!(
+        traffic.stop() > 0,
+        "the measurements ran with no foreign traffic, so they prove nothing about it"
     );
 }
 

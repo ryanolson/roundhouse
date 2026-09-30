@@ -17,14 +17,19 @@ redis = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+# Only under `test-support`: `test_support::monitor` reads the `MONITOR`
+# stream and bounds that read with a timeout.
+futures = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 [features]
 # Compiles this store's `LeaseControl` impl, the hook the shared conformance
 # suite uses to expire a lease without waiting out its TTL. A feature rather
 # than `cfg(test)` because integration tests build the library without
 # `cfg(test)`; the self-dev-dependency below turns it on for exactly those
-# builds and nothing else.
-test-support = ["roundhouse-core/test-support"]
+# builds and nothing else. It also compiles `test_support::monitor`, which
+# counts the commands one test's calls cost on a Redis that other tests share.
+test-support = ["roundhouse-core/test-support", "dep:futures", "dep:tokio"]
 
 [dev-dependencies]
 # `test-support` is the conformance suite: the same assertions that judge

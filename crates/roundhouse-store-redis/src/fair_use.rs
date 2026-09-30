@@ -437,6 +437,7 @@ impl FairUseLedger for RedisFairUseLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::monitor::{ForeignTraffic, commands_naming};
 
     fn project_only_tokens(window: FairUseWindow, max_tokens: u64) -> FairUseTerms {
         FairUseTerms {
@@ -711,38 +712,6 @@ mod tests {
         );
     }
 
-    /// Serializes every test in this module that talks to a real Redis
-    /// server: the server is a process-wide resource that two tests can each
-    /// disturb without touching the other's state directly.
-    ///
-    /// `would_exceed_worst_case_seven_day_decay_reads_six_bucket_chunks`
-    /// below counts `HMGET` calls off `INFO commandstats`, which is
-    /// server-wide: it has no way to tell its own commands from a
-    /// concurrently-running neighbour's. `tests/fair_use_storage.rs`'s own
-    /// invariant comment ("one measuring loop per test binary") names half
-    /// of that hazard — two such counting loops racing each other — but
-    /// undersells it: `a_windows_four_sum_fields_move_as_a_set` right here
-    /// is not a measuring loop at all, just an ordinary test that happens to
-    /// issue its own `HMGET`s against the same real server, and running it
-    /// concurrently with the measuring test below inflated the count from 7
-    /// to 8 or 9 depending on how much of its traffic landed inside the
-    /// `RESETSTAT`-to-`INFO` window (found the hard way: `--lib
-    /// --include-ignored` at default thread count failed nearly every run,
-    /// `--test-threads=1` never did). The fix generalizes the invariant to
-    /// what it actually needs to say: no other real-Redis test in this
-    /// binary may run while a commandstats measurement is in flight, full
-    /// stop, whether or not that other test is itself counting anything.
-    /// Held for a test's entire body, connect through cleanup, because the
-    /// neighbour's traffic can land at any point while it holds the counter
-    /// uncontended, not only during whatever window this test happens to be
-    /// in.
-    ///
-    /// Waiting for this lock must yield to the runtime because each test holds
-    /// the guard across Redis calls. The guard spans the whole test to prevent
-    /// another test from changing its counters.
-    static REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
-
     /// M13.1 review F7's other half, held as a premise rather than assumed:
     /// **a window's four sum fields move as a set.**
     ///
@@ -756,8 +725,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
     async fn a_windows_four_sum_fields_move_as_a_set() {
-        let _serialized = REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME.lock().await;
-
         let url = std::env::var("ROUNDHOUSE_TEST_REDIS_URL")
             .expect("--include-ignored asks for the real backend; set ROUNDHOUSE_TEST_REDIS_URL");
         let ledger = RedisFairUseLedger::connect(&url)
@@ -865,16 +832,16 @@ mod tests {
     /// `decay` takes the steady-state subtract branch and walks all `2015`
     /// aged-out buckets in one call.
     ///
-    /// `CONFIG RESETSTAT` before the one `would_exceed` invocation and
-    /// `INFO commandstats` after it count every `HMGET` the script actually
-    /// issued: the outer read of the window's four sum fields and the scope's
-    /// mark (1), plus `read_buckets`'s `ceil(2015 / 400) = 6` chunks. A bound
-    /// of one would read `1`; `CHUNK` makes it `7`.
+    /// `MONITOR` around the one `would_exceed` invocation counts every
+    /// `HMGET` the script issued on this run's project: the outer read of the
+    /// window's four sum fields and the scope's mark (1), plus
+    /// `read_buckets`'s `ceil(2015 / 400) = 6` chunks. A bound of one would
+    /// read `1`; `CHUNK` makes it `7`. Not `INFO commandstats`: it is
+    /// server-wide, so the `HMGET`s of the learn tests in this binary, which
+    /// run beside this one, landed in the count and read 8 or 9.
     #[tokio::test]
     #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
     async fn would_exceed_worst_case_seven_day_decay_reads_six_bucket_chunks() {
-        let _serialized = REAL_REDIS_TESTS_RUN_ONE_AT_A_TIME.lock().await;
-
         let url = std::env::var("ROUNDHOUSE_TEST_REDIS_URL")
             .expect("--include-ignored asks for the real backend; set ROUNDHOUSE_TEST_REDIS_URL");
         let client = redis::Client::open(url.as_str()).expect("a valid redis url");
@@ -884,7 +851,11 @@ mod tests {
         let scripts = scripts::Scripts::new();
 
         let namespace = KeyNamespace::default();
-        let project = ProjectId::new("f7-decay-chunk-worst-case");
+        // Unique per run: it is what the `MONITOR` count below filters on.
+        let project = ProjectId::new(format!(
+            "f7-decay-chunk-worst-case-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
         let user = UserId::new("ada");
         let project_key = project_scope_key(&namespace, &project);
         let member_key = member_scope_key(&namespace, &project, &user);
@@ -1001,14 +972,14 @@ mod tests {
             }
         }
 
-        let _: () = redis::cmd("CONFIG")
-            .arg("RESETSTAT")
-            .query_async(&mut conn)
-            .await
-            .expect("CONFIG RESETSTAT must succeed on the test Redis");
-
-        let refusal = scripts
-            .would_exceed(
+        // Counted by `MONITOR` on this run's own project id, under foreign
+        // traffic that issues `HMGET`s of its own: see
+        // `test_support::monitor` for why a server-wide counter cannot
+        // tell this test's reads from a neighbour's.
+        let traffic = ForeignTraffic::start().await;
+        let (refusal, executed) = commands_naming(
+            project.as_str(),
+            scripts.would_exceed(
                 &mut conn,
                 scripts::WouldExceedArgs {
                     project_key: &project_key,
@@ -1018,30 +989,24 @@ mod tests {
                     max_count: MAX_COUNT,
                     windows,
                 },
-            )
-            .await
-            .expect("would_exceed must succeed");
+            ),
+        )
+        .await;
+        assert!(
+            traffic.stop() > 0,
+            "the measurement ran with no foreign traffic, so it proves nothing about it"
+        );
+        let refusal = refusal.expect("would_exceed must succeed");
         assert!(
             refusal.is_none(),
             "F7: the cap was set far above the draws; a refusal here means \
              the arithmetic drifted from what this test assumes, and the \
              HMGET count below would not mean what this test claims"
         );
-
-        let info: String = redis::cmd("INFO")
-            .arg("commandstats")
-            .query_async(&mut conn)
-            .await
-            .expect("INFO commandstats must succeed");
-        let hmget_calls: u64 = info
-            .lines()
-            .find_map(|line| line.strip_prefix("cmdstat_hmget:calls="))
-            .and_then(|rest| rest.split(',').next())
-            .and_then(|n| n.parse().ok())
-            .expect(
-                "a cmdstat_hmget line must be present in INFO commandstats \
-                 after a HMGET-issuing script ran since the last RESETSTAT",
-            );
+        let hmget_calls = executed
+            .iter()
+            .filter(|e| e.from_script && e.command == "HMGET")
+            .count();
 
         // The bound the module doc now states: the outer state read (1) plus
         // `read_buckets`'s CHUNK=400 chunking of the 2015-bucket gap
