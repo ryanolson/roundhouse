@@ -4,9 +4,9 @@
 """Search an installed Claude Code executable as bytes and print a window around each hit.
 
 The executable is never run. It is a Bun single-file binary with minified
-JavaScript inside, so a byte search is the only reliable read. The offsets
-cited as [claude@<version> +N] in prefix-anchored-routing-evidence.md come
-from this script.
+JavaScript inside, so a byte search is the only reliable read. Use it to
+read a claim about the client again when the pinned Claude Code version
+moves.
 
 Usage:
   ccgrep.py <executable> <pattern> <before> <after> [max_hits=3] [start_offset=150000000]

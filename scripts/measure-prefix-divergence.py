@@ -7,6 +7,9 @@ Approximates roundhouse-server messages_api::wire::canonicalize and
 roundhouse-core Item::render at 2dd40dd. Byte-exact agreement with the Rust
 render is not needed here: the measurement only needs one deterministic
 per-item encoding applied to every fixture alike.
+
+Usage:
+  measure-prefix-divergence.py crates/roundhouse-server/tests/fixtures
 """
 import difflib
 import hashlib
