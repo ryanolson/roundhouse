@@ -77,7 +77,13 @@
     "has no measurement to report and an invented one is worse than none -- a made-up",
     "latency loses real turns to a hosted model. At 0.0 a local worker is quoted the",
     "flat floor however much prefill the Dynamo residency answer says it faces, which",
-    "is what every deployment quoted before these fields existed."
+    "is what every deployment quoted before these fields existed.",
+    "fleet_quote_deadline_ms bounds the Dynamo residency call on a turn that can",
+    "fail open: past it, or on a fleet error, the turn routes without a local quote",
+    "and records fleet_timeout or fleet_error. Zero is refused at load. A turn is not",
+    "held to the bound when it cannot fail open -- its policy admits only local",
+    "targets, no credential reaches any hosted provider, or its cadence is spent --",
+    "and it waits for the turn deadline and still fails with the fleet."
   ],
 
   "providers": {
@@ -229,5 +235,6 @@
   "capability_band": 0.10,
 
   "local_base_ttft_ms": 60.0,
-  "local_ttft_ms_per_prefill_token": 0.0
+  "local_ttft_ms_per_prefill_token": 0.0,
+  "fleet_quote_deadline_ms": 500
 }

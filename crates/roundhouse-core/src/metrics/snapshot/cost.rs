@@ -67,16 +67,19 @@ impl From<&EvaluationCallTally> for EvaluationTokens {
 /// does not erase the usage that was billed, so `unconfirmed_usd` is money this
 /// deployment knows it owes and cannot yet prove it committed —
 /// `committed_usd + unconfirmed_usd` agrees with
-/// [`EvaluationMetrics::measured_usd`] up to the rounding of two independently
-/// ordered float sums over the same addends. `unconfirmed_usd` is exactly zero
-/// once nothing is open; that identity is bit-exact and pinned by
-/// `evaluation_tests.rs`.
+/// [`EvaluationMetrics::measured_usd`] plus [`EvaluationMetrics::estimated_usd`],
+/// up to the rounding of two independently ordered float sums over the same
+/// addends. The estimates are ledger bookings and never enter `measured_usd`,
+/// which is what keeps a measured dollar distinguishable from a booked one.
+/// `unconfirmed_usd` is exactly zero once nothing is open; that identity is
+/// bit-exact and pinned by `evaluation_tests.rs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct EvaluationSettlement {
     /// Calls that reached a service and whose settle the ledger answered for,
     /// at the call or through a later repair.
     pub acknowledged_calls: u64,
-    /// The measured share of those calls, in dollars.
+    /// What the ledger acknowledged for those calls, in dollars: the measured
+    /// price, or the grant's estimate for a call whose usage never arrived.
     pub committed_usd: f64,
     /// Calls whose settle nobody has answered for. See
     /// [`SettlementAck::Unconfirmed`](crate::classify::SettlementAck::Unconfirmed):
@@ -141,8 +144,9 @@ pub struct EvaluationModelMetrics {
 /// The four call classes are a partition of what the log knows:
 /// `results == measured_calls + unknown_usage_calls + refused_calls`, and
 /// `intents == results + pending`. A pending intent and an unreported usage are
-/// both cost this deployment cannot state, which is what `cost_incomplete`
-/// says; a refusal is genuinely free, because nothing was sent.
+/// both cost this deployment cannot state exactly, which is what
+/// `cost_incomplete` says; a refusal is genuinely free, because nothing was
+/// sent.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EvaluationMetrics {
     /// Calls committed to, by durable call identity within a session.
@@ -162,12 +166,39 @@ pub struct EvaluationMetrics {
     /// Results whose usage nobody reported. The call billed an amount that
     /// cannot be named, and zero is the wrong guess.
     pub unknown_usage_calls: u64,
+    /// What the settles of `unknown_usage_calls` booked: the grant's estimate
+    /// for a call that may have reached the service, zero for one that
+    /// provably did not. Counted once per call, whether its settle was
+    /// acknowledged at the call, by a later repair, or is still open.
+    ///
+    /// **An estimate, not a measurement, and never part of `measured_usd`.**
+    /// It is published so the evaluation total does not read a call that may
+    /// have been billed as free, which would make classifying look cheaper
+    /// than it is. [`ObservedCost::evaluation_estimated_usd`] carries the same
+    /// figure into the combined total.
+    pub estimated_usd: f64,
+    /// Of `unknown_usage_calls`, how many booked an estimate above zero.
+    ///
+    /// `unknown_usage_calls` also counts a call whose settle submitted `0.0`
+    /// because it provably never reached the service, and that call is not
+    /// one of the calls `estimated_usd` is spread over -- the dashboard's
+    /// "estimated for N unreported calls" sentence needs this count rather
+    /// than `unknown_usage_calls` for exactly that reason. Mirrors
+    /// [`ServingCostGaps::estimated_calls`].
+    pub estimated_calls: u64,
     /// Results established before any HTTP — a refused budget, an unreachable
     /// ledger, an expired call. Nothing was sent, so nothing was billed.
     pub refused_calls: u64,
     pub settlement: EvaluationSettlement,
-    /// Whether some in-scope evaluation cost cannot be stated, which makes
-    /// `measured_usd` a floor rather than a total.
+    /// Whether some in-scope evaluation cost cannot be stated exactly: a
+    /// pending intent, whose cost is in no figure here, or an unreported
+    /// usage, whose cost is stood in for by its booked estimate.
+    ///
+    /// **An estimate still sets this**, for the reason an estimated serving
+    /// call sets [`ServingCostGaps::estimated_calls`]: the dollars are counted,
+    /// and they are not what the service billed. `measured_usd +
+    /// estimated_usd` is then the best statement this document can make, not a
+    /// complete one.
     pub cost_incomplete: bool,
     pub unbooked: EvaluationUnbooked,
     /// One row per identity pair, ordered by requested then reported name.
@@ -186,6 +217,8 @@ impl EvaluationMetrics {
             price_basis: EVALUATION_PRICE_BASIS,
             tokens: EvaluationTokens::from(&counters.all),
             unknown_usage_calls: counters.all.unknown_usage_calls,
+            estimated_usd: counters.all.estimated_usd,
+            estimated_calls: counters.all.estimated_calls,
             refused_calls: counters.all.refused_calls,
             settlement: EvaluationSettlement {
                 acknowledged_calls: view.acknowledged_calls(),
@@ -373,7 +406,20 @@ pub const OBSERVED_COST_SCOPE: &str = "hosted_serving_and_classifier_calls";
 pub struct ObservedCost {
     pub serving_usd: f64,
     pub serving_basis: &'static str,
+    /// `evaluation_measured_usd + evaluation_estimated_usd`.
     pub evaluation_usd: f64,
+    /// The part of `evaluation_usd` priced from usage a service reported:
+    /// [`EvaluationMetrics::measured_usd`].
+    pub evaluation_measured_usd: f64,
+    /// The part booked at the grant's estimate for calls whose usage nobody
+    /// reported: [`EvaluationMetrics::estimated_usd`].
+    ///
+    /// Split out the way hosted spend splits
+    /// [`Savings::frontier_spend_estimated_usd`](super::Savings::frontier_spend_estimated_usd)
+    /// from its measured part. Leaving it out of the total would make an
+    /// evaluation that may have been billed read as free; folding it in
+    /// unlabelled would pass a booking off as a measurement.
+    pub evaluation_estimated_usd: f64,
     pub evaluation_basis: &'static str,
     /// `serving_usd + evaluation_usd`.
     pub total_usd: f64,
@@ -381,8 +427,9 @@ pub struct ObservedCost {
     pub covers: &'static str,
     /// What the serving half does not know. See [`ServingCostGaps`].
     pub serving_gaps: ServingCostGaps,
-    /// Whether the evaluation half could not state some of its cost — a pending
-    /// intent, or usage nobody reported. The same value as
+    /// Whether the evaluation half could not state some of its cost exactly — a
+    /// pending intent, or usage nobody reported (booked at its estimate, and
+    /// still not measured). The same value as
     /// [`EvaluationMetrics::cost_incomplete`], read from it rather than
     /// recomputed.
     pub evaluation_incomplete: bool,
@@ -408,12 +455,15 @@ impl ObservedCost {
         gaps: ServingCostGaps,
         evaluation: &EvaluationMetrics,
     ) -> Self {
+        let evaluation_usd = evaluation.measured_usd + evaluation.estimated_usd;
         Self {
             serving_usd,
             serving_basis: SERVING_PRICE_BASIS,
-            evaluation_usd: evaluation.measured_usd,
+            evaluation_usd,
+            evaluation_measured_usd: evaluation.measured_usd,
+            evaluation_estimated_usd: evaluation.estimated_usd,
             evaluation_basis: EVALUATION_PRICE_BASIS,
-            total_usd: serving_usd + evaluation.measured_usd,
+            total_usd: serving_usd + evaluation_usd,
             covers: OBSERVED_COST_SCOPE,
             serving_gaps: gaps,
             evaluation_incomplete: evaluation.cost_incomplete,

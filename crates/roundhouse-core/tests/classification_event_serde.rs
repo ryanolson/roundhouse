@@ -171,6 +171,7 @@ fn all_three_outcomes_round_trip_and_read_distinctly() {
                 spend: EvaluationSpend::Unknown {
                     granted_usd: 0.000_1,
                     settled: SettlementAck::Committed,
+                    submitted_usd: 0.0,
                 },
             },
         ),
@@ -426,6 +427,7 @@ async fn a_replayed_log_reports_an_answered_call_and_an_outstanding_one() {
                             spend: EvaluationSpend::Unknown {
                                 granted_usd: 0.000_1,
                                 settled: SettlementAck::Committed,
+                                submitted_usd: 0.0,
                             },
                             reported_model: None,
                         },

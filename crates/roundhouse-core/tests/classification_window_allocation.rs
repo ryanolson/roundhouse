@@ -191,6 +191,7 @@ fn classify_result(turn: u64) -> ClassificationRecord {
             spend: EvaluationSpend::Unknown {
                 granted_usd: 0.0,
                 settled: SettlementAck::Committed,
+                submitted_usd: 0.0,
             },
             reported_model: None,
         },

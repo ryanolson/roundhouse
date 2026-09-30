@@ -34,6 +34,7 @@ mod ledger_deadline;
 mod model_identity;
 mod projection;
 mod question;
+mod settle_amount;
 mod settlement_order;
 
 const KEY: &str = "sk-ZZZQQQ-typesafe-deployment-key";

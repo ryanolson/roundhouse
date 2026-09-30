@@ -455,26 +455,25 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
         };
         match sent {
             Err(error) => {
-                // Nothing priceable came back, so a release at zero is
-                // submitted — the attempt, not its outcome: whether the ledger
-                // acknowledged it is what `settled` carries. The record says
-                // the accounting is unknown rather than claiming a free call.
+                let submitted_usd = failure_submission_usd(&error, granted_usd);
                 let settled = self
-                    .settle(settle, 0.0, roundhouse_core::now_ms(), deadline)
+                    .settle(settle, submitted_usd, roundhouse_core::now_ms(), deadline)
                     .await;
                 ClassificationOutcome::Failed {
                     reason: transport_reason(&error).to_string(),
                     spend: EvaluationSpend::Unknown {
                         granted_usd,
                         settled,
+                        submitted_usd,
                     },
                 }
             }
             Ok(reply) => {
-                // Two statements, kept apart on purpose. The ledger is sent zero
-                // when nothing priceable came back, because that is how a hold is
-                // released; the record says `Unknown`, because a measured zero
-                // would book a billed call as free.
+                // Two statements, kept apart on purpose. The ledger is sent the
+                // grant's estimate when no usage came back, because an envelope
+                // arrived and the call was billed at an amount nobody reported;
+                // the record says `Unknown`, because the estimate is a booking
+                // and not a measurement. See `failure_submission_usd`.
                 let usage = reply.usage.map(|usage| EvaluationUsage {
                     input_tokens: usage.input_tokens,
                     output_tokens: usage.output_tokens,
@@ -483,7 +482,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
                 let settled = self
                     .settle(
                         settle,
-                        usd.unwrap_or(0.0),
+                        usd.unwrap_or(granted_usd),
                         roundhouse_core::now_ms(),
                         deadline,
                     )
@@ -498,6 +497,7 @@ impl<T: Tokenizer> TypeSafeShadow<T> {
                     _ => EvaluationSpend::Unknown {
                         granted_usd,
                         settled,
+                        submitted_usd: granted_usd,
                     },
                 };
                 // Carried onto every arm an envelope reached, usable answers or
@@ -849,6 +849,38 @@ enum SettleFailure {
     /// unknown, not refused: whether the backend applied this settlement is
     /// exactly the question a later repair exists to resolve.
     TimedOut,
+}
+
+/// What a call that produced no priceable reply settles at: the grant's
+/// estimate when the request may have reached the service, zero when it
+/// provably did not.
+///
+/// **An estimate may be approximate, but it must not be biased low.** Every
+/// failure used to settle at zero, and every one of them that the provider
+/// billed — a reset after the write, an answer too slow or too large to read,
+/// an envelope this deployment could not parse — then vanished from the
+/// evaluation budget, which is the direction that makes the evaluation arm
+/// look cheaper than it is (2026-09-28 ruling 3). The grant is the estimate
+/// because it is what the ledger already held against the quote for these
+/// exact bytes; re-pricing here would be a second quote of the same call.
+///
+/// Zero is kept for the failures that bought nothing: a connection never
+/// established, and an error status, which is the service declining the work.
+/// The pre-socket refusals never reach a send at all and are listed only
+/// because the match is exhaustive.
+fn failure_submission_usd(error: &SystemOneError, granted_usd: f64) -> f64 {
+    match error {
+        SystemOneError::Transport { sent: false, .. }
+        | SystemOneError::Status { .. }
+        | SystemOneError::Credential(_)
+        | SystemOneError::ForwardedCredentialRefused
+        | SystemOneError::NoQuestions
+        | SystemOneError::RequestTooLarge { .. } => 0.0,
+        SystemOneError::Transport { sent: true, .. }
+        | SystemOneError::ResponseTooLarge { .. }
+        | SystemOneError::Malformed
+        | SystemOneError::DeadlineExceeded => granted_usd,
+    }
 }
 
 /// A stable short token for a transport failure.

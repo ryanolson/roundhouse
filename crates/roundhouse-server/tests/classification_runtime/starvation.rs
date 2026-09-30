@@ -13,10 +13,13 @@
 //! settlement go unconfirmed without a real provider outage: this suite
 //! reuses it rather than inventing a second failing ledger.
 //!
-//! A zero-dollar release must never trigger that same withhold at all --
-//! the routine case behind the claim, not a ledger outage, and just as
-//! untested by the shape above. [`settlement_repair::YieldingLedger`] is
-//! what reproduces one without touching `typesafe_shadow` itself.
+//! A zero-dollar release must never trigger that same withhold at all, and
+//! the shape above does not test that either. A zero-dollar release is what
+//! a call the service refused with an error status submits; a call that may
+//! have been billed books its estimate instead (2026-09-28 ruling 3), so the
+//! zero-dollar fixtures here answer 529 rather than hang.
+//! [`settlement_repair::SettleOnceFailingLedger`] leaves that release
+//! unconfirmed the same way it does any other first settle.
 //!
 //! Neither shape proves the withhold actually *lifts* once the debt it was
 //! for is repaid, either: a mutation that withholds unconditionally would
@@ -24,7 +27,7 @@
 //! classifier again after the repair lands. The last turn appended to
 //! [`a_sessions_own_new_ticket_does_not_starve_its_owed_repair`] does.
 
-use super::settlement_repair::{SettleOnceFailingLedger, YieldingLedger};
+use super::settlement_repair::SettleOnceFailingLedger;
 use super::*;
 
 /// [`config`] at one in-flight slot -- so the permit a session's own new
@@ -241,24 +244,21 @@ async fn two_slots_leave_room_for_the_repair() {
 
 /// **A zero-dollar release must never withhold the next turn's own ticket.**
 ///
-/// t1's call never gets an answer: the upstream hangs, so the client's own
-/// `call_ttl_ms` deadline fires first and `send_and_settle` submits a release
-/// at zero -- `EvaluationSpend::Unknown`. The settle that follows reuses that
-/// same, already-elapsed deadline, and [`YieldingLedger`] forces its first
-/// poll to return `Pending` -- exactly what a real network round trip does
-/// for free -- so `settle_once`'s own `timeout_at` finds the clock already
-/// past and answers `Unconfirmed`: a zero-dollar entry in
-/// `unrepaired_settlements`, the routine case this test is about, not a
-/// contrived one. t2 owes nothing and must still buy its own classification.
+/// t1's call is refused: the upstream answers 529, so `send_and_settle`
+/// submits a release at zero -- `EvaluationSpend::Unknown` with nothing
+/// booked, because a service that declined the work billed nothing.
+/// [`SettleOnceFailingLedger`] refuses that first settle, which leaves a
+/// zero-dollar entry in `unrepaired_settlements`. t2 owes nothing and must
+/// still buy its own classification.
 #[tokio::test]
 async fn a_zero_dollar_release_does_not_withhold_the_next_turns_ticket() {
     use axum::Router;
+    use axum::body::Body;
+    use axum::response::Response;
     use axum::routing::post;
-    use std::future::pending;
 
-    // A classifier that never answers -- signals `arrived` the instant its
-    // handler is invoked, then hangs forever, so t1's call is cut off by its
-    // own deadline rather than by anything server-side.
+    // A classifier that refuses every call -- and signals `arrived` the
+    // instant its handler is invoked, so the test knows the call was made.
     let arrived = Arc::new(tokio::sync::Notify::new());
     let handler_arrived = Arc::clone(&arrived);
     let app = Router::new().route(
@@ -267,7 +267,10 @@ async fn a_zero_dollar_release_does_not_withhold_the_next_turns_ticket() {
             let arrived = Arc::clone(&handler_arrived);
             async move {
                 arrived.notify_one();
-                pending::<()>().await
+                Response::builder()
+                    .status(529)
+                    .body(Body::from(r#"{"error":"overloaded"}"#))
+                    .unwrap()
             }
         }),
     );
@@ -280,9 +283,8 @@ async fn a_zero_dollar_release_does_not_withhold_the_next_turns_ticket() {
 
     let classify = classify_config(&base_url, |value| {
         value["enabled"] = serde_json::json!(true);
-        value["executor"]["call_ttl_ms"] = serde_json::json!(200);
     });
-    let ledger = YieldingLedger::new();
+    let ledger = SettleOnceFailingLedger::new();
     let runtime = compose(
         "<test>",
         &classify,
@@ -328,11 +330,7 @@ async fn a_zero_dollar_release_does_not_withhold_the_next_turns_ticket() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let parked = runtime.ready(&session).await;
-    assert_eq!(
-        parked.len(),
-        1,
-        "t1's call must complete by its own deadline, not by an answer"
-    );
+    assert_eq!(parked.len(), 1, "t1's refused call completed and parked");
     let spend = parked[0]
         .record
         .outcome
@@ -357,8 +355,8 @@ async fn a_zero_dollar_release_does_not_withhold_the_next_turns_ticket() {
 }
 
 /// How many durable `ClassificationRecorded` events this session's log holds
-/// whose settlement is zero-dollar and unconfirmed -- the routine release a
-/// deadline-fired call submits, not a rare failure.
+/// whose settlement is zero-dollar and unconfirmed -- the release a refused
+/// call submits, left unacknowledged.
 async fn zero_dollar_unconfirmed_results(store: &impl SessionStore, session: &SessionId) -> usize {
     store
         .read_events(session, 0, 1_000)
@@ -382,16 +380,15 @@ async fn zero_dollar_unconfirmed_results(store: &impl SessionStore, session: &Se
 /// **A real debt must not wait behind a wall of zero-dollar releases that
 /// merely arrived first.**
 ///
-/// At one in-flight slot, over a classifier whose first three calls hang --
-/// each cut short only by its own `call_ttl_ms`, the routine shape a
-/// deadline firing before an answer comes back produces -- three zero-dollar
-/// unconfirmed entries accumulate in the log, one per turn that delivers the
-/// previous call and dispatches the next (`t1` dispatches the first; `t2`
-/// delivers it and dispatches the second; and so on). The fourth call
-/// answers normally, and [`SettleOnceFailingLedger`] -- which fails every
-/// call's first settle attempt regardless of timing -- turns it into a
-/// genuine positive debt the same way it turns any answered call's settle
-/// into one.
+/// At one in-flight slot, over a classifier that refuses its first three
+/// calls with a 529 -- a status the service billed nothing for, so each
+/// releases at zero -- and [`SettleOnceFailingLedger`], which fails every
+/// call's first settle attempt, three zero-dollar unconfirmed entries
+/// accumulate in the log, one per turn that delivers the previous call and
+/// dispatches the next (`t1` dispatches the first; `t2` delivers it and
+/// dispatches the second; and so on). The fourth call answers normally, and
+/// the same ledger turns it into a genuine positive debt the same way it
+/// turns any answered call's settle into one.
 ///
 /// The turn that delivers the fourth call's result (`t5`) is also the turn
 /// that first owes a real repair, so it withholds its own new ticket (the
@@ -408,7 +405,6 @@ async fn a_positive_debt_is_repaired_ahead_of_zero_dollar_entries_that_arrived_f
     use axum::body::Body;
     use axum::response::Response;
     use axum::routing::post;
-    use std::future::pending;
 
     let calls = Arc::new(AtomicUsize::new(0));
     let arrived = Arc::new(tokio::sync::Notify::new());
@@ -423,7 +419,10 @@ async fn a_positive_debt_is_repaired_ahead_of_zero_dollar_entries_that_arrived_f
                 let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
                 arrived.notify_one();
                 if n <= 3 {
-                    pending::<Response>().await
+                    Response::builder()
+                        .status(529)
+                        .body(Body::from(r#"{"error":"overloaded"}"#))
+                        .unwrap()
                 } else {
                     Response::new(Body::from(
                         roundhouse_server::test_support::classification::ANSWER,
@@ -442,7 +441,6 @@ async fn a_positive_debt_is_repaired_ahead_of_zero_dollar_entries_that_arrived_f
     let classify = classify_config(&base_url, |value| {
         value["enabled"] = serde_json::json!(true);
         value["executor"]["max_in_flight"] = serde_json::json!(1);
-        value["executor"]["call_ttl_ms"] = serde_json::json!(1_000);
     });
     let ledger = SettleOnceFailingLedger::new();
     let runtime = compose(
@@ -482,8 +480,7 @@ async fn a_positive_debt_is_repaired_ahead_of_zero_dollar_entries_that_arrived_f
     /// Wait for the `want`th call to reach the upstream, then for the
     /// runtime to park at least `count` results for this session -- bounded
     /// on the arrival notification rather than a guessed sleep, and on the
-    /// park count rather than the elapsed time, so this does not race the
-    /// classifier's own `call_ttl_ms`.
+    /// park count rather than the elapsed time.
     async fn await_call_then_parked(
         arrived: &tokio::sync::Notify,
         calls: &AtomicUsize,
@@ -517,7 +514,7 @@ async fn a_positive_debt_is_repaired_ahead_of_zero_dollar_entries_that_arrived_f
                 .spend()
                 .and_then(|spend| spend.unconfirmed_settlement_usd()),
             Some(0.0),
-            "the first call must hang past its own deadline and release at zero"
+            "the first call must be refused and release at zero"
         );
     }
 

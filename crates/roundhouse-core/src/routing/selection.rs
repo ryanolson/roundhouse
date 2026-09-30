@@ -99,6 +99,14 @@ pub enum StageOutcome {
     /// caller that needs to know which tier served reads it off its own
     /// resolution rather than reconstructing it from this arm.
     ///
+    /// **The head's tier, not every dispatch's.** A guarded turn's fallbacks
+    /// run through the efficient tier before the rest of the capable one
+    /// (2026-09-28 ruling 4), so a failover can dispatch an efficient member
+    /// under a record that still carries this arm. A reader that needs the
+    /// tier of a dispatched target reads it off the recipe lists in
+    /// [`StageEvidence`] by the `Routed` record's own target, the way
+    /// `engine::opened_a_tier_escalation` does, never off this arm.
+    ///
     /// `displaced` is the head it dominated, by
     /// [`Target::policy_identity`](super::Target::policy_identity) — the same
     /// spelling the recipe uses, so the two read as one language.

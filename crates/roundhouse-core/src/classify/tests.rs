@@ -574,6 +574,7 @@ fn unknown_usage_commits_nothing_even_when_the_ledger_accepted_the_release() {
     let released = EvaluationSpend::Unknown {
         granted_usd: 0.002,
         settled: SettlementAck::Committed,
+        submitted_usd: 0.0,
     };
     assert_eq!(released.committed_usd(), None);
     assert_eq!(released.settled(), SettlementAck::Committed);
@@ -582,9 +583,10 @@ fn unknown_usage_commits_nothing_even_when_the_ledger_accepted_the_release() {
 
 /// **A release whose acknowledgement was lost is repaired as a release.**
 ///
-/// The zero a repair carries here is the amount of a *hold being handed back*,
-/// and the record goes on saying the accounting is unknown. The distinction is
-/// the whole reason `unconfirmed_settlement_usd` is a separate question from
+/// A call that provably never reached the service submitted zero, and the
+/// zero a repair carries here is that same *hold being handed back*; the
+/// record goes on saying the accounting is unknown. The distinction is the
+/// whole reason `unconfirmed_settlement_usd` is a separate question from
 /// `committed_usd`: this arm answers `Some(0.0)` and that one answers `None`,
 /// and collapsing them would either strand the hold or book a billed call as
 /// free.
@@ -593,6 +595,7 @@ fn an_unconfirmed_release_is_repaired_at_zero_without_becoming_a_measured_zero()
     let released = EvaluationSpend::Unknown {
         granted_usd: 0.002,
         settled: SettlementAck::Unconfirmed,
+        submitted_usd: 0.0,
     };
     assert_eq!(released.unconfirmed_settlement_usd(), Some(0.0));
     assert_eq!(
@@ -600,6 +603,52 @@ fn an_unconfirmed_release_is_repaired_at_zero_without_becoming_a_measured_zero()
         None,
         "nobody can say what this call cost, and a repair does not change that"
     );
+}
+
+/// **A booked estimate whose acknowledgement was lost is repaired at the
+/// estimate.** A call that may have been billed settled at the grant, and a
+/// repair re-drives the amount the record says was submitted — never a zero
+/// that would hand back money the call may have spent, and never a measured
+/// cost the record does not have.
+#[test]
+fn an_unconfirmed_estimate_is_repaired_at_the_amount_it_submitted() {
+    let booked = EvaluationSpend::Unknown {
+        granted_usd: 0.002,
+        settled: SettlementAck::Unconfirmed,
+        submitted_usd: 0.002,
+    };
+    assert_eq!(booked.unconfirmed_settlement_usd(), Some(0.002));
+    assert_eq!(booked.submitted_usd(), 0.002);
+    assert_eq!(
+        booked.committed_usd(),
+        None,
+        "an estimate is a booking, not a measured cost"
+    );
+}
+
+/// **A record written before `submitted_usd` existed repairs at zero**, which
+/// is what that record's settle submitted. And a zero is not written, so such
+/// a record keeps its bytes when it is written again.
+#[test]
+fn an_unknown_spend_without_a_submitted_amount_reads_as_a_zero_release() {
+    let historical: EvaluationSpend =
+        serde_json::from_str(r#"{"kind":"unknown","granted_usd":0.002,"settled":"unconfirmed"}"#)
+            .expect("a record written before the field parses");
+    assert_eq!(historical.unconfirmed_settlement_usd(), Some(0.0));
+    assert_eq!(
+        serde_json::to_value(historical).unwrap(),
+        serde_json::json!({"kind":"unknown","granted_usd":0.002,"settled":"unconfirmed"}),
+        "a zero release is written the way it was before the field existed"
+    );
+
+    let booked = EvaluationSpend::Unknown {
+        granted_usd: 0.002,
+        settled: SettlementAck::Unconfirmed,
+        submitted_usd: 0.002,
+    };
+    let round_tripped: EvaluationSpend =
+        serde_json::from_str(&serde_json::to_string(&booked).unwrap()).unwrap();
+    assert_eq!(round_tripped, booked, "a booked estimate survives the log");
 }
 
 /// An unusable answer set is not a classification of any kind — including not

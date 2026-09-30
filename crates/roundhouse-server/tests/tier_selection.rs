@@ -12,7 +12,9 @@
 //!   rather than through a hand-built `ToolSignals` that would pass whatever the
 //!   extractor happened to compute;
 //! - a failed dispatch **advances** to the next candidate of the same tier,
-//!   inside one turn, one grant and one deadline;
+//!   inside one turn, one grant and one deadline — except on a cost-guarded
+//!   turn, which tries the capable members cheaper than the efficient head,
+//!   then the efficient tier, then the rest of the capable tier;
 //! - and a provider that *answered* — a refusal, a 404, a bad key — does not,
 //!   because a second model would answer it the same way and the difference
 //!   between those two cases is the whole of R5.

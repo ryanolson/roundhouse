@@ -767,14 +767,16 @@ pub struct DecisionRecord {
     /// decision bytes it wrote before failover existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<DispatchAttempt>,
-    /// Why this turn never asked the local fleet what it was holding.
+    /// Why this turn has no local quote: the fleet was never asked, or it was
+    /// asked and gave no answer in time.
     ///
     /// **"Not quoted" and "quoted and rejected" are different answers**, and a
     /// dashboard that cannot tell them apart reports a fleet the router keeps
     /// turning down when the truth is a fleet the router never asked. The
     /// quote is a realtime residency check over HTTP on the path to first
     /// token, so it is made only when its answer could still move the
-    /// decision; this is what that decision wrote down.
+    /// decision, and a failed one is dropped rather than failing a turn that
+    /// had somewhere else to go; this is what that decision wrote down.
     ///
     /// `None` on a turn that *was* quoted, whatever the quote said, and also
     /// on a deployment with no fleet configured — there was nothing to skip,
@@ -816,16 +818,21 @@ pub struct DecisionRecord {
     pub block_marker: Option<BlockMarker>,
 }
 
-/// Why a turn's local residency check was not made.
+/// Why a turn has no local quote.
 ///
 /// Typed rather than a message, because the consumer is a projection and not a
 /// reader: these records are persisted, replayed and folded, and a
 /// `&'static str` written by one build is a string a later one has to match on
-/// to count anything. The variants are reachability facts — the same answer on
-/// every turn of every session that looks like this one — which is why a
-/// squeezed budget and a spent cadence are deliberately absent: both make a
-/// local route *more* likely, so skipping the quote under them would skip it
-/// exactly when it mattered most.
+/// to count anything.
+///
+/// Two kinds of answer, kept apart by variant. [`Self::ToolsDeclared`] and
+/// [`Self::PolicyAdmitsNoLocal`] are reachability facts — the same answer on
+/// every turn of every session that looks like this one, decided before any
+/// call — which is why a squeezed budget and a spent cadence are deliberately
+/// absent: both make a local route *more* likely, so skipping the quote under
+/// them would skip it exactly when it mattered most. [`Self::FleetError`] and
+/// [`Self::FleetTimeout`] are events on this turn: the call was made and the
+/// local candidate was dropped for want of an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalQuoteSkip {
@@ -837,6 +844,12 @@ pub enum LocalQuoteSkip {
     /// This principal's policy names no local target, so a quote would have
     /// produced a candidate the pre-`choose` filter drops.
     PolicyAdmitsNoLocal,
+    /// The fleet answered the residency call with an error, and the turn routed
+    /// among its other admitted targets.
+    FleetError,
+    /// The fleet did not answer the residency call inside its own bound, and
+    /// the turn routed among its other admitted targets.
+    FleetTimeout,
 }
 
 /// One dispatch that failed and was fallen forward from.
@@ -1005,6 +1018,25 @@ pub trait RoutingPolicy: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The skip reasons are folded by name, so each one's wire spelling is a
+    /// contract: the two fail-open reasons ruled 2026-09-28 are `fleet_error`
+    /// and `fleet_timeout`, beside the two reachability facts.
+    #[test]
+    fn every_local_quote_skip_has_a_stable_wire_name() {
+        for (skip, wire) in [
+            (LocalQuoteSkip::ToolsDeclared, "\"tools_declared\""),
+            (
+                LocalQuoteSkip::PolicyAdmitsNoLocal,
+                "\"policy_admits_no_local\"",
+            ),
+            (LocalQuoteSkip::FleetError, "\"fleet_error\""),
+            (LocalQuoteSkip::FleetTimeout, "\"fleet_timeout\""),
+        ] {
+            assert_eq!(serde_json::to_string(&skip).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<LocalQuoteSkip>(wire).unwrap(), skip);
+        }
+    }
 
     #[test]
     fn cache_hit_ratio_reflects_prefill_savings() {

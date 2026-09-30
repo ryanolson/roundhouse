@@ -74,16 +74,35 @@ pub(super) struct EvaluationModelKey {
 /// One accepted result's booking, on whatever grouping holds it -- the
 /// deployment-wide tally and each `(requested, reported)` row alike.
 ///
-/// A single type rather than two, because the two were the same six fields
+/// A single type rather than two, because the two were the same fields
 /// written out by hand in every arm of [`EvaluationFold::recorded`]: adding a
-/// seventh meant five edits that had to agree, and [`Self::book`] is now the
-/// one place that can disagree with itself.
+/// field meant an edit in every arm that had to agree with every other, and
+/// [`Self::book`] is now the one place that can disagree with itself.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct EvaluationCallTally {
     pub(super) calls: u64,
     pub(super) measured_calls: u64,
     pub(super) measured_usd: f64,
     pub(super) unknown_usage_calls: u64,
+    /// What the settles of `unknown_usage_calls` submitted: the grant's
+    /// estimate for a request that may have been billed, zero for one that
+    /// provably never left.
+    ///
+    /// Booked here, at the one accepted result per call, and never at a
+    /// repair: a repair moves a settlement from open to acknowledged and adds
+    /// no cost, so booking at the record is what counts a repaired call once
+    /// by construction rather than by a subtraction that has to agree with it.
+    /// Kept apart from `measured_usd` because it is a ledger booking, not a
+    /// price anybody measured.
+    pub(super) estimated_usd: f64,
+    /// Of `unknown_usage_calls`, how many booked an estimate above zero.
+    ///
+    /// `unknown_usage_calls` also holds a call that provably never left (its
+    /// settle submits `0.0`), and that call must not be counted as one of the
+    /// calls `estimated_usd` is spread over -- the same split
+    /// `ServingCostGaps::estimated_calls` makes for a serving row nobody
+    /// reported usage for.
+    pub(super) estimated_calls: u64,
     pub(super) refused_calls: u64,
     pub(super) input_tokens: u64,
     pub(super) output_tokens: u64,
@@ -102,8 +121,12 @@ impl EvaluationCallTally {
                 self.input_tokens += usage.input_tokens;
                 self.output_tokens += usage.output_tokens;
             }
-            Some(EvaluationSpend::Unknown { .. }) => {
+            Some(EvaluationSpend::Unknown { submitted_usd, .. }) => {
                 self.unknown_usage_calls += 1;
+                self.estimated_usd += submitted_usd;
+                if *submitted_usd > 0.0 {
+                    self.estimated_calls += 1;
+                }
             }
             // Nothing was sent, so nothing was billed -- the one class that
             // is free rather than unknown, and the one with no settlement.
@@ -118,6 +141,8 @@ impl EvaluationCallTally {
         self.measured_calls += other.measured_calls;
         self.measured_usd += other.measured_usd;
         self.unknown_usage_calls += other.unknown_usage_calls;
+        self.estimated_usd += other.estimated_usd;
+        self.estimated_calls += other.estimated_calls;
         self.refused_calls += other.refused_calls;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
@@ -150,9 +175,10 @@ pub(super) struct EvaluationCounters {
     pub(super) intents: u64,
     /// Every accepted result: measured, unknown-usage and refused alike.
     pub(super) all: EvaluationCallTally,
-    /// Measured dollars whose settle this scope has an answer for, added
-    /// exactly once each: at the record, when the settle already arrived
-    /// committed, or at the repair that later closes it (see
+    /// Dollars whose settle this scope has an answer for -- the measured
+    /// price, or an unknown-usage call's booked estimate -- added exactly
+    /// once each: at the record, when the settle already arrived committed,
+    /// or at the repair that later closes it (see
     /// [`EvaluationFold::repaired`]). Never derived by subtracting an open
     /// amount from `measured_usd` -- that subtraction would leave a float
     /// residue behind once the open set empties, so committed dollars are
@@ -206,7 +232,7 @@ impl EvaluationCounters {
         self.all.calls - self.all.refused_calls - open_calls
     }
 
-    /// Measured dollars whose settle this scope has an answer for.
+    /// Dollars whose settle this scope has an answer for. See the field.
     pub(super) fn committed_usd(&self) -> f64 {
         self.committed_usd
     }
@@ -215,6 +241,11 @@ impl EvaluationCounters {
     ///
     /// A pending intent and an unreported usage are both "somebody billed an
     /// amount nobody here can name". A refusal is not: nothing was sent.
+    ///
+    /// An unreported usage stays here even though its booked estimate is now
+    /// in the evaluation total: the estimate is a stand-in for the amount, not
+    /// the amount, the same way an estimated serving call is priced and still
+    /// counted in `ServingCostGaps::estimated_calls`.
     pub(super) fn cost_incomplete(&self) -> bool {
         self.pending() > 0 || self.all.unknown_usage_calls > 0
     }
@@ -430,10 +461,12 @@ impl EvaluationFold {
         let row = self.by_principal.entry(payer.clone()).or_default();
         row.counters.all.book(spend);
         row.counters.by_model.entry(model).or_default().book(spend);
-        // The amount a repair would re-drive, which is the record's own: a zero
-        // on the unknown-usage arm is a *release* and not a price. Keyed into
-        // `open` under the same key `calls` uses, so `repaired` can find it
-        // by identity without a second lookup path.
+        // The amount a repair would re-drive, which is the record's own: on
+        // the unknown-usage arm that is what the settle submitted -- the
+        // grant's estimate, or a zero release for a call that never left --
+        // and never a price. Keyed into `open` under the same key `calls`
+        // uses, so `repaired` can find it by identity without a second lookup
+        // path.
         let state = match spend.filter(|spend| spend.settled() == SettlementAck::Unconfirmed) {
             Some(spend) => {
                 let usd = spend.unconfirmed_settlement_usd().unwrap_or_default();
@@ -443,10 +476,14 @@ impl EvaluationFold {
             // Already answered for at record time -- a settle that arrived
             // committed needs no later repair, so its dollars join
             // `committed_usd` right here rather than waiting on an event
-            // that will never come. `Unknown` spend has no dollars to book:
-            // `committed_usd` is Some(_) only off `Measured`.
+            // that will never come. The dollars are what the settle
+            // submitted, the same amount `repaired` would move out of `open`:
+            // an unknown-usage call's booked estimate counts once it is
+            // acknowledged, whichever path the acknowledgement took, or the
+            // committed figure would hang on whether one ledger reply
+            // arrived.
             None => {
-                if let Some(usd) = spend.and_then(EvaluationSpend::committed_usd) {
+                if let Some(usd) = spend.map(EvaluationSpend::submitted_usd) {
                     row.counters.committed_usd += usd;
                 }
                 CallState::Closed

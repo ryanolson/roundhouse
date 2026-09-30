@@ -224,6 +224,68 @@ async fn a_transport_error_does_not_carry_the_configured_url() {
     }
 }
 
+/// **A refused connection bought nothing, and the error says so.**
+///
+/// `sent` is what the caller's accounting turns on: a request that never
+/// found a socket settles its hold at zero, and anything later books the
+/// estimate. Port 1 on loopback refuses before any byte of the request exists
+/// on a wire.
+#[tokio::test]
+async fn a_refused_connection_is_a_transport_error_that_was_never_sent() {
+    let client = SystemOneClient::new("http://127.0.0.1:1", limits()).unwrap();
+    let error = ask(&client, &request("z"), &stored())
+        .await
+        .expect_err("nothing is listening on port 1");
+    assert!(
+        matches!(error, SystemOneError::Transport { sent: false, .. }),
+        "a connection that was never established cannot have carried the \
+         request: {error:?}"
+    );
+}
+
+/// **A connection dropped after the request went out may have been billed.**
+///
+/// The upstream accepts, reads the whole request, and closes without a status
+/// line. Nothing came back to price, but the service had the request, so the
+/// error must not read as the refused connection above.
+#[tokio::test]
+async fn a_connection_dropped_after_the_request_is_a_transport_error_that_was_sent() {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let read = Arc::new(tokio::sync::Notify::new());
+    let read_signal = Arc::clone(&read);
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = vec![0u8; 64 * 1024];
+        // One read is enough for a loopback request this small; the point is
+        // only that the bytes arrived before the socket closed.
+        let _ = socket.read(&mut buffer).await;
+        read_signal.notify_one();
+        drop(socket);
+    });
+    let client = SystemOneClient::new(format!("http://{addr}"), limits()).unwrap();
+
+    let error = ask(&client, &request("z"), &stored())
+        .await
+        .expect_err("the upstream closed without answering");
+    tokio::time::timeout(Duration::from_secs(1), read.notified())
+        .await
+        .expect("the request must actually have reached the upstream");
+    assert!(
+        matches!(
+            error,
+            SystemOneError::Transport {
+                sent: true,
+                timed_out: false,
+                ..
+            }
+        ),
+        "a request the upstream received is not a refused connection: {error:?}"
+    );
+}
+
 /// The bearer and the documented body reach the upstream.
 #[tokio::test]
 async fn the_bearer_and_the_keyed_question_arrive() {

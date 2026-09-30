@@ -66,15 +66,16 @@ pub(crate) struct ClassificationFold {
     /// **Drained by repair, one entry per unacknowledged call.** An entry
     /// appears when a result lands saying nobody acknowledged its settle,
     /// and leaves when a `SessionEventKind::ClassificationSettlementRepaired`
-    /// says the ledger answered. A zero-dollar entry is not a symptom of the
-    /// ledger being down: a call whose own deadline fires before an answer
-    /// comes back submits a release at zero, so a deployment whose
-    /// evaluation ledger is perfectly healthy still accumulates these
-    /// routinely. A deployment whose ledger is down additionally accumulates
-    /// a positive one per call, the same posture the serving ledger's own
-    /// repair already accepts — and [`UnrepairedSettlements::iter`] offers
-    /// those ahead of any zero-dollar entry, so the two causes never
-    /// compete for the same repair attempt.
+    /// says the ledger answered. A zero-dollar entry is a call refused before
+    /// it could be billed — a connection never made, an error status — whose
+    /// release went unacknowledged. A call whose own deadline fires before an
+    /// answer comes back is not one: it may have been billed, so it books the
+    /// grant's estimate, and when that settle runs against the already-spent
+    /// deadline it leaves a positive entry. A deployment whose ledger is down
+    /// accumulates a positive entry per billed call, the same posture the
+    /// serving ledger's own repair already accepts — and
+    /// [`UnrepairedSettlements::iter`] offers positive entries ahead of any
+    /// zero-dollar one, so the two never compete for the same repair attempt.
     ///
     /// Folded here rather than re-derived at the repair site because the join
     /// it needs is not available later: the amount is on the *result*, the
