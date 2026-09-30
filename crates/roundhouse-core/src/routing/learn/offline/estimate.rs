@@ -103,12 +103,48 @@ pub struct Outcome {
 }
 
 /// How many replicates and which stream.
+///
+/// A manifest that asks for fewer than [`MIN_RESAMPLES`] is refused when it
+/// is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "BootstrapFields")]
 pub struct BootstrapPlan {
     /// The seed of the [`SplitMix64`] stream, recorded in the report.
     pub seed: u64,
     pub resamples: u32,
+}
+
+/// The fewest resamples a manifest may ask for.
+///
+/// **Below 40 the 2.5% tail has no place.** The lower bound is the replicate
+/// at `floor(0.025 B)`, which is index 0 for any `B` under 40: the smallest
+/// replicate, not a percentile, and a single undefined replicate would make
+/// the bound [`Bootstrap::sparse`].
+pub const MIN_RESAMPLES: u32 = 40;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapFields {
+    seed: u64,
+    resamples: u32,
+}
+
+impl TryFrom<BootstrapFields> for BootstrapPlan {
+    type Error = String;
+
+    fn try_from(fields: BootstrapFields) -> Result<Self, String> {
+        if fields.resamples < MIN_RESAMPLES {
+            return Err(format!(
+                "bootstrap.resamples is {}, and must be at least {MIN_RESAMPLES}: fewer leave \
+                 the 2.5% tail no place, so the lower bound would be the smallest replicate",
+                fields.resamples
+            ));
+        }
+        Ok(BootstrapPlan {
+            seed: fields.seed,
+            resamples: fields.resamples,
+        })
+    }
 }
 
 /// The two-sided level of the bootstrap interval.
@@ -482,5 +518,28 @@ impl SplitMix64 {
     /// modulo bias worth the name at cluster counts.
     pub fn below(&mut self, n: usize) -> usize {
         ((u128::from(self.next_u64()) * n as u128) >> 64) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `sparse` starts one past the lower index: with 200 replicates the
+    /// lower bound is the sixth smallest (index 5), so five fillers leave it
+    /// an estimate and a sixth makes it filler.
+    #[test]
+    fn sparse_starts_one_past_the_lower_index() {
+        let with = |undefined: usize| {
+            let replicates: Vec<Option<f64>> = (0..200)
+                .map(|at| (at >= undefined).then_some(0.5))
+                .collect();
+            percentile(&replicates, 0.0, 1.0)
+        };
+        let low_at = 5;
+        assert!(!with(low_at).sparse);
+        assert_eq!(with(low_at).lower, Some(0.5));
+        assert!(with(low_at + 1).sparse);
+        assert_eq!(with(low_at + 1).lower, Some(0.0));
     }
 }

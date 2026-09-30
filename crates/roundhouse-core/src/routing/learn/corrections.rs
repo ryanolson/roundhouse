@@ -15,9 +15,10 @@
 //! the direction that makes a route look cheaper than it is. The reuse
 //! correction therefore only ever moves predicted-cached tokens back to
 //! uncached: a target that reused more than predicted keeps the ledger's own
-//! quote. See [`adjusted_cached_tokens`]. The re-priced difference is also
-//! clamped at zero, so the rule holds whatever the rate card says; see
-//! [`Corrections::cost`].
+//! quote. See [`adjusted_cached_tokens`]. A target whose history gives no
+//! ratio moves all of them, because a discount nothing measured is not
+//! evidence. The re-priced difference is also clamped at zero, so the rule
+//! holds whatever the rate card says; see [`Corrections::cost`].
 //!
 //! **Predictions, not measurements.** A corrected quote does not establish a
 //! measured cost reduction; the offline report measures serving cost from the
@@ -89,6 +90,13 @@ impl<'a> Corrections<'a> {
     /// penalty is added on top, and a local target is not corrected: its quote
     /// is the residency answer, priced at the configured capacity rate when
     /// there is one, and it has no ledger model to re-price against.
+    ///
+    /// **No predicted reuse removes the whole discount** (the 2026-09-30
+    /// ruling under the owner's cost rule). A target whose measured pairs
+    /// never predicted reuse gives no ratio, so nothing has checked a quote
+    /// that predicts reuse on it. Keeping that quote would bank a discount
+    /// the evidence never showed; it is re-priced with no cached tokens, the
+    /// conservative bound, and a quote that predicts none stands.
     pub fn cost(&self, candidate: &Candidate) -> CostEvidence {
         let quoted_usd = candidate.expected_cost_usd;
         let unchanged = |correction| CostEvidence {
@@ -104,20 +112,30 @@ impl<'a> Corrections<'a> {
             return unchanged(CostCorrection::TooFewSamples);
         }
         if reuse.predicted_permille == 0 {
-            return unchanged(CostCorrection::NoPredictedReuse);
+            return CostEvidence {
+                quoted_usd,
+                adjusted_usd: self.repriced(candidate, 0.0),
+                correction: CostCorrection::NoPredictedReuse,
+            };
         }
-        let isl = self.isl_tokens as f64;
-        let quoted_cached = quoted_cached_tokens(candidate, self.isl_tokens);
         let adjusted_cached = adjusted_cached_tokens(candidate, self.isl_tokens, &reuse);
-        let (_, pricing) = self.ledger.model_for(&candidate.target);
-        let repriced = pricing.price_tokens(isl - adjusted_cached, adjusted_cached, 0.0)
-            - pricing.price_tokens(isl - quoted_cached, quoted_cached, 0.0);
-        let adjusted_usd = quoted_usd + repriced.max(0.0);
         CostEvidence {
             quoted_usd,
-            adjusted_usd,
+            adjusted_usd: self.repriced(candidate, adjusted_cached),
             correction: CostCorrection::Applied,
         }
+    }
+
+    /// The quote with `cached` of its input read from cache in place of the
+    /// quote's own count: the quote plus the re-priced difference, which
+    /// stops at zero.
+    fn repriced(&self, candidate: &Candidate, cached: f64) -> f64 {
+        let isl = self.isl_tokens as f64;
+        let quoted_cached = quoted_cached_tokens(candidate, self.isl_tokens);
+        let (_, pricing) = self.ledger.model_for(&candidate.target);
+        let difference = pricing.price_tokens(isl - cached, cached, 0.0)
+            - pricing.price_tokens(isl - quoted_cached, quoted_cached, 0.0);
+        candidate.expected_cost_usd + difference.max(0.0)
     }
 
     /// First output from turn start, modeled (ruling 10): the quoted TTFT, the
@@ -199,8 +217,8 @@ fn quoted_cached_tokens(candidate: &Candidate, isl_tokens: usize) -> f64 {
 /// upside the learner does not bank on.
 ///
 /// `reuse.predicted_permille` must be nonzero; [`Corrections::cost`] records
-/// `NoPredictedReuse` and never calls this otherwise. A zero is treated as a
-/// ratio of one rather than dividing by it.
+/// `NoPredictedReuse`, re-prices with no cached tokens, and never calls this
+/// otherwise. A zero is treated as a ratio of one rather than dividing by it.
 pub fn adjusted_cached_tokens(candidate: &Candidate, isl_tokens: usize, reuse: &CacheReuse) -> f64 {
     let quoted_cached = quoted_cached_tokens(candidate, isl_tokens);
     let ratio = match reuse.predicted_permille {

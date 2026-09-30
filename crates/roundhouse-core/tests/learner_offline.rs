@@ -476,6 +476,28 @@ fn intervals_are_excluded_by_cause_and_the_counts_are_reported() {
     // A propensity below 1 on a turn that could not explore.
     let turn = script.turn(Spec::new().propensity(0.5).decision());
     script.review(&[&turn], on_track());
+    // Three matched turns whose propensities multiply to below the smallest
+    // float: the weight of a candidate that matched them is not finite.
+    let exploration = ExplorationEvidence {
+        draw: Draw {
+            rate: 0.9,
+            member: 0,
+        },
+        possible: true,
+        set: vec![Strategy::Efficient],
+    };
+    let tiny: Vec<Turn> = (0..3)
+        .map(|_| {
+            script.turn(
+                Spec::new()
+                    .live()
+                    .propensity(1e-110)
+                    .exploration(exploration.clone())
+                    .decision(),
+            )
+        })
+        .collect();
+    script.review(&tiny.iter().collect::<Vec<_>>(), on_track());
 
     let calibrated = run(&[&script]);
     let exclusions = &calibrated.evidence.exclusions;
@@ -486,11 +508,12 @@ fn intervals_are_excluded_by_cause_and_the_counts_are_reported() {
         (Cause::Screen(Exclusion::MixedEpoch), 1),
         (Cause::Screen(Exclusion::OtherCreditRevision), 1),
         (Cause::ReplayMismatch, 1),
+        (Cause::NonFiniteWeight, 1),
     ] {
         assert_eq!(exclusions.get(&cause), Some(&count), "{cause:?}");
     }
     assert_eq!(calibrated.evidence.intervals.len(), 1);
-    assert_eq!(calibrated.report.accepted_reviews, 7);
+    assert_eq!(calibrated.report.accepted_reviews, 8);
     let text = calibrated.report.render();
     for cause in Cause::ALL {
         assert_eq!(
@@ -796,6 +819,7 @@ fn the_cluster_unit_label_appears_on_every_clustered_number() {
         "eligible intervals:",
         "bootstrap:",
         "bootstrap interval",
+        "bootstrap lower bound",
         "weighted intervals:",
         "intervals rules served",
         "quality.min_sessions",

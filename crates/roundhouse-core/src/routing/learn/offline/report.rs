@@ -98,7 +98,19 @@ impl Report {
             .map(|interval| interval.outcome(Candidate::Fixed(Strategy::Rules)))
             .collect();
         let rules = factual(&rules_outcomes);
-        let promotion = PromotionSummary::build(config, evidence);
+        let held = |candidate| {
+            estimates
+                .iter()
+                .find(|(held, _)| *held == candidate)
+                .map(|(_, estimate)| estimate)
+                .expect("the learned candidate and rules, which every strategy list holds")
+        };
+        let promotion = PromotionSummary::build(
+            config,
+            evidence,
+            held(Candidate::Learned),
+            held(Candidate::Fixed(Strategy::Rules)),
+        );
         Report {
             project: config.project.clone(),
             manifest_digest: artifact.manifest_digest().to_owned(),

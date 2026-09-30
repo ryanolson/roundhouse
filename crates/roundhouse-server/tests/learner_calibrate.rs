@@ -203,7 +203,7 @@ async fn a_redis_source_names_its_url_variable_and_never_the_url() {
   "calibration": {
     "project": "acme", "strategies": ["rules", "capable"], "prior": "zero",
     "quality": { "min_sessions": 20 }, "latency_limit_ms": 10000,
-    "bootstrap": { "seed": 1, "resamples": 10 }
+    "bootstrap": { "seed": 1, "resamples": 40 }
   }
 }"#,
     )

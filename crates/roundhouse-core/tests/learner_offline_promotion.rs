@@ -614,23 +614,29 @@ fn the_paired_bootstrap_resamples_clusters_not_intervals() {
 /// where every agreeing interval explored away has no weight, and one where
 /// three of fifty sessions hold weight is sparse. Both read `not evaluable`,
 /// never `pass` and never `fail`.
+///
+/// `quality.min_sessions` counts only the sessions where learned has weight,
+/// so from the report the no-weight guard answers only under a minimum of
+/// zero, and the sparse one only under a minimum the three weighted sessions
+/// meet. Under any larger minimum the sessions guard answers first
+/// (`learner_offline_gates.rs` holds the order).
 #[test]
 fn the_paired_test_without_support_or_on_sparse_support_is_not_evaluable() {
     let unweighted: Vec<Script> = (0..20)
         .map(|at| live_session(&format!("acme/ada/live{at:02}#g0"), &[(true, true)]))
         .collect();
-    let calibrated = run(&config(20), &unweighted);
+    let calibrated = run(&config(0), &unweighted);
     let test = calibrated.report.promotion.quality_agreeing;
     assert_eq!(test.intervals, 20);
     assert!(
-        matches!(test.result, TestResult::NotEvaluable(reason) if reason.contains("weight")),
+        matches!(test.result, TestResult::NotEvaluable(reason) if reason.contains("learned has no interval")),
         "{test:?}"
     );
 
     let sparse: Vec<Script> = (0..50)
         .map(|at| live_session(&format!("acme/ada/live{at:02}#g0"), &[(at >= 3, true)]))
         .collect();
-    let calibrated = run(&config(20), &sparse);
+    let calibrated = run(&config(3), &sparse);
     let test = calibrated.report.promotion.quality_agreeing;
     assert!(
         matches!(test.result, TestResult::NotEvaluable(reason) if reason.contains("filler")),

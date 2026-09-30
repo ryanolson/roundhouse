@@ -82,8 +82,8 @@ pub use extract::{
 };
 pub use promotion::{
     CostTest, LatencyTest, PairedQualityTest, PromotionSummary, QualityTest, QuoteCensus,
-    TestResult, corrected_cost, corrected_first_output, cost_gate, paired_quality_gate,
-    quality_gate, quality_test,
+    TestResult, corrected_cost, corrected_first_output, cost_gate, paired_quality,
+    paired_quality_gate, quality_gate, quality_test,
 };
 pub use report::Report;
 pub use source::{

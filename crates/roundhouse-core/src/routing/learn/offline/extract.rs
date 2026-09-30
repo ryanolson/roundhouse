@@ -16,7 +16,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use super::estimate::{Money, Outcome, TurnTrace, trajectory_supported, trajectory_weight};
+use super::estimate::{
+    Money, Outcome, TurnTrace, trajectory_probability, trajectory_supported, trajectory_weight,
+};
 use super::source::SessionLog;
 use super::{ArtifactPrior, CalibrationConfig, Candidate};
 use crate::classify::EvaluationSpend;
@@ -41,17 +43,22 @@ pub enum Cause {
     Screen(Exclusion),
     /// A covered turn's record does not replay: see [`replays`].
     ReplayMismatch,
+    /// The product of the covered turns' propensities is so small that its
+    /// inverse, the weight of any candidate that matched every turn, is not a
+    /// finite number.
+    NonFiniteWeight,
 }
 
 impl Cause {
     /// Every cause, in the order the report lists them.
-    pub const ALL: [Cause; 6] = [
+    pub const ALL: [Cause; 7] = [
         Cause::Screen(Exclusion::UnknownLabel),
         Cause::Screen(Exclusion::FailoverInInterval),
         Cause::Screen(Exclusion::MissingRow),
         Cause::Screen(Exclusion::MixedEpoch),
         Cause::Screen(Exclusion::OtherCreditRevision),
         Cause::ReplayMismatch,
+        Cause::NonFiniteWeight,
     ];
 
     pub fn label(self) -> &'static str {
@@ -62,6 +69,7 @@ impl Cause {
             Cause::Screen(Exclusion::MixedEpoch) => "mixed epoch",
             Cause::Screen(Exclusion::OtherCreditRevision) => "other credit revision",
             Cause::ReplayMismatch => "record does not replay",
+            Cause::NonFiniteWeight => "trajectory weight not finite",
         }
     }
 }
@@ -314,6 +322,9 @@ impl Evidence {
                 .map(|seq| index.turn(*seq))
                 .collect();
             match turns {
+                Some(turns) if !turns.is_empty() && !finite_weight(&turns) => {
+                    *self.exclusions.entry(Cause::NonFiniteWeight).or_default() += 1
+                }
                 Some(turns) if !turns.is_empty() => self.intervals.push(IntervalFacts {
                     cluster,
                     positive,
@@ -364,6 +375,26 @@ impl Evidence {
             targets,
         });
     }
+}
+
+/// Whether a candidate that matched every turn would carry a finite weight.
+///
+/// **Excluded before any estimate reads it**, and counted under its own
+/// cause. The weight is `1 / P_log`, the same for every candidate that
+/// matched, and a product of many small propensities can fall below the
+/// smallest normal float: whether it then rounds to a subnormal or flushes
+/// to zero depends on the platform, and either way its inverse is infinite.
+/// One infinite weight turns every sum it enters into `inf / inf`, so the
+/// estimate and both bounds would read NaN, or a number that differs
+/// between machines. The same rule holds for any propensity that makes the
+/// weight not a number.
+fn finite_weight(turns: &[TurnFacts]) -> bool {
+    let traces: Vec<TurnTrace> = turns
+        .iter()
+        .map(|turn| turn.trace(Candidate::Learned))
+        .collect();
+    let probability = trajectory_probability(&traces);
+    probability > 0.0 && probability.is_finite() && (1.0 / probability).is_finite()
 }
 
 /// The learned evidence on a decision, when it has any.

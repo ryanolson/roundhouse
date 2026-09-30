@@ -107,6 +107,9 @@ pub struct Spec {
     /// `Applied` with the first output given. Every other plan records
     /// `TooFewSamples`, which a corrected quote estimate cannot use.
     pub corrected: Vec<(Strategy, f64, f64)>,
+    /// Strategies whose recorded quote is exactly the evidence given, applied
+    /// after `corrected`.
+    pub quotes: Vec<(Strategy, CostEvidence, TtftEvidence)>,
     pub rate_card: Option<ProviderPricing>,
 }
 
@@ -131,6 +134,7 @@ impl Spec {
             propensity: 1.0,
             passing: Vec::new(),
             corrected: Vec::new(),
+            quotes: Vec::new(),
             rate_card: None,
         }
     }
@@ -159,6 +163,12 @@ impl Spec {
     /// term applied.
     pub fn corrected(mut self, strategy: Strategy, usd: f64, first_output_ms: f64) -> Self {
         self.corrected.push((strategy, usd, first_output_ms));
+        self
+    }
+
+    /// `strategy`'s plan recorded with exactly `cost` and `ttft`.
+    pub fn quote(mut self, strategy: Strategy, cost: CostEvidence, ttft: TtftEvidence) -> Self {
+        self.quotes.push((strategy, cost, ttft));
         self
     }
 
@@ -232,6 +242,12 @@ impl Spec {
                         residual: LatencyTerm::Applied { mean_ms: 0 },
                         overhead: LatencyTerm::Applied { mean_ms: 0 },
                     };
+                }
+                if let Some((_, cost, ttft)) =
+                    self.quotes.iter().find(|(named, ..)| named == strategy)
+                {
+                    plan.cost = *cost;
+                    plan.ttft = *ttft;
                 }
                 plan
             })

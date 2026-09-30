@@ -37,12 +37,19 @@
 //! passes once the set meets `quality.min_sessions` with support. It cannot
 //! show a loss, because on these intervals none can exist.
 //!
+//! **`quality.min_sessions` counts sessions that carry weight** (the round-2
+//! ruling of 2026-09-30): the sessions with an agreeing interval where the
+//! learned candidate has weight above zero. In `shadow` that is every
+//! session with an agreeing interval. In `live` an explored interval weighs
+//! nothing, and counting its session would let a set the bootstrap never
+//! reads meet the minimum.
+//!
 //! A test without support reads `not evaluable`, never `pass`.
 
 use std::fmt::Write as _;
 
 use super::estimate::{
-    BootstrapPlan, CostEstimate, Estimate, Money, Outcome, estimate, paired_bootstrap, weighted_p50,
+    BootstrapPlan, CostEstimate, Estimate, Money, Outcome, paired_bootstrap, weighted_p50,
 };
 use super::extract::{Evidence, IntervalFacts, TurnFacts};
 use super::{
@@ -126,6 +133,15 @@ const NO_SUPPORT: &str = "the candidate has no interval with weight above zero";
 const SPARSE: &str = "more bootstrap replicates held no weight than the 2.5% tail, so the \
                       lower bound is filler";
 
+const EMPTY: &str = "no interval in the set";
+
+const FEW_SESSIONS: &str = "fewer sessions hold an agreeing interval with learned weight than \
+                            quality.min_sessions";
+
+const NO_LEARNED_WEIGHT: &str = "learned has no interval in the set with weight above zero";
+
+const NO_RULES_WEIGHT: &str = "rules has no interval in the set with weight above zero";
+
 /// The quality gate on one candidate's estimate against a `rules` rate over
 /// the same intervals.
 pub fn quality_test(learned: &Estimate, rules_rate: Option<f64>) -> TestResult {
@@ -146,10 +162,10 @@ pub fn quality_test(learned: &Estimate, rules_rate: Option<f64>) -> TestResult {
 ///
 /// **The conservative side of the correction.** M3 only ever raises a quote,
 /// so `adjusted_usd` is already the bound; the `max` keeps that true for any
-/// record. `NoPredictedReuse` had its samples and M3 ruled no correction
-/// applies, so the quote stands. With too few samples there is no residual
-/// to correct by, and a local quote has no ledger model: both are unpriced,
-/// never $0.
+/// record. `NoPredictedReuse` had its samples, and M3 re-priced its quote
+/// with no cached tokens (the 2026-09-30 ruling), so its `adjusted_usd` is
+/// the bound too. With too few samples there is no residual to correct by,
+/// and a local quote has no ledger model: both are unpriced, never $0.
 pub fn corrected_cost(cost: &CostEvidence) -> Money {
     match cost.correction {
         CostCorrection::Applied | CostCorrection::NoPredictedReuse
@@ -239,8 +255,9 @@ pub struct PromotionSummary {
     pub quotes: QuoteCensus,
     /// Clusters with an eligible interval.
     pub sessions: u64,
-    /// Clusters with an agreeing interval: what the quality test reads, so
-    /// what `quality.min_sessions` is met on.
+    /// Clusters with an agreeing interval where learned has weight above
+    /// zero: what the quality test's bootstrap reads, so what
+    /// `quality.min_sessions` is met on.
     pub agreeing_sessions: u64,
     pub min_sessions: u64,
     pub latency_limit_ms: u64,
@@ -265,13 +282,20 @@ impl PromotionSummary {
         ])
     }
 
-    pub fn build(config: &CalibrationConfig, evidence: &Evidence) -> Self {
+    /// `learned` and `rules` are the report's estimates of the two
+    /// candidates over every eligible interval, so the full quality line
+    /// reads the same bootstrap the candidate blocks print.
+    pub fn build(
+        config: &CalibrationConfig,
+        evidence: &Evidence,
+        learned: &Estimate,
+        rules: &Estimate,
+    ) -> Self {
         let intervals = &evidence.intervals;
         let agreeing: Vec<&IntervalFacts> = intervals
             .iter()
             .filter(|interval| interval.turns.iter().all(agrees))
             .collect();
-        let all: Vec<&IntervalFacts> = intervals.iter().collect();
         let mut quotes = QuoteCensus::default();
         for turn in intervals.iter().flat_map(|interval| &interval.turns) {
             quotes.count(turn, turn.learned_strategy);
@@ -279,7 +303,12 @@ impl PromotionSummary {
                 quotes.count(turn, Strategy::Rules);
             }
         }
-        let agreeing_sessions = clusters(&agreeing);
+        let weighted: Vec<&IntervalFacts> = agreeing
+            .iter()
+            .copied()
+            .filter(|interval| interval.outcome(Candidate::Learned).weight > 0.0)
+            .collect();
+        let agreeing_sessions = clusters(&weighted);
         PromotionSummary {
             intervals: intervals.len(),
             agreeing: agreeing.len(),
@@ -289,11 +318,11 @@ impl PromotionSummary {
                 agreeing_sessions,
                 config.quality.min_sessions,
             ),
-            quality_full: quality(&all, config.bootstrap),
+            quality_full: quality(intervals.len(), learned, rules),
             cost: cost(intervals),
             latency: latency(intervals, config.latency_limit_ms),
             quotes,
-            sessions: clusters(&all),
+            sessions: clusters(&intervals.iter().collect::<Vec<_>>()),
             agreeing_sessions,
             min_sessions: config.quality.min_sessions,
             latency_limit_ms: config.latency_limit_ms,
@@ -333,36 +362,28 @@ fn clusters(intervals: &[&IntervalFacts]) -> u64 {
 }
 
 /// The learned estimate's lower bound against the `rules` estimate, both over
-/// `intervals`. Each side needs logging probability above zero on every one,
-/// or the comparison would be over two different sets again.
-fn quality(intervals: &[&IntervalFacts], plan: BootstrapPlan) -> QualityTest {
-    let over = |candidate| {
-        let outcomes: Vec<_> = intervals
-            .iter()
-            .map(|interval| interval.outcome(candidate))
-            .collect();
-        estimate(&outcomes, plan)
-    };
-    let learned = over(Candidate::Learned);
-    let rules = over(Candidate::Fixed(Strategy::Rules));
-    let supported = learned.supported == intervals.len() && rules.supported == intervals.len();
-    let result = if intervals.is_empty() {
-        TestResult::NotEvaluable("no interval in the set")
-    } else if learned.supported < intervals.len() {
+/// the same `intervals` eligible intervals. Each side needs logging
+/// probability above zero on every one, or the comparison would be over two
+/// different sets again.
+fn quality(intervals: usize, learned: &Estimate, rules: &Estimate) -> QualityTest {
+    let supported = learned.supported == intervals && rules.supported == intervals;
+    let result = if intervals == 0 {
+        TestResult::NotEvaluable(EMPTY)
+    } else if learned.supported < intervals {
         TestResult::NotEvaluable(
             "the learned choice has zero logging probability on some intervals; shadow \
              never serves it where it differs from rules",
         )
-    } else if rules.supported < intervals.len() {
+    } else if rules.supported < intervals {
         TestResult::NotEvaluable(
             "rules has zero logging probability on some intervals; live never serves it \
              where the learned choice differs",
         )
     } else {
-        quality_test(&learned, rules.snips)
+        quality_test(learned, rules.snips)
     };
     QualityTest {
-        intervals: intervals.len(),
+        intervals,
         learned_supported: learned.supported,
         rules_supported: rules.supported,
         // Printed only when both sides cover the set: a bound over the
@@ -375,9 +396,15 @@ fn quality(intervals: &[&IntervalFacts], plan: BootstrapPlan) -> QualityTest {
 }
 
 /// The paired lower bound of learned minus `rules` over `intervals`, against
-/// the allowance. Not evaluable below `min_sessions` clusters, without weight
-/// on either side, or on sparse support, in that order.
-fn paired_quality(
+/// the allowance. Not evaluable on an empty set, below `min_sessions`
+/// clusters, without learned weight, without `rules` weight, or on sparse
+/// support, in that order, each with its own message.
+///
+/// `sessions` is the caller's count of the clusters the set holds weight in.
+/// Public so a test can hand it intervals the agreeing filter never passes:
+/// on the agreeing set both sides are equal, and nothing about the order of
+/// the difference, or which side lacks weight, can show there.
+pub fn paired_quality(
     intervals: &[&IntervalFacts],
     plan: BootstrapPlan,
     sessions: u64,
@@ -394,11 +421,13 @@ fn paired_quality(
     let bounds = paired_bootstrap(&learned, &rules, plan);
     let weighted = |side: &[Outcome]| side.iter().any(|outcome| outcome.weight > 0.0);
     let result = if intervals.is_empty() {
-        TestResult::NotEvaluable("no interval in the set")
+        TestResult::NotEvaluable(EMPTY)
     } else if sessions < min_sessions {
-        TestResult::NotEvaluable("the agreeing intervals span fewer than quality.min_sessions")
-    } else if !weighted(&learned) || !weighted(&rules) {
-        TestResult::NotEvaluable("a side has no agreeing interval with weight above zero")
+        TestResult::NotEvaluable(FEW_SESSIONS)
+    } else if !weighted(&learned) {
+        TestResult::NotEvaluable(NO_LEARNED_WEIGHT)
+    } else if !weighted(&rules) {
+        TestResult::NotEvaluable(NO_RULES_WEIGHT)
     } else if bounds.sparse {
         TestResult::NotEvaluable(SPARSE)
     } else {
@@ -483,17 +512,17 @@ fn latency(intervals: &[IntervalFacts], limit_ms: u64) -> LatencyTest {
         })
         .collect();
     let uncorrectable = modeled.iter().filter(|ms| ms.is_none()).count();
-    let p50_ms = match uncorrectable {
-        0 => weighted_p50(modeled.iter().flatten().map(|ms| (*ms, 1.0))),
-        _ => None,
-    };
-    let result = match p50_ms {
-        _ if uncorrectable > 0 => TestResult::NotEvaluable(
-            "a first-output quote without both M3 latency terms applied is not an estimate",
+    let p50 = weighted_p50(modeled.iter().flatten().map(|ms| (*ms, 1.0)));
+    let (p50_ms, result) = match (uncorrectable, p50) {
+        (1.., _) => (
+            None,
+            TestResult::NotEvaluable(
+                "a first-output quote without both M3 latency terms applied is not an estimate",
+            ),
         ),
-        Some(p50) if p50 <= limit_ms => TestResult::Pass,
-        Some(_) => TestResult::Fail,
-        None => TestResult::NotEvaluable("no eligible turn"),
+        (0, Some(p50)) if p50 <= limit_ms => (Some(p50), TestResult::Pass),
+        (0, Some(p50)) => (Some(p50), TestResult::Fail),
+        (0, None) => (None, TestResult::NotEvaluable("no eligible turn")),
     };
     LatencyTest {
         p50_ms,
@@ -549,8 +578,8 @@ impl PromotionSummary {
             o,
             "1b. quality, over every eligible interval (binding at the M11 live rerun, not a \
              promotion gate here): learned has logging probability above zero on {} of {} \
-             intervals, rules on {} of {}; bootstrap lower bound, {ESTIMAND_LABEL}, {} against \
-             rules, {ESTIMAND_LABEL}, {}: {}",
+             intervals, rules on {} of {}; bootstrap lower bound, {ESTIMAND_LABEL}, clustered \
+             by {unit}, {} against rules, {ESTIMAND_LABEL}, {}: {}",
             q.learned_supported,
             q.intervals,
             q.rules_supported,
@@ -576,8 +605,8 @@ impl PromotionSummary {
         let _ = writeln!(
             o,
             "cost quotes read, the learned and rules plans of every covered turn: {} corrected, \
-             {} with no predicted reuse (the quote stands), {} with too few cache samples \
-             (unpriced), {} local (unpriced), {} not planned (unpriced)",
+             {} with no predicted reuse (priced without the cache discount), {} with too few \
+             cache samples (unpriced), {} local (unpriced), {} not planned (unpriced)",
             n.applied, n.no_predicted_reuse, n.too_few_samples, n.local, n.missing
         );
         let l = &self.latency;
@@ -596,7 +625,8 @@ impl PromotionSummary {
         let _ = writeln!(
             o,
             "{unit} with an eligible interval: {}; {unit} with an interval where learned \
-             agreed with rules, the quality test's set: {}, against quality.min_sessions {}: {}",
+             agreed with rules and has weight above zero, the quality test's set: {}, against \
+             quality.min_sessions {}: {}",
             self.sessions,
             self.agreeing_sessions,
             self.min_sessions,

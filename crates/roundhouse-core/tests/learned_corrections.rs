@@ -193,6 +193,37 @@ fn zero_predicted_reuse_applies_no_correction() {
     assert_eq!(cost.adjusted_usd, cost.quoted_usd);
 }
 
+/// **No ratio is not a verified discount** (the 2026-09-30 ruling under the
+/// owner's cost rule). A target whose measured pairs never predicted reuse
+/// gives no ratio to scale by, so a quote that predicts reuse on it carries a
+/// cache discount nothing has checked. The correction re-prices it with no
+/// cached tokens, the conservative bound: 100 predicted reads become 100
+/// uncached tokens at the write rate. A quote that predicts no reuse has no
+/// discount to remove, and stands.
+#[test]
+fn a_predicted_reuse_on_a_target_that_never_predicted_any_is_priced_uncached() {
+    let isl = 100 * MTOK;
+    let view = view(
+        vec![ops(&sol(), LatencySum::default(), reuse(0, 0, MIN))],
+        LatencySum::default(),
+    );
+    let ledger = ledger();
+    let corrections = Corrections::new(&view, &ledger, isl, MIN, MIN);
+
+    let warm = corrections.cost(&frontier(sol(), isl, isl as f64, 800.0));
+    assert_eq!(warm.correction, CostCorrection::NoPredictedReuse);
+    assert!(close(warm.quoted_usd, 10.0), "quote is 100 reads");
+    assert!(
+        close(warm.adjusted_usd, 200.0),
+        "the unverified discount must be removed: got {}",
+        warm.adjusted_usd
+    );
+
+    let cold = corrections.cost(&frontier(sol(), isl, 0.0, 800.0));
+    assert_eq!(cold.correction, CostCorrection::NoPredictedReuse);
+    assert_eq!(cold.adjusted_usd, cold.quoted_usd);
+}
+
 fn view_with_local_shortfall() -> ReadView {
     view(
         vec![ops(
