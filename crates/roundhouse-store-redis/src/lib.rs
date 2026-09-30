@@ -31,7 +31,7 @@
 //! `rh` is the default [`KeyNamespace`] (`keys`), `v1` is this family's own
 //! [`keys::KeyFamily::version`] and `sess` is its [`keys::KeyFamily::name`]
 //! — see [`keys`] for the one function every family builds its keys from
-//! (R-S3), and the table below for the other three.
+//! (R-S3), and the table below for the others.
 //!
 //! | Family | Version | Module |
 //! |---|---|---|
@@ -40,6 +40,7 @@
 //! | `fairuse` — the rolling fair-use windows | v1 | [`fair_use`] |
 //! | `corr` — the generation/call/thread correlation maps | v1 | [`correlation`] |
 //! | `dir` — the admin-created tenancy, as one versioned document | v1 | [`directory`] |
+//! | `learn` — the online routing learner's shared counters | v1 | [`learn`] |
 //!
 //! The log's wire format is the load-bearing decision. Entries are added with
 //! *explicit* stream ids `<seq>-0`, so the entry id and the event's `seq` are
@@ -78,11 +79,17 @@
 //! conversation reach the same session from any node, and — since M16.1 — the
 //! admin directory in [`directory`], which is what lets a project created on
 //! one node exist on the next one and survive a restart.
+//!
+//! The learner store in [`learn`] is the one family nothing selects yet: the
+//! online routing learner's startup composition (M9 of
+//! `agent-docs/PLAN-online-routing-learner.md`) will select it from the same
+//! variable.
 
 pub mod correlation;
 pub mod directory;
 pub mod fair_use;
 pub mod keys;
+pub mod learn;
 mod scripts;
 pub mod spend;
 #[cfg(feature = "test-support")]
@@ -92,6 +99,7 @@ pub use correlation::RedisCorrelationMaps;
 pub use directory::RedisDocumentStore;
 pub use fair_use::RedisFairUseLedger;
 pub use keys::{EmptyNamespace, KeyNamespace};
+pub use learn::RedisLearnerStore;
 pub use spend::{RedisSpendLedger, SpendPurpose};
 
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
@@ -134,9 +142,10 @@ const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 /// own two-second budget, not under a background job that can afford to be
 /// generous.
 ///
-/// **What this buys the other four families and only the other four**
-/// (M16.1 review, F6). `sess`, `spend`, `fairuse` and `corr` all move small,
-/// fixed-shape payloads — a lease hash, a counter, a stream entry — so 300ms
+/// **What this buys every family but `dir`** (M16.1 review, F6). `sess`,
+/// `spend`, `fairuse`, `corr` and `learn` all move small, fixed-shape
+/// payloads — a lease hash, a counter, a stream entry, one turn's four
+/// counter hashes or one page of learning entries — so 300ms
 /// is generous for any of them and the ceiling-check budget above is what
 /// actually constrains it. The `dir` family does not fit that shape: see
 /// [`directory::DIRECTORY_RESPONSE_TIMEOUT`], which carries it instead.

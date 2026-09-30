@@ -5,9 +5,10 @@
 //!
 //! Every guarantee the trait documents lives here as a test any backend must
 //! pass unchanged, as [`store::contract`](crate::store::contract) does for the
-//! session store. The memory backend runs it now; the Redis backend of M7 runs
-//! the same list, which is what makes "a Lua script and a `HashMap` keep the
-//! same counters" a checked property. The cases carry the model check of
+//! session store. The memory backend runs it, and the Redis backend runs the
+//! same list in `roundhouse-store-redis`'s `tests/learn_contract.rs`, which is
+//! what makes "a Lua script and a `HashMap` keep the same counters" a checked
+//! property. The cases carry the model check of
 //! draft section 15 into Rust: the lost acknowledgement, the chain gap, the
 //! overflow with no change, and store loss repaired by a backfill. The
 //! diverged chain, which no backfill repairs, is a case of its own.

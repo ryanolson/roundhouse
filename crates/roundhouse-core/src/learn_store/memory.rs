@@ -4,8 +4,9 @@
 //! The in-process [`LearnerStore`]: one lock over every project's counters.
 //!
 //! **The layout mirrors the Redis layout of draft section 11.4**, one map per
-//! key family, so the Lua script of M7 is a translation of `stage` and
-//! `Staged::commit` rather than a second design:
+//! key family, so the Redis backend's apply script (`roundhouse-store-redis`'s
+//! `learn::scripts`) is a translation of `stage` and `Staged::commit` rather
+//! than a second design:
 //!
 //! | Redis key | Here |
 //! |---|---|
@@ -17,7 +18,8 @@
 //! [`key_name`] spells the quality and operations keys after `{project}:`, and
 //! both the test-support visit recorder and the counter a
 //! [`LearnerError::CounterRange`] names use it, so an operator reading a
-//! refusal and a test reading the visits see the key M7 will store.
+//! refusal and a test reading the visits see the key the Redis backend
+//! stores.
 //!
 //! **The check phase borrows the state immutably.** `stage` takes
 //! `&ProjectState` and returns every new value; only `Staged::commit` takes
