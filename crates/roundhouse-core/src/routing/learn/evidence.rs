@@ -475,7 +475,9 @@ pub enum ReadFailure {
     ReadTimedOut,
 }
 
-/// The counters one turn read, for one project and one epoch.
+/// The counters one turn read, for one project and one epoch, as
+/// [`LearnerStore::read`](crate::learn_store::LearnerStore::read) returns
+/// them.
 ///
 /// Integers throughout: integer addition gives the same state in every order of
 /// updates, so an offline rebuild matches the store exactly.

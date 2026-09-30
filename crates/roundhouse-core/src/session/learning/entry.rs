@@ -7,7 +7,8 @@
 //! updates, so two nodes that apply the same entries in different orders, and
 //! an offline rebuild from the log, reach the same counters.
 //!
-//! **An entry says how much, never how many sessions.** The store counts a
+//! **An entry says how much, never how many sessions.**
+//! [`LearnerStore::apply`](crate::learn_store::LearnerStore::apply) counts a
 //! session once per key and strategy from its own `seen` set (draft section
 //! 11.4), so a session's second interval on a key adds units and no session.
 
