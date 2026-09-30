@@ -42,8 +42,8 @@
 //! list. Here the opposite holds: the client's `--mcp-config` registration
 //! makes it call `tools/list` on every session, and every descriptor's full
 //! description then rides in `tools[]` on *every* request
-//! (`research/claude-code-client-surface.md` §5.8: the MCP schemas flow into
-//! the Messages toolbox verbatim). Restating them here would put each
+//! (seen in a Claude Code 2.1.257 capture: the MCP schemas flow into the
+//! Messages toolbox verbatim). Restating them here would put each
 //! description in the same context window twice, on every turn, for the whole
 //! fleet — and would create a second copy to keep in step with the first.
 //!
@@ -258,7 +258,7 @@ mod tests {
     /// R-M4's cost control: the block says *when*, and never repeats *what*.
     ///
     /// Every descriptor's own description already rides in `tools[]` on every
-    /// request this client makes (§5.8), so a sentence duplicated here is paid
+    /// request this client makes, so a sentence duplicated here is paid
     /// for twice per turn, forever, and becomes a second copy to keep in step.
     /// Asserted on the descriptions themselves rather than on a length budget,
     /// because the failure is a copy-paste and not a size.

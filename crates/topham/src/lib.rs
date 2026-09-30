@@ -8,9 +8,8 @@
 //! unmodified client needs in order to drive it —
 //! [`codex_launch`](roundhouse_server::codex_launch) writes the files codex
 //! reads and [`claude_launch`](roundhouse_server::claude_launch) builds the map
-//! Claude Code reads — and no way for a person to run either. Both README
-//! deferrals name that gap in the same words ("no CLI subcommand or admin route
-//! produces these files"), and this crate closes it.
+//! Claude Code reads — and no way for a person to run either. This crate
+//! closes that gap.
 //!
 //! # Why a separate binary rather than a subcommand of `roundhouse`
 //!

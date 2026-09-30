@@ -4,8 +4,7 @@
 //! What a call that produced no priceable reply settles at, one test per way
 //! it can end.
 //!
-//! The rule (2026-09-28 ruling 3 in
-//! `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`): a request
+//! The rule (ruled 2026-09-28; see `docs/src/concepts/routing.md`): a request
 //! that may have reached the service books the grant's estimate, and only one
 //! that provably never left settles at zero. The record still says the usage
 //! is unknown either way. Every assertion is on the amount the ledger was

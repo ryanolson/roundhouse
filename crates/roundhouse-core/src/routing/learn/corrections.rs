@@ -3,7 +3,7 @@
 
 //! The corrections a learned decision applies to a candidate's quote before it
 //! compares strategy plans: the cache reuse correction on cost, the latency
-//! model of the 2026-09-28 ruling 10, and the grant check on the corrected
+//! model, and the grant check on the corrected
 //! cost.
 //!
 //! Pure functions of the quote, the store view and the ledger's rate card.
@@ -71,14 +71,14 @@ impl<'a> Corrections<'a> {
         self.view.target(&candidate.target)
     }
 
-    /// The candidate's quote with the reuse correction (draft section 9).
+    /// The candidate's quote with the reuse correction.
     ///
     /// The shortfall is re-priced through
     /// [`ProviderPricing::price_tokens`](crate::routing::ProviderPricing::price_tokens),
     /// the one pricing contract, so a token moved from cached to uncached pays
-    /// the effective write rate and a cache-write premium survives. Revision 1
-    /// of the draft used the plain input rate less the read rate, which
-    /// dropped the premium and priced a one-hour cache at half its cost.
+    /// the effective write rate and a cache-write premium survives. Pricing it
+    /// as the plain input rate less the read rate would drop the premium and
+    /// price a one-hour cache at half its cost.
     ///
     /// **The re-priced term stops at zero.** Moving a token to uncached raises
     /// the price only while the card's cached read rate is below its effective
@@ -138,7 +138,7 @@ impl<'a> Corrections<'a> {
         candidate.expected_cost_usd + difference.max(0.0)
     }
 
-    /// First output from turn start, modeled (ruling 10): the quoted TTFT, the
+    /// First output from turn start, modeled: the quoted TTFT, the
     /// target's mean residual from its `Routed` to first output, and the
     /// project's mean overhead from `TurnStarted` to `Routed`.
     ///
@@ -233,7 +233,7 @@ pub fn adjusted_cached_tokens(candidate: &Candidate, isl_tokens: usize, reuse: &
         .max(0.0)
 }
 
-/// The grant constraint on a corrected cost (draft section 7.2, constraint 2).
+/// The grant constraint on a corrected cost.
 ///
 /// **Takes the [`CostEvidence`], not a number**, and reads its `adjusted_usd`.
 /// A bare `f64` parameter would accept the quote as readily as the correction,

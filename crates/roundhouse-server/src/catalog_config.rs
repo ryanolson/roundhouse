@@ -113,8 +113,7 @@ pub struct CatalogConfig {
     /// What our own fleet's capacity costs, per million uncached input tokens
     /// and per million output tokens. Absent means local is unpriced.
     ///
-    /// Ruled 2026-09-28 (ruling 6 in
-    /// `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`). The
+    /// Ruled 2026-09-28 (see `docs/src/concepts/routing.md`). The
     /// router quotes local turns at it, and the dashboard reports local
     /// capacity spend and a routing saving net of it. Without it local quotes
     /// stay at zero dollars and the dashboard marks local cost unpriced rather
@@ -147,7 +146,7 @@ const PROVENANCE_FILE: &str = "quality-prior.provenance.json";
 /// something the deployment does on the operator's behalf (M10 review G12).
 ///
 /// **The convention is the tool's own default filename**, `--provenance`'s
-/// default and what the README tells an operator to keep beside the catalog. A
+/// default and what `docs/src/guides/catalog.md` tells an operator to keep beside the catalog. A
 /// deployment that renamed the file on the command line is not discovered and
 /// gets no line — deliberately, since guessing at other names would mean
 /// parsing every JSON file in the catalog's directory to see whether it looks

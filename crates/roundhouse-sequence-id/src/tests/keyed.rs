@@ -162,8 +162,8 @@ fn a_codex_family_shares_a_session_but_never_a_sequence() {
     assert!(digest(&parent_label) != digest(&child_label));
 }
 
-/// Known-answer vectors for every keyed formula of §3.2, computed outside the
-/// crate (Python `hmac`/`hashlib`) from the formulas as the plan writes them.
+/// Known-answer vectors for every keyed formula, computed outside the crate
+/// (Python `hmac`/`hashlib`) from the formulas stated in `keyed.rs`.
 ///
 /// The values are compared across nodes and releases — tips in a shared store,
 /// `S` in a deployment's session table — so a formula change orphans all of

@@ -98,7 +98,7 @@ pub fn route_facts(turn: &TurnRecord) -> Value {
         "considered": considered,
         // Not a routing fact but the one thing a reader of *this* document
         // cannot otherwise recover: the crate documentation says a steered turn
-        // publishes as an ordinary tool call, and this is what lets somebody
+        // publishes as an ordinary turn, and this is what lets somebody
         // holding both the trajectory and our log find which ones those were.
         "steered": turn.steered,
     })

@@ -551,19 +551,19 @@ pub enum SessionEventKind {
     /// **A hint, never the authority.** The store's watermark decides which
     /// entries apply; this only lets the session fold stop holding entries the
     /// store already has, so a successor that replays the log resends less.
-    /// A stale value costs a resend the store skips by identity (draft section
-    /// 11.5 of `agent-docs/DRAFT-online-routing-learner.md`).
+    /// A stale value costs a resend the store skips by identity (see
+    /// `docs/src/concepts/routing-learner.md`).
     ///
     /// No response id and not terminal: it is this deployment's delivery
     /// bookkeeping, about entries rather than about any turn, so no surface
     /// streams it and no dispatch pairs with it.
     ///
-    /// Part of the one-way door of draft section 13: a build older than this
-    /// variant cannot decode a log that holds one. Written per session, not
-    /// per project mode: only a session with a `Routed` that carries learned
-    /// evidence produces entries, and it keeps producing them, and so keeps
-    /// receiving this event, after its project returns to `off` (draft section
-    /// 23). A session whose project never enabled the learner never holds one.
+    /// A one-way door: a build older than this variant cannot decode a log that
+    /// holds one. Written per session, not per project mode: only a session
+    /// with a `Routed` that carries learned evidence produces entries, and it
+    /// keeps producing them, and so keeps receiving this event, after its
+    /// project returns to `off`. A session whose project never enabled the
+    /// learner never holds one.
     LearningApplied {
         through_seq: u64,
     },

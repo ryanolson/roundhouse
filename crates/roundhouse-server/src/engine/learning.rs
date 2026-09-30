@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The online routing learner's two engine seams (draft sections 11.5 and
-//! 12.3, milestone M8 of `agent-docs/PLAN-online-routing-learner.md`): the
+//! The online routing learner's two engine seams (design in
+//! `docs/src/concepts/routing-learner.md`): the
 //! learned choice in `plan`, and delivery in the `run_turn` tail.
 //!
 //! **An `off` project never reaches the first seam.** [`Engine::learning_for`]
@@ -12,8 +12,8 @@
 //! learner-store call on its path.
 //!
 //! **Delivery follows the log, not the mode.** A session that has learned
-//! history keeps producing entries after its project returns to `off` (draft
-//! section 23), so the tail delivers whatever the session's fold holds,
+//! history keeps producing entries after its project returns to `off`, so
+//! the tail delivers whatever the session's fold holds,
 //! whatever the project says now. A session with no learned history holds no
 //! entry, and the tail returns before any store call.
 //!
@@ -76,9 +76,9 @@ use crate::learner_recovery::{LearnerRecovery, RecoveryCadence};
 /// How long delivery waits for an apply on a session whose project writes no
 /// `apply_timeout_ms` any more, in milliseconds.
 ///
-/// Such a session still has entries owed (draft section 23): its project has
-/// no learner block, or an `off` block that writes no timeout. The plan's
-/// starting value (section 4), named here so it is not a literal in the tail.
+/// Such a session still has entries owed: its project has no learner block,
+/// or an `off` block that writes no timeout. The starting value, named here so
+/// it is not a literal in the tail.
 /// A block that writes the timeout, in any mode, runs under its own value
 /// (`Admission::learner_apply_timeout_ms`).
 pub const UNCONFIGURED_APPLY_TIMEOUT_MS: u64 = 250;
@@ -340,7 +340,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         .map_err(EngineError::from)
     }
 
-    /// Deliver the session's pending learning entries (draft section 11.5).
+    /// Deliver the session's pending learning entries.
     ///
     /// Runs in the `run_turn` tail after the settle and the fair-use draw,
     /// while the lease is still held, for steered, failed and dispatched turns

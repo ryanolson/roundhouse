@@ -96,7 +96,7 @@ fn every_key_of_one_project_starts_with_its_prefix_and_shares_its_tag() {
 ///
 /// A string in a reply would be a number that crossed through `tostring`, or a
 /// status tag the Rust side has to parse; a counter formatted with `%.14g`
-/// loses digits past the fourteenth (draft section 11.3). Each case also
+/// loses digits past the fourteenth. Each case also
 /// asserts the reply code, so the test reaches every code rather than
 /// passing on the one outcome it happened to produce.
 #[tokio::test]

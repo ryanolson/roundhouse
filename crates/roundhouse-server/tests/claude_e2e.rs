@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #![cfg(feature = "e2e-claude")]
 
-//! M11.2b of `PLAN-agentic-control-plane.md`: a **real `claude` binary** driving
+//! A **real `claude` binary** driving
 //! a real roundhouse over a real socket, on the Direct topology.
 //!
 //! [`codex_e2e`](../codex_e2e.rs)'s sibling, and deliberately its mirror: the
@@ -151,12 +151,13 @@
 //!
 //! # The isolation trap this suite is written around
 //!
-//! `agent-docs/research/claude-code-client-surface.md` §5.7: with
-//! `CLAUDE_CODE_REMOTE=true` in the environment — which is exactly the
+//! With `CLAUDE_CODE_REMOTE=true` in the environment — which is exactly the
 //! environment a Claude Code Remote container runs this repository's own
 //! sessions in — the client presents the container's **managed OAuth token**,
-//! because §1.3's API-key arm is guarded by `!CLAUDE_CODE_REMOTE` and the
-//! sentinel therefore suppresses nothing. A real subscription seat would reach
+//! because its `VV()` auth check lets a resolved `ANTHROPIC_API_KEY` suppress
+//! the subscription login only when `!CLAUDE_CODE_REMOTE` (read from the 2.1.42
+//! bundle, confirmed against a live 2.1.257) and the sentinel therefore
+//! suppresses nothing. A real subscription seat would reach
 //! this test rig, on a socket that records every header it is handed.
 //!
 //! Three things stand between that and a run of this file, and they are ordered
@@ -198,7 +199,7 @@
 //! `auth.json` and never checks a JWT signature, so a hermetic seat is
 //! constructible — and nothing equivalent is true of a `claude` subscription
 //! login, which is a keychain/OAuth artifact this box does not hold and must not
-//! be given one. So that arm stays a documented one-capture: §1.3 predicts the
+//! be given one. So that arm stays a documented one-capture: the v2.1.42 static read predicts the
 //! login's bearer would ride `Authorization` while the turn key rides
 //! [`TURN_KEY_HEADER`], which is precisely the pass-through shape
 //! `control_config`'s own suites pin from the other side. What this file adds is
@@ -215,7 +216,7 @@
 //! load-bearing and would move:
 //!
 //! - the trailing `<total_tokens>` notice exists at all, and is a `role:
-//!   "system"` message rather than turn configuration (R-A; §5.7);
+//!   "system"` message rather than turn configuration (2.1.257);
 //! - `-p` with `--output-format json` prints one JSON document whose
 //!   `session_id`, `result` and `num_turns` this file reads. An older line
 //!   printed the same fields; a client that renamed one would fail here on the
@@ -234,16 +235,14 @@
 //! under `--include-ignored` is the same loud panic naming the variable that a
 //! missing client is.
 //!
-//! **Where "Relay evidence §x" points.** Every claim here or in the rig module
-//! about what Relay
-//! does is read from one document —
-//! `agent-docs/research/nemo-relay-0.8.0-published-read.md`, whose 2026-09-01
-//! addendum re-derived each of them against the 0.8.2 tarball this suite drives
-//! — and is cited by section, never by file and line. M11.2b review F10: a
-//! citation by file and line, copied into Rust, is a claim about a pinned tree
-//! that nobody re-derives when the pin moves — and it had already been copied
-//! into two files. One pointer per claim leaves one place to re-read, which is
-//! what CLAUDE.md's synergy-vigilance rule asks for.
+//! **Where the Relay claims come from.** Every claim here or in the rig module
+//! about what Relay does was re-derived on 2026-09-01 against the 0.8.2 tarball
+//! this suite drives, and is stated without a file and line. A citation by file
+//! and line, copied into Rust, is a claim about a pinned tree that nobody
+//! re-derives when the pin moves — and it had already been copied into two
+//! files. The pin and what rides on it are in
+//! `docs/src/development/upstream.md`, which is what CLAUDE.md's
+//! synergy-vigilance rule asks for.
 //!
 //! **The chained launch is the Direct launch, wrapped** (R-D′). Relay overwrites
 //! `ANTHROPIC_BASE_URL` with its own gateway and *merges* its
@@ -271,8 +270,8 @@
 //!
 //! - **Hazard 4: set the upstream base URL and auth header in one config layer.**
 //!   `replace_upstream_base_url` clears a configured `anthropic_auth_header`
-//!   whenever the base URL is changed by a *different* layer
-//!   (Relay evidence §A.5), so a deployment that names the base URL
+//!   whenever the base URL is changed by a *different* layer,
+//!   so a deployment that names the base URL
 //!   on the command line and the auth header in `config.toml` runs
 //!   unauthenticated and finds out at roundhouse's 401. The reference wiring
 //!   below sidesteps this by configuring no auth header at all — the turn key
@@ -283,13 +282,13 @@
 //!   drives `nemo-relay run --dry-run` directly, at the bottom of this file.
 //! - **Hazard 5: a plugin's dispatch-override turn is key-authed only.** Relay's
 //!   `effective_dispatch_request` strips provider credentials before redirecting
-//!   a turn to an explicit target (Relay evidence §A.6), so a turn
+//!   a turn to an explicit target, so a turn
 //!   redirected by a plugin arrives carrying no forwarded seat whatever the
 //!   client presented. No pass-through deployment may assume otherwise.
 //!
 //! **Resumption is not offered in band on this surface**, and R-D closes plan
 //! open question 4 that way for this rung: Relay's SSE decoder ignores `id:`
-//! lines outright (Relay evidence §A.3), so a cursor carried as an SSE
+//! lines outright, so a cursor carried as an SSE
 //! id does not survive the hop — and the Messages emitter carries none, so there
 //! is nothing to lose today and a documented reason not to add one tomorrow.
 
@@ -369,7 +368,7 @@ const CONTROL_CALL_ID: &str = "toolu_e2e_mcp_01";
 /// One of roundhouse's own control tools, in both spellings a run of it needs.
 struct ControlTool {
     /// What `roundhouse-mcp` serves it under, and what the client posts as
-    /// `params.name` once it has split the flat name apart (§5.8, request 6).
+    /// `params.name` once it has split the flat name apart (2.1.257: request 6 of the handshake).
     bare: &'static str,
     /// What a Claude Code model spells — `mcp__roundhouse__<tool>` — and
     /// therefore what `tools[]`, the `tool_use` block, `--allowedTools` and
@@ -410,7 +409,7 @@ static CONTROL_TOOL: LazyLock<ControlTool> = LazyLock::new(|| {
 /// Named here so the chained tests can assert its **absence** at roundhouse's
 /// edge. Relay merges it into the client's `ANTHROPIC_CUSTOM_HEADERS` so the
 /// client presents it to the gateway, and strips it again before dispatch
-/// (Relay evidence §2.3) — so this is the one header whose arrival here
+/// — so this is the one header whose arrival here
 /// would mean Relay's own credential had been handed to an upstream that is not
 /// Relay.
 const RELAY_PROXY_TOKEN_HEADER: &str = "x-nemo-relay-proxy-token";
@@ -758,8 +757,8 @@ fn the_childs_environment_is_the_generated_map_plus_the_isolation_vars() {
     );
 
     // Named explicitly on top of the `==` above, because these are the specific
-    // suspects: the first defeats the sentinel entirely (§5.7) and the rest
-    // resolve ahead of it (§1.3). The set check already catches each as an extra
+    // suspects: the first defeats the sentinel entirely (2.1.257) and the rest
+    // resolve ahead of it (v2.1.42). The set check already catches each as an extra
     // key; naming them is what makes a future reader's intent legible without
     // re-deriving it from a diff.
     for suspect in [
@@ -966,7 +965,7 @@ fn the_version_probe_isolates_the_child_it_spawns() {
 
 /// **R-D′ made structural: the chained launch is the Direct launch, wrapped.**
 ///
-/// The ruling is that one generator serves both topologies — Relay overwrites
+/// The rule is that one generator serves both topologies — Relay overwrites
 /// `ANTHROPIC_BASE_URL` and merges into `ANTHROPIC_CUSTOM_HEADERS`, so the same
 /// [`ClaudeEnv`] that hooks a client straight up also carries the turn key
 /// through the hop. A test that only ran the chain end to end would confirm that
@@ -1153,8 +1152,8 @@ fn a_rigs_root_cannot_be_claimed_twice() {
 /// The first thing this rung has to establish and deliberately ahead of the
 /// rest: that the generated map is one a real client hooks up with. Every unit
 /// test in `claude_launch` proves the map says the right thing — that the base
-/// URL is a deployment root, that the header block parses the way §1.6 says the
-/// client parses it — and none of them proves the client reads any of it. A
+/// URL is a deployment root, that the header block parses the way the client
+/// parses it (v2.1.42) — and none of them proves the client reads any of it. A
 /// wrong answer here would otherwise surface two tests later as "the tool loop
 /// did not close", and be diagnosed as a tool bug.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1482,7 +1481,7 @@ async fn a_continued_run_extends_the_session_rather_than_forking_it() {
         assert!(
             is_the_budget_notice(last),
             "2.1.257 appends the remaining-budget notice after the new user turn; if this client \
-             no longer does, R-A's drop rule is guarding a shape nobody sends and the ruling must \
+             no longer does, the drop rule for that notice is guarding a shape nobody sends and must \
              be read again (turn {index}): {last:?}"
         );
     }
@@ -1570,21 +1569,21 @@ async fn a_continued_run_extends_the_session_rather_than_forking_it() {
 /// - the turn key arrived in [`TURN_KEY_HEADER`], which is what makes this a
 ///   pass-through-shaped request whose `Authorization` would belong to the
 ///   client's own upstream;
-/// - the sentinel arrived on `x-api-key`, exactly where §1.3's suppression puts
-///   it — so the serve side's rule that it is never captured as a seat
+/// - the sentinel arrived on `x-api-key`, exactly where the client's suppression puts
+///   it (v2.1.42) — so the serve side's rule that it is never captured as a seat
 ///   (`control_config`'s `the_launchers_api_key_sentinel_is_never_forwarded_as_a_seat`)
 ///   is a rule about a value that really does arrive;
-/// - there is **no** `Authorization` header at all. That is the negative §1.3
-///   predicts for a non-interactive launch with a resolved API key, and it is
+/// - there is **no** `Authorization` header at all. That is the negative the v2.1.42
+///   read predicts for a non-interactive launch with a resolved API key, and it is
 ///   the only way this suite can say anything about the forwarded-login arm it
 ///   cannot drive: the prediction is that the arm which suppresses nothing is
 ///   the arm where a bearer appears here;
 /// - and no remote-container header. Their presence would mean the environment
 ///   clear leaked `CLAUDE_CODE_REMOTE`, the sentinel suppressed nothing, and the
 ///   `Authorization` above is a real managed OAuth token that has just been
-///   recorded by a test rig (§5.7). That is the single most likely way a real
-///   credential reaches this file, so it is checked on the wire and not only at
-///   construction.
+///   recorded by a test rig (seen in the 2.1.257 isolation capture). That is the
+///   single most likely way a real credential reaches this file, so it is
+///   checked on the wire and not only at construction.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the real claude binary: --features e2e-claude -- --include-ignored; ROUNDHOUSE_TEST_CLAUDE_BIN overrides PATH"]
 async fn the_seat_chain_a_launched_client_presents() {
@@ -1603,7 +1602,7 @@ async fn the_seat_chain_a_launched_client_presents() {
     }
     println!(
         "    forwarded-login arm: not driven here — no `claude` login exists on this box and \
-         none may be created for a test rig. §1.3 predicts a subscription bearer on \
+         none may be created for a test rig. the v2.1.42 read predicts a subscription bearer on \
          `authorization` beside the turn key on `{TURN_KEY_HEADER}`; the negative below is \
          what makes that prediction checkable."
     );
@@ -1618,7 +1617,7 @@ async fn the_seat_chain_a_launched_client_presents() {
     assert_eq!(
         turn.header("x-api-key"),
         Some(ROUNDHOUSE_API_KEY_SENTINEL),
-        "the sentinel must arrive where §1.3 puts a resolved API key: {:?}",
+        "the sentinel must arrive where the client puts a resolved API key: {:?}",
         turn.redacted_headers()
     );
     assert_eq!(
@@ -1634,7 +1633,7 @@ async fn the_seat_chain_a_launched_client_presents() {
         assert!(
             !name.contains("remote"),
             "a remote-container header (`{name}`) means the environment clear leaked \
-             CLAUDE_CODE_REMOTE and this run is contaminated (§5.7): {:?}",
+             CLAUDE_CODE_REMOTE and this run is contaminated: {:?}",
             turn.redacted_headers()
         );
     }
@@ -1666,9 +1665,8 @@ async fn the_seat_chain_a_launched_client_presents() {
 /// sentinel, and Relay's own `x-nemo-relay-proxy-token` — and the question a
 /// chained deployment has to answer is which of them went upstream. R-D′ rules
 /// that the carrier is the client's own environment: Relay overwrites
-/// `ANTHROPIC_BASE_URL` and *merges* into `ANTHROPIC_CUSTOM_HEADERS`
-/// (Relay evidence §A.7), forwards unknown request headers
-/// untouched (Relay evidence §2.3), and strips only its own credential
+/// `ANTHROPIC_BASE_URL` and *merges* into `ANTHROPIC_CUSTOM_HEADERS`,
+/// forwards unknown request headers untouched, and strips only its own credential
 /// — so the turn key arrives on [`TURN_KEY_HEADER`] exactly as it does Direct,
 /// and a chained turn is dedicated-header authed with the same semantics.
 ///
@@ -1767,12 +1765,12 @@ async fn a_chained_turn_reaches_roundhouse_with_the_turn_key_and_not_relays_own(
     assert_eq!(
         turn.query.as_deref(),
         Some("beta=true"),
-        "the client's query string must survive Relay's base-URL concatenation \
-         (Relay evidence §A.4); path was `{}`",
+        "the client's query string must survive Relay's base-URL concatenation; \
+         path was `{}`",
         turn.path
     );
 
-    // 5. The sentinel arrived where §1.3 puts a resolved API key, and was not
+    // 5. The sentinel arrived where the client puts a resolved API key, and was not
     //    captured as a seat. Both halves: a chained deployment forwarding
     //    `rh_sentinel_not_a_credential` upstream as a tenant's own key is a 401
     //    three processes from its cause.
@@ -1829,7 +1827,7 @@ async fn a_chained_turn_reaches_roundhouse_with_the_turn_key_and_not_relays_own(
 /// The hazard is that Relay deserializes a rewritten request body into a
 /// `serde_json::Map` and re-serializes it — and both Relay crates declare
 /// `serde_json` with no `preserve_order`, so that `Map` is `BTreeMap`-backed and
-/// alphabetizes every object it round-trips (§A.2). A prefix check that hashed
+/// alphabetizes every object it round-trips. A prefix check that hashed
 /// rendered JSON would see turn two's resend of turn one as a different history
 /// and rebind the conversation, silently, on the second turn of every chained
 /// session.
@@ -1924,8 +1922,8 @@ async fn a_chained_continue_survives_relays_re_encode_without_forking() {
 /// Every other test in this file hands the client [`ClaudeEnv`] directly, which
 /// proves the generated map is one a client hooks up with and leaves one link
 /// unproven: that anything an operator can actually *run* produces that map.
-/// Until M11.3 nothing did — both README deferrals said so in the same words,
-/// "no CLI subcommand or admin route produces these files" — so the launcher's
+/// Until `topham launch` existed nothing did — the documentation said so in the
+/// same words, "no CLI subcommand or admin route produces these files" — so the launcher's
 /// own suite could only prove `topham` builds the map the generator builds,
 /// which is a claim about two functions in one process.
 ///
@@ -1989,7 +1987,7 @@ async fn a_real_client_launched_through_topham_hooks_up_on_direct() {
         turn.redacted_headers()
     );
 
-    // 2. The sentinel is inert: it arrived where §1.3 puts a resolved API key,
+    // 2. The sentinel is inert: it arrived where the client puts a resolved API key,
     //    suppressing any subscription login, and this deployment did not treat
     //    it as a seat. A launcher that forwarded it as a tenant's own key would
     //    be a 401 two processes from its cause.
@@ -2051,7 +2049,7 @@ async fn a_real_client_launched_through_topham_hooks_up_on_direct() {
 ///    registers the server: `topham` does, from the profile, as inline argv.
 /// 2. **The name was split back apart on the MCP wire** — the model saw
 ///    `mcp__roundhouse__status` and the surface was asked for `status`, which
-///    is §5.8's request 6 observed live rather than replayed from a fixture.
+///    is the 2.1.257 capture's request 6 observed live rather than replayed from a fixture.
 /// 3. **The call was correlated by tool-use id and not guessed** (R-M2). This
 ///    is the assertion the whole [`ControlRace`] apparatus exists for: a rival
 ///    conversation of the same principal's holds the `latest` slot when the
@@ -2105,7 +2103,7 @@ async fn a_real_client_reaches_the_control_surface_through_the_turn() {
             // permission refusal for an `mcp__*` tool its own argv does not
             // name — no `tools/call` reaches the surface at all — and
             // `--dangerously-skip-permissions` is refused outright on a box
-            // running as root (§5.8). `topham plan` says as much in its notes;
+            // running as root (2.1.257). `topham plan` says as much in its notes;
             // what it cannot do is decide a permission grant on an operator's
             // behalf.
             &["--allowedTools", &CONTROL_TOOL.flat],
@@ -2173,7 +2171,7 @@ async fn a_real_client_reaches_the_control_surface_through_the_turn() {
         body["params"]["name"].as_str(),
         Some(CONTROL_TOOL.bare),
         "the model spelled `{}` and the client posts the bare tool, the server prefix stripped \
-         (§5.8, request 6): {body}",
+         (2.1.257, request 6): {body}",
         CONTROL_TOOL.flat
     );
     assert_eq!(
@@ -2336,7 +2334,7 @@ struct McpConfigDocument {
 #[allow(dead_code)]
 enum McpServer {
     /// Streamable HTTP — JSON-RPC over `POST <url>`, which is what the 2.1.257
-    /// capture recorded against a server registered exactly this way (§5.8).
+    /// capture recorded against a server registered exactly this way.
     Http {
         url: String,
         #[serde(default)]
@@ -2425,7 +2423,7 @@ fn the_generated_mcp_registration_resolves_to_this_deployments_http_surface() {
     );
 
     // And it survives being written down. The flag takes the JSON inline, but
-    // the same document is what a project `.mcp.json` holds (§5.8), so a
+    // the same document is what a project `.mcp.json` holds (2.1.257), so a
     // rendering that only round-tripped in memory would be one an operator
     // could not save.
     let rewritten = serde_json::to_string(&serde_json::from_str::<Value>(&registration).unwrap())
@@ -2446,7 +2444,7 @@ fn the_generated_mcp_registration_resolves_to_this_deployments_http_surface() {
 /// it inherited, so a `CLAUDE_CONFIG_DIR/settings.json` left behind by
 /// something else — nemo-relay's persistent install writes exactly this,
 /// `env.ANTHROPIC_BASE_URL` pointed at its gateway
-/// (`agent-docs/research/nemo-relay-0.8.0-published-read.md`'s Finding 2.2) —
+/// (read from nemo-relay 0.8.0's `claude` host install) —
 /// outranks the environment `topham` generated. When this was first run live
 /// the launch went through and the client hung: zero turns at roundhouse's
 /// edge, no refusal anywhere, and no way for an operator to tell a re-routed
@@ -2718,7 +2716,7 @@ async fn a_real_client_handed_to_relay_through_topham_hooks_up_chained() {
 /// configured, and a *second* layer supplying the *same* base URL must not
 /// clear it either — isolating that it is specifically a base URL arriving
 /// from a **different** layer that trips `replace_upstream_base_url`, exactly
-/// as the module doc's citation of the Relay evidence's §A.5 predicts.
+/// as the module doc predicts.
 ///
 /// The probe spawns Relay with the ambient environment **cleared** (M11.2b
 /// review F7): Relay applies its `NEMO_RELAY_*` layer above the explicit
@@ -2870,7 +2868,7 @@ fn f7_an_ambient_base_url_env_var_cannot_trip_the_hazard_4_control() {
 /// precedence, which is exactly when the preflight and the chained runbook want
 /// re-reading.
 ///
-/// F8 claims the Relay evidence's §2.4 `config_paths` appends the
+/// F8 claims Relay's `config_paths` appends the
 /// system file *after* the explicit one and `merge_toml`'s later-wins
 /// semantics let a system file clobber an explicit config's leaf values, so
 /// an operator box with a system Relay install could re-aim a chained turn
@@ -2919,7 +2917,7 @@ fn f8_system_config_layer_outranks_the_chained_rigs_explicit_config() {
     let dry_run = || -> String { relay_dry_run(&relay, &root, &config, &[]) };
 
     // `system_config_dir()` is hardcoded to `/etc/nemo-relay` on non-Windows
-    // (Relay evidence §2.4) — not overridable by any
+    // — not overridable by any
     // env var — so proving this claim means writing the real path. Guard it:
     // refuse to touch a box that already has one, and remove it again on
     // scope exit whether the test panics or not.
@@ -3497,7 +3495,7 @@ fn the_module_doc_does_not_enumerate_a_count_of_real_binary_tests() {
         );
     }
 
-    // Relay's source belongs in the evidence document, cited by section. A
+    // Relay's source is not cited by file and line in Rust. A
     // `file.rs:1070-1078` here is a claim about a pinned tree with no path back
     // to the tree it was read from.
     //
@@ -3528,9 +3526,9 @@ fn the_module_doc_does_not_enumerate_a_count_of_real_binary_tests() {
         .collect();
     assert!(
         offenders.is_empty(),
-        "F10: Relay source is cited by file and line in this suite or its rig module; cite the \
-         evidence document's section instead (see the module doc's \"Where Relay evidence §x \
-         points\"):\n{}",
+        "F10: Relay source is cited by file and line in this suite or its rig module; state the \
+         claim and the Relay version it was read from instead (see the module doc's \"Where \
+         the Relay claims come from\"):\n{}",
         offenders.join("\n")
     );
 }

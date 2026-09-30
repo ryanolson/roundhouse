@@ -114,7 +114,7 @@ async fn the_store_writes_only_the_keys_its_key_functions_name() {
     assert_eq!(keys_in(&namespace).await, Vec::<String>::new());
 }
 
-/// Draft section 11.3: a key of the wrong type is refused as `WrongType`,
+/// A key of the wrong type is refused as `WrongType`,
 /// naming the key, before the script writes anything.
 ///
 /// Each case sabotages one key a batch or read touches, with the other keys

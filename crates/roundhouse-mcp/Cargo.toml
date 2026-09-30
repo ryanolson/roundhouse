@@ -27,7 +27,7 @@ http = "1"
 # the three features requested are the server handler, the streamable-HTTP
 # server, and the `tower` Service impl the existing axum router mounts it with.
 #
-# The gate this had to pass, from the plan: rustls only (the Dynamo `deny.toml`
+# The gate this had to pass: rustls only (the Dynamo `deny.toml`
 # rule) and no second `axum` against the `=0.8.4` pin. It brings no TLS stack at
 # all and reaches axum not at all -- its server is a `tower_service::Service` --
 # so both hold, and `cargo tree` is the exit criterion that keeps them holding.

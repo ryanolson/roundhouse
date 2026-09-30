@@ -109,10 +109,10 @@ const CONTINUATION: &str = "and only the second half.";
 /// The version and the session id are fields rather than literals inside the
 /// tests because they come *from* the capture: a test that spelled one would
 /// pass for one line and fail for the other with a `SessionNotFound` that looks
-/// like a serve-surface refusal and is not (§5.7's second confound). The tool
+/// like a serve-surface refusal and is not. The tool
 /// count is not a field at all — it is read off each fixture's own toolbox,
-/// because the two rigs declared different toolboxes (24 vs. 21, §5.7's first
-/// confound) and an expected literal there would read client drift into a
+/// because the two rigs declared different toolboxes (24 vs. 21 in the 2.1.257
+/// re-capture) and an expected literal there would read client drift into a
 /// difference between two invocations.
 struct CapturedLine {
     /// The client version the attribution pseudo-header names.
@@ -133,7 +133,7 @@ impl CapturedLine {
     }
 }
 
-/// The prior line: 2.1.251, captured 2026-08-29 (§5.6).
+/// The prior line: 2.1.251, captured 2026-08-29.
 static LINE_PRIOR: CapturedLine = CapturedLine {
     version: "2.1.251",
     session: "e13acbde-ab70-46ff-b094-fd8ce95d286d",
@@ -142,7 +142,7 @@ static LINE_PRIOR: CapturedLine = CapturedLine {
     headers: include_str!("fixtures/claude-2.1.251-headers.json"),
 };
 
-/// The current line: 2.1.257, captured 2026-09-01 (§5.7).
+/// The current line: 2.1.257, captured 2026-09-01.
 static LINE_CURRENT: CapturedLine = CapturedLine {
     version: "2.1.257",
     session: "c0cb70b6-938b-4cbb-a8e8-1b8a60b7c4d8",
@@ -203,7 +203,7 @@ macro_rules! per_line_tests {
 ///
 /// It exists because turn three is the first turn on which the client's
 /// remaining-budget notice appears *twice* — once flattened in the history and
-/// once fresh at the end — and that is the shape R-A rules on (§5.7.1). There is
+/// once fresh at the end — and that is the shape the ephemeral-notice rule covers. There is
 /// no 2.1.251 counterpart because the prior line sends no notice at all.
 const TURN_THREE_CURRENT: &str = include_str!("fixtures/claude-2.1.257-turn-3-continue.json");
 
@@ -851,7 +851,7 @@ fn fixture(text: &str) -> Value {
 ///
 /// **The count is read, never expected.** The two rigs declared 24 and 21 tools
 /// — a difference in what a plain `-p` invocation offers, not client drift
-/// (§5.7's first confound) — so a literal here would have failed the current
+/// — so a literal here would have failed the current
 /// line for a reason that has nothing to do with the surface. What is asserted
 /// instead is the property the tests below actually rest on: that this really is
 /// a live capture's toolbox and not a hand-written stub.
@@ -984,7 +984,7 @@ async fn a_dispatched_turn_is_a_conformant_stream() {
 /// The one-token probes Claude Code opens a session with are served genuinely.
 ///
 /// Its auth probe and its quota probe are both `stream`-less creates with
-/// `max_tokens: 1` (§3.6). A surface that 4xx'd or 500'd them would fail before
+/// `max_tokens: 1` (v2.1.42). A surface that 4xx'd or 500'd them would fail before
 /// the first turn — and the failure would look like a broken deployment rather
 /// than an unimplemented mode.
 #[tokio::test]
@@ -1225,7 +1225,7 @@ async fn f1_the_clients_max_tokens_is_the_dispatch_ceiling_and_not_the_estimate(
         (quotes[0].output_token_cap, quotes[1].output_token_cap),
         (Some(1), Some(1_000_000)),
         "F1: the ceiling each dispatch carried is the one its client declared, \
-         verbatim — a `max_tokens: 1` auth probe (client surface §3.6) and a \
+         verbatim — a `max_tokens: 1` auth probe (Claude Code 2.1.42) and a \
          64 000-token coding turn are not the same request: {quotes:?}"
     );
     assert_eq!(
@@ -1857,7 +1857,7 @@ async fn the_clients_tool_results_come_back_onto_the_same_session() {
 /// too.
 ///
 /// Claude Code re-issues a turn non-streaming when it cannot parse the stream
-/// (§3.6), so the two projections answer the same question and must not
+/// (v2.1.42), so the two projections answer the same question and must not
 /// disagree: a non-streaming path that flattened `content` to one text block
 /// would return, for the *same turn*, an answer that calls nothing.
 #[tokio::test]
@@ -2378,7 +2378,7 @@ async fn a_retried_turn_replays_rather_than_answering_twice() {
 /// The scenario `mark_incomplete`'s own doc names as the reason it commits a
 /// partial at all: "the successor can resume from it." Here the successor is
 /// the *same* turn id retried after a transient failure, exactly as `Z59`
-/// (`research/claude-code-client-surface.md` §3.2/§2.5) retries a mid-stream
+/// (Claude Code 2.1.42's retry predicate) retries a mid-stream
 /// `overloaded_error` by re-issuing the identical request — the client never
 /// saw the partial (its parser throws on `event: error` before any
 /// `message_stop`), so the retry's body cannot and does not carry it.
@@ -2425,7 +2425,7 @@ async fn a_retry_after_a_mid_stream_failure_keeps_the_conversation_on_one_sessio
     assert_eq!(
         failure.kind,
         StrictErrorKind::OverloadedError,
-        "only this spelling is retried under subscription OAuth (§2.5's `Z59`): {failure:?}"
+        "only this spelling is retried under subscription OAuth (v2.1.42's `Z59`): {failure:?}"
     );
     assert_eq!(
         first.text, PARTIAL,
@@ -2618,7 +2618,7 @@ async fn an_orphaned_tool_call_does_not_fork_the_session_on_the_next_turn() {
     // `append_emitted`, then the store drops the terminal write. The client
     // sees the block close and then an `error` frame with no `message_stop`
     // -- a permanent fault (`api_error`, not `overloaded_error`), not one the
-    // SDK retries on its own (§3.2).
+    // SDK retries on its own (v2.1.42).
     let first = stream(&app, &headers, &body("do it")).await;
     let failure = first
         .error
@@ -3100,10 +3100,10 @@ async fn a_turn_with_nowhere_to_go_ends_the_stream_with_an_error_event() {
     // change that stops an agent turn carrying an empty text block ahead of its
     // tool call — so a turn that failed before saying anything opens none, which
     // is also what the upstream API does: an `overloaded_error` mid-stream is
-    // `message_start` then `error`, with no content between them. The §3.6
+    // `message_start` then `error`, with no content between them. The
     // re-issue condition this does *not* trip is about a stream that *completes*
     // with no block; an `error` event throws in the client's SSE layer before
-    // any of that is reached (§3.2).
+    // any of that is reached (v2.1.42).
     assert_eq!(
         accumulated.completed_blocks, 0,
         "a turn that produced nothing opens no block to close: {text}"
@@ -3207,7 +3207,7 @@ async fn f3_control_an_ordinary_large_body_is_served_normally() {
 /// pure function. Ruled **valid** on both halves — the wrong limit *and* the
 /// wrong envelope — and both are fixed: the routes carry
 /// `DefaultBodyLimit::max(MAX_REQUEST_BYTES)` at the platform's documented
-/// 32 MB (`research/claude-code-client-surface.md` §3.6), and the `Bytes`
+/// 32 MB (`platform.claude.com/docs/en/api/errors`), and the `Bytes`
 /// rejection is translated by the `RequestBody` extractor into a refusal
 /// `MessagesError` renders.
 ///
@@ -3215,7 +3215,7 @@ async fn f3_control_an_ordinary_large_body_is_served_normally() {
 /// ceiling — the control above is the same shape under it. What is asserted is
 /// the envelope as much as the status: a client that cannot parse a refusal
 /// treats it as an unparseable stream, and this dialect's client answers that
-/// by re-issuing the whole turn (§3.6).
+/// by re-issuing the whole turn (v2.1.42).
 #[tokio::test]
 async fn f3_an_oversized_body_is_refused_in_the_clients_envelope() {
     let (app, _store) = surface();
@@ -3327,10 +3327,10 @@ per_line_tests!(fn a_seat_rides_only_beside_a_dedicated_turn_key);
 
 /// **The launcher's `ANTHROPIC_API_KEY` sentinel is served, and is inert.**
 ///
-/// R-B's serve-side half. `claude_launch` puts
+/// The serve-side half of the launch sentinel. `claude_launch` puts
 /// [`ROUNDHOUSE_API_KEY_SENTINEL`] in a launched client's `ANTHROPIC_API_KEY`
 /// so the client's auth resolution is a property of the launch rather than of
-/// whoever last ran `claude` on that machine (§1.3) — and a client that resolves
+/// whoever last ran `claude` on that machine (v2.1.42) — and a client that resolves
 /// that variable sends the value on `x-api-key`, which is a *credential* header
 /// on this dialect's allowlist row. So the sentinel is only safe to set if this
 /// surface both serves the turn and refuses to pass the value on.
@@ -3488,7 +3488,7 @@ fn client_headers(line: &CapturedLine) -> HeaderMap {
 /// Both pinned lines, and the version literal comes from the line rather than
 /// from the test: the attribution block's *shape* (block 0, uncached, first) is
 /// what this pins, and the only thing that moved between the two captures is the
-/// number inside it (§5.7).
+/// number inside it (2.1.251 to 2.1.257).
 fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against(line: &CapturedLine) {
     let params = parse(line.turn_one);
     let items = canonicalize(&params).expect("the live client's body must be servable");
@@ -3501,7 +3501,7 @@ fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against(line:
         items.iter().map(|item| item.role).collect::<Vec<_>>()
     );
     // Block 0 of `system` is the attribution pseudo-header, stored as ordinary
-    // prefix with no special case (§5.5 ¶5). It is stable per conversation, so
+    // prefix with no special case (2.1.247 capture). It is stable per conversation, so
     // its stability is the client's to keep and a server stripping it would be
     // guessing at which parts of a system prompt matter.
     assert_eq!(items[0].role, Role::Developer);
@@ -3577,9 +3577,10 @@ per_line_tests!(fn the_shipping_clients_body_becomes_the_prefix_it_will_be_check
 /// current line posts a third new `messages` item on every `--continue` — the
 /// remaining-budget notice, which it rewrites per request — and if that were
 /// admitted as history this assertion would read three for one line and two for
-/// the other, which is the shape §5.7 found and mistook for arithmetic. It is
-/// not arithmetic: an ephemeral notice is not a thing anyone said, so it never
-/// becomes an item, and the count is two on every line that ever ships.
+/// the other, which is the shape the 2.1.257 re-capture first showed and
+/// mistook for arithmetic. It is not arithmetic: an ephemeral notice is not a
+/// thing anyone said, so it never becomes an item, and the count is two on
+/// every line that ever ships.
 fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed(
     line: &CapturedLine,
 ) {
@@ -3705,8 +3706,8 @@ fn f6_every_pinned_line_is_its_own_reported_test() {
 /// `"MOCKED"`, exactly the text turn two's own fixture replays verbatim as
 /// history, so the *only* disagreement between the two turns really is the one
 /// line this test is about (the model-identity line the CLI itself rewrote as
-/// `context-1m-2025-08-07` dropped out of the beta header, §5.6 addendum 2) —
-/// nothing here rests on the test double answering differently than the live
+/// `context-1m-2025-08-07` dropped out of the beta header, in the 2.1.251
+/// re-capture) — nothing here rests on the test double answering differently than the live
 /// capture rig did.
 ///
 /// **What used to happen, and why it was the finding.** Every item was admitted
@@ -3715,9 +3716,9 @@ fn f6_every_pinned_line_is_its_own_reported_test() {
 /// `fork()` doc, a silently orphaned MCP `scope=session` narrowing — on
 /// precisely the turn a warm prefix would first have paid off. The trigger
 /// recurs for the life of every session on an unpredictable cadence (the date,
-/// cwd, git branch, any beta flag, an overnight client self-update, §5.6), so
-/// the warm-prefix thesis this surface exists to serve did not survive contact
-/// with the shipping client.
+/// cwd, git branch, any beta flag, an overnight client self-update, which is
+/// how 2.1.247 became 2.1.251), so the warm-prefix thesis this surface exists
+/// to serve did not survive contact with the shipping client.
 ///
 /// What happens now: the leading system run is turn configuration, so a resend
 /// that rewrote it *replaces* it and continues — while the conversation itself
@@ -3869,8 +3870,8 @@ per_line_tests!(async f7_control_the_same_pair_does_not_fork_once_the_one_line_i
 // R-A: the current line's remaining-budget notice
 // ---------------------------------------------------------------------------
 
-/// CONTROL for R-A: the third captured turn really does carry the notice twice,
-/// in the two different shapes the ruling is about.
+/// CONTROL for the ephemeral-notice rule: the third captured turn really does
+/// carry the notice twice, in the two different shapes the rule is about.
 ///
 /// Without this, the two probes below could pass against a fixture that had
 /// quietly lost the notice — which is the one way "the session did not fork" is
@@ -3924,7 +3925,7 @@ fn control_the_third_captured_turn_carries_the_budget_notice_twice() {
 ///
 /// The fixture is a genuine third turn — captured by resuming the very session
 /// [`LINE_CURRENT`]'s two turns built, so its resent history is turn two's bytes
-/// and not a reconstruction (§5.7.1). That matters because turn three is where
+/// and not a reconstruction (2.1.257). That matters because turn three is where
 /// the notice first appears twice: flattened in the history and fresh at the
 /// end.
 ///
@@ -4037,7 +4038,7 @@ fn the_one_recognizer_accepts_a_notice_the_length_heuristic_missed() {
 ///
 /// The captures cannot show this on their own — the mock rig answers a constant
 /// `usage`, so `N` read 15000000 on every turn of every run, including the one
-/// that deliberately varied the reported output tokens (§5.7.1). A test that
+/// that deliberately varied the reported output tokens (2.1.257). A test that
 /// only replayed them would therefore be green against an implementation that
 /// stored the notice as history, and would go red in production on the first
 /// session long enough for the client's counter to move.
@@ -4491,7 +4492,7 @@ fn dechunk(body: &str) -> String {
 /// The captured pair in which the client calls roundhouse's own MCP tool.
 ///
 /// One conversation, two requests, taken from the same 2.1.257 run as the rest
-/// of this suite's fixtures (`research/claude-code-client-surface.md` §5.8):
+/// of this suite's fixtures:
 /// turn one declares `mcp__roundhouse__status` in its toolbox, turn two resends
 /// that turn's `tool_use` together with the `tool_result` the client got back
 /// from `/mcp`. They are the *bytes a real client sent*, which is the whole

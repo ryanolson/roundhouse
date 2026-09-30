@@ -232,10 +232,11 @@ impl RoutingPolicy for AffinityPolicy {
 /// longer uncollected so much as unadopted: Switchyard publishes its judge
 /// prompt (`prompts/escalation/prompt.md`, Apache-2.0) and a two-confirmation
 /// latch whose outage arm deliberately holds the streak rather than clearing
-/// it — an unreachable judge is not evidence the cheap tier is fine. Adopting
-/// the prompt without the crate is scheduled synergy work
-/// (`agent-docs/synergies/nemo-relay.md` §S5); until then `audit_every` stays, knowing it
-/// benchmarks below boundary-triggered review on weak executors.
+/// it — an unreachable judge is not evidence the cheap tier is fine. The prompt
+/// is already adopted without the crate, as the judge's system prompt
+/// (`roundhouse-core/src/validate/prompt.rs`); the latch is not, so
+/// `audit_every` stays, knowing it benchmarks below boundary-triggered review on
+/// weak executors. See `docs/src/development/upstream.md`.
 pub struct EscalationPolicy {
     inner: AffinityPolicy,
     audit_every: u64,

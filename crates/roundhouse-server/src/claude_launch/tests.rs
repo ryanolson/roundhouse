@@ -67,7 +67,7 @@ fn each_auth_kind_renders_one_exact_environment() {
     );
 }
 
-/// The header block is in the syntax §1.6 says the client parses.
+/// The header block is in the syntax the client parses (v2.1.42).
 ///
 /// Re-derived here by running the client's own regex rather than by
 /// asserting the string this module just built, which would be a tautology.
@@ -127,7 +127,7 @@ fn the_turn_key_rides_the_environment_and_no_rendering_of_it() {
     );
 }
 
-/// Every one of §1.3's five suppressing inputs is refused by name under a
+/// Every one of the five suppressing inputs (v2.1.42) is refused by name under a
 /// forwarded login.
 ///
 /// One assertion per input rather than one over the list, because what the
@@ -240,14 +240,14 @@ fn oauth_suppressors_present_carries_which_suppressor_fired() {
 
 /// The redirect-defeating three are refused under **both** kinds.
 ///
-/// The ruling names them among the five a forwarded login refuses; they are
-/// refused for the bring-your-own-key launch as well, and the reason is a
-/// different one. §1.3's `I7()` picks the provider before any credential is
-/// resolved, and a non-`firstParty` answer means [`BASE_URL_ENV`] is not read
-/// at all — so the sentinel does its job perfectly and the client still
-/// never reaches roundhouse. That failure is silent on both sides: the agent
-/// answers, from somebody else's serving plane, and no roundhouse log has a
-/// row for the turn that did not arrive.
+/// They are among the five a forwarded login refuses; they are refused for the
+/// bring-your-own-key launch as well, and the reason is a different one. The
+/// client's provider selector (`I7()` in v2.1.42) picks the provider before any
+/// credential is resolved, and a non-`firstParty` answer means [`BASE_URL_ENV`]
+/// is not read at all — so the sentinel does its job perfectly and the client
+/// still never reaches roundhouse. That failure is silent on both sides: the
+/// agent answers, from somebody else's serving plane, and no roundhouse log has
+/// a row for the turn that did not arrive.
 #[test]
 fn a_cloud_provider_selector_is_refused_even_under_a_roundhouse_key() {
     for name in [
@@ -281,7 +281,7 @@ fn a_cloud_provider_selector_is_refused_even_under_a_roundhouse_key() {
 /// F2: the three inputs that resolve to a credential of the operator's own are
 /// refused beside the sentinel, not only beside a forwarded login.
 ///
-/// The sentinel decides what §1.3's `VV()` resolves for the *API-key* arm and
+/// The sentinel decides what the client's auth resolver resolves for the *API-key* arm and
 /// nothing else, so each of these still reaches `Authorization` — and
 /// roundhouse's edge records what arrives there as the forwarded seat. A
 /// `RoundhouseKey` launch next to one of them is a forwarded-login launch in
@@ -420,8 +420,8 @@ fn must_be_unset_names_what_the_generator_would_refuse() {
     }
 }
 
-/// M11.2b F3: `CLAUDE_CODE_REMOTE` is the one input documented (§1.3's
-/// `VV()`, client-surface.md:98-102) to defeat the `ANTHROPIC_API_KEY`
+/// `CLAUDE_CODE_REMOTE` is the one input documented (v2.1.42's
+/// `VV()`) to defeat the `ANTHROPIC_API_KEY`
 /// suppressor specifically — `!$6(CLAUDE_CODE_REMOTE)` gates only that arm,
 /// every other suppressor in `VV()` is unconditional — yet it is absent from
 /// [`OAUTH_SUPPRESSORS`], so a `RoundhouseKey` launch neither refuses it nor

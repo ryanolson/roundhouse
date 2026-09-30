@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The learner recovery task: idle sessions with entries owed are found in
-//! the session store's index and delivered without the engine (draft section
-//! 11.7, milestone M9 of `agent-docs/PLAN-online-routing-learner.md`).
+//! the session store's index and delivered without the engine (design in
+//! `docs/src/concepts/routing-learner.md`).
 //!
 //! **Why it exists.** The engine delivers a session's entries in the tail of
 //! its next turn. A session that never turns again, whose every learner-store

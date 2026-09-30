@@ -272,7 +272,7 @@ fn an_upstream_failure_is_an_error_and_not_a_short_stream() {
 /// **P3: an OpenRouter-shaped stream parses, keep-alives and all.**
 ///
 /// OpenRouter injects `: OPENROUTER PROCESSING` comment lines into the SSE
-/// body (`openrouter-api-surface.md` Q5.1, live 2026-08-24), and a
+/// body (seen live 2026-08-24), and a
 /// line-oriented parser that tried to JSON-decode one would fail an
 /// otherwise perfect turn — at an interval that depends on how long the
 /// upstream took, so it would fail *the slow turns* and look like a

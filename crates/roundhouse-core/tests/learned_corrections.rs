@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The learner's cost, latency and grant corrections (plan M3).
+//! The learner's cost, latency and grant corrections.
 //!
 //! Three claims. The cache correction re-prices a reuse shortfall through the
 //! one pricing contract, so the write premium survives, and it never prices a
-//! route below its quote (the 2026-09-28 owner rule). The latency model is the
+//! route below its quote. The latency model is the
 //! quote plus the target's residual plus one project overhead, each term only
-//! once it has its minimum samples (ruling 10). And the grant is checked again
+//! once it has its minimum samples. And the grant is checked again
 //! on the corrected cost, except for a candidate the overflow valve admitted.
 
 use roundhouse_core::control::{BudgetState, Exhaustion, TurnBudget};
@@ -21,7 +21,7 @@ use roundhouse_core::routing::{
 
 const MTOK: usize = 1_000_000;
 
-/// The draft's parent rate card: input 1, write 2, read 0.1.
+/// The parent rate card: input 1, write 2, read 0.1.
 const PARENT: ProviderPricing = ProviderPricing {
     input_per_mtok_usd: 1.0,
     cached_input_per_mtok_usd: 0.1,
@@ -116,7 +116,7 @@ const MIN: u64 = 20;
 /// **The parent case: 100 becomes 200.** A predicted-warm 100 MTok prefix
 /// that the target's history says is never reused is re-priced as uncached,
 /// and uncached prompt tokens pay the write rate (2), not the plain input rate
-/// (1). Revision 1 of the draft used input minus read and got 100.
+/// (1). Pricing it as plain input minus read would get 100.
 #[test]
 fn a_reuse_shortfall_keeps_the_effective_write_premium() {
     let isl = 100 * MTOK;
@@ -199,13 +199,12 @@ fn a_cold_quote_needs_no_correction_under_no_predicted_reuse() {
     assert_eq!(cost.adjusted_usd, cost.quoted_usd);
 }
 
-/// **No ratio is not a verified discount** (the 2026-09-30 ruling under the
-/// owner's cost rule). A target whose measured pairs never predicted reuse
-/// gives no ratio to scale by, so a quote that predicts reuse on it carries a
-/// cache discount nothing has checked. The correction re-prices it with no
-/// cached tokens, the conservative bound: 100 predicted reads become 100
-/// uncached tokens at the write rate. A quote that predicts no reuse has no
-/// discount to remove, and stands.
+/// **No ratio is not a verified discount** (the owner's cost rule). A target
+/// whose measured pairs never predicted reuse gives no ratio to scale by, so a
+/// quote that predicts reuse on it carries a cache discount nothing has
+/// checked. The correction re-prices it with no cached tokens, the conservative
+/// bound: 100 predicted reads become 100 uncached tokens at the write rate. A
+/// quote that predicts no reuse has no discount to remove, and stands.
 #[test]
 fn a_predicted_reuse_on_a_target_that_never_predicted_any_is_priced_uncached() {
     let isl = 100 * MTOK;
@@ -235,7 +234,7 @@ fn a_predicted_reuse_on_a_target_that_never_predicted_any_is_priced_uncached() {
 /// (see its own doc), so a warm quote on a target with no predicted reuse
 /// now grants at the repriced cost, not the quote. A budget sized between
 /// the two — it fits the $10 quote but not the $200 repriced cost — reads
-/// `Exceeds`. Before the 2026-09-30 ruling, `NoPredictedReuse` left
+/// `Exceeds`. Before that re-price, `NoPredictedReuse` left
 /// `adjusted_usd == quoted_usd`, and this same budget would have admitted
 /// the candidate.
 #[test]

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The two learner claims that need a classification window: row 2 of draft
-//! 7.8, where the classification sequence changes the route, and the Jev tier
+//! The two learner claims that need a classification window: row 2 of the worked
+//! examples, where the classification sequence changes the route, and the Jev tier
 //! answer reaching the store as a count on its source turn's keys.
 //!
 //! The classifier is configured and **saturated for the whole of each test**:

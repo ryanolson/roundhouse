@@ -128,8 +128,8 @@
 //! any reason would cancel a writer rather than prompt about it, and there is
 //! no interactive operator in that topology to prompt. Scoping the grant to
 //! the reads instead — the narrower-looking option — was considered and
-//! refused for exactly that reason; the ruling and its citations live beside
-//! the generated stanza.
+//! refused for exactly that reason; the reasoning and its citations live beside
+//! the generated stanza (`roundhouse_server::codex_launch`).
 //!
 //! *[History — recorded so nobody re-litigates it. Until M9 this block was a
 //! documented assumption citing the then-current Cargo pin `6344a65`:
@@ -310,7 +310,7 @@ mod tests {
              contract is gone"
         );
         for marker in [
-            // The upstream fact the ruling is built on.
+            // The upstream fact the contract is built on.
             "with_mcp_tool_call_thread_id_meta",
             "core/src/mcp_tool_call.rs:1198-1220",
             "prompt_cache_key",
@@ -327,7 +327,7 @@ mod tests {
             "core/src/mcp_tool_call.rs:1175-1221",
             "core/src/turn_metadata.rs:183-222",
             "session_id",
-            // The ruling itself, R-M7.
+            // The resolver that applies it.
             "ControlReads::resolve_session",
             "ContradictoryConversation",
             // What proves it, R-M8, and where.

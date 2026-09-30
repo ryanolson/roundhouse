@@ -7,7 +7,7 @@
 //! **These are uncertain features, never truth and never reward.** A label here
 //! says a classifier answered; it does not say the answer was right, and nothing
 //! downstream may read one as evidence that a route was good. The quality signal
-//! is the frontier review interval (`PLAN-routing-strategy-bandit.md`), and it is
+//! is the frontier review interval (`docs/src/concepts/routing.md`), and it is
 //! a different thing arriving on a different event.
 //!
 //! ## Why a taxonomy, and a tier beside it
@@ -253,10 +253,10 @@ impl ClassificationAxis for ContextDependence {
 /// **The one routing-shaped question, asked about the work and never about a
 /// model.** The three axes above describe the turn and leave the mapping to
 /// code; this one asks the classifier to make the mapping itself, so that the
-/// served tier can be compared with it (2026-09-28 addendum, "Jev as a scout").
-/// The rubric describes kinds of work, and no option names a model, a target
-/// or a price: the 2026-09-17 ruling, section 2, allowed exactly this question
-/// on that condition.
+/// served tier can be compared with it. The rubric
+/// describes kinds of work, and no option names a model, a target or a price,
+/// which is the condition on which asking the classifier this question is
+/// acceptable.
 ///
 /// **No `unknown` option, unlike the axes above.** The question is a choice
 /// between the two tiers a recipe has, and a third answer would have no tier to
@@ -843,7 +843,7 @@ impl ClassificationWindow {
 ///
 /// **Local metadata, which is half of what the owner's direction permits**:
 /// "bounded prior-turn metadata and classifications, together with the current
-/// user prompt" (`PLAN-routing-strategy-bandit.md`, 2026-09-21). A projection
+/// user prompt" (owner direction, 2026-09-21). A projection
 /// carrying only prior *classifications* leaves a tool-continuation turn with
 /// almost nothing to describe, because that turn has no prompt of its own and
 /// its predecessors may not have been classified yet.

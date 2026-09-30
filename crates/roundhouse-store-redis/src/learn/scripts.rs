@@ -9,7 +9,7 @@
 //! `ARGV` that the Rust side turns back into names. A Lua number returned from
 //! a script becomes a RESP integer, exact up to `2^53 - 1`; nothing here is
 //! returned through `tostring` or `..`, which format with `%.14g` in Lua 5.1
-//! and drop digits past the fourteenth (draft section 11.3). The counters a
+//! and drop digits past the fourteenth. The counters a
 //! script stores are passed to `HSET` as Lua numbers too, which Redis writes
 //! as exact decimal integers.
 //!

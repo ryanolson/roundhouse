@@ -182,7 +182,7 @@ impl<'a> Evidence<'a> {
 /// One piece of evidence that a session is in trouble.
 ///
 /// A trait with one method rather than an enum with four arms, and the
-/// difference is what the plan calls out: a deployment that wants the
+/// difference is this: a deployment that wants the
 /// prompt-stability signal, or an experiment that wants a signal disabled,
 /// changes the *list* and not the gate. An enum would put every future signal
 /// inside the one function every existing signal already passes through.

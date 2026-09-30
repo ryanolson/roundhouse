@@ -77,15 +77,17 @@
 //!
 //! # One divergence, stated rather than reconciled
 //!
-//! A turn that roundhouse **steered** — the validate loop interjecting a
-//! synthetic tool call — appears in these documents as an ordinary tool call,
-//! because that is what it is on the wire and what the client acted on. The fact
-//! that this deployment authored it rather than the model lives in the session
-//! log (a `ToolCall` item bearing a `response_id`) and in the validate tally,
-//! and it is deliberately not reconciled into the trajectory: ATIF describes
-//! what the agent did, and inventing a step kind for it would make our export
-//! unreadable by every consumer of the format. One event log is authoritative
-//! for accounting, and it is ours; this is observability.
+//! A turn that roundhouse **steered** — a judged verdict under an acting arm
+//! led the validate loop to intervene — appears in these documents as an
+//! ordinary turn: guidance from a steer or a halt is plain assistant text, and
+//! an escalation is an ordinary model answer under a raised floor, because that
+//! is what each is on the wire and what the client acted on. The fact that this
+//! deployment intervened lives in the session log (the turn's
+//! `ValidationDecided` event) and in the validate tally, and it is deliberately
+//! not reconciled into the trajectory: ATIF describes what the agent did, and
+//! inventing a step kind for it would make our export unreadable by every
+//! consumer of the format. One event log is authoritative for accounting, and it
+//! is ours; this is observability.
 
 pub mod atif;
 pub mod atof;

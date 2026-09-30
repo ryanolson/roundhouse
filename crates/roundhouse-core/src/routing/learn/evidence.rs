@@ -64,7 +64,7 @@ pub struct LearnedEvidenceParts {
     ///
     /// `1.0` whenever the turn could not explore. With uniform exploration the
     /// exploit target has `1 - rate` plus `rate` times its share of the set,
-    /// and every other target `rate` times its share (plan section 3, item 2).
+    /// and every other target `rate` times its share.
     pub propensity: f64,
 }
 
@@ -301,7 +301,7 @@ impl PlanEvidence {
     /// bypasses only the quality gate; were the two spellings to drift, an
     /// exploring turn could serve a route the exploit path would refuse on
     /// cost or latency. An overflow admission keeps its status and meets the
-    /// grant (draft 7.2): only [`GrantCheck::Exceeds`] fails it.
+    /// grant: only [`GrantCheck::Exceeds`] fails it.
     pub fn meets_hard(&self) -> bool {
         self.grant != GrantCheck::Exceeds && self.latency_met
     }
@@ -337,7 +337,7 @@ pub enum CostCorrection {
     NotFrontier,
 }
 
-/// First output from turn start, modeled (ruling 10): the quoted TTFT, the
+/// First output from turn start, modeled: the quoted TTFT, the
 /// target's mean residual, and the project's mean overhead before dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TtftEvidence {
@@ -458,11 +458,10 @@ pub struct ExplorationEvidence {
     pub set: Vec<Strategy>,
     /// The project's `on_infeasible` when the turn was decided.
     ///
-    /// **Recorded because the set depends on it** (the owner's ruling of
-    /// 2026-09-30): under `refuse`, `rules` joins only when some strategy
-    /// passes. Without it, the calibrator could not re-derive the set of a
-    /// turn that nothing passed, and could not tell a `refuse` record from a
-    /// `serve_rules` one.
+    /// **Recorded because the set depends on it**: under `refuse`, `rules`
+    /// joins only when some strategy passes. Without it, the calibrator could
+    /// not re-derive the set of a turn that nothing passed, and could not tell
+    /// a `refuse` record from a `serve_rules` one.
     ///
     /// **`None` only on a record written before the field existed**; the
     /// policy always writes it. Optional so that such a record still decodes:

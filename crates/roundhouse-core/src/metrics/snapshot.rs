@@ -183,8 +183,8 @@ pub enum ModelAccounting {
         /// `local_capacity_price`, or `null` when the catalog sets none.
         ///
         /// **`null` and never `0.0` when unpriced**: a zero here would read as
-        /// traffic that cost nothing, which is the claim ruling 6 of the
-        /// 2026-09-28 addendum exists to stop. Over the whole row, a seat's
+        /// traffic that cost nothing, which is the claim this field exists to
+        /// stop. Over the whole row, a seat's
         /// share included, because the hardware is this deployment's whoever
         /// the caller's hosted alternative would have billed. Charged on
         /// uncached prompt plus output, the router's own rule; a serving plane

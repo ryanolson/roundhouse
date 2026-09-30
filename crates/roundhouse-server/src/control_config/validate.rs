@@ -266,8 +266,8 @@ mod tests {
             "and names the value that is retired, not just the field: {message}"
         );
         assert!(
-            message.contains("PLAN-frontier-selection.md"),
-            "and cites the ruling, so the answer to `why` is one file away: \
+            message.contains("docs/src/concepts/validate-steer.md"),
+            "and cites the chapter, so the answer to `why` is one file away: \
              {message}"
         );
 

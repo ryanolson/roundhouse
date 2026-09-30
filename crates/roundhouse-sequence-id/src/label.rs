@@ -65,8 +65,8 @@ pub enum LabelError {
 /// header is absent from v2.1.42 and present at 2.1.247, so a deployment whose
 /// users have not updated is served by the second rung. `user_id` changed shape
 /// between those versions — an underscore-delimited string became a JSON object
-/// string (§5.5 ¶1) — and `claude-code-router`'s `_session_` split, which the
-/// evidence cites, does not parse the newer one; reading both is what keeps one
+/// string (2.1.247 capture) — and `claude-code-router`'s `_session_` split
+/// does not parse the newer one; reading both is what keeps one
 /// client session on one roundhouse session across a client upgrade. The whole
 /// string is kept as a name when neither shape parses because a name we do not
 /// recognise is still a name, and hashing it into an anonymous session would

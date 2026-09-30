@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #![cfg(feature = "e2e-codex")]
 
-//! M9 of `PLAN-agentic-control-plane.md`: a **real `codex` binary** driving a
+//! A **real `codex` binary** driving a
 //! real roundhouse over a real socket.
 //!
 //! Every other suite in this crate proves a claim about one seam with the rest
@@ -15,18 +15,16 @@
 //!
 //! # What the suite is the closure of
 //!
-//! Three tests below are named in the plan's §9 M9 rung, and they are named
-//! there rather than invented here because each closes one thing M0–M6 could
-//! only document:
+//! Three claims were the reason this suite exists, because each is one that
+//! could only be documented until a real binary ran it:
 //!
 //! - `a_real_codex_binary_executes_our_synthetic_tool_call_and_returns_its_output`
-//!   — the dispatch assumption. **Deleted by M10.0 T7**, with the ruling above
-//!   `a_real_codex_binary_receives_the_correction_as_the_turns_answer`: R1
-//!   retires the tool-call channel, so there is no dispatch left to assume;
+//!   — the dispatch assumption. **Deleted**, and replaced by
+//!   `a_real_codex_binary_receives_the_correction_as_the_turns_answer`: the
+//!   tool-call channel is retired, so there is no dispatch left to assume;
 //! - `a_real_codex_binary_resends_the_call_and_output_and_the_session_does_not_fork`
-//!   — the history-buffer resend, which §10 open item 1 records as
-//!   unverifiable without `codex-core` and names M9 as the only closure.
-//!   **Deleted by T7 as well, and its surviving half re-landed**: the claim was
+//!   — the history-buffer resend, which could not be verified without a real
+//!   client. **Deleted as well, and its surviving half re-landed**: the claim was
 //!   never really about calls, it was that a real client *extends* its history
 //!   rather than rebuilding it, and `the_next_turn_reflects_the_correction` now
 //!   asserts that pairwise over the guidance item instead;
@@ -42,22 +40,21 @@
 //! willing and able to call us back.
 //!
 //! Green here retires the documented-assumption block that
-//! `crates/roundhouse-mcp/src/lib.rs` carried until now, which §9 makes the
-//! explicit condition. Two more are preconditions this suite could not assume:
-//! that `exec resume --last` continues one roundhouse session, and that our
-//! rmcp 3.1.3 service answers codex's rmcp 1.8.0 client at all. The rest were
-//! added by the M9 thermo-nuclear review — the forwarded-login stanza (F12) and
-//! mid-session revocation (F15), each the first real-binary evidence for a
-//! claim only prose had carried, plus two guards that need no binary at all
-//! (F02, F11) because what they catch is this harness lying to itself.
+//! `crates/roundhouse-mcp/src/lib.rs` carried until now. Two more are
+//! preconditions this suite could not assume: that `exec resume --last`
+//! continues one roundhouse session, and that our rmcp 3.1.3 service answers
+//! codex's rmcp 1.8.0 client at all. The rest were added by the M9
+//! thermo-nuclear review — the forwarded-login stanza (F12) and mid-session
+//! revocation (F15), each the first real-binary evidence for a claim only prose
+//! had carried, plus two guards that need no binary at all (F02, F11) because
+//! what they catch is this harness lying to itself.
 //!
-//! §10 open item **2** — whether reporting a judge's usage on a steered turn
-//! disturbs the client's own bookkeeping — arrived here as *evidence* and left
-//! as a ruling. The evidence block (now `M10-USAGE-RULED`, folded into the one
-//! test that rules on it) is still printed and never asserted, because what a
-//! reader should conclude from four numbers is not a thing a fixture should
-//! decide. What review finding F03 settled is narrower
-//! and is now asserted, in
+//! Whether reporting a judge's usage on a steered turn disturbs the client's
+//! own bookkeeping arrived here as *evidence* and left as a ruling. The
+//! evidence block (now `M10-USAGE-RULED`, folded into the one test that rules
+//! on it) is still printed and never asserted, because what a reader should
+//! conclude from four numbers is not a thing a fixture should decide. What
+//! review finding F03 settled is narrower and is now asserted, in
 //! `a_steered_turns_reported_usage_is_the_context_it_admitted`: the wire number
 //! and the ledger number answer different questions, so the wire reports the
 //! turn's context contribution while the log keeps booking the judge. The
@@ -470,7 +467,7 @@ impl Rig {
                             // (M10.0 T2). It used to say `tool_call` because
                             // `auto` ran a capability probe and a fixture whose
                             // steer depended on detection would have been
-                            // testing §7. The probe is gone — every
+                            // testing the probe. The probe is gone — every
                             // interjection is text — so `auto` and `text` are
                             // one thing, and the retired spelling would make
                             // `directory.apply` below refuse the project rather
@@ -1533,7 +1530,7 @@ async fn a_key_revoked_between_runs_fails_the_next_turn_and_leaves_no_half_writt
 // successor is
 // `a_real_codex_binary_is_correlated_by_the_thread_id_it_stamps` immediately
 // below. What has *not* changed is the observability argument: that successor
-// is ignored here for two independent reasons and either alone is enough, both
+// is left uncalled here for two independent reasons and either alone is enough, both
 // of which it states.
 
 /// **R-M7's real-binary counterpart: a real codex stamps `_meta.threadId`, and
@@ -1896,7 +1893,7 @@ async fn the_delimiter_a_skill_spells_is_the_one_the_real_binary_namespaces_with
 }
 
 /// M10.1 P7: the generated plugin surface reaches the model, and it reaches it
-/// as **skills** rather than as the `prompts/` files the plan named.
+/// as **skills** rather than as `prompts/` files.
 ///
 /// This is the falsifier for the pivot in
 /// [`roundhouse_server::codex_launch::skills`]'s module doc. That doc argues
@@ -2053,9 +2050,10 @@ async fn a_forwarded_login_sends_the_seat_and_our_key_on_the_same_request() {
     // it must not appear. Swept rather than reasoned about, because the
     // pass-through stanza is the first shape in this system where a credential
     // roundhouse never minted travels through it — and "we do not store it" is
-    // the claim §3 rests on. The `config.toml` is swept too: the generator must
-    // name the *mechanism* (a completed login in `CODEX_HOME`), never the seat,
-    // and a generator that inlined one would put it on disk world-readable.
+    // the claim the pass-through design rests on. The `config.toml` is swept
+    // too: the generator must name the *mechanism* (a completed login in
+    // `CODEX_HOME`), never the seat, and a generator that inlined one would put
+    // it on disk world-readable.
     let events = rig
         .store
         .read_events(&session, 0, 1024)
@@ -2090,10 +2088,10 @@ async fn a_forwarded_login_sends_the_seat_and_our_key_on_the_same_request() {
          inlined the seat would write a live credential into a file on disk"
     );
 
-    // ---- §3 evidence: the pass-through stanza, on a real request -----------
+    // ---- pass-through evidence: the pass-through stanza, on a real request -----------
     //
-    // Printed rather than only asserted, because the plan's §3 describes this
-    // stanza in prose and until this test nothing had ever run it against a
+    // Printed rather than only asserted, because this
+    // stanza had only been described in prose until this test ran it against a
     // binary. The bearer is redacted to its length: what a reader needs from
     // this block is that the two doors carried *different* values and which
     // header each took, not the values themselves.
@@ -2263,8 +2261,8 @@ async fn a_real_codex_binary_receives_the_correction_as_the_turns_answer() {
     rig.clean();
 }
 
-/// §10.2, ruled: **the wire and the ledger answer different questions and no
-/// longer share one number.**
+/// **The wire and the ledger answer different questions and no longer share one
+/// number.**
 ///
 /// F03 found what sharing it cost. Codex folds `response.completed.usage` into
 /// `last_token_usage`, *replacing* it rather than summing
@@ -2277,7 +2275,7 @@ async fn a_real_codex_binary_receives_the_correction_as_the_turns_answer() {
 /// the client was told its context had collapsed on the very turn before it
 /// resent the largest history the session had ever held.
 ///
-/// The ruling moved the *wire* number and left the ledger alone, so this test
+/// The fix moved the *wire* number and left the ledger alone, so this test
 /// reads both and asserts they disagree in the intended direction:
 ///
 /// - the **log** still books the judge's usage on the steered turn (the
@@ -2320,7 +2318,7 @@ async fn a_steered_turns_reported_usage_is_the_context_it_admitted() {
     let [first, second, third] = rig.drive_to_a_steer().await;
     let fourth = rig.resume_after_the_steer().await;
 
-    // ---- the ledger, which the ruling deliberately did not move ------------
+    // ---- the ledger, which the fix deliberately did not move ------------
     let responses = rig.response_usage().await;
     assert_eq!(
         responses.len(),
@@ -2340,7 +2338,7 @@ async fn a_steered_turns_reported_usage_is_the_context_it_admitted() {
     assert_eq!(
         *booked, side_calls[1],
         "the steered turn's *booked* usage must still be exactly the judge call \
-         that decided it: the ruling changed what the client is told, not what \
+         that decided it: the fix changed what the client is told, not what \
          the deployment spent, and a dashboard whose turn row stopped equalling \
          its side-call row would be the worse bug"
     );
@@ -2399,7 +2397,7 @@ async fn a_steered_turns_reported_usage_is_the_context_it_admitted() {
         "the fulfilling turn's answer comes after the correction it answers:\n{items:#?}"
     );
 
-    // Recorded, not asserted — the §10.2 evidence block the deleted tool-call
+    // Recorded, not asserted — the usage evidence block the deleted tool-call
     // test carried, kept because the one arithmetic a reader wants to do (how
     // close did the client think it was to compacting?) needs the window the
     // client was accumulating toward, and that window is this catalog's. What
@@ -2652,7 +2650,7 @@ async fn the_next_turn_reflects_the_correction() {
 /// itself, points `CODEX_HOME` at them, and proves the *generated files* are
 /// ones a real client hooks up with. What none of them can prove is that
 /// anything an operator can run produces those files — until M11.3 nothing did,
-/// and this crate's README deferral said so in as many words: "no CLI
+/// and the documentation said so in as many words: "no CLI
 /// subcommand or admin route produces these files".
 ///
 /// This closes it, and the negative is the interesting half: the child is

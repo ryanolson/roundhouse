@@ -118,8 +118,8 @@ pub(crate) fn item_digest(render: &str) -> ItemDigest {
 /// One link, `c_i`: the unkeyed digest of items `0..=i`.
 ///
 /// No `Serialize`, no `Display`, no hex, and a redacting `Debug`: an unkeyed
-/// chain value must not reach a store, a log, or a wire by accident (plan
-/// §3.8). The module doc says why and pins it with `compile_fail` doctests.
+/// chain value must not reach a store, a log, or a wire by accident. The module
+/// doc says why and pins it with `compile_fail` doctests.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChainValue([u8; 32]);
 
@@ -370,8 +370,8 @@ mod tests {
         assert!(Chain::over(&[]).is_empty());
     }
 
-    /// Known-answer vectors for the §3.2 formula, computed outside this crate
-    /// (Python `hashlib`) from the formula as written in the plan.
+    /// Known-answer vectors for the chain formula, computed outside this crate
+    /// (Python `hashlib`) from the formula in the module doc.
     ///
     /// Tips are stored in a shared store and compared across nodes and
     /// releases, so a change to the formula is not a refactor: it orphans every

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The learner at boot (milestone M9 of
-//! `agent-docs/PLAN-online-routing-learner.md`): what `routing_composition`
-//! builds from a booted plane and the backends `shared_backend::open` chose.
+//! The learner at boot (design in `docs/src/concepts/routing-learner.md`): what
+//! `routing_composition` builds from a booted plane and the backends
+//! `shared_backend::open` chose.
 //!
 //! **Every test calls the library functions `main.rs` calls**, never a copy of
 //! their rules, for the reason `shared_backend` gives: a `[[bin]]` is not

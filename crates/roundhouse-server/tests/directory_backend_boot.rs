@@ -265,7 +265,7 @@ async fn an_archived_project_stays_archived_across_a_restart_of_the_wired_direct
 /// `StoreFailure::Unavailable`, and `ControlDirectory::new` — whose first load
 /// *is* the boot check — refuses to exist.
 ///
-/// Fail closed is the ruling and the alternative is the reason for it: a node
+/// Fail closed is the decision and the alternative is the reason for it: a node
 /// that read an unreadable directory as the empty one would serve a plane with
 /// no admin-created project, member or key in it, authenticate every request
 /// against that, and then commit the emptiness over the top on the first admin

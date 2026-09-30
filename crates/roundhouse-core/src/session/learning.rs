@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Learning entries, folded from the log (draft sections 8 and 11 of
-//! `agent-docs/DRAFT-online-routing-learner.md`, milestone M5 of
-//! `agent-docs/PLAN-online-routing-learner.md`).
+//! Learning entries, folded from the log (design in `docs/src/concepts/routing-learner.md`).
 //!
 //! **Which entries exist is decided by the event kind alone.** After the first
 //! `Routed` of the session that carries learned evidence, every
@@ -35,8 +33,8 @@
 //!
 //! **Marks.** [`learning_mark`] tells `Session::commit` which event of a batch
 //! the source store must record as the session's learning mark, so every
-//! durable entry-producing event is discoverable by recovery (draft section
-//! 11.7). It reads the same [`produces_entry`] list the fold does.
+//! durable entry-producing event is discoverable by recovery. It reads the same
+//! [`produces_entry`] list the fold does.
 
 mod credit;
 mod entry;
@@ -152,8 +150,8 @@ struct AwaitingAnswer {
 ///
 /// Two variants rather than `hint.max(floor)`, because the two thresholds
 /// disagree exactly when it matters. The learner store can hold less than the
-/// log acknowledged: it lost recent writes (draft 11.6), or the audit found
-/// its watermark below the mark (11.7). A backfill from that watermark that
+/// log acknowledged: it lost recent writes, or the audit found
+/// its watermark below the mark. A backfill from that watermark that
 /// also honored the hint would skip the entries between the two, the store
 /// would answer `ChainGap` with the same watermark, and delivery for the
 /// session would stall for good.

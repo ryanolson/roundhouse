@@ -2407,7 +2407,7 @@ async fn apply_s_publish_does_not_clobber_a_newer_version_a_concurrent_refresh_a
 /// own doc — so a caller cancelled at the gate has already landed its write;
 /// only `apply`'s own publish, the part that installs the result into
 /// `current` and clears `refused_version`, never runs. The client that
-/// cancelled saw no success, which is the point: the ruling is no give-back,
+/// cancelled saw no success, which is the point: the rule is no give-back,
 /// because giving one back would mean the store's own compare-and-set lied
 /// about what it just accepted. What is pinned here is the other half —
 /// nothing is lost. The write sits in the store exactly as any other node's
@@ -2462,7 +2462,7 @@ async fn a_cancelled_apply_s_write_is_picked_up_by_the_next_refresh() {
 
     // Still inside the TTL: nobody told this node its own write landed, so
     // the plane it serves is still the one it booted with. This is the
-    // "client saw no success" half of the ruling -- the write is real, but
+    // "client saw no success" half of that rule -- the write is real, but
     // this node does not yet know it.
     assert_eq!(
         directory.version(GUARD_TTL_MS / 2).await,

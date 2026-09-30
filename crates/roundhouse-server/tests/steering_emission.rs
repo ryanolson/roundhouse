@@ -16,12 +16,12 @@
 //! # What M10.0 changed, and what it deliberately did not
 //!
 //! Until M10.0 the emitted item was a synthetic `function_call` naming
-//! `fetch_steer`: the client dispatched it, fetched the correction over MCP, and
-//! returned its output as a tool result the next turn. Ruling R1/T1 of
-//! `PLAN-frontier-selection.md` retired that channel. The steered turn is
-//! answered with **assistant text** — the rendered directive followed by the
-//! pending request restated, quoted line by line — so the agent reads the
-//! correction where it reads every other answer and decides with no round trip.
+//! `fetch_steer`: the client dispatched it, fetched the correction over MCP,
+//! and returned its output as a tool result the next turn. That channel was
+//! later retired. The steered turn is answered with **assistant text** — the
+//! rendered directive followed by the pending request restated, quoted line by
+//! line — so the agent reads the correction where it reads every other answer
+//! and decides with no round trip.
 //!
 //! Three consequences run through every test below.
 //!
@@ -1029,13 +1029,13 @@ async fn an_assistant_text_item_is_not_forwarded_twice() {
 /// The degrade path reaches the client as an answer, not as silence.
 ///
 /// Outcome C is what happens when the correction cannot be a tool call — no MCP
-/// registered, or a membership whose channel forbids one — and it is named
-/// honestly in the plan: Codex ends its loop on a message with no tool call, so
-/// a halt *hands control back to the human*. That only works if the human is
-/// handed something. Before this projection existed a halted turn streamed
-/// `created` then `completed` with no text at all: the guidance sat in the log
-/// and the agent saw an empty answer, which is the most complete failure in the
-/// design and the most silent from the deployment's side.
+/// registered, or a membership whose channel forbids one — and the limit is
+/// real: Codex ends its loop on a message with no tool call, so a halt *hands
+/// control back to the human*. That only works if the human is handed
+/// something. Before this projection existed a halted turn streamed `created`
+/// then `completed` with no text at all: the guidance sat in the log and the
+/// agent saw an empty answer, which is the most complete failure in the design
+/// and the most silent from the deployment's side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_halted_turn_carries_its_guidance_as_the_answer() {
     let halting = rig([Plan::Halt]);
@@ -1278,10 +1278,10 @@ async fn a_verbatim_namespaced_retry_replays_and_a_bare_resend_is_a_different_co
 /// **Inverted by M17 (R-N6), and the inversion is the point.** This used to
 /// assert the namespace appeared nowhere in the stored bytes, on the reasoning
 /// that keeping it would make a namespaced resend and a flat resend two
-/// different items. They *are* two different items, that is now the ruling
-/// rather than the hazard, and what the old assertion cost was named in the
-/// evidence: a third party's tool called `status` was indistinguishable from
-/// ours in the log, and a call re-emitted without its namespace resolved
+/// different items. They *are* two different items, that is now the intended
+/// behaviour rather than the hazard, and what the old assertion cost was a log
+/// in which a third party's tool called `status` was indistinguishable from
+/// ours, and a call re-emitted without its namespace resolved
 /// against nothing in codex's exact `ToolName { name, namespace }` lookup.
 ///
 /// Asserted over the log's own bytes rather than over the typed item, because

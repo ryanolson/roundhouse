@@ -1148,7 +1148,7 @@ mod tests {
             assert_eq!(signals.todowrite_count, 1, "`{name}` is planning");
         }
 
-        // First match wins, and the order is the ruling: redirection beats the
+        // First match wins, and the order matters: redirection beats the
         // read-like operand, so `grep … > out` is a write and not a read.
         let redirecting = ToolSignals::from_exchanges(
             &session(&[("bash", &shell("grep x f > /tmp/o"), Some("ok"))]),

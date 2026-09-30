@@ -55,8 +55,8 @@ pub const STAGE_SELECTOR_REVISION: u32 = 1;
 /// artifact or a stored record written under revision 1 is refused rather
 /// than re-read under the new pricing.
 ///
-/// **Bumped to `3` on 2026-09-30** (the owner's ruling that `rules` joins the
-/// live exploration set): `explore::eligible` now appends the `rules` plan,
+/// **Bumped to `3` on 2026-09-30**, when `rules` joined the live exploration
+/// set: `explore::eligible` now appends the `rules` plan,
 /// so a `live` turn logs `rules` with probability above zero wherever the
 /// learned choice differs. That is the exploration rule this constant names.
 /// The draw's hash encoding did not change, so `LEARNER_DRAW_VERSION` stays
@@ -129,8 +129,8 @@ pub enum StageOutcome {
     /// resolution rather than reconstructing it from this arm.
     ///
     /// **The head's tier, not every dispatch's.** A guarded turn's fallbacks
-    /// run through the efficient tier before the rest of the capable one
-    /// (2026-09-28 ruling 4), so a failover can dispatch an efficient member
+    /// run through the efficient tier before the rest of the capable one,
+    /// so a failover can dispatch an efficient member
     /// under a record that still carries this arm. A reader that needs the
     /// tier of a dispatched target reads it off the recipe lists by the
     /// `Routed` record's own target ([`RecipeEvidence::tier_of`]), never off

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The online learner's decisions and deliveries (draft section 12.4).
+//! The online learner's decisions and deliveries.
 //!
 //! Two halves, and they are kept apart on purpose.
 //!

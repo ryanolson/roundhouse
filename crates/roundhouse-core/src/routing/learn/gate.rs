@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The quality gate, `wilson-v1` (draft section 7.4, plan section 4).
+//! The quality gate, `wilson-v1`.
 //!
 //! For one strategy the gate reads the most specific key level whose **live**
 //! units meet `min_evidence`, adds that key's prior, and takes the Wilson
@@ -43,7 +43,7 @@ use crate::routing::stage::Tier;
 pub const CREDIT_SCALE: u64 = 1_000;
 
 /// The weight of Jev's prior, in intervals: small, so a handful of reviews
-/// outweighs it (plan section 4).
+/// outweighs it.
 pub const JEV_PRIOR_PSEUDO_INTERVALS: u64 = 3;
 
 /// Fewer Jev answers than this on a key is no prior at all. One or two
@@ -77,9 +77,8 @@ pub enum PriorSource {
 
 /// The gate's full reading for one strategy on one turn.
 ///
-/// The record keeps only [`GateEvidence`], the level and the result (draft
-/// section 7.7). The bounds and the prior are here so a test, and later the
-/// metrics, can see why.
+/// The record keeps only [`GateEvidence`], the level and the result. The bounds
+/// and the prior are here so a test, and later the metrics, can see why.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GateReading {
     /// The level read, or `None` when no level had enough live evidence.

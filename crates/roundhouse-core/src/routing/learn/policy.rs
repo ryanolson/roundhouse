@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `LearnedPolicy::choose`: the learned decision for one turn (draft sections
-//! 7.1 to 7.7, as the 2026-09-28 rulings amend them).
+//! `LearnedPolicy::choose`: the learned decision for one turn.
 //!
 //! **Quality first, then cost, within a latency limit.** Every configured
 //! strategy is planned over one admitted pool. A plan's first target must meet
@@ -85,7 +84,7 @@ pub enum LearnedError {
     #[error(transparent)]
     Routing(#[from] RoutingError),
     /// The context carries no tier recipe. A strategy is a tier pick, so a
-    /// learner without a recipe has nothing to choose between (draft 4.2).
+    /// learner without a recipe has nothing to choose between.
     #[error("a learner routes by a tier recipe, and this project has none")]
     NoRecipe,
     /// `on_infeasible = refuse`, and no strategy met the constraints.
@@ -232,7 +231,7 @@ impl LearnedPolicy {
 
         let order = exploit_order(&plans);
 
-        // Ruling 8: live only, a reviewed session only, a frontier target in
+        // Live only, a reviewed session only, a frontier target in
         // the pool, and a read that gave gate results to explore on. The
         // arena is the rate and the set, and exists only when a turn could
         // explore and something is eligible, so the draw and the propensity
@@ -322,7 +321,7 @@ struct Planner<'a> {
 /// `rules` decision.
 ///
 /// **Only the `rules` decision is kept.** A learned route is assembled from
-/// the plans' first targets (draft 7.6), so the other strategies' decisions
+/// the plans' first targets, so the other strategies' decisions
 /// are never read; `shadow` and `serve_rules` serve the `rules` one whole.
 struct Plans {
     plans: Vec<PlanEvidence>,
@@ -469,8 +468,7 @@ pub(super) fn exploit_order(plans: &[PlanEvidence]) -> Vec<usize> {
 }
 
 /// The fallbacks of a learned route: the first targets of the passing plans,
-/// in exploit order, without repeats and without the served target (draft
-/// 7.6).
+/// in exploit order, without repeats and without the served target.
 ///
 /// **Not a strategy's own second choices.** Its evidence is about its first
 /// target only; a fallback it never earned evidence for would be an unchecked

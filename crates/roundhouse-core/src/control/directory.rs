@@ -12,7 +12,7 @@
 //! durable value with a version a writer can gate on. So [`DocumentStore`]
 //! takes and returns `Vec<u8>` and has no opinion about the bytes.
 //!
-//! **Opaque, and that is the ruling rather than a shortcut.** The alternative
+//! **Opaque, and that is a decision rather than a shortcut.** The alternative
 //! — a `DirectoryStore` in the server crate with a Redis implementation beside
 //! it — was rejected on where the code would then have to live: the Redis key
 //! builder, the namespace type and the connection manager are all in

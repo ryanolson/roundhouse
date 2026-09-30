@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! C4 of `PLAN-cache-affinity.md` — the catalog's TTL reaches the request.
+//! The catalog's TTL reaches the request.
 //!
 //! One lifetime per target, taken from `FrontierModelSpec::cache_model` and
 //! carried on the quote, so the ledger's retention prediction and the marker on

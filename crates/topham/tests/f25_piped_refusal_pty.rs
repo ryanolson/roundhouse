@@ -9,8 +9,8 @@
 //! `terminal::size` fall back to `/dev/tty` when stdin is not itself a tty --
 //! so `try_init` only fails when *no* controlling terminal exists at all,
 //! not merely when stdout is redirected. That contradicts the stronger claim
-//! at `agent-docs/PLAN-anthropic-messages.md:736-737`: "a piped `topham` now
-//! refuses naming the subcommands and writes nothing to stdout".
+//! that a piped `topham` refuses naming the subcommands and writes nothing to
+//! stdout.
 //!
 //! **Why this needs a real pty and a real subprocess, not a unit test**:
 //! `tui::run`'s refusal path is exercised in-process nowhere in this crate's
@@ -111,8 +111,8 @@ fn control_the_pty_helper_actually_launches_topham() {
 /// redirected to a real file, `topham` (no subcommand) still opens the full
 /// TUI and writes ratatui's alternate-screen escape sequences to that file,
 /// rather than refusing per `TuiError::Terminal` and writing nothing --
-/// contradicting `agent-docs/PLAN-anthropic-messages.md:736-737`'s "a piped
-/// `topham` now refuses ... and writes nothing to stdout".
+/// contradicting the claim that a piped `topham` refuses and writes nothing to
+/// stdout.
 ///
 /// Failed until the fix: `out.txt` held 47 bytes beginning with the
 /// `EnterAlternateScreen` sequence `\x1b[?1049h`, exactly as F25's own

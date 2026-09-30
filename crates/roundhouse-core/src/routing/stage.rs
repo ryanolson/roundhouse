@@ -817,19 +817,18 @@ impl StagePolicy {
                 let displaced = head.target.policy_identity();
                 // **Fallbacks by the same comparison that picked the winner.**
                 // First every capable member that also quotes below the
-                // efficient head (the winner leads them: `position` above
-                // found the first member this same predicate keeps),
-                // then the efficient tier the pick named, then the capable
-                // members that quote at or above the head, each part in
-                // recipe order. The rule used to be "a guarded turn's
-                // fallbacks are a capable turn's fallbacks", which let a
-                // failover from the cheap winner go straight to the most
-                // expensive capable member and never try the efficient tier
-                // at all -- a failover that raised the bill past the head the
-                // guard had just refused for costing too much (2026-09-28
-                // ruling 4). A capable member that quotes no less than the
-                // head dominates nothing, so it has no claim to go ahead of
-                // the tier the pick named.
+                // efficient head (the winner leads them: `position` above found
+                // the first member this same predicate keeps), then the
+                // efficient tier the pick named, then the capable members that
+                // quote at or above the head, each part in recipe order. The
+                // rule used to be "a guarded turn's fallbacks are a capable
+                // turn's fallbacks", which let a failover from the cheap winner
+                // go straight to the most expensive capable member and never
+                // try the efficient tier at all -- a failover that raised the
+                // bill past the head the guard had just refused for costing too
+                // much. A capable member that quotes no less than the head
+                // dominates nothing, so it has no claim to go ahead of the tier
+                // the pick named.
                 let (cheaper_capable, dearer_capable): (Vec<_>, Vec<_>) = capable
                     .into_iter()
                     .partition(|candidate| candidate.expected_cost_usd < head.expected_cost_usd);
@@ -1718,7 +1717,7 @@ mod tests {
         }
     }
 
-    /// capable = [sol], efficient = [luna, terra] — the shape the plan names.
+    /// capable = [sol], efficient = [luna, terra] — the shape the guard tests use.
     fn recipe(picker: PickerMode) -> TierRecipe {
         TierRecipe::new(
             vec!["openai/sol".into()],
@@ -2256,7 +2255,7 @@ mod tests {
     /// the review-round-6 example: a failover from `nova` used to go to the
     /// rest of the capable tier, so the next hop was the most expensive thing
     /// here and `luna` — the tier the pick named, and cheaper than `sol` — was
-    /// never tried (2026-09-28 ruling 4).
+    /// never tried.
     #[tokio::test]
     async fn the_guard_serves_the_first_capable_target_that_is_cheaper_not_the_tier_head() {
         let candidates = vec![

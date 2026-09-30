@@ -132,7 +132,7 @@ pub fn trailing_user_request(items: &[Item]) -> Option<&str> {
 /// How much of a session the judge is shown.
 ///
 /// Bounds rather than a full transcript, and which of the two is better is an
-/// open question the plan keeps on its risk register: a full transcript costs
+/// open question: a full transcript costs
 /// more, may judge better, and keeps the judge's own prefix warm. Making it
 /// configuration rather than a constant is what lets a deployment answer that
 /// with its own Shadow data instead of with an argument.

@@ -3,15 +3,17 @@
 
 //! What the unkeyed chain costs next to the tokenization it rides beside.
 //!
-//! **Nothing in production extends the chain yet.** The plan wires it in at M3:
-//! the chain will be extended in the context assembler from the render it
+//! **Nothing in production extends the chain yet.** The server's cache-hint
+//! fingerprint is its own digest (`request_context::prefix_fingerprint`), not a
+//! chain. Extending the chain in the context assembler from the render it
 //! already computes, once per item, on every turn — the same loop that encodes
-//! each render into token ids. The plan's claim is that the chain will be noise
-//! against that encode; this measures the chain against the encode it will sit
-//! beside, on real Claude Code bodies with a real BPE vocabulary, per 100 KiB of
-//! rendered text, so the claim is a number rather than an intuition about
-//! SHA-256 being fast — and is a number before the wiring exists, when a
-//! surprising answer still costs a design change rather than a revert.
+//! each render into token ids — is the change this anticipates. The expectation
+//! is that the chain will be noise against that encode; this measures the chain
+//! against the encode it will sit beside, on real Claude Code bodies with a
+//! real BPE vocabulary, per 100 KiB of rendered text, so the claim is a number
+//! rather than an intuition about SHA-256 being fast — and is a number before
+//! the wiring exists, when a surprising answer still costs a design change
+//! rather than a revert.
 //!
 //! It lives under `tokenizer` as a lib unit test because that puts it beside the
 //! `HfTokenizer` it measures against, and because an integration test would be
@@ -51,7 +53,7 @@ const BODIES: [&str; 7] = [
     include_str!("../../tests/fixtures/claude-2.1.257-mcp-turn-2-toolresult.json"),
 ];
 
-/// The unit the plan asks the numbers in.
+/// The unit the numbers are reported in.
 const HUNDRED_KIB: usize = 100 * 1024;
 
 /// Every body's canonical items, repeated until their renders reach 100 KiB.

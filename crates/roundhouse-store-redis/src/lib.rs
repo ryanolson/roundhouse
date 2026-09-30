@@ -85,10 +85,8 @@
 //! admin directory in [`directory`], which is what lets a project created on
 //! one node exist on the next one and survive a restart.
 //!
-//! The learner store in [`learn`] is the one family nothing selects yet: the
-//! online routing learner's startup composition (M9 of
-//! `agent-docs/PLAN-online-routing-learner.md`) will select it from the same
-//! variable.
+//! The learner store in [`learn`] is selected by the same variable but opened
+//! lazily, only once some project enables the online routing learner.
 
 pub mod correlation;
 pub mod directory;
@@ -334,7 +332,7 @@ fn backend(error: redis::RedisError) -> StoreError {
 /// **Redis-version scoped** (M9 round-3, item 2, low): `is_wrong_type` reads
 /// `WRONGTYPE` from the server errors a pipeline or a script's own command
 /// raised. A plain pipelined command — `read_events`, `last_seq` — classifies
-/// on every version this crate supports (`README`'s Redis ≥ 6.2 floor is
+/// on every version this crate supports (the Redis ≥ 6.2 floor is
 /// unchanged). A Lua script's `WRONGTYPE` reaches the client this way only on
 /// Redis 7 and later; Redis 6.x wraps a script's raised error as `ERR Error
 /// running script ...` with no code to read, so `acquire`, `renew` and

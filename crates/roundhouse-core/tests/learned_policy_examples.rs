@@ -1,15 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Draft section 7.8, row by row, as pure-policy tests.
+//! The learned policy's worked example rows, one pure-policy test per row.
 //!
 //! The recipe is `efficient: [local/small]`, `capable: [frontier/large]`, and
 //! `rules` picks capable, so its route is `frontier/large` on every row. Rows
 //! 1 to 4 put evidence for `efficient` into a key where `rules` picks capable.
 //! Serving cannot produce that state without exploration, so the tests write
-//! it into the view directly. Two rows changed after the draft: cold start
-//! now reads `serve_rules` by default (ruling 7), and an exploration row is
-//! added (ruling 8).
+//! it into the view directly. Two rows go beyond the original table: cold
+//! start reads `serve_rules` by default, and an exploration row is added.
 
 mod learned_support;
 
@@ -343,7 +342,7 @@ fn row_8_without_exploration_the_route_is_rules() {
 
 /// The added row, exploration: cold start on a reviewed session with a draw
 /// below the rate. The set is the one cheaper unproven strategy,
-/// `efficient`, then `rules` (the 2026-09-30 ruling); member 0 serves, and
+/// `efficient`, then `rules`; member 0 serves, and
 /// the record carries the draw, the set and the propensity, `rate / 2`.
 #[test]
 fn row_9_a_reviewed_cold_start_can_explore_the_cheaper_strategy() {

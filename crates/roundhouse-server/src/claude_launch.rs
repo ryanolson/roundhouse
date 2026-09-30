@@ -10,7 +10,7 @@
 //! **Nothing here writes a file, and that is the whole shape of this module.**
 //! Codex is configured by a `config.toml` it reads out of its `CODEX_HOME`;
 //! Claude Code's entire redirect surface is environment
-//! (`agent-docs/research/claude-code-client-surface.md` §1.1–§1.6) — a base URL
+//! (read from the Claude Code 2.1.42 bundle) — a base URL
 //! read by the vendored SDK, a newline-separated header block, and the API-key
 //! variable. So the output is an [`ClaudeEnv`] and there is no settings overlay
 //! beside it: a `settings.json` would be a second place the same three answers
@@ -29,7 +29,7 @@
 //! `codex_launch` could keep the secret out of its own hands entirely because
 //! codex's `env_key` / `env_http_headers` name a *variable*. Claude Code offers
 //! no such indirection: `ANTHROPIC_CUSTOM_HEADERS` is parsed as literal
-//! `Name: Value` lines (§1.6), so the only way to put roundhouse's turn key in
+//! `Name: Value` lines (v2.1.42), so the only way to put roundhouse's turn key in
 //! [`TURN_KEY_HEADER`] is to put the key itself in a variable. This module
 //! therefore holds one, as a [`Secret`], and the type is what keeps the rule
 //! honest: [`ClaudeEnv`]'s `Debug` renders a fingerprint, and
@@ -38,8 +38,8 @@
 //! holds in flight.
 //!
 //! **Which topology this is.** The *Direct* one — an agent pointed straight at
-//! roundhouse — and it is the reference by the same ruling that made it so for
-//! Codex (`agent-docs/synergies/ecosystem-round-2.md`'s launch-surface dedup).
+//! roundhouse — and it is the reference for the same reason it is for Codex
+//! (see [`codex_launch`](crate::codex_launch)).
 //! Chained through a NeMo Relay is supported **by this same map**: Relay
 //! overwrites the base URL and merges into the header block rather than
 //! replacing it, so the turn key survives the hop and one generator serves both
@@ -52,7 +52,7 @@
 //!   here the model rides in the request body, roundhouse ignores it (routing
 //!   policy chooses the target), and naming one would not be free on the
 //!   client's side: the `anthropic-beta` envelope is built *from the model
-//!   string* (§1.5 — `[1m]`, `haiku` and the thinking-mode gates are all
+//!   string* (v2.1.42: `[1m]`, `haiku` and the thinking-mode gates are all
 //!   substring tests on it), so a slug chosen here changes which betas arrive
 //!   without changing anything roundhouse does with them.
 //! - **No autoupdater or telemetry variables.** `DISABLE_AUTOUPDATER` and
@@ -74,22 +74,22 @@
 //! failures it stands between are the same two: an ambient login silently
 //! aimed at roundhouse, and a launch that quietly forwards nothing.
 //!
-//! [`ClaudeAuthKind::RoundhouseKey`] writes
-//! [`ROUNDHOUSE_API_KEY_SENTINEL`] into `ANTHROPIC_API_KEY`, and that line is the
-//! analogue of `codex_launch` writing `env_key` beside
-//! `requires_openai_auth = false`. §1.3's `VV()` is the whole reason: a
-//! subscription login is suppressed when — and only when — one of five inputs
-//! resolves, and `ANTHROPIC_BASE_URL` is not one of them. Leave the variable
-//! empty and a client whose user happens to be logged in presents that login's
-//! OAuth bearer to *our* base URL (§1.4: no host check gates the inference
-//! path), so roundhouse receives a real subscription seat from an operator who
-//! chose the bring-your-own-roundhouse-key stanza and never said so.
+//! [`ClaudeAuthKind::RoundhouseKey`] writes [`ROUNDHOUSE_API_KEY_SENTINEL`]
+//! into `ANTHROPIC_API_KEY`, and that line is the analogue of `codex_launch`
+//! writing `env_key` beside `requires_openai_auth = false`. The client's auth
+//! resolver (`VV()` in v2.1.42) is the whole reason: a subscription login is
+//! suppressed when — and only when — one of five inputs resolves, and
+//! `ANTHROPIC_BASE_URL` is not one of them. Leave the variable empty and a
+//! client whose user happens to be logged in presents that login's OAuth bearer
+//! to *our* base URL (v2.1.42: no host check gates the inference path), so
+//! roundhouse receives a real subscription seat from an operator who chose the
+//! bring-your-own-roundhouse-key stanza and never said so.
 //!
 //! **Three limits of that suppression, recorded rather than reconciled**,
 //! because a launcher cannot lie about the environment it runs in:
 //!
 //! 1. **Interactive mode prompts once.** The documented behaviour
-//!    (`code.claude.com/docs/en/env-vars`, quoted at §1.3) is that in
+//!    (`code.claude.com/docs/en/env-vars`) is that in
 //!    non-interactive mode (`-p`) a present key is always used, while in
 //!    interactive mode the user is asked to approve it overriding their
 //!    subscription — once. Until they do, an interactive session is on the
@@ -97,8 +97,8 @@
 //! 2. **`CLAUDE_CODE_REMOTE=true` defeats it entirely.** The API-key arm of
 //!    `VV()` is guarded by `!CLAUDE_CODE_REMOTE`, so inside a Claude Code Remote
 //!    container the sentinel suppresses nothing and the container's managed
-//!    OAuth token is presented instead — observed, not inferred (§5.7's isolation
-//!    note captured exactly that, including two remote-only headers and the
+//!    OAuth token is presented instead — observed, not inferred (the 2.1.257 isolation
+//!    capture showed exactly that, including two remote-only headers and the
 //!    `oauth-2025-04-20` beta). Nothing this module writes changes what the
 //!    client does with that variable; what it does is **refuse the launch**
 //!    ([`ClaudeLaunchError::SentinelDefeated`]), because a `RoundhouseKey` launch
@@ -140,20 +140,19 @@
 //! and it takes this same map.** That is not the shape it looked like from the
 //! evidence alone, so it is worth stating what changed: `nemo-relay claude`
 //! *overwrites* `ANTHROPIC_BASE_URL` with its own gateway and merges its
-//! `x-nemo-relay-proxy-token` into `ANTHROPIC_CUSTOM_HEADERS` (Relay evidence
-//! §A.7), which reads at first like a surface that cannot carry a key of ours.
-//! It carries every one of them. ("Relay evidence §x" throughout this runbook
-//! points at the 2026-09-01 addendum of
-//! `agent-docs/research/nemo-relay-0.8.0-published-read.md`, where each claim
-//! carries its `file:line` against the 0.8.2 tarballs — citations live there,
-//! not here, so a pin bump re-verifies them in one place.)
+//! `x-nemo-relay-proxy-token` into `ANTHROPIC_CUSTOM_HEADERS`, which reads at
+//! first like a surface that cannot carry a key of ours. It carries every one
+//! of them. (Every Relay claim in this runbook was read from the 0.8.2 tarballs
+//! on 2026-09-01 and is stated without a file and line, so a pin bump
+//! re-verifies it by re-reading Relay rather than by following stale
+//! coordinates.)
 //!
 //! - the merge is a **line-wise replacement of the matching name only**
-//!   (`replace_custom_header`, Relay evidence §A.7), so a [`TURN_KEY_HEADER`]
+//!   (`replace_custom_header`), so a [`TURN_KEY_HEADER`]
 //!   line in the operator's `ANTHROPIC_CUSTOM_HEADERS` survives beside Relay's
 //!   token;
 //! - Relay's dispatch forwards headers it does not own untouched
-//!   (`should_forward_request_header`, Relay evidence §A.13, which
+//!   (`should_forward_request_header`, which
 //!   subtracts hop-by-hop names, `Host`, `Content-Length`, `Accept-Encoding`
 //!   and its own two credential headers — and nothing else);
 //! - and it therefore also strips `x-nemo-relay-proxy-token` before the hop, so
@@ -172,11 +171,11 @@
 //! assert exactly that header set arriving.
 //!
 //! The base URL is the **deployment root** for the same reason it is one here:
-//! Relay concatenates the inbound `path_and_query` onto it whole
-//! (Relay evidence §A.4), so a value carrying [`API_PREFIX`] produces
+//! Relay concatenates the inbound `path_and_query` onto it whole,
+//! so a value carrying [`API_PREFIX`] produces
 //! `/v1/v1/messages`. `?beta=true` survives that concatenation (R7 hazard 3),
 //! and the gateway must bind loopback — 0.8.2 refuses anything else outright
-//! (Relay evidence §A.10, new at that release). `run` is the wizard-free entry
+//! (new at that release). `run` is the wizard-free entry
 //! point: the bare `nemo-relay claude` shortcut runs interactive setup when no
 //! config layer exists.
 //!
@@ -191,10 +190,10 @@
 //!
 //! - **Relay injects it only into `Authorization`, and only when the inbound
 //!   request is unauthenticated.** `already_authed` short-circuits on any of
-//!   `authorization` / `x-api-key` / `api-key` / `anthropic-api-key`
-//!   (Relay evidence §A.13), and [`ROUNDHOUSE_API_KEY_SENTINEL`] on
-//!   `x-api-key` is exactly such a header. So this arm requires
-//!   `ANTHROPIC_API_KEY` unset, which under §1.3 means an ambient login is *not*
+//!   `authorization` / `x-api-key` / `api-key` / `anthropic-api-key`,
+//!   and [`ROUNDHOUSE_API_KEY_SENTINEL`] on `x-api-key` is exactly such a
+//!   header. So this arm requires `ANTHROPIC_API_KEY` unset, which under the
+//!   client's `VV()` auth check means an ambient login is *not*
 //!   suppressed — hence "credential-less client" is a precondition rather than a
 //!   preference.
 //! - **The value is `Bearer <turn key>`**, because `ControlPlane::presented_key`
@@ -207,8 +206,8 @@
 //!
 //! - **Hazard 4 — set the base URL and the auth header in one config layer.**
 //!   `replace_upstream_base_url` clears a configured `anthropic_auth_header`
-//!   whenever the base URL is changed by a *different* layer (Relay evidence
-//!   §A.5 — the function body is unchanged from 0.8.0), so
+//!   whenever the base URL is changed by a *different* layer (the function
+//!   body is unchanged from 0.8.0 to 0.8.2), so
 //!   naming the base URL on the command line and the header in `config.toml`
 //!   runs unauthenticated. **A documented refusal, not something roundhouse can
 //!   enforce** — the layering happens inside Relay's process, and this
@@ -222,11 +221,11 @@
 //!   behaviour this bullet describes.
 //! - **Hazard 5 — a plugin's dispatch-override turn is key-authed only.**
 //!   `effective_dispatch_request` strips provider credentials before redirecting
-//!   a turn to an explicit target (Relay evidence §A.6), so such a turn
+//!   a turn to an explicit target, so such a turn
 //!   arrives carrying no forwarded seat whatever the client presented. Also a
 //!   refusal rather than a guard, and for the same reason.
 //! - **Resumption is not offered in band on this surface.** Relay's SSE decoder
-//!   ignores `id:` lines outright (Relay evidence §A.3), so a cursor
+//!   ignores `id:` lines outright, so a cursor
 //!   carried as an SSE id would not survive the hop; the Messages emitter
 //!   carries none, and plan open question 4 is closed that way for this rung.
 //!
@@ -236,7 +235,8 @@
 //! gated real-binary suite that drives the actual client with this map is
 //! `crates/roundhouse-server/tests/claude_e2e.rs`.
 
-/// The evidence half: the §1.3 table, and which launch each row is fatal to.
+/// The evidence half: the table of what suppresses a subscription login, and
+/// which launch each row is fatal to.
 /// Split out because a client-surface re-capture edits the table and nothing
 /// else, and because it is the one part of this module that is claims about
 /// somebody else's binary rather than mechanism of ours.
@@ -282,7 +282,7 @@ pub use control_surface::{APPEND_SYSTEM_PROMPT_FLAG, GeneratedArg, flatten_argv}
 
 /// Where the client's vendored SDK reads the deployment address.
 ///
-/// **Read by the SDK, not by Claude Code** (§1.2): the client's own factory
+/// **Read by the SDK, not by Claude Code** (v2.1.42): the client's own factory
 /// never passes `baseURL`, so the SDK's environment default applies, with no
 /// validation and no scheme check on that path. The SDK then appends the
 /// version segment itself — which is why [`ClaudeLaunch::new`] refuses a value
@@ -290,14 +290,14 @@ pub use control_surface::{APPEND_SYSTEM_PROMPT_FLAG, GeneratedArg, flatten_argv}
 pub const BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 
 /// The newline-separated `Name: Value` block the client merges into its own
-/// default headers (§1.6).
+/// default headers.
 ///
 /// The merge order puts these *after* the SDK's auth headers, so a name spelled
 /// here overrides the SDK's own — which is what makes this the carrier for
 /// [`TURN_KEY_HEADER`] and would make it a foot-gun for anything else.
 pub const CUSTOM_HEADERS_ENV: &str = "ANTHROPIC_CUSTOM_HEADERS";
 
-/// The variable whose resolution suppresses a subscription login (§1.3).
+/// The variable whose resolution suppresses a subscription login.
 ///
 /// Written under [`ClaudeAuthKind::RoundhouseKey`] and refused under
 /// [`ClaudeAuthKind::ForwardedClaudeLogin`], which is the one line that
@@ -313,8 +313,8 @@ pub enum ClaudeAuthKind {
     /// The client holds a roundhouse turn key and nothing else.
     ///
     /// [`ROUNDHOUSE_API_KEY_SENTINEL`] goes into [`API_KEY_ENV`], never nothing:
-    /// an empty variable leaves §1.3's `VV()` free to resolve a subscription
-    /// login, and §1.4 establishes that the resulting OAuth bearer follows
+    /// an empty variable leaves the client's auth resolver free to resolve a
+    /// subscription login, and (v2.1.42) the resulting OAuth bearer follows
     /// [`BASE_URL_ENV`] anywhere — so the ambient login is presented to
     /// roundhouse as if the operator had chosen the other variant. The sentinel
     /// is what makes the client's auth resolution a property of the launch
@@ -486,7 +486,7 @@ pub struct ClaudeLaunch {
     /// Whether the registration excludes every MCP configuration but its own.
     ///
     /// Off by default: `--strict-mcp-config` drops an operator's own servers
-    /// wholesale rather than only the one whose name collides (§5.8), which is
+    /// wholesale rather than only the one whose name collides, which is
     /// a deployment-wide decision and not a detail of hooking up.
     strict_mcp: bool,
 }
@@ -613,7 +613,7 @@ impl ClaudeLaunch {
     ///
     /// A deployment-wide choice with a cost: the flag drops an operator's own
     /// servers entirely, including ones whose names collide with nothing at all
-    /// (§5.8). See the module doc.
+    /// See the module doc.
     pub fn with_strict_mcp_config(mut self, strict: bool) -> Self {
         self.strict_mcp = strict;
         self
@@ -680,7 +680,7 @@ impl ClaudeLaunch {
             LaunchValue::Public(self.base_url.clone()),
         );
         // Newline-separated `Name: Value`, first colon wins, whitespace trimmed
-        // (§1.6). One line, because this is the only header roundhouse needs and
+        // (v2.1.42). One line, because this is the only header roundhouse needs and
         // every additional one would override an SDK default of the same name.
         vars.insert(
             CUSTOM_HEADERS_ENV.to_string(),

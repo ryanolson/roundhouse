@@ -39,7 +39,7 @@
 //!
 //! [`StreamOracle`] encodes what Claude Code's own consumer enforces, which is
 //! stricter than the documented contract in some places and looser in others
-//! (`agent-docs/research/claude-code-client-surface.md` §3.2–§3.4):
+//! (read from the Claude Code 2.1.42 bundle):
 //!
 //! - Dispatch is on the SSE `event:` name. A frame without one matches no branch
 //!   and is **silently dropped** — the stream then ends having consumed nothing
@@ -380,7 +380,7 @@ impl StrictEvent {
 
 /// What the client's accumulator holds after merging every `usage` it saw.
 ///
-/// `p91` from the bundle, reproduced field for field (§3.4). The point of
+/// `p91` from the bundle, reproduced field for field (v2.1.42). The point of
 /// reproducing it rather than asserting on our frames directly is that the
 /// *merge* is where a correct-looking pair of frames can still bill wrongly: a
 /// `message_start` reporting the input counts and a `message_delta` reporting
@@ -453,7 +453,7 @@ pub struct Accumulated {
     /// Zero is a specific, expensive failure and not merely an empty answer:
     /// "stream completed with `message_start` but no content blocks completed"
     /// is one of the two conditions that make Claude Code re-issue the entire
-    /// turn without streaming (§3.6).
+    /// turn without streaming (v2.1.42).
     pub completed_blocks: usize,
     /// Every completed block, in index order — the `content` array the client
     /// assembles and then resends as history on its next turn.

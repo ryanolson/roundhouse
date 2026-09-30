@@ -212,7 +212,7 @@ impl Default for FakeDeployment {
 
 impl FakeDeployment {
     /// A deployment whose configured policy admits local models only — the
-    /// ceiling the plan's `prefer frontier` example runs against.
+    /// ceiling a `prefer frontier` ask runs against.
     pub fn local_only() -> Self {
         Self {
             ceiling: TurnPolicy {

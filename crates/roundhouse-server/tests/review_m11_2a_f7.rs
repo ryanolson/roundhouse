@@ -284,7 +284,7 @@ async fn streaming_and_non_streaming_agree_a_truncated_tool_call_never_happened(
     // what turns that into one empty text block on the wire rather than a
     // stream that reaches `message_stop` having completed nothing at all —
     // the shape that costs a real client a second, full-price non-streaming
-    // turn (§3.6). Both projections below are checked for exactly that block
+    // turn (v2.1.42). Both projections below are checked for exactly that block
     // and nothing else, which is this test's own proof that the fallback
     // engages correctly for an all-dropped turn too.
     let script: Vec<Scripted> = vec![];

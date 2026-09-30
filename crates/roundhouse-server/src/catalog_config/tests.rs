@@ -533,8 +533,8 @@ fn a_misspelled_fleet_quote_deadline_key_is_refused() {
     assert!(matches!(err, CatalogError::Parse { .. }), "{err}");
 }
 
-/// **A local capacity price loads and reaches both readers.** Ruling 6 of the
-/// 2026-09-28 addendum: the router quotes local turns at it and the dashboard
+/// **A local capacity price loads and reaches both readers.** The router
+/// quotes local turns at it and the dashboard
 /// reports local spend at it, so the engine config and the metrics config must
 /// carry the one value the file wrote.
 #[test]
@@ -961,7 +961,7 @@ fn a_malformed_catalog_names_the_file_it_could_not_parse() {
 /// which is what "has no mechanism to re-resolve it later" has to mean if
 /// the rule mattered enough to state.
 ///
-/// **Refusal, provider-scoped.** The ruling on G17 was between refuse, warn
+/// **Refusal, provider-scoped.** The choice was between refuse, warn
 /// and accept; refuse is what the three neighbouring identity checks already
 /// do, and the scope is `openrouter` alone because `~` is a marker in that
 /// provider's id vocabulary and nobody else's — see

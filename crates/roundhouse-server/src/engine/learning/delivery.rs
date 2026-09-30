@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The one delivery of a session's learning entries, for both of its callers
-//! (draft sections 11.5 and 11.7, milestone M9).
+//! (design in `docs/src/concepts/routing-learner.md`).
 //!
 //! **The engine tail and the recovery task run this same code**: the page,
 //! the apply under a timeout, the refill and the gap backfill, the stop
@@ -226,10 +226,10 @@ impl<S: SessionStore> Delivery<'_, S> {
     /// acknowledged), and a refill that spent the gap's backfill would leave
     /// every later tail to refill, meet the same gap, and stop there.
     ///
-    /// **A gap's backfill is applied at once**, not on the next turn as draft
-    /// 11.5 step 6 has it. The live fold's page still starts above the store's
-    /// watermark on the next turn, so sending it then would meet the same gap,
-    /// forever. The backfilled page is the one that closes it.
+    /// **A gap's backfill is applied at once**, not on the next turn. The live
+    /// fold's page still starts above the store's watermark on the next turn,
+    /// so sending it then would meet the same gap, forever. The backfilled page
+    /// is the one that closes it.
     pub(crate) async fn deliver(&self, mut source: Source<'_, S>) -> Delivered {
         let Delivery {
             learner,

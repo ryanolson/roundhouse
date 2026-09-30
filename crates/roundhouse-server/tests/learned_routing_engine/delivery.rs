@@ -379,9 +379,9 @@ async fn a_steered_turn_still_applies_pending_entries() {
     assert_eq!(rig.acknowledged(&session).await.len(), 1);
 }
 
-/// Delivery follows the log, not the project's current mode (draft section
-/// 23): a session with learned history whose project is turned `off` still
-/// has its pending entries delivered, and makes no store read for its turns.
+/// Delivery follows the log, not the project's current mode: a session with
+/// learned history whose project is turned `off` still has its pending entries
+/// delivered, and makes no store read for its turns.
 #[tokio::test]
 async fn a_project_turned_off_still_delivers_its_sessions_pending_entries() {
     let rig = Rig::new(RigConfig::default());

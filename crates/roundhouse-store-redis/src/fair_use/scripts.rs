@@ -155,7 +155,7 @@ pub(crate) fn would_exceed_source() -> &'static str {
 ///
 /// Every bucket range a decay reads is bounded by one window's width by
 /// construction, but it is *not* one `HMGET`: `read_buckets`/`drop_buckets`
-/// chunk at `CHUNK` fields per command, because `unpack` is limited by Lua's C
+/// chunk at `CHUNK` buckets per command, because `unpack` is limited by Lua's C
 /// stack (`LUAI_MAXCSTACK`, 8000 in Redis) and a range assembled into one call
 /// would sit within a factor of two of that at today's widest window and past
 /// it the moment a wider one is added. So the worst case is one command per

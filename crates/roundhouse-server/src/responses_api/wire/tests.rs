@@ -441,7 +441,7 @@ fn the_turn_id_of_a_fixed_conversation_is_pinned() {
 /// The existing pin above cannot see this rung's edit: its fixture tool is
 /// `search`, an ordinary client tool with no `namespace` on the wire, so a
 /// change confined to how a namespaced call canonicalizes leaves it green.
-/// That is the hazard §3.5 of the stored-namespace evidence names — the
+/// That is the hazard — the
 /// guard the tree wrote to catch "an edit that moves historical hashes" is
 /// blind to exactly the edit that carries a namespace into the log.
 ///

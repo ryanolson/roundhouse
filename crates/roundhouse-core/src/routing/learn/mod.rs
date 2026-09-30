@@ -88,7 +88,7 @@ pub const STRATEGY_REVISION: u32 = 1;
 
 /// One serving strategy: a way to pick a tier for a turn.
 ///
-/// Three, and no target arms, by the 2026-09-28 ruling 14. A calibrated `rules`
+/// Three, and no target arms. A calibrated `rules`
 /// strategy is deferred: its pick would have to join the key, or it would earn
 /// evidence where it agrees with `rules` and be served where it does not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -277,8 +277,8 @@ impl ActiveMode {
 
 /// What a `live` turn does when no strategy satisfies the constraints.
 ///
-/// `serve_rules` is the default by the 2026-09-28 ruling 7: `refuse` fails
-/// every live turn during a learner-store outage.
+/// `serve_rules` is the default because `refuse` fails every live turn during a
+/// learner-store outage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnInfeasible {
@@ -367,7 +367,7 @@ pub struct Units {
 ///
 /// **Only the artifact's prior.** The Jev prior is computed on the turn from
 /// the Jev counts in the [`ReadView`], and it applies only where this prior is
-/// zero (plan section 4): an artifact prior is review evidence carried across
+/// zero: an artifact prior is review evidence carried across
 /// epochs, and a scout's opinion does not outrank it.
 ///
 /// A missing entry is zero units, which is what an artifact with no evidence
@@ -405,7 +405,7 @@ pub struct LearnerTerms {
     pub epoch: EpochId,
     pub prior: PriorUnits,
     pub quality: QualityTerms,
-    /// First output from turn start, in milliseconds (ruling 10).
+    /// First output from turn start, in milliseconds.
     pub latency_limit_ms: u64,
     pub latency_min_samples: u64,
     pub cache_min_samples: u64,

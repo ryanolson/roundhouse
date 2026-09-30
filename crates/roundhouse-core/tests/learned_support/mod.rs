@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared fixtures for the learned policy suites (plan M4).
+//! Shared fixtures for the learned policy suites.
 //!
-//! The recipe is draft section 7.8's: `efficient: [local/small]` and
-//! `capable: [frontier/large]`. The quality terms are the ruled starting
+//! The recipe is `efficient: [local/small]` and
+//! `capable: [frontier/large]`. The quality terms are the starting
 //! numbers (floor 0.8, z 1.96, 5 intervals of live evidence, 20 sessions), so
 //! a fixture that passes here passes under the configuration a deployment
 //! would actually write.
@@ -58,7 +58,7 @@ pub const UNPROVEN: Counts = (5_000, 5_000, 20);
 /// 20 intervals, all negative: the upper bound is 0.161, below the floor.
 pub const BELOW: Counts = (0, 20_000, 20);
 
-/// The draft's parent rate card: input 1, write 2, read 0.1 per MTok.
+/// The parent rate card: input 1, write 2, read 0.1 per MTok.
 pub const CARD: ProviderPricing = ProviderPricing {
     input_per_mtok_usd: 1.0,
     cached_input_per_mtok_usd: 0.1,

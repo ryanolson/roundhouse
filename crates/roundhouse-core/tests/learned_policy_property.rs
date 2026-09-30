@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Without exploration, a live learner cannot change a route (draft 7.5).
+//! Without exploration, a live learner cannot change a route.
 //!
 //! A deterministic exhaustive enumeration, since the workspace carries no
-//! property-testing crate. Consistent-trajectory credit (ruling 9) gives a
+//! property-testing crate. Consistent-trajectory credit gives a
 //! strategy live units only on turns where its plan's first target was the
 //! served one, and without exploration the served one is the `rules` target.
 //! So the enumeration gives live units only to strategies whose first target
@@ -16,8 +16,8 @@
 //! there the latency or grant constraint can separate it from `rules`: with
 //! `rules` over the latency limit on this turn, a strategy credited on turns
 //! where it agreed with `rules` serves instead. That is the constraints
-//! working, not exploration, but it is a route change the draft's sentence
-//! does not allow for. The plan's M4 status records it.
+//! working, not exploration, but it is a route change the claim above
+//! does not allow for.
 
 mod learned_support;
 

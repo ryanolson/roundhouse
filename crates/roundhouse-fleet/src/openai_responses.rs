@@ -77,7 +77,7 @@ pub const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
 
 /// Where a forwarded ChatGPT device login authenticates.
 ///
-/// Stage 0's ruling, against codex `3b45c29`: a `CodexAuth` in ChatGPT mode is
+/// Read from codex `3b45c29`: a `CodexAuth` in ChatGPT mode is
 /// wrapped into a bearer and sent to the provider's configured `base_url`, and
 /// `https://chatgpt.com/backend-api/codex` is what that defaults to
 /// (`model-provider-info/src/lib.rs:39, 289-303`). It is a *different* origin
@@ -797,8 +797,7 @@ mod tests {
     /// The same client now serves OpenAI's endpoint and OpenRouter's, and their
     /// `ResponsesRequest` schemas are not the same set. OpenRouter's has no
     /// `stream_options` and no `client_metadata`
-    /// (`agent-docs/research/openrouter-api-surface.md` Q1, read from
-    /// `openapi.json` on 2026-08-24), and whether it *rejects* an unknown
+    /// (read from its `openapi.json` on 2026-08-24), and whether it *rejects* an unknown
     /// top-level field or ignores it is untested — the route authenticates
     /// before it validates, so an unauthenticated probe cannot reach the
     /// validator. Sending only what both schemas name is what makes that open

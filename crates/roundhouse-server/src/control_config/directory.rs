@@ -160,7 +160,7 @@
 //! ahead of this node, with nobody left to run the publish that would have
 //! installed it into `current`.
 //!
-//! **The ruling is no give-back, and it could not be otherwise.** Rolling the
+//! **The rule is no give-back, and it could not be otherwise.** Rolling the
 //! commit back would mean lying to the store about what it just durably
 //! accepted — and by the time a caller could react to its own cancellation
 //! there is no caller left to run any compensating action at all. So the
@@ -729,12 +729,12 @@ impl ControlDirectory {
     }
 
     /// What this node serves, what it has refused, and what it has named as
-    /// divergent (M16.1, R-D9).
+    /// divergent.
     ///
-    /// **This is R-D9's `divergence()` accessor**, named for everything it
-    /// answers rather than for one of them: the ruling asks that the refused
-    /// version be exposed "beside the served version" *and* that the typed
-    /// divergence be readable, and three accessors over three lock
+    /// **This is the `divergence()` accessor**, named for everything it
+    /// answers rather than for one of them: the refused version is to be
+    /// exposed "beside the served version" *and* the typed divergence is to be
+    /// readable, and three accessors over three lock
     /// acquisitions would let a caller assemble those from three instants —
     /// see [`DirectoryStatus`].
     ///
@@ -815,10 +815,9 @@ impl Managed {
         Ok(managed)
     }
 
-    /// Name a stored version whose writer's inputs are not this node's — once
-    /// (R-D9).
+    /// Name a stored version whose writer's inputs are not this node's — once.
     ///
-    /// **Never refuses, and that is the ruling rather than a softness here.**
+    /// **Never refuses, and that is deliberate rather than a softness here.**
     /// The node compiles the plane from the inputs it holds, which are the
     /// only inputs it can honestly compile against; refusing would convert
     /// every rolling config change into a fleet-wide outage for the length of

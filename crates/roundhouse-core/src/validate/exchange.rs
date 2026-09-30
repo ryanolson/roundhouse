@@ -29,15 +29,15 @@
 //! wearing pinned-source knowledge.
 //!
 //! **Where that knowledge went, checked rather than assumed.** Of the three
-//! literals, only the `"aborted"` one is in `research/codex-0.146.0-vs-pin-
-//! vigilance.md` (claim 10, `ensure_call_outputs_present` synthesising an output
-//! for an unanswered call); the two approval-prompt texts are recorded in
-//! `PLAN-agentic-control-plane.md` (§ F05) and in git history, and nowhere on
-//! the vigilance list. That is a smaller loss than it looks — the vigilance list
-//! exists so a codex bump re-reads the claims *this build still depends on*, and
-//! after M10.0 no build path depends on those two — but it is stated here rather
-//! than implied, because "it is on the vigilance list" was the tempting thing to
-//! write and it would have been false.
+//! literals, only the `"aborted"` one is on the codex vigilance list
+//! (`docs/src/guides/codex.md`: `ensure_call_outputs_present` synthesising an
+//! output for an unanswered call); the two approval-prompt texts are in git
+//! history only, and nowhere on the vigilance list. That is a smaller loss than
+//! it looks — the vigilance list exists so a codex bump re-reads the claims
+//! *this build still depends on*, and after M10.0 no build path depends on
+//! those two — but it is stated here rather than implied, because "it is on the
+//! vigilance list" was the tempting thing to write and it would have been
+//! false.
 //!
 //! [`tool_output_body`] stays, and it is the half that was ever load-bearing
 //! beyond steering: [`ErrorSeverity`](crate::validate::ErrorSeverity) and

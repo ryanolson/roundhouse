@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The learning cursor, the `LearningApplied` event, replay, and the
-//! automatic source marks (milestone M5 of
-//! `agent-docs/PLAN-online-routing-learner.md`, draft sections 11.5 and
-//! 11.7). The entries themselves are in `learning_entries.rs`.
+//! The learning cursor, the `LearningApplied` event, replay, and the automatic
+//! source marks (design in `docs/src/concepts/routing-learner.md`). The entries
+//! themselves are in `learning_entries.rs`.
 
 mod learning_support;
 
@@ -98,8 +97,8 @@ async fn backfill_from_a_seq_refills_the_page_in_order() {
 }
 
 /// **The learner store's watermark outranks the log's hint.** When the store
-/// lost writes the log already acknowledged (draft 11.6), or an audit finds a
-/// watermark below the mark (11.7), the backfill from that watermark must hold
+/// lost writes the log already acknowledged, or an audit finds a
+/// watermark below the mark, the backfill from that watermark must hold
 /// the entries between it and the hint, or the store answers `ChainGap` with
 /// the same watermark forever. The live fold on the same log is the control:
 /// it still drops what `LearningApplied` confirmed.

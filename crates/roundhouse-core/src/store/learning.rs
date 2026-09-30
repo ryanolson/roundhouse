@@ -3,8 +3,7 @@
 
 //! Source-side learning discovery: the index a marked append writes.
 //!
-//! The online routing learner (`agent-docs/DRAFT-online-routing-learner.md`
-//! §11.7, and `agent-docs/PLAN-online-routing-learner.md`) folds some session
+//! The online routing learner (`docs/src/concepts/routing-learner.md`) folds some session
 //! events into shared counters in a separate store. Every call to that store
 //! can fail, so the record of *which sessions still owe it entries* cannot
 //! live there: a session whose every learner-store call failed would never be
@@ -33,8 +32,8 @@
 //! [`SessionStore::pending_learning`](super::SessionStore::pending_learning).
 //!
 //! **Both enumerations are ordered by session id bytes, never by time**, and
-//! resume strictly after a [`LearningCursor`]. The draft ordered pending work
-//! oldest-first by marking time. A repeated oldest-first page with no cursor
+//! resume strictly after a [`LearningCursor`]. Ordering pending work
+//! oldest-first by marking time is not safe: a repeated oldest-first page with no cursor
 //! returns the same head forever, so one session the consumer can never
 //! finish would starve every session behind it; and a time-scored order has
 //! no bounded, tie-safe resume point in Redis, whose lexicographic range only

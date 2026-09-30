@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M7 of `PLAN-agentic-control-plane.md`: real frontier credentials, at the
-//! seam a deployment actually runs.
+//! Real frontier credentials, at the seam a deployment actually runs.
 //!
 //! The core suite proves each piece in isolation — a secret redacts, a filter
 //! filters, a payer draws. What it cannot prove is that the pieces are *wired*:

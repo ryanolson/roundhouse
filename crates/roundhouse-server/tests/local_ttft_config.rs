@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! C5 of `PLAN-cache-affinity.md` — a deployment sets the local TTFT curve.
+//! A deployment sets the local TTFT curve.
 //!
 //! `LocalQuote::to_candidate` has taken a base and a slope since the mechanism
 //! landed, and its own unit tests prove the arithmetic. They cannot prove the

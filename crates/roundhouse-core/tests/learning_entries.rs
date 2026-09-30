@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Learning entries folded from the log: existence, credit, operational rows,
-//! and Jev counts (milestone M5 of `agent-docs/PLAN-online-routing-learner.md`,
-//! draft sections 8 and 11.1). The cursor and the marks are in
-//! `learning_cursor.rs`.
+//! and Jev counts (design in `docs/src/concepts/routing-learner.md`). The
+//! cursor and the marks are in `learning_cursor.rs`.
 
 mod learning_support;
 

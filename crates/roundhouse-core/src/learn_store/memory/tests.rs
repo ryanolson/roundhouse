@@ -16,7 +16,7 @@ use crate::routing::learn::{Band, KeyLevel, LevelKey, PriorBand, Strategy};
 
 crate::learner_store_contract_suite!(MemoryLearnerStore::new());
 
-/// Draft section 11.3: a failure after the check phase and before the write
+/// A failure after the check phase and before the write
 /// phase leaves no change. The hook fails the one call at exactly that point;
 /// a store that wrote while it checked would leave the first entries behind.
 #[tokio::test]
@@ -113,8 +113,8 @@ fn every_key() -> Vec<LevelKey> {
 }
 
 /// A read visits the three quality keys of the turn and the operations key,
-/// and nothing else, however many keys the project holds (draft section 11.4:
-/// its cost does not depend on the number of keys or sessions).
+/// and nothing else, however many keys the project holds: its cost does
+/// not depend on the number of keys or sessions.
 #[tokio::test]
 async fn read_visits_only_the_keys_of_the_turn() {
     const KEYS: usize = 1_000;

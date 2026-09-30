@@ -8,8 +8,8 @@
 //! session store. The memory backend runs it, and the Redis backend runs the
 //! same list in `roundhouse-store-redis`'s `tests/learn_contract.rs`, which is
 //! what makes "a Lua script and a `HashMap` keep the same counters" a checked
-//! property. The cases carry the model check of
-//! draft section 15 into Rust: the lost acknowledgement, the chain gap, the
+//! property. The cases carry the store's model check
+//! into Rust: the lost acknowledgement, the chain gap, the
 //! overflow with no change, and store loss repaired by a backfill. The
 //! diverged chain, which no backfill repairs, is a case of its own.
 //!
@@ -46,7 +46,7 @@ use crate::validate::REVIEW_RULE_REVISION;
 /// sets included, in whatever form the backend can compare: the suite checks
 /// "changed nothing" and "made no write" by equality, which no read through
 /// the trait could prove. `restore` puts a snapshot back, which is how the
-/// suite stages the loss of recent writes (draft section 11.6). The memory
+/// suite stages the loss of recent writes. The memory
 /// backend clones its project state; a Redis backend dumps and restores the
 /// keys under the project's prefix. Test-only by construction, like
 /// [`LeaseControl`](crate::store::contract::LeaseControl).
@@ -313,7 +313,7 @@ pub async fn a_repeated_batch_applies_zero_entries<S: LearnerStoreControl>(store
     );
 }
 
-/// The parent scenario of draft section 15: entry 10 applies but its
+/// The parent scenario: entry 10 applies but its
 /// acknowledgement is lost, then the sender resends 10 with the new 20. The
 /// total is 2, not 3.
 pub async fn a_lost_ack_then_a_new_entry_credits_each_entry_once<S: LearnerStoreControl>(
@@ -480,7 +480,7 @@ pub async fn a_diverged_chain_is_refused_and_is_not_a_gap<S: LearnerStoreControl
     assert_eq!(store.watermark(&project, &session).await.unwrap(), 20);
 }
 
-/// Draft section 11.6: the store applied 10 and 20, then 30, then lost the
+/// Store loss: the store applied 10 and 20, then 30, then lost the
 /// write of 30. A page above the log's hint of 30 gaps at 20, and the backfill
 /// from 20 restores what a rebuild from the log gives.
 ///

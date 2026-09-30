@@ -3,8 +3,8 @@
 
 //! The offline calibrator: it lists a project's learner sessions from the
 //! source marks, replays their logs, writes a calibration artifact, and builds
-//! the report a promotion from `shadow` to `live` is decided on (draft section
-//! 14, milestone M10 of `agent-docs/PLAN-online-routing-learner.md`).
+//! the report a promotion from `shadow` to `live` is decided on (design in
+//! `docs/src/concepts/routing-learner.md`).
 //!
 //! **Read-only against both stores.** Sessions are enumerated through
 //! `SessionStore::learning_sessions`, every log is read through `read_events`,
@@ -13,17 +13,17 @@
 //! calibration that wrote would change the evidence it is measuring.
 //!
 //! **One estimand, and one label for it.** Every weighted number is the
-//! logged-boundary *conditional interval value* of the 2026-09-28 ruling 12:
+//! logged-boundary *conditional interval value*:
 //! an interval start taken from the histories the logging policy produced,
 //! the candidate followed to the next review. The report prints that label on
 //! every such number and never names any other value, because an
 //! interval-local weight cannot estimate the value of running a candidate for
-//! a whole conversation (draft 14.3, the reviewer's 0.75 against 1.0).
+//! a whole conversation.
 //! Numbers about the `rules` route itself are labeled `factual`, and numbers
 //! priced or timed from recorded plan quotes are labeled
 //! [`CORRECTED_QUOTE_LABEL`].
 //!
-//! **The mechanics are plan section 4's.** The evaluation unit is an accepted
+//! **The mechanics.** The evaluation unit is an accepted
 //! interval with a `Positive` or `Negative` label, no failover, and learned
 //! evidence of one epoch on every covered decision: exactly what credit
 //! accepts, through the same screen (`session::screen`). Each turn's weight is
@@ -48,9 +48,8 @@
 //! Submodules: [`source`] reads the stores, [`extract`] turns logs into
 //! intervals, [`estimate`] holds the arithmetic, [`drift`] compares a
 //! point-in-time copy of the learner store, [`write`] writes the artifact and
-//! the sidecar, [`promotion`] holds ruling 13's tests as the owner staged
-//! them on 2026-09-29, [`report`] renders the report, and [`dump`] is the
-//! read-only in-memory source a fixture run reads.
+//! the sidecar, [`promotion`] holds the promotion tests, [`report`] renders the
+//! report, and [`dump`] is the read-only in-memory source a fixture run reads.
 
 pub mod drift;
 pub mod dump;
@@ -92,24 +91,23 @@ pub use source::{
 };
 pub use write::{artifact_bytes, sidecar_bytes};
 
-/// The label every weighted number carries (ruling 12).
+/// The label every weighted number carries.
 pub const ESTIMAND_LABEL: &str = "conditional interval value";
 
 /// The label every number about the served `rules` route carries.
 pub const FACTUAL_LABEL: &str = "factual";
 
-/// The label every number priced or timed from recorded plan quotes carries
-/// (the owner's ruling of 2026-09-29): a prediction corrected by measured
-/// residuals, never a measurement.
+/// The label every number priced or timed from recorded plan quotes carries: a
+/// prediction corrected by measured residuals, never a measurement.
 pub const CORRECTED_QUOTE_LABEL: &str = "corrected quote estimate";
 
-/// Ruling 13: the candidate's positive-rate lower bound may be at most this far
+/// The candidate's positive-rate lower bound may be at most this far
 /// below the `rules` rate. On the agreeing intervals the comparison is paired:
 /// the lower bound of learned minus `rules` may be at most this far below
 /// zero.
 pub const QUALITY_ALLOWANCE: f64 = 0.02;
 
-/// Ruling 13: the candidate's estimated cost must be at least this fraction
+/// The candidate's estimated cost must be at least this fraction
 /// below the `rules` cost.
 pub const COST_REDUCTION: f64 = 0.10;
 
@@ -196,7 +194,7 @@ pub struct CalibrationConfig {
     pub strategies: StrategySet,
     pub prior: ArtifactPrior,
     pub quality: QualityMinimum,
-    /// First output from turn start, in milliseconds (ruling 10).
+    /// First output from turn start, in milliseconds.
     pub latency_limit_ms: u64,
     pub bootstrap: BootstrapPlan,
     /// Each session's cutoff, when the run is pinned to a manifest an earlier

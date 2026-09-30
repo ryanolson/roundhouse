@@ -175,9 +175,9 @@ async fn run() -> Result<(), String> {
         options.out.display(),
         options.provenance.display()
     );
-    // Said on every successful run rather than in the README only. The file
+    // Said on every successful run rather than in the docs only. The file
     // this tool writes is the one that gets copied around; the obligation
-    // travels with it, and an operator who never reads a README still sees this.
+    // travels with it, and an operator who never reads the docs still sees this.
     println!(
         "The provenance file carries the attribution OpenRouter requires when this data is \
          republished, and the fragment carries none -- republishing a number derived from \

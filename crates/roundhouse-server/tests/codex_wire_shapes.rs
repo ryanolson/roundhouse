@@ -1,24 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! M0 of `PLAN-agentic-control-plane.md`: pinning the wire-shape facts the
-//! whole steering design rests on, against the *real* pinned Codex parser,
-//! before any roundhouse production code exists to emit a synthetic tool call
-//! at all.
+//! Pinning the wire-shape facts the whole steering design rests on, against the
+//! *real* pinned Codex parser, before any roundhouse production code exists to
+//! emit a synthetic tool call at all.
 //!
 //! These are not conformance tests for our own `/v1/responses` surface — that
 //! is `codex_conformance.rs`, and it stays untouched. Nothing here binds a
 //! router or an engine; there is no roundhouse server in this file. The point
-//! is narrower and comes first: is the fact this plan is built on actually
+//! is narrower and comes first: is the fact the wire design is built on actually
 //! true of the crates it cites? A fact confirmed by reading source is an
 //! opinion about source; a fact confirmed by a passing test against the real
 //! parser is a fact about the parser. If one of these fails, that is a finding
-//! against the plan, not a test to loosen.
+//! against the design, not a test to loosen.
 //!
 //! # Addendum (M10.0): what these facts now underwrite
 //!
-//! The design these were pinned for is gone. `PLAN-frontier-selection.md` R1
-//! retired the synthetic tool call as a steering channel, so **roundhouse emits
+//! The design these were pinned for is gone. The synthetic tool call was
+//! retired as a steering channel, so **roundhouse emits
 //! no `function_call` at all** — the steered turn is answered with assistant
 //! text and the outbound projection that built these frames was deleted with
 //! it (T4).
@@ -295,8 +294,8 @@ fn what_we_emit_for_a_namespaced_call_is_what_codex_encodes_for_one() {
 
 /// Pinned fact 2: dispatch is keyed off `response.output_item.done` alone.
 ///
-/// `handle_output_item_done` (the private `core/src/stream_events_utils.rs:288`
-/// the plan cites) calls `ToolRouter::build_tool_call` on whatever item
+/// `handle_output_item_done` (the private `core/src/stream_events_utils.rs:288`)
+/// calls `ToolRouter::build_tool_call` on whatever item
 /// arrives, with no dependency on a preceding `response.output_item.added`.
 /// `codex_api` cannot prove the *dispatch* half of that claim — `codex-core`
 /// is private and not a pinned dependency — but it can prove the *parse* half:
@@ -304,9 +303,8 @@ fn what_we_emit_for_a_namespaced_call_is_what_codex_encodes_for_one() {
 /// `ResponseItem::FunctionCall` rather than silently becoming
 /// `ResponseItem::Other`, which is the shape upstream's own
 /// `parses_tool_search_call_items` (sse/responses.rs:938-972) proves for a
-/// different item type. If this failed, the plan's optimistic-emission design
-/// (§9 M4) would be building on a parser that drops the very frame it means to
-/// send.
+/// different item type. If this failed, emitting a lone `done` frame would be
+/// building on a parser that drops the very frame it means to send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_function_call_done_frame_parses_without_a_preceding_added() {
     ensure_rustls_crypto_provider();

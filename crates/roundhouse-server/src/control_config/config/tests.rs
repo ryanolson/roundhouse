@@ -295,8 +295,7 @@ fn the_example_file_validates() {
     }
 }
 
-/// Review finding G07, ruled on a corrected mechanism — see
-/// `reports/m10-fix-C.md`, and the rename from
+/// A review finding, ruled on a corrected mechanism, and the rename from
 /// `..._is_one_this_binary_could_quote`, which named a property the shipped
 /// binary cannot have.
 ///

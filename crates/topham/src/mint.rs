@@ -13,7 +13,7 @@
 //!
 //! # Why a subcommand rather than a new route
 //!
-//! The route exists. What was deferred by name in the README was *who calls
+//! The route exists. What was missing was *who calls
 //! it*, and every alternative to a subcommand ends up worse: an admin read that
 //! also mints would be a GET with a side effect, and a launcher that minted
 //! locally would need the directory's private key material. So this is a client

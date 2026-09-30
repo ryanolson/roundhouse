@@ -263,7 +263,7 @@ fn every_strategy_keeps_the_dominance_cost_guard_and_degrade_to_local() {
         );
         assert_eq!(identity(&plan), "openai/vega", "{strategy}");
         assert_eq!(plan.source, Some(DecisionSource::CostGuard), "{strategy}");
-        // Ruling 4's order: cheaper capable, then the efficient tier, then
+        // The guard's order: cheaper capable, then the efficient tier, then
         // the dearer capable members.
         let fallbacks: Vec<String> = plan.fallbacks.iter().map(Target::policy_identity).collect();
         assert_eq!(

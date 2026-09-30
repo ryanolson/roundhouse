@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Redis-backed [`LearnerStore`]: the online routing learner's shared
-//! counters (draft section 11.4 of `agent-docs/DRAFT-online-routing-learner.md`,
-//! milestone M7 of `agent-docs/PLAN-online-routing-learner.md`).
+//! counters (design in `docs/src/concepts/routing-learner.md`).
 //!
 //! **The engine calls it through [`LearnerStore`]** (the server's
 //! `engine::learning`, milestone M8): one `read` per learned turn and one
-//! `apply` per turn tail with entries pending. Nothing in the binary selects
-//! this backend until the startup composition of milestone M9.
+//! `apply` per turn tail with entries pending. The startup composition opens
+//! this backend through the same switch as the rest, only once some project
+//! enables the learner.
 //!
 //! One project maps to these keys, all sharing a hash tag on the project id:
 //!
@@ -33,7 +33,7 @@
 //!
 //! **Single instance.** The hash tag keeps one project's keys on one Cluster
 //! slot, which is what the one-script `apply` needs, but this family claims
-//! no Redis Cluster support: the recovery design of draft section 11.6
+//! no Redis Cluster support: the recovery design
 //! assumes a counter and its watermark live in one replication unit, and no
 //! test here runs against a Cluster.
 //!

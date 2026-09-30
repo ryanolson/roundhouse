@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The staged promotion of the owner's 2026-09-29 rulings, and the gate
-//! arithmetic under it (the M10 review fixes of
-//! `agent-docs/PLAN-online-routing-learner.md`).
+//! The staged promotion tests, and the gate arithmetic under them (design in
+//! `docs/src/concepts/routing-learner.md`).
 //!
 //! A `shadow` project never explores, so the learned candidate has weight only
 //! where it agreed with `rules`. A report that compared that subset with the
 //! `rules` rate over every interval would promote by selection alone. These
-//! tests hold the rulings: cost and latency from corrected quotes on every
+//! tests hold the rules: cost and latency from corrected quotes on every
 //! eligible interval, quality only on the agreeing intervals, and `not
 //! evaluable` wherever a test lacks support.
 
@@ -390,7 +389,7 @@ fn noisy_agreeing_fixture() -> Vec<Script> {
         .collect()
 }
 
-/// The M10 review-fix ruling of 2026-09-30: test 1 is the paired statistic.
+/// Test 1 is the paired statistic.
 /// On twenty agreeing sessions, seventeen positive, the learned lower bound
 /// sits well below the `rules` point estimate (the unpaired form reads
 /// `fail` on sample noise alone), while the paired difference is exactly
@@ -401,7 +400,7 @@ fn the_agreeing_quality_test_is_paired_and_passes_on_sample_noise() {
     let promotion = &calibrated.report.promotion;
     assert_eq!((promotion.agreeing, promotion.intervals), (20, 20));
     assert_eq!(promotion.agreeing_sessions, 20);
-    // The control: the unpaired comparison the ruling retired does fail
+    // The control: the unpaired comparison the paired test replaced does fail
     // here, so a pass below is the paired statistic and not a lenient
     // fixture.
     let learned = calibrated.report.estimate(Candidate::Learned).unwrap();
@@ -485,8 +484,8 @@ fn live_session(id: &str, intervals: &[(bool, bool)]) -> Script {
     script
 }
 
-/// The 2026-09-30 ruling expected the paired difference to be nonzero in
-/// `live` with exploration. It is not, and no fixture can make it so: an
+/// One might expect the paired difference to be nonzero in `live` with
+/// exploration. It is not, and no fixture can make it so: an
 /// agreeing interval is one where the learned action is the
 /// `rules` action on every turn, and a candidate's weight reads only its
 /// action, the served target and the recorded propensity. So both sides
@@ -566,7 +565,7 @@ fn the_paired_bound_fails_a_loss_the_weights_show() {
     assert_eq!(paired_quality_gate(0.0), TestResult::Pass);
 }
 
-/// The paired allowance is inclusive, as ruling 13's is.
+/// The paired allowance is inclusive.
 #[test]
 fn a_paired_lower_bound_exactly_the_allowance_below_zero_passes() {
     assert_eq!(paired_quality_gate(-QUALITY_ALLOWANCE), TestResult::Pass);
@@ -715,9 +714,9 @@ fn rules_explored_fixture(set: &[Strategy]) -> Vec<Script> {
         .collect()
 }
 
-/// The owner's 2026-09-30 ruling exists for this: with `rules` in the live
+/// This is what `rules` joining the exploration set exists for: with `rules` in the live
 /// exploration set, `rules` has logging probability above zero on every
-/// diverging interval, so test 1b, the binding M11 comparison, is evaluable.
+/// diverging interval, so test 1b, the binding comparison, is evaluable.
 /// The recorded propensities are the policy's own formula over the recorded
 /// set.
 #[test]
@@ -857,8 +856,8 @@ fn nothing_passes_explored(on_infeasible: OnInfeasible, set: Vec<Strategy>) -> S
     script
 }
 
-/// Replay applies the owner's `refuse` ruling of 2026-09-30 through the same
-/// rule the policy draws from: on a `refuse` turn that nothing passes,
+/// Replay applies the `refuse` rule through the same rule the policy draws
+/// from: on a `refuse` turn that nothing passes,
 /// `rules` is never a member, so a record whose set holds it does not replay.
 /// The set without it does, and under `serve_rules` the set with it does.
 #[test]
