@@ -265,7 +265,7 @@ mod tests {
 
     fn file(strategies: &str, prior: &str) -> String {
         format!(
-            r#"{{"schema_revision":1,"input_revision":1,"selector_revision":1,"stage_revision":1,"credit_revision":1,
+            r#"{{"schema_revision":{ARTIFACT_SCHEMA_REVISION},"input_revision":{LEARNING_INPUT_REVISION},"selector_revision":{LEARNED_SELECTOR_REVISION},"stage_revision":{STAGE_SELECTOR_REVISION},"credit_revision":{LEARNING_CREDIT_REVISION},
                "gate":"wilson-v1","strategies":{strategies},"prior":{prior},
                "manifest_digest":"00","source_commit":"abc"}}"#
         )
@@ -339,9 +339,13 @@ mod tests {
     /// ```text
     /// a = sha256(b"golden artifact bytes").hexdigest()
     /// c = "roundhouse-learner-epoch-v1\nartifact=" + a
-    ///     + "\nstrategies=rules,efficient,capable\ninput=1\nselector=1\nstage=1\ncredit=1\n"
+    ///     + "\nstrategies=rules,efficient,capable\ninput=1\nselector=2\nstage=1\ncredit=1\n"
     /// sha256(c).hexdigest()[:32]
     /// ```
+    ///
+    /// Recomputed on 2026-09-30 for `LEARNED_SELECTOR_REVISION` 2 (the M10
+    /// round-2 `NoPredictedReuse` reprice); the prior digest was
+    /// `a0a82da1b79e03319379c3cd5223efad`, under `selector=1`.
     #[test]
     fn the_epoch_matches_a_golden_digest() {
         let strategies = StrategySet::new(vec![
@@ -352,7 +356,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             epoch_of(b"golden artifact bytes", &strategies).to_string(),
-            "a0a82da1b79e03319379c3cd5223efad"
+            "eee5455dd9af28118f894e0fdec917f9"
         );
     }
 
@@ -360,19 +364,22 @@ mod tests {
     fn every_content_rule_refuses_its_artifact() {
         let listed = r#"["rules","capable"]"#;
         let key = r#"{"level":"l0","rules_pick":"capable"}"#;
-        for (which, field) in [
-            ("input", "input_revision"),
-            ("selector", "selector_revision"),
-            ("stage", "stage_revision"),
+        for (which, field, expected) in [
+            ("input", "input_revision", LEARNING_INPUT_REVISION),
+            ("selector", "selector_revision", LEARNED_SELECTOR_REVISION),
+            ("stage", "stage_revision", STAGE_SELECTOR_REVISION),
         ] {
-            let bytes =
-                file(listed, "[]").replace(&format!(r#""{field}":1"#), &format!(r#""{field}":2"#));
+            let found = expected + 1;
+            let bytes = file(listed, "[]").replace(
+                &format!(r#""{field}":{expected}"#),
+                &format!(r#""{field}":{found}"#),
+            );
             assert_eq!(
                 Artifact::parse(bytes.as_bytes()),
                 Err(ArtifactError::Revision {
                     which,
-                    found: 2,
-                    expected: 1
+                    found,
+                    expected
                 })
             );
         }
@@ -408,6 +415,25 @@ mod tests {
             &format!(r#"[{{"key":{key},"strategy":"rules","pos":2,"n":2}}]"#),
         );
         assert!(Artifact::parse(once.as_bytes()).is_ok());
+    }
+
+    /// An artifact calibrated before the M10 round-2 `NoPredictedReuse`
+    /// reprice (`LEARNED_SELECTOR_REVISION` 1) is refused rather than read
+    /// under today's pricing: its prior counted turns under the old,
+    /// unadjusted cost, which now feeds the constraints and the choice
+    /// differently.
+    #[test]
+    fn an_artifact_written_under_the_prior_selector_revision_is_refused() {
+        let stale = file(r#"["rules","capable"]"#, "[]")
+            .replace(r#""selector_revision":2"#, r#""selector_revision":1"#);
+        assert_eq!(
+            Artifact::parse(stale.as_bytes()),
+            Err(ArtifactError::Revision {
+                which: "selector",
+                found: 1,
+                expected: LEARNED_SELECTOR_REVISION,
+            })
+        );
     }
 
     #[test]

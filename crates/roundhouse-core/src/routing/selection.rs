@@ -45,7 +45,16 @@ pub const STAGE_SELECTOR_REVISION: u32 = 1;
 ///
 /// Part of the epoch id, like the input and credit revisions in
 /// [`learn`](super::learn).
-pub const LEARNED_SELECTOR_REVISION: u32 = 1;
+///
+/// **Bumped to `2` on 2026-09-30** (the M10 round-2 fixes): under
+/// `NoPredictedReuse`, `Corrections::cost` now re-prices the quote with no
+/// cached tokens instead of leaving it unchanged. That corrected cost feeds
+/// the constraints (the grant check) and the choice among passing strategies
+/// (`exploit_order`, exploration eligibility), so it is a change of
+/// interpretation under this constant's own doc, not just of a caller. An
+/// artifact or a stored record written under revision 1 is refused rather
+/// than re-read under the new pricing.
+pub const LEARNED_SELECTOR_REVISION: u32 = 2;
 
 /// What the extractor computed for this turn, and where in the log it read to.
 ///

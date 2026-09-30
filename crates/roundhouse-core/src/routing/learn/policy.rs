@@ -458,7 +458,10 @@ fn route(
 /// Configured order is the index itself, so a stable sort on the two numbers
 /// breaks the remaining ties by it. `total_cmp` keeps the order total even for
 /// a NaN a broken quote could carry.
-fn exploit_order(plans: &[PlanEvidence]) -> Vec<usize> {
+///
+/// Visible to the offline calibrator, which re-derives a record's exploit
+/// choice with this same function rather than a second spelling of the order.
+pub(super) fn exploit_order(plans: &[PlanEvidence]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..plans.len())
         .filter(|&index| plans[index].meets_hard() && plans[index].gate.result == GateResult::Pass)
         .collect();

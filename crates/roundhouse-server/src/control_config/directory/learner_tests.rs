@@ -23,7 +23,7 @@ const PATH: &str = "ROUNDHOUSE_CONTROL_PLANE";
 
 fn artifact_bytes(manifest: &str) -> String {
     format!(
-        r#"{{"schema_revision":1,"input_revision":1,"selector_revision":1,"stage_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":["rules","capable"],"prior":[],"manifest_digest":"{manifest}","source_commit":"test"}}"#
+        r#"{{"schema_revision":1,"input_revision":1,"selector_revision":2,"stage_revision":1,"credit_revision":1,"gate":"wilson-v1","strategies":["rules","capable"],"prior":[],"manifest_digest":"{manifest}","source_commit":"test"}}"#
     )
 }
 

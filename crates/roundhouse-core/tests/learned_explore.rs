@@ -440,3 +440,37 @@ fn the_draw_matches_a_golden_digest() {
     assert_eq!(draw.member % 3, 2);
     assert_eq!(LEARNER_DRAW_VERSION, "v1");
 }
+
+/// L4: two members whose first targets are one local model on two workers
+/// are one route. Credit and the calibrator match a served target by
+/// `same_route`, so the propensity must sum over the same equivalence: a turn
+/// that explored over both served `small` with probability `rate * 2/2`,
+/// whichever worker answered, and a default on the other worker is still the
+/// exploit route.
+#[test]
+fn the_propensity_counts_members_by_route_not_by_worker() {
+    use roundhouse_core::routing::Target;
+    use roundhouse_core::routing::learn::explore::propensity;
+
+    let (rig, turn) = two_member_rig();
+    let decision = rig.chosen(&Turn::new(turn.terms.clone(), turn.view.clone(), go(0)));
+    let mut plans = evidence(&decision).plans.clone();
+    let other_worker = Target::Local {
+        worker_id: 2,
+        dp_rank: 0,
+        model: "small".into(),
+    };
+    let efficient = plans
+        .iter_mut()
+        .find(|plan| plan.strategy == Strategy::Efficient)
+        .unwrap();
+    assert_eq!(efficient.first, small());
+    efficient.first = other_worker.clone();
+    let set = [Strategy::Rules, Strategy::Efficient];
+    let close = |left: f64, right: f64| (left - right).abs() < 1e-12;
+
+    let explored = propensity(&plans, &set, &small(), Some(&large()), RATE);
+    assert!(close(explored, RATE), "explored: {explored}");
+    let stayed = propensity(&plans, &set, &small(), Some(&other_worker), RATE);
+    assert!(close(stayed, 1.0 - RATE + RATE), "stayed: {stayed}");
+}

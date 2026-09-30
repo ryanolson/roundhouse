@@ -58,7 +58,9 @@ pub struct LearnedEvidenceParts {
     /// `None` when the project configured no exploration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exploration: Option<ExplorationEvidence>,
-    /// The probability that this turn served the first target it served.
+    /// The logging probability of the served route: the probability that
+    /// this turn served its first target's route, counting members by route
+    /// (`same_route`), not by worker.
     ///
     /// `1.0` whenever the turn could not explore. With uniform exploration the
     /// exploit target has `1 - rate` plus `rate` times its share of the set,
@@ -321,7 +323,9 @@ pub enum CostCorrection {
     /// The correction ran, and `adjusted_usd` is its result. That equals the
     /// quote when nothing moved, or when moving would have lowered it.
     Applied,
-    /// The target's measured pairs predicted no reuse, so there is no ratio.
+    /// The target's measured pairs predicted no reuse, so there is no ratio,
+    /// and `adjusted_usd` is the quote re-priced with no cached tokens: a
+    /// discount no pair measured is not banked.
     NoPredictedReuse,
     /// Fewer measured pairs than `cache_min_samples`. Also recorded for a
     /// target the store view holds nothing for, and for zero pairs under a

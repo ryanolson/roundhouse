@@ -5,8 +5,10 @@
 //! learned input and its keys, the configuration a learner runs under, the
 //! evidence a learned decision records, and the cost, latency and grant
 //! corrections a decision applies to a quote ([`corrections`]), the quality
-//! gate ([`gate`]), bounded exploration ([`explore`]), and the policy that
-//! puts them together ([`LearnedPolicy`]).
+//! gate ([`gate`]), bounded exploration ([`explore`]), the policy that
+//! puts them together ([`LearnedPolicy`]), the calibration artifact
+//! ([`artifact`]), and the offline calibrator that writes it and the
+//! promotion report ([`offline`]).
 //!
 //! **Pure functions only.** The policy never reads the store and never draws;
 //! the caller passes both in a [`LearningTurn`]. The server's engine does both
@@ -27,6 +29,7 @@ pub mod evidence;
 pub mod explore;
 pub mod gate;
 pub mod input;
+pub mod offline;
 pub mod policy;
 
 use std::collections::BTreeMap;

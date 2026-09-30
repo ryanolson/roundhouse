@@ -576,6 +576,63 @@ The file's top-level `learner_recovery` block sets the cadence. It is required w
 
 Each node reads an artifact from its own path. The admin directory's fingerprint records the SHA-256 of each artifact's bytes, by project, so a node that read other bytes at the same path than the node that wrote a directory version reports a `learner_artifacts` divergence. A version written by a node with no learner enabled, or by a build older than this record, records no artifacts, and this check is skipped for it.
 
+#### Calibration and the promotion report
+
+The `learner-calibrate` binary writes a project's artifact and the report that a promotion from `shadow` to `live` is decided on (ruling 13). It only reads the stores: it never appends, clears, requeues, or takes a lease.
+
+```text
+learner-calibrate <manifest.json> <out-dir>
+```
+
+```json
+{
+  "source": { "redis": { "url_env": "ROUNDHOUSE_REDIS_URL", "namespace": "rh" } },
+  "drift_check": { "point_in_time_copy": { "url_env": "SNAPSHOT_REDIS_URL", "namespace": "rh" } },
+  "calibration": {
+    "project": "acme",
+    "strategies": ["rules", "efficient", "capable"],
+    "prior": "credit",
+    "quality": { "min_sessions": 20 },
+    "latency_limit_ms": 10000,
+    "bootstrap": { "seed": 20260929, "resamples": 1000 }
+  }
+}
+```
+
+- `source` is a Redis session store, or `{ "dump": { "path": "dump.json" } }`, a file of marked logs (`LogDump`) resolved against the manifest's directory. A Redis source names the environment variable that holds its URL, never the URL.
+- `drift_check` is optional. It names a point-in-time copy of the learner store, for example a snapshot loaded into a disposable Redis. The report then compares the counters in the copy with the entries that the copy's watermarks cover. Without it, the report says `drift check not run`, because a live store changes while the logs are read.
+- `prior` is required: `credit` carries the review credit of this manifest's intervals into the artifact, and `zero` writes no prior units. Jev answers never enter the prior.
+- `calibration.cutoff` is optional. Without it, every marked session of the project is read to its end.
+- `bootstrap.resamples` must be at least 40. With fewer, the 2.5% tail has no place, and the lower bound would be the smallest replicate. The manifest is refused, and the error names the field.
+
+The binary lists the project's sessions from the source marks (`learning_sessions`), and it replays each log. It writes four files:
+
+| File | What it is |
+|---|---|
+| `artifact.json` | The artifact that `learner.artifact` names. It holds no clock time. Its bytes decide the epoch. |
+| `artifact.json.meta.json` | The sidecar: the creation time, the host, and the digests. Nothing hashes it. |
+| `report.md` | The report. |
+| `input-manifest.json` | The cutoff that the run read: each session id, its last sequence, and the SHA-256 of its events. Copy its `sessions` into `calibration.cutoff` to reproduce the run byte for byte. The report and the artifact name its digest. |
+
+The same manifest gives byte-identical artifact and report files. The bootstrap seed is in the report.
+
+What the report shows:
+
+- **The estimand.** Every weighted number is labeled `conditional interval value` (ruling 12). An evaluation unit is an accepted review with a `Positive` or `Negative` label, no failover, and learned evidence of one epoch on every covered decision. This is the same screen that credit uses. A candidate's weight on an interval is the product over its turns of `1[candidate == served] / propensity`, with the propensity that each turn recorded, so one mismatched turn gives weight zero. The estimate is self-normalized. Numbers about the served `rules` route are labeled `factual`.
+- **Candidates.** `learned` is what `live` would have served on each logged turn without exploration: the recorded exploit strategy, else `rules`. Each configured strategy is also shown as a fixed candidate. Each candidate has the support census, the effective sample size, and a bootstrap interval that resamples whole sessions.
+- **The cluster unit.** Sessions are clustered by `SessionId`, the ruled sequence key. A compaction starts a new generation, and a new generation is a new cluster. Every clustered number is labeled `sessions (sequence key)`.
+- **Exclusions.** Intervals excluded by cause (unknown label, failover, no learned row, mixed epoch, other credit revision, a record that does not replay, and a trajectory weight that is not finite), and index members whose mark cannot be read. A weight is not finite when the product of the turns' propensities is so small that its inverse overflows. Such an interval would make every estimate NaN, so it is excluded and counted, never dropped silently.
+- **Measured cost and latency.** Each candidate block shows measured cost: the terminal usage at the rate card that each dispatch recorded. A local dispatch records no rate card, and Roundhouse's own usage estimate leaves cached input at zero, so both are `unpriced`, never $0. The measured p50 first output is from `TurnStarted` to the first output after the served `Routed`, and the line says how many turns had a sample. These lines are shown, not gated.
+- **The promotion summary, staged (owner rulings of 2026-09-29).** A `shadow` project never explores, so the `learned` candidate has weight only where it agreed with `rules`. Comparing that subset with `rules` over every interval would promote by selection alone, so every test compares both sides on one interval set:
+  - Cost: the learned choice and `rules`, each priced on every eligible interval from its recorded plan quote as the M3 corrections left it, labeled `corrected quote estimate`. It must be at least 10% lower. A quote without enough cache samples, or a local quote, is `unpriced`, and the test is then `not evaluable`. When a target's history never predicted reuse, M3 has no ratio to check a predicted discount against. So it prices that quote with no cached tokens, and the report reads that price.
+  - Latency: the p50 of the learned plan's modeled first output from turn start (quote, residual, and overhead, with both terms applied), also a `corrected quote estimate`, against `latency_limit_ms`.
+  - Quality: a paired statistic, only on the intervals where the learned choice was the `rules` route on every turn. The report reads the bootstrap lower bound of the per-interval difference, learned minus `rules`, with both sides summed over the same resampled sessions and the recorded seed. It passes when that bound is at least -0.02. It is `not evaluable` when the agreeing sessions with learned weight are fewer than `quality.min_sessions`, when a side has no weight, or when support is sparse. On these intervals both candidates chose the same route, so they carry the same weight, and the difference is zero in `shadow` and in `live`. So this test cannot show a quality loss. The report prints the share that differed. It also prints the comparison over every interval (the learned lower bound against the `rules` estimate, less 0.02), which reads `not evaluable` unless both sides have logging probability above zero everywhere.
+  - The session count against `quality.min_sessions`, on the sessions that hold an agreeing interval where the learned candidate has weight above zero. In `shadow` this is every session with an agreeing interval. In `live`, a session whose agreeing intervals all explored carries no weight, so it does not count.
+  - The line `promotion to live, staged` is `yes` when cost, latency, and quality on the agreeing intervals pass. The M11 rerun after the first 20 live sessions is the binding quality test, and any failure there reverts the project to `shadow`. A test whose inputs do not exist says `not evaluable` and why, never `pass`. The owner approves each promotion.
+- Judge and classifier spend by strategy stratum (judge side calls record no rate card, so judge dollars are unpriced), the Jev agreement block, and the drift check.
+
+Rollback is a configuration change: name the previous artifact again, or set `mode` back. The previous artifact's bytes give the previous epoch, and the learner store still holds that epoch's counters.
+
 ## Hooking up Codex
 
 `POST /v1/responses` is an OpenAI Responses API surface over the same event

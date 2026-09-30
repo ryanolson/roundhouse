@@ -147,11 +147,17 @@ fn a_reuse_shortfall_keeps_the_effective_write_premium() {
     );
 }
 
-/// No predicted reuse means no ratio, so nothing moves and the record says why.
-/// A local target is never corrected either, even now that a configured
-/// capacity price gives it a nonzero quote (PR 23).
+/// **Covers only the cold quote**: a candidate that itself predicts no
+/// reuse (`matched_prefix_tokens` 0) needs no correction, whatever the
+/// target's own history says — there is no predicted-cached count to
+/// re-price. A *warm* quote on a target with no predicted reuse is a
+/// different case and is corrected; see
+/// `a_predicted_reuse_on_a_target_that_never_predicted_any_is_priced_uncached`.
+/// A thin-sample target and a local target are never corrected either, even
+/// now that a configured capacity price gives the local one a nonzero quote
+/// (PR 23).
 #[test]
-fn zero_predicted_reuse_applies_no_correction() {
+fn a_cold_quote_needs_no_correction_under_no_predicted_reuse() {
     let isl = MTOK;
     let candidate = frontier(sol(), isl, 0.0, 800.0);
     let view = view(
@@ -191,6 +197,85 @@ fn zero_predicted_reuse_applies_no_correction() {
     assert_eq!(cost.correction, CostCorrection::NotFrontier);
     assert!(cost.quoted_usd > 0.0, "a priced local quote is not $0");
     assert_eq!(cost.adjusted_usd, cost.quoted_usd);
+}
+
+/// **No ratio is not a verified discount** (the 2026-09-30 ruling under the
+/// owner's cost rule). A target whose measured pairs never predicted reuse
+/// gives no ratio to scale by, so a quote that predicts reuse on it carries a
+/// cache discount nothing has checked. The correction re-prices it with no
+/// cached tokens, the conservative bound: 100 predicted reads become 100
+/// uncached tokens at the write rate. A quote that predicts no reuse has no
+/// discount to remove, and stands.
+#[test]
+fn a_predicted_reuse_on_a_target_that_never_predicted_any_is_priced_uncached() {
+    let isl = 100 * MTOK;
+    let view = view(
+        vec![ops(&sol(), LatencySum::default(), reuse(0, 0, MIN))],
+        LatencySum::default(),
+    );
+    let ledger = ledger();
+    let corrections = Corrections::new(&view, &ledger, isl, MIN, MIN);
+
+    let warm = corrections.cost(&frontier(sol(), isl, isl as f64, 800.0));
+    assert_eq!(warm.correction, CostCorrection::NoPredictedReuse);
+    assert!(close(warm.quoted_usd, 10.0), "quote is 100 reads");
+    assert!(
+        close(warm.adjusted_usd, 200.0),
+        "the unverified discount must be removed: got {}",
+        warm.adjusted_usd
+    );
+
+    let cold = corrections.cost(&frontier(sol(), isl, 0.0, 800.0));
+    assert_eq!(cold.correction, CostCorrection::NoPredictedReuse);
+    assert_eq!(cold.adjusted_usd, cold.quoted_usd);
+}
+
+/// **The live effect of the reprice (an M4-level check): it can turn
+/// `Admits` into `Exceeds`.** `grant` reads only `CostEvidence::adjusted_usd`
+/// (see its own doc), so a warm quote on a target with no predicted reuse
+/// now grants at the repriced cost, not the quote. A budget sized between
+/// the two — it fits the $10 quote but not the $200 repriced cost — reads
+/// `Exceeds`. Before the 2026-09-30 ruling, `NoPredictedReuse` left
+/// `adjusted_usd == quoted_usd`, and this same budget would have admitted
+/// the candidate.
+#[test]
+fn a_no_predicted_reuse_reprice_can_turn_admits_into_exceeds() {
+    let isl = 100 * MTOK;
+    let candidate = frontier(sol(), isl, isl as f64, 800.0);
+    let view = view(
+        vec![ops(&sol(), LatencySum::default(), reuse(0, 0, MIN))],
+        LatencySum::default(),
+    );
+    let ledger = ledger();
+    let corrections = Corrections::new(&view, &ledger, isl, MIN, MIN);
+
+    let cost = corrections.cost(&candidate);
+    assert_eq!(cost.correction, CostCorrection::NoPredictedReuse);
+    assert!(close(cost.quoted_usd, 10.0), "quote is 100 reads");
+    assert!(
+        close(cost.adjusted_usd, 200.0),
+        "repriced with no cached tokens: got {}",
+        cost.adjusted_usd
+    );
+
+    let budget = TurnBudget::Granted {
+        ceiling_usd: 100.0,
+        state: BudgetState::Unconstrained,
+        on_exhaustion: Exhaustion::DegradeToLocal {
+            overflow_when_local_saturated: false,
+        },
+    };
+    assert!(
+        budget.admits(&Candidate {
+            expected_cost_usd: cost.quoted_usd,
+            ..candidate.clone()
+        }),
+        "the pre-fix, unadjusted cost fits this budget"
+    );
+    assert_eq!(
+        grant(&budget, BudgetState::Unconstrained, &candidate, &cost),
+        GrantCheck::Exceeds
+    );
 }
 
 fn view_with_local_shortfall() -> ReadView {

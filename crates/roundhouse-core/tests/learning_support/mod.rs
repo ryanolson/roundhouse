@@ -22,10 +22,10 @@ use roundhouse_core::event::{
 };
 use roundhouse_core::ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 use roundhouse_core::routing::learn::{
-    ActiveMode, Band, CostCorrection, CostEvidence, EpochId, GateEvidence, GateResult, GrantCheck,
-    LEARNING_CREDIT_REVISION, LEARNING_INPUT_REVISION, LatencyTerm, LearnedChoice, LearnedEvidence,
-    LearnedEvidenceParts, LearnedInput, PlanEvidence, PriorBand, ReadFailure, StoreRead, Strategy,
-    TtftEvidence, Unmet,
+    ActiveMode, Band, CostCorrection, CostEvidence, EpochId, ExplorationEvidence, GateEvidence,
+    GateResult, GrantCheck, LEARNING_CREDIT_REVISION, LEARNING_INPUT_REVISION, LatencyTerm,
+    LearnedChoice, LearnedEvidence, LearnedEvidenceParts, LearnedInput, PlanEvidence, PriorBand,
+    ReadFailure, StoreRead, Strategy, TtftEvidence, Unmet,
 };
 use roundhouse_core::routing::{
     AttemptClass, CacheLedger, Candidate, DecisionRecord, DecisionSource, DispatchAttempt,
@@ -95,6 +95,22 @@ pub struct Spec {
     pub plans: Vec<(Strategy, Target)>,
     /// This dispatch follows a failed one.
     pub failed_before: bool,
+    /// The recorded choice; `None` is the serve-rules turn every other
+    /// fixture writes.
+    pub choice: Option<LearnedChoice>,
+    pub exploration: Option<ExplorationEvidence>,
+    pub propensity: f64,
+    /// Strategies whose plan passed the gate, at the corrected cost given.
+    pub passing: Vec<(Strategy, f64)>,
+    /// Strategies whose recorded quote the M3 terms corrected: the cost
+    /// correction `Applied` at the dollars given, and both latency terms
+    /// `Applied` with the first output given. Every other plan records
+    /// `TooFewSamples`, which a corrected quote estimate cannot use.
+    pub corrected: Vec<(Strategy, f64, f64)>,
+    /// Strategies whose recorded quote is exactly the evidence given, applied
+    /// after `corrected`.
+    pub quotes: Vec<(Strategy, CostEvidence, TtftEvidence)>,
+    pub rate_card: Option<ProviderPricing>,
 }
 
 impl Spec {
@@ -113,7 +129,52 @@ impl Spec {
                 (Strategy::Capable, opus()),
             ],
             failed_before: false,
+            choice: None,
+            exploration: None,
+            propensity: 1.0,
+            passing: Vec::new(),
+            corrected: Vec::new(),
+            quotes: Vec::new(),
+            rate_card: None,
         }
+    }
+
+    pub fn choice(mut self, choice: LearnedChoice) -> Self {
+        self.choice = Some(choice);
+        self
+    }
+
+    pub fn exploration(mut self, exploration: ExplorationEvidence) -> Self {
+        self.exploration = Some(exploration);
+        self
+    }
+
+    pub fn propensity(mut self, propensity: f64) -> Self {
+        self.propensity = propensity;
+        self
+    }
+
+    pub fn passing(mut self, strategy: Strategy, adjusted_usd: f64) -> Self {
+        self.passing.push((strategy, adjusted_usd));
+        self
+    }
+
+    /// `strategy`'s plan quoted at `usd` and `first_output_ms`, with every M3
+    /// term applied.
+    pub fn corrected(mut self, strategy: Strategy, usd: f64, first_output_ms: f64) -> Self {
+        self.corrected.push((strategy, usd, first_output_ms));
+        self
+    }
+
+    /// `strategy`'s plan recorded with exactly `cost` and `ttft`.
+    pub fn quote(mut self, strategy: Strategy, cost: CostEvidence, ttft: TtftEvidence) -> Self {
+        self.quotes.push((strategy, cost, ttft));
+        self
+    }
+
+    pub fn rate_card(mut self, card: ProviderPricing) -> Self {
+        self.rate_card = Some(card);
+        self
     }
 
     pub fn input(mut self, input: LearnedInput) -> Self {
@@ -161,7 +222,35 @@ impl Spec {
         let plans = self
             .plans
             .iter()
-            .map(|(strategy, first)| plan(*strategy, first.clone()))
+            .map(|(strategy, first)| {
+                let mut plan = plan(*strategy, first.clone());
+                if let Some((_, usd)) = self.passing.iter().find(|(pass, _)| pass == strategy) {
+                    plan.gate.result = GateResult::Pass;
+                    plan.cost.adjusted_usd = *usd;
+                }
+                if let Some((_, usd, ms)) =
+                    self.corrected.iter().find(|(named, ..)| named == strategy)
+                {
+                    plan.cost = CostEvidence {
+                        quoted_usd: *usd,
+                        adjusted_usd: *usd,
+                        correction: CostCorrection::Applied,
+                    };
+                    plan.ttft = TtftEvidence {
+                        quoted_ms: *ms,
+                        adjusted_ms: *ms,
+                        residual: LatencyTerm::Applied { mean_ms: 0 },
+                        overhead: LatencyTerm::Applied { mean_ms: 0 },
+                    };
+                }
+                if let Some((_, cost, ttft)) =
+                    self.quotes.iter().find(|(named, ..)| named == strategy)
+                {
+                    plan.cost = *cost;
+                    plan.ttft = *ttft;
+                }
+                plan
+            })
             .collect();
         let evidence = LearnedEvidence::new(LearnedEvidenceParts {
             mode: self.mode,
@@ -175,17 +264,21 @@ impl Spec {
             recipe,
             plans,
             // The serve-rules turn: `rules` served, in either mode.
-            choice: LearnedChoice::ConstraintUnmet {
-                unmet: vec![Unmet::ReadTimedOut],
-            },
-            exploration: None,
-            propensity: 1.0,
+            choice: self
+                .choice
+                .clone()
+                .unwrap_or(LearnedChoice::ConstraintUnmet {
+                    unmet: vec![Unmet::ReadTimedOut],
+                }),
+            exploration: self.exploration.clone(),
+            propensity: self.propensity,
         })
         .expect("a fixture record with a rules plan");
         let mut decision = decision(
             self.chosen.clone(),
             Some(SelectorSnapshot::learned(evidence)),
         );
+        decision.rate_card = self.rate_card;
         if self.failed_before {
             decision.attempts = vec![DispatchAttempt {
                 target: haiku(),
@@ -365,8 +458,17 @@ impl Script {
     }
 
     pub fn with(principal: Option<Principal>, arm: Option<Arm>) -> Self {
+        Self::named_with("acme/ada/learning", principal, arm)
+    }
+
+    /// A session of `acme/ada` in the judge-consulting shadow arm, under `id`.
+    pub fn named(id: &str) -> Self {
+        Self::named_with(id, Some(Principal::new("acme", "ada")), Some(Arm::Shadow))
+    }
+
+    pub fn named_with(id: &str, principal: Option<Principal>, arm: Option<Arm>) -> Self {
         let mut script = Self {
-            session: SessionId::new("acme/ada/learning"),
+            session: SessionId::new(id),
             events: Vec::new(),
             clock: 1_000,
             turns: 0,
