@@ -139,7 +139,8 @@ pub(super) struct Counters {
     /// consumer that needs the split.
     pub(super) seat_estimated_calls: u64,
     /// Summed over locally-served turns: the cheapest frontier option the
-    /// router had quoted at the moment it chose local.
+    /// router had quoted at the moment it chose local, less the local quote it
+    /// chose — see [`DecisionRecord::quoted_routing_saving_usd`].
     ///
     /// Only over turns whose decision recorded [`Billing::Billed`]. The figure
     /// is a *saving*, and a saving is money this deployment would otherwise
@@ -148,7 +149,7 @@ pub(super) struct Counters {
     /// roundhouse with somebody else's economy.
     ///
     /// [`Billing::Billed`]: crate::control::Billing::Billed
-    pub(super) quoted_alternative_usd: f64,
+    pub(super) quoted_saving_usd: f64,
     /// How many of [`Self::calls`] this deployment made for its own purposes.
     ///
     /// A *subset* of `calls`, not an addition to it: the tokens are in the
@@ -313,7 +314,7 @@ impl Counters {
         self.billed.absorb(&other.billed);
         self.seat.absorb(&other.seat);
         self.seat_estimated_calls += other.seat_estimated_calls;
-        self.quoted_alternative_usd += other.quoted_alternative_usd;
+        self.quoted_saving_usd += other.quoted_saving_usd;
         self.side_calls += other.side_calls;
         self.abandoned_side_calls += other.abandoned_side_calls;
         self.failed_attempts += other.failed_attempts;
@@ -371,9 +372,10 @@ pub struct SideCallTally {
 /// A dispatch waiting for its response to terminate.
 struct Pending {
     key: ModelKey,
-    /// `None` when the chosen target was itself a frontier model, or when no
-    /// frontier was quoted at all.
-    best_frontier_alternative_usd: Option<f64>,
+    /// The router's own saving for a local choice: cheapest hosted quote less
+    /// the local quote. `None` when the chosen target was itself a frontier
+    /// model, or when no frontier was quoted at all.
+    quoted_saving_usd: Option<f64>,
     /// Whether roundhouse may price what this dispatch consumes, as the
     /// decision recorded it.
     ///
@@ -727,11 +729,12 @@ impl MetricsFold {
                     Pending {
                         key: ModelKey::from_target(&decision.chosen),
                         // The road not taken, priced by the router at the
-                        // moment it chose. On the record rather than here
-                        // because the Relay emission reads the same number per
-                        // turn, and a `min` spelled twice would agree until one
-                        // copy learned about a new candidate kind.
-                        best_frontier_alternative_usd: decision.quoted_frontier_alternative_usd(),
+                        // moment it chose, less the local quote it took. On
+                        // the record rather than here because the Relay
+                        // emission reads the same number per turn, and a
+                        // `min` spelled twice would agree until one copy
+                        // learned about a new candidate kind.
+                        quoted_saving_usd: decision.quoted_routing_saving_usd(),
                         billing: decision.billing,
                         isl_tokens: decision.isl_tokens,
                         expected_prefill_tokens: decision.expected_prefill_tokens,
@@ -865,12 +868,7 @@ impl MetricsFold {
                     return true;
                 }
 
-                settle(
-                    counters,
-                    usage,
-                    pending.best_frontier_alternative_usd,
-                    pending.billing,
-                );
+                settle(counters, usage, pending.quoted_saving_usd, pending.billing);
                 // What the decision expected of the cache against what the
                 // provider reported, booked behind the same evidence gate the
                 // call itself is: a dispatch that reached nobody observed
@@ -1216,7 +1214,7 @@ impl MetricsFold {
 fn settle(
     counters: &mut Counters,
     usage: &Usage,
-    best_frontier_alternative_usd: Option<f64>,
+    quoted_saving_usd: Option<f64>,
     billing: Billing,
 ) {
     counters.calls += 1;
@@ -1237,8 +1235,8 @@ fn settle(
     // A counterfactual is a saving only if the money it stands in for would
     // have been ours — the same predicate the pot above turns on, asked of the
     // road not taken.
-    if let Some(alternative) = best_frontier_alternative_usd.filter(|_| billing.is_billable()) {
-        counters.quoted_alternative_usd += alternative;
+    if let Some(saving) = quoted_saving_usd.filter(|_| billing.is_billable()) {
+        counters.quoted_saving_usd += saving;
     }
 }
 
@@ -1429,6 +1427,22 @@ pub(super) mod tests {
                 } = &mut event.kind
                 {
                     *slot = Some(provider_reported_cost_usd);
+                    break;
+                }
+            }
+            self
+        }
+
+        /// Rewrite the last decision's own quote for the target it chose.
+        ///
+        /// Every other fixture records `0.0`, which is what a local turn
+        /// quoted before a catalog could price local capacity. A test about
+        /// a priced local quote says so here rather than through a defaulted
+        /// argument on `turn`.
+        pub(crate) fn quoted(&mut self, expected_cost_usd: f64) -> &mut Self {
+            for event in self.events.iter_mut().rev() {
+                if let SessionEventKind::Routed { decision, .. } = &mut event.kind {
+                    decision.expected_cost_usd = expected_cost_usd;
                     break;
                 }
             }
@@ -1877,7 +1891,7 @@ pub(super) mod tests {
              reports as measured what a tenant reports as estimated"
         );
         assert_eq!(merged.estimated_usage().output_tokens, 200);
-        assert!((merged.quoted_alternative_usd - 0.05).abs() < 1e-12);
+        assert!((merged.quoted_saving_usd - 0.05).abs() < 1e-12);
         assert_eq!(
             (merged.side_calls, merged.abandoned_side_calls),
             (0, 0),

@@ -83,7 +83,14 @@
     "and records fleet_timeout or fleet_error. Zero is refused at load. A turn is not",
     "held to the bound when it cannot fail open -- its policy admits only local",
     "targets, no credential reaches any hosted provider, or its cadence is spent --",
-    "and it waits for the turn deadline and still fails with the fleet."
+    "and it waits for the turn deadline and still fails with the fleet.",
+    "local_capacity_price is optional and absent here: { \"input_per_mtok_usd\": ...,",
+    "\"output_per_mtok_usd\": ... } is what your own GPU time is worth per million",
+    "uncached prompt tokens and per million output tokens. With it the router quotes",
+    "local turns at that price (matched local tokens are free) and the dashboard",
+    "reports local capacity spend and a routing saving net of it. Without it local",
+    "quotes $0 and the dashboard marks local cost unpriced, never free. An estimate",
+    "is fine; one that makes local look cheaper than it is is not."
   ],
 
   "providers": {

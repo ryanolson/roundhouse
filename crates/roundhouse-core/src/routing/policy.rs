@@ -792,10 +792,10 @@ mod tests {
     #[tokio::test]
     async fn a_zero_grant_excludes_frontier_and_admits_local_with_no_special_case() {
         // The whole of degrade-to-local, and the reason it needed no branch:
-        // local candidates are priced at zero dollars, so `expected_cost_usd <=
-        // ceiling` with a ceiling of zero excludes every hosted option and
-        // admits every local one through the same comparison every other
-        // candidate goes through.
+        // `TurnBudget::admits` admits a local candidate by target and a hosted
+        // one when `expected_cost_usd <= ceiling`, so a ceiling of zero
+        // excludes every hosted option and admits every local one in the same
+        // admissibility pass every other candidate goes through.
         //
         // The candidate set is the one from `a_warm_frontier_beats_a_cold_local_worker`,
         // chosen because the router *wants* the hosted model here: it is

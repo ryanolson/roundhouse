@@ -195,6 +195,7 @@ fn a_model_row_cannot_contradict_its_own_serving_mode() {
         },
         seat_tokens: Default::default(),
         seat_estimated_calls: 0,
+        capacity_usd: None,
     };
     let row = roundhouse_core::metrics::ModelMetrics {
         provider: "dynamo".into(),

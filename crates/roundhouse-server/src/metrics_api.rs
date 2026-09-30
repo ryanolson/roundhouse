@@ -654,6 +654,197 @@ mod tests {
         );
     }
 
+    /// One local turn with a hosted alternative quoted, so the local capacity
+    /// figures have a row to be about.
+    fn recorder_with_a_local_turn() -> Arc<MetricsRecorder> {
+        let recorder = Arc::new(MetricsRecorder::new());
+        let session_id = SessionId::new("s1");
+        let response_id = ResponseId::new("r1");
+        let hosted = Target::Frontier {
+            provider: "anthropic".into(),
+            model: "claude".into(),
+        };
+        recorder.record(&[
+            SessionEvent {
+                seq: 1,
+                session_id: session_id.clone(),
+                at_ms: 1_000,
+                kind: SessionEventKind::Routed {
+                    response_id: response_id.clone(),
+                    decision: DecisionRecord {
+                        block_marker: None,
+                        selection: None,
+                        local_quote_skipped: None,
+                        chosen: Target::Local {
+                            worker_id: 1,
+                            dp_rank: 0,
+                            model: "llama".into(),
+                        },
+                        rationale: "test".into(),
+                        policy: "test".into(),
+                        isl_tokens: 10_000,
+                        expected_prefill_tokens: 10_000.0,
+                        expected_cost_usd: 0.0,
+                        considered: vec![roundhouse_core::routing::Candidate {
+                            target: hosted,
+                            expected_prefill_tokens: 10_000.0,
+                            matched_prefix_tokens: 0,
+                            expected_ttft_ms: 300.0,
+                            expected_cost_usd: 0.04,
+                            quality_prior: 0.6,
+                            load: None,
+                        }],
+                        turn_policy_digest: String::new(),
+                        budget_state: BudgetState::Unconstrained,
+                        rate_card: None,
+                        payer: Default::default(),
+                        billing: Default::default(),
+                        budget_draw: None,
+                        withheld_providers: Vec::new(),
+                        declared_baseline: None,
+                        attempts: Vec::new(),
+                    },
+                },
+            },
+            SessionEvent {
+                seq: 2,
+                session_id,
+                at_ms: 1_100,
+                kind: SessionEventKind::ResponseCompleted {
+                    response_id,
+                    usage: Usage {
+                        input_tokens: 10_000,
+                        output_tokens: 500,
+                        ..Default::default()
+                    },
+                    provider_reported_cost_usd: None,
+                    stop_reason: None,
+                },
+            },
+        ]);
+        recorder
+    }
+
+    async fn document(config: Arc<MetricsConfig>) -> serde_json::Value {
+        let app = metrics_router(ControlPlane::open(), recorder_with_a_local_turn(), config);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The local row of a served document's `models` or `providers` table.
+    fn local_row<'a>(document: &'a serde_json::Value, table: &str) -> &'a serde_json::Value {
+        document[table]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["mode"] == "local")
+            .unwrap_or_else(|| {
+                panic!("the fixture serves a local turn, so `{table}` has a local row")
+            })
+    }
+
+    /// **The page renders local capacity spend when priced, and says local is
+    /// unpriced when not** (ruling 6, 2026-09-28).
+    ///
+    /// `field_paths` only scans `data.evaluation.` and `data.observed_cost.`,
+    /// so the top-level price and the savings field are named here. Both
+    /// documents are fetched, because each field has a branch that matters:
+    /// a page that read `local_capacity_usd` only when present would print
+    /// `$NaN` or nothing in the other.
+    ///
+    /// The model and provider tables are checked each in its own renderer, not
+    /// against the page as a whole: one table reading `capacity_usd` would
+    /// otherwise satisfy the check for both, and the other would go on showing
+    /// only what local traffic avoided — which reads as free.
+    #[tokio::test]
+    async fn the_dashboard_reads_local_capacity_in_both_states() {
+        let priced = document(Arc::new((*config()).clone().with_local_capacity_price(
+            roundhouse_core::routing::LocalCapacityPrice {
+                input_per_mtok_usd: 0.5,
+                output_per_mtok_usd: 2.0,
+            },
+        )))
+        .await;
+        assert_eq!(priced["local_capacity_price"]["input_per_mtok_usd"], 0.5);
+        assert_eq!(priced["local_capacity_price"]["output_per_mtok_usd"], 2.0);
+        let capacity = 10_000.0 * 0.5e-6 + 500.0 * 2.0e-6;
+        let spend = priced["savings"]["local_capacity_usd"].as_f64().unwrap();
+        assert!((spend - capacity).abs() < 1e-12, "{spend}");
+        assert!(priced["observed_cost"]["local_capacity_usd"].is_number());
+        assert_eq!(priced["observed_cost"]["serving_gaps"]["local_calls"], 0);
+        for table in ["models", "providers"] {
+            let row = local_row(&priced, table);
+            let row_spend = row["capacity_usd"].as_f64().unwrap_or_else(|| {
+                panic!("a priced local `{table}` row publishes its capacity: {row}")
+            });
+            assert!((row_spend - capacity).abs() < 1e-12, "{row}");
+        }
+
+        let unpriced = document(config()).await;
+        assert!(
+            unpriced.as_object().unwrap()["local_capacity_price"].is_null(),
+            "an unpriced document publishes the price as `null`"
+        );
+        assert!(unpriced["savings"]["local_capacity_usd"].is_null());
+        assert!(unpriced["observed_cost"]["local_capacity_usd"].is_null());
+        assert_eq!(unpriced["observed_cost"]["serving_gaps"]["local_calls"], 1);
+        for table in ["models", "providers"] {
+            let row = local_row(&unpriced, table);
+            assert!(
+                row.as_object().unwrap()["capacity_usd"].is_null(),
+                "an unpriced local `{table}` row publishes `null`, never a zero: {row}"
+            );
+        }
+
+        // "Priced" is derived from the price on the page, not served beside it.
+        for document in [&priced, &unpriced] {
+            assert!(document.get("local_capacity_priced").is_none());
+        }
+        assert!(
+            !DASHBOARD_HTML.contains("local_capacity_priced"),
+            "the page reads a field the document no longer publishes, so every \
+             deployment would read as unpriced"
+        );
+
+        for field in [
+            "data.local_capacity_price",
+            "data.savings.local_capacity_usd",
+            "data.observed_cost.local_capacity_usd",
+        ] {
+            assert!(
+                DASHBOARD_HTML.contains(field),
+                "the page must render `{field}`, or local reads as free"
+            );
+        }
+        assert!(
+            function_body(DASHBOARD_HTML, "renderEvaluation")
+                .contains("data.observed_cost.local_capacity_usd"),
+            "the combined cost note must name its local capacity component"
+        );
+        for (renderer, field) in [
+            ("renderModels", "m.capacity_usd"),
+            ("renderProviders", "p.capacity_usd"),
+            ("renderModes", "m.capacity_usd"),
+        ] {
+            assert!(
+                function_body(DASHBOARD_HTML, renderer).contains(field),
+                "`{renderer}` must render `{field}` beside what local avoided, or \
+                 its table reads local serving as free"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_dashboard_is_self_contained() {
         let (status, content_type, body) = get("/v1/metrics/dashboard").await;

@@ -83,12 +83,14 @@ pub fn candidate(target: Target, expected_cost_usd: f64) -> Candidate {
 
 /// A decision a turn was routed on.
 pub fn decision(chosen: Target, considered: Vec<Candidate>) -> DecisionRecord {
-    // A local dispatch bills nothing, so it records no card -- exactly as the
-    // engine writes it.
-    let rate_card = if chosen.is_local() {
-        None
+    // A local dispatch bills nothing, so it records no card, and with no
+    // `local_capacity_price` the router quoted it at zero dollars -- exactly as
+    // the engine writes it. A nonzero local quote here would net the
+    // at-decision saving of every unpriced fixture.
+    let (rate_card, expected_cost_usd) = if chosen.is_local() {
+        (None, 0.0)
     } else {
-        Some(HOSTED)
+        (Some(HOSTED), 0.01)
     };
     DecisionRecord {
         block_marker: None,
@@ -101,7 +103,7 @@ pub fn decision(chosen: Target, considered: Vec<Candidate>) -> DecisionRecord {
         policy: "affinity".into(),
         isl_tokens: 1_000,
         expected_prefill_tokens: 1_000.0,
-        expected_cost_usd: 0.01,
+        expected_cost_usd,
         considered,
         turn_policy_digest: "0123456789abcdef".into(),
         budget_state: BudgetState::Unconstrained,

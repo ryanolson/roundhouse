@@ -672,11 +672,13 @@ impl TurnPolicy {
     /// was supposed to constrain, and every turn would be affordable by
     /// construction.
     ///
-    /// Hosted only, because a local candidate is priced at zero and asking for
-    /// zero more dollars is asking for nothing. Zero is therefore also the
-    /// honest answer for a turn with no hosted option at all — a local-only
-    /// key requests nothing and receives a ceiling that still admits every
-    /// local candidate through the same comparison.
+    /// Hosted only, because a local candidate's quote — zero, or its
+    /// configured capacity price — is GPU time the deployment owns, not money
+    /// the ledger grants. Zero is therefore also the honest answer for a turn
+    /// with no hosted option at all — a local-only key requests nothing and
+    /// receives a ceiling that still admits every local candidate, since
+    /// [`TurnBudget::admits`](super::TurnBudget::admits) admits local by
+    /// target.
     ///
     /// A fold over [`Self::admits`] rather than a second opinion about
     /// admissibility: what the ledger reserves and what the router may then
@@ -1005,9 +1007,9 @@ mod tests {
             "the control: the same cadence with the window open reserves in full"
         );
 
-        // Local is priced at zero and asking for zero more dollars is asking
-        // for nothing, so a local-only pool requests nothing — which still
-        // yields a ceiling every local candidate clears.
+        // Local capacity is not budget money, so a local-only pool requests
+        // nothing — and the budget admits local by target, so every local
+        // candidate clears the zero ceiling that yields.
         assert_eq!(
             TurnPolicy::unrestricted().dearest_admissible_frontier_usd(&[worker], &empty),
             0.0

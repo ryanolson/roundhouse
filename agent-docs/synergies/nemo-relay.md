@@ -537,3 +537,5 @@ model_provider=` override onto codex's argv that outranks the generated
 `config.toml` (`research/nemo-relay-0.8.0-published-read.md` §A.14), so a
 chained Codex turn arrives credential-less until Relay's upstream-layer
 carrier is used for it.
+
+**Addendum (2026-09-28, local capacity price):** a fifth limitation exists, `roundhouse_local_capacity_unpriced`. A billed local turn on a deployment whose catalog sets no `local_capacity_price` publishes no `actual_cost`, because unpriced capacity is unknown, not free, and this limitation says so. The capability gate alone could not: every local turn carries it, priced or not. A priced local turn publishes its capacity cost as `actual_cost` and carries no such limitation. See `crates/roundhouse-relay/src/summary.rs`.

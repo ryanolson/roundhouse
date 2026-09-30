@@ -21,6 +21,24 @@
 //! to what a turn cost, and the day a rate card was corrected the two would
 //! disagree about the same turn.
 //!
+//! **Local capacity is the one price read from the booted catalog**, because
+//! that is where the dashboard reads it. When the catalog sets a
+//! `local_capacity_price`, a local turn's `actual_cost` is
+//! `LocalCapacityPrice::price` over its usage, published under
+//! `pricing_provider: "roundhouse_local_capacity_price"`, and its
+//! `estimated_cost_saved` is the counterfactual less that cost — the
+//! dashboard's `local_capacity_usd` and net `routing_savings_usd` for the one
+//! turn, unclamped like them. The price is read off the snapshot
+//! ([`MetricsSnapshot::local_capacity_price`]), which the binary builds from
+//! the same [`MetricsConfig`] it hands `/v1/metrics`. Without a price, a local turn publishes no
+//! `actual_cost` at all, the way the dashboard publishes `null` for unpriced
+//! capacity: a zero here would read as free hardware, which is the one claim
+//! the owner's rule forbids. Its saving is still the whole counterfactual,
+//! and it carries the `roundhouse_local_capacity_unpriced` limitation, which
+//! says the cost is missing rather than zero. The payload's
+//! `routing_savings_at_decision_usd` is the router's hosted quote less its own
+//! local quote, the dashboard's figure of that name.
+//!
 //! **The capability gate's outcome is carried, never recomputed.** Which hosted
 //! model a local one may be priced against was decided in
 //! `metrics::pricing`; this module publishes the band it used and the basis it
@@ -80,7 +98,7 @@ use roundhouse_core::metrics::{
     Correlary, MetricsConfig, MetricsFold, MetricsSnapshot, ModelKey, PricedBasis, Scope,
     TokenBreakdown,
 };
-use roundhouse_core::routing::{ProviderPricing, Target};
+use roundhouse_core::routing::{LocalCapacityPrice, ProviderPricing, Target};
 use serde::Serialize;
 
 use crate::PRODUCER;
@@ -92,6 +110,15 @@ use crate::replay::{SessionReplay, TurnRecord};
 /// and the spend ledger is a USD ledger, so a configurable currency here would
 /// be a label over unconverted numbers.
 const CURRENCY: &str = "USD";
+
+/// The `pricing_provider` a local turn's capacity cost is published under.
+///
+/// Not the serving provider's name (`dynamo`): nobody quoted this price. It is
+/// the deployment's own `local_capacity_price` from its catalog, and a
+/// consumer reading `pricing_provider: "dynamo"` beside `ModelPricing` would
+/// take it for a vendor's rate card. Named for the catalog field so an operator
+/// can find the number it came from.
+const LOCAL_CAPACITY_PRICING_PROVIDER: &str = "roundhouse_local_capacity_price";
 
 /// What the deployment's pricing configuration says about one turn's
 /// counterfactual.
@@ -107,6 +134,9 @@ pub struct Baseline<'a> {
     /// actually happened.
     pub correlary: Option<&'a Correlary>,
     pub capability_band: f64,
+    /// What a local turn's capacity costs, or `None` when the catalog sets no
+    /// price. The same value the dashboard prices local capacity at.
+    pub local_capacity_price: Option<LocalCapacityPrice>,
 }
 
 /// Every local model's correlary, resolved once for a session.
@@ -120,6 +150,7 @@ pub struct Baseline<'a> {
 pub struct Baselines {
     by_local_model: BTreeMap<String, Correlary>,
     capability_band: f64,
+    local_capacity_price: Option<LocalCapacityPrice>,
 }
 
 impl Baselines {
@@ -133,7 +164,12 @@ impl Baselines {
         Self::from_snapshot(&MetricsSnapshot::build(&fold, Scope::Deployment, config, 0))
     }
 
-    /// Read the correlaries out of a snapshot somebody else already built.
+    /// Read the correlaries and the local capacity price out of a snapshot
+    /// somebody else already built.
+    ///
+    /// Everything comes off the snapshot, the price included, so the price a
+    /// local turn is published at is the one the snapshot's own dollars were
+    /// priced at.
     pub fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
         let mut by_local_model = BTreeMap::new();
         for row in &snapshot.models {
@@ -144,6 +180,7 @@ impl Baselines {
         Self {
             by_local_model,
             capability_band: snapshot.capability_band,
+            local_capacity_price: snapshot.local_capacity_price,
         }
     }
 
@@ -155,6 +192,7 @@ impl Baselines {
                 .then(|| self.by_local_model.get(target.model()))
                 .flatten(),
             capability_band: self.capability_band,
+            local_capacity_price: self.local_capacity_price,
         }
     }
 }
@@ -185,11 +223,18 @@ pub struct RoutingEvidence {
     /// Not smaller or larger than the truth — unknown, since a tokenizer
     /// mismatch cuts either way.
     pub billed_estimated_usd: f64,
-    /// What the router itself quoted for the best hosted alternative at the
-    /// moment it chose local — an independent estimate of the same
-    /// counterfactual `estimated_cost_saved` carries, deliberately not added to
+    /// What choosing local saved by the router's own quotes at the moment it
+    /// chose: the cheapest hosted quote less the local quote the turn was
+    /// served on ([`DecisionRecord::quoted_routing_saving_usd`]), the figure
+    /// the dashboard sums under the same name. An independent estimate of the
+    /// same saving `estimated_cost_saved` carries, deliberately not added to
     /// it. Two estimates built from different inputs should land near each
-    /// other; when they do not, one of the two models is wrong.
+    /// other; when they do not, one of the two models is wrong — except on a
+    /// turn quoted at a different capacity price, or at none (a gross $0 local
+    /// quote), while `estimated_cost_saved` is net at the current price: they
+    /// then differ by the difference in capacity cost.
+    ///
+    /// [`DecisionRecord::quoted_routing_saving_usd`]: roundhouse_core::routing::DecisionRecord::quoted_routing_saving_usd
     pub routing_savings_at_decision_usd: Option<f64>,
     /// Thinking tokens, which are a component of `completion_tokens` rather than
     /// an addition to them and have no Relay field of their own.
@@ -210,7 +255,11 @@ pub struct RoutingEvidence {
 
 impl LlmOptimizationPayload for RoutingEvidence {
     const SCHEMA_NAME: &'static str = "roundhouse/routing";
-    const SCHEMA_VERSION: &'static str = "1";
+    /// `2` since the local capacity price: `routing_savings_at_decision_usd`
+    /// is the hosted quote less the router's own quote (net), where `1`
+    /// published the hosted quote alone (gross). Relay's consumers keep
+    /// unknown keys, so only a change of meaning bumps this.
+    const SCHEMA_VERSION: &'static str = "2";
 }
 
 /// Every turn's summary, for one session.
@@ -255,15 +304,24 @@ pub fn for_decision(turn: &TurnRecord, baseline: &Baseline<'_>) -> Option<LlmOpt
 
     let limitations = limitations(turn, baseline);
     let priced_reference = baseline.correlary.and_then(Correlary::reference);
-    let hosted_cost = hosted_cost(local, billed, card, usage);
+    let capacity_cost = capacity_cost(local, baseline.local_capacity_price, usage);
+    let actual_cost = actual_cost(local, billed, card, capacity_cost, usage);
     let shadow_cost = shadow_cost(local, billed, baseline.correlary, usage);
 
     // A hosted turn has no counterfactual model, so the only saving that exists
     // on it is the discount the provider's own cache applied — measured, from
     // the cache-read tokens it reported and the gap between its two published
-    // rates. A local turn's saving is the counterfactual itself.
+    // rates. A local turn's saving is the counterfactual less what the turn
+    // cost our own fleet at the catalog's capacity price, the dashboard's
+    // `routing_savings_usd` for this one turn. Not clamped at zero, the same as
+    // the dashboard: a local turn dearer than its stand-in is a loss, and
+    // publishing it as nothing saved would make the route look cheaper than it
+    // is. With no stand-in there is no saving to net, so none is published.
     let saved = match local {
-        true => shadow_cost,
+        true => shadow_cost.map(|shadow| match capacity_cost {
+            Some(capacity) => shadow - capacity,
+            None => shadow,
+        }),
         false => card
             .filter(|_| billed)
             .map(|card| card.cache_savings(usage)),
@@ -271,7 +329,11 @@ pub fn for_decision(turn: &TurnRecord, baseline: &Baseline<'_>) -> Option<LlmOpt
 
     Some(LlmOptimizationSummary {
         schema_version: "1".to_string(),
-        calculation_version: "1".to_string(),
+        // `2` since the local capacity price: a priced local turn's saving is
+        // net of its capacity cost, and an unpriced one publishes no
+        // `actual_cost`. The document's shape did not change, so
+        // `schema_version` stays `1`.
+        calculation_version: "2".to_string(),
         // Derived, never chosen: see the module documentation.
         status: status(&limitations),
         limitations,
@@ -310,15 +372,20 @@ pub fn for_decision(turn: &TurnRecord, baseline: &Baseline<'_>) -> Option<LlmOpt
             pricing_as_of: None,
             pricing_source: None,
         }),
-        actual_cost: hosted_cost.map(|total| CostEstimate {
+        actual_cost: actual_cost.map(|total| CostEstimate {
             total: Some(total),
             currency: CURRENCY.to_string(),
             input: None,
             output: None,
             cache_read: None,
             cache_write: None,
+            // Our arithmetic in both arms: a hosted rate card, or a
+            // configured capacity price. Unpriced local publishes none.
             source: CostSource::ModelPricing,
-            pricing_provider: Some(key.provider.clone()),
+            pricing_provider: Some(match capacity_cost {
+                Some(_) => LOCAL_CAPACITY_PRICING_PROVIDER.to_string(),
+                None => key.provider.clone(),
+            }),
             pricing_model: Some(key.model.clone()),
             pricing_as_of: None,
             pricing_source: None,
@@ -360,14 +427,27 @@ fn limitations(turn: &TurnRecord, baseline: &Baseline<'_>) -> Vec<String> {
             baseline.capability_band
         ));
     }
-    // Not in the ruling's three, and added because omitting it would make the
-    // status field lie: a forwarded seat publishes no cost of any kind, and a
-    // summary with no money in it and `status: Complete` claims every requested
-    // calculation was available.
-    if let Some(decision) = turn.decision()
-        && !decision.billing.is_billable()
-    {
-        limitations.push("roundhouse_seat_forwarded".to_string());
+    // Not in the ruling's three either, and for the seat's reason below: an
+    // unpriced local turn publishes no `actual_cost`, because unpriced capacity
+    // is unknown, not free. Without a name for that gap the only limitation on
+    // it would be the capability gate, which every local turn carries priced
+    // or not, so nothing on the document would say the cost is missing rather
+    // than zero. A seat's turn is left to its own entry: it publishes no cost
+    // of any kind, priced or not.
+    if let Some(decision) = turn.decision() {
+        if baseline.local_capacity_price.is_none()
+            && decision.chosen.is_local()
+            && decision.billing.is_billable()
+        {
+            limitations.push("roundhouse_local_capacity_unpriced".to_string());
+        }
+        // Not in the ruling's three, and added because omitting it would make
+        // the status field lie: a forwarded seat publishes no cost of any
+        // kind, and a summary with no money in it and `status: Complete`
+        // claims every requested calculation was available.
+        if !decision.billing.is_billable() {
+            limitations.push("roundhouse_seat_forwarded".to_string());
+        }
     }
     limitations
 }
@@ -408,25 +488,55 @@ fn shadow_cost(
     }
 }
 
-/// What this turn actually billed, where roundhouse may say.
+/// What this local turn cost our own fleet at the catalog's
+/// `local_capacity_price`, or `None` when the catalog sets no price or the turn
+/// is hosted.
 ///
-/// A local dispatch bills nothing and says so with a measured zero — which is
-/// what makes the summary's own arithmetic close, `baseline - actual` being the
-/// routing saving. A forwarded seat and a turn with no recorded rate card both
-/// answer `None`: the first because there is no bill of ours to name, the second
-/// because a log written before the card travelled in it can no longer be priced
-/// from the log alone.
-fn hosted_cost(
+/// `LocalCapacityPrice::price`, the arithmetic the dashboard's capacity spend
+/// is, over this turn's usage. The price is the catalog's current one, as the
+/// dashboard's is, and not a figure the decision recorded: the decision's own
+/// local quote is an estimate over expected tokens, and this is the measured
+/// turn.
+///
+/// A forwarded seat's turn is not refused here: both readers — [`actual_cost`]
+/// and the saving, which needs a shadow cost — already answer `None` for it, so
+/// a second check here would be one nothing could observe.
+fn capacity_cost(local: bool, price: Option<LocalCapacityPrice>, usage: &Usage) -> Option<f64> {
+    local
+        .then_some(price)
+        .flatten()
+        .map(|price| price.price(usage))
+}
+
+/// What this turn actually cost, where roundhouse may say.
+///
+/// Three answers on a billed turn: a hosted turn costs its recorded rate card's
+/// price; a priced local turn costs its capacity cost; an unpriced local turn
+/// answers `None`, because unpriced capacity is unknown, not free. A forwarded
+/// seat and a hosted turn with no recorded rate card also answer `None`: the
+/// first because there is no bill of ours to name, the second because a log
+/// written before the card travelled in it can no longer be priced from the log
+/// alone.
+///
+/// The summary's own arithmetic, `baseline - actual = saved`, closes only on a
+/// local turn that publishes both `baseline_cost` and `actual_cost` — a priced
+/// local turn with a priced stand-in. An unpriced local turn publishes a gross
+/// saving with no `actual_cost` to close against; a priced local turn with no
+/// stand-in publishes a cost and no saving; and a hosted turn's saving is its
+/// cache discount, with no baseline at all.
+fn actual_cost(
     local: bool,
     billed: bool,
     card: Option<ProviderPricing>,
+    capacity_cost: Option<f64>,
     usage: &Usage,
 ) -> Option<f64> {
     if !billed {
         return None;
     }
     match local {
-        true => Some(0.0),
+        // Unpriced capacity is unknown, not free. See the module doc.
+        true => capacity_cost,
         false => card.map(|card| card.price(usage)),
     }
 }
@@ -471,7 +581,7 @@ fn contribution(
         billed_measured_usd: if measured { price } else { 0.0 },
         billed_estimated_usd: if measured { 0.0 } else { price },
         routing_savings_at_decision_usd: decision
-            .and_then(|decision| decision.quoted_frontier_alternative_usd())
+            .and_then(|decision| decision.quoted_routing_saving_usd())
             .filter(|_| billed),
         reasoning_tokens: turn.usage.reasoning_tokens,
         seat_tokens: (!billed).then_some(*tokens),
@@ -590,455 +700,4 @@ fn measured_cache_write(usage: &Usage) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::fixtures::{self, HOSTED, Log};
-    use roundhouse_core::control::Billing;
-    use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
-    use serde_json::Value;
-
-    /// A deployment that has declared what its local model stands in for.
-    ///
-    /// Declared rather than inferred, because inference needs an observed shape
-    /// for the hosted candidate and the point of most of these fixtures is a
-    /// session that never called one.
-    fn declared() -> MetricsConfig {
-        MetricsConfig::new(
-            ShadowPricing::new(vec![ReferenceModel {
-                provider: "anthropic".into(),
-                model: "claude".into(),
-                pricing: HOSTED,
-                quality_prior: 0.6,
-            }])
-            .declare("llama", "anthropic", "claude", "matched on our eval suite"),
-        )
-        .with_default_local_quality(0.6)
-    }
-
-    /// The same deployment with nothing declared, so the gate has to decide.
-    fn undeclared() -> MetricsConfig {
-        MetricsConfig::new(ShadowPricing::new(vec![ReferenceModel {
-            provider: "anthropic".into(),
-            model: "claude".into(),
-            pricing: HOSTED,
-            quality_prior: 0.95,
-        }]))
-        .with_default_local_quality(0.35)
-    }
-
-    fn summaries(log: &Log, config: &MetricsConfig) -> Vec<LlmOptimizationSummary> {
-        for_session(log.events(), config)
-    }
-
-    /// Every field name of `LlmOptimizationSummary`, so a pin exists on our side
-    /// of a crate we do not control.
-    #[test]
-    fn the_summary_carries_relays_field_names() {
-        let mut log = Log::new("s1");
-        log.created(None);
-        log.turn(
-            "t1",
-            "r1",
-            fixtures::local("llama"),
-            fixtures::usage(1_000, 0, 100),
-        );
-        let summary = &summaries(&log, &declared())[0];
-        let json: Value = serde_json::to_value(summary).unwrap();
-
-        let mut got: Vec<&str> = json
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        got.sort_unstable();
-        let mut want = vec![
-            "schema_version",
-            "calculation_version",
-            "status",
-            "limitations",
-            "baseline_model",
-            "effective_model",
-            "effective_usage",
-            "baseline_usage",
-            "tokens_saved",
-            "baseline_cost",
-            "actual_cost",
-            "estimated_cost_saved",
-            "currency",
-            "contributions",
-        ];
-        want.sort_unstable();
-        assert_eq!(got, want);
-        assert_eq!(json["schema_version"], "1");
-        assert_eq!(json["calculation_version"], "1");
-
-        let contribution = &json["contributions"][0];
-        assert_eq!(contribution["producer"], "roundhouse");
-        assert_eq!(contribution["kind"], "model_routing");
-        assert_eq!(contribution["applied"], true);
-        assert_eq!(contribution["payload_schema"]["name"], "roundhouse/routing");
-        assert_eq!(contribution["payload_schema"]["version"], "1");
-        assert!(
-            contribution.get("id").is_none() && contribution.get("sequence").is_none(),
-            "Relay assigns both on ingestion and replaces what a producer sent"
-        );
-    }
-
-    /// Both directions of the derivation, from one fixture pair.
-    #[test]
-    fn status_is_complete_exactly_when_nothing_was_missing() {
-        // A hosted turn on this deployment's key, usage reported, rate card
-        // recorded: completely accounted for, and the only shape that is.
-        let mut hosted = Log::new("s1");
-        hosted.created(None);
-        hosted.turn(
-            "t1",
-            "r1",
-            fixtures::frontier("anthropic", "claude"),
-            fixtures::usage(10_000, 8_000, 500),
-        );
-        let complete = &summaries(&hosted, &declared())[0];
-        assert_eq!(complete.status, LlmOptimizationSummaryStatus::Complete);
-        assert!(complete.limitations.is_empty());
-
-        // The same turn with the provider silent: one limitation, and the status
-        // follows it rather than being chosen.
-        let mut estimated = Log::new("s2");
-        estimated.created(None);
-        estimated.turn(
-            "t1",
-            "r1",
-            fixtures::frontier("anthropic", "claude"),
-            fixtures::estimated(fixtures::usage(10_000, 8_000, 500)),
-        );
-        let partial = &summaries(&estimated, &declared())[0];
-        assert_eq!(partial.status, LlmOptimizationSummaryStatus::Partial);
-        assert_eq!(partial.limitations, vec!["roundhouse_usage_estimated"]);
-    }
-
-    #[test]
-    fn a_local_turn_is_always_partial_and_names_the_gate() {
-        let mut log = Log::new("s1");
-        log.created(None);
-        log.turn(
-            "t1",
-            "r1",
-            fixtures::local("llama"),
-            fixtures::usage(100_000, 90_000, 1_000),
-        );
-        let summary = &summaries(&log, &declared())[0];
-
-        assert_eq!(summary.status, LlmOptimizationSummaryStatus::Partial);
-        assert!(
-            summary
-                .limitations
-                .iter()
-                .any(|note| note == "roundhouse_capability_gate:0.1"),
-            "a counterfactual gated on configured priors must never sit \
-             indistinguishable beside an ungated number: {:?}",
-            summary.limitations
-        );
-        assert_eq!(
-            summary.baseline_model.as_ref().map(|m| m.model.as_str()),
-            Some("claude")
-        );
-        assert_eq!(
-            summary
-                .baseline_model
-                .as_ref()
-                .and_then(|m| m.provider.as_deref()),
-            Some("anthropic"),
-            "the provider travels with the model, or the baseline names a \
-             string two vendors both use"
-        );
-
-        // Core's arithmetic, not ours: same tokens including the same cached
-        // fraction, at the reference model's rates.
-        let expected = 10_000.0 * 3.75e-6 + 90_000.0 * 0.3e-6 + 1_000.0 * 15.0e-6;
-        let baseline = summary.baseline_cost.as_ref().unwrap().total.unwrap();
-        assert!(
-            (baseline - expected).abs() < 1e-12,
-            "{baseline} != {expected}"
-        );
-        assert_eq!(
-            summary.actual_cost.as_ref().unwrap().total,
-            Some(0.0),
-            "our own fleet bills nothing, and that is a measured zero"
-        );
-        assert!((summary.estimated_cost_saved.unwrap() - expected).abs() < 1e-12);
-    }
-
-    #[test]
-    fn an_unpriced_correlary_publishes_as_partial_with_its_reason() {
-        let mut log = Log::new("s1");
-        log.created(None);
-        // A hosted call, so there is an observed shape to infer against, and a
-        // local one the gate will refuse to compare with it.
-        log.turn(
-            "t1",
-            "r1",
-            fixtures::frontier("anthropic", "claude"),
-            fixtures::usage(10_000, 5_000, 500),
-        );
-        log.turn(
-            "t2",
-            "r2",
-            fixtures::local("tiny"),
-            fixtures::usage(10_000, 5_000, 500),
-        );
-
-        let summaries = summaries(&log, &undeclared());
-        let local = summaries
-            .iter()
-            .find(|summary| {
-                summary
-                    .effective_model
-                    .as_ref()
-                    .is_some_and(|model| model.model == "tiny")
-            })
-            .expect("the local turn");
-        assert_eq!(local.status, LlmOptimizationSummaryStatus::Partial);
-        assert!(
-            local
-                .limitations
-                .iter()
-                .any(|note| note.starts_with("roundhouse_correlary_unpriced:")),
-            "{:?}",
-            local.limitations
-        );
-        assert!(local.baseline_model.is_none());
-        assert!(
-            local.baseline_cost.is_none(),
-            "no stand-in could be justified, so no shadow price is charged"
-        );
-        assert_eq!(local.estimated_cost_saved, None);
-    }
-
-    /// The rule read off the wire, because `skip_serializing_if` hides an
-    /// absent field: a `None` cost is invisible in JSON and present in the type,
-    /// so a struct-level assertion would pass on a document that carried one.
-    #[test]
-    fn a_forwarded_seat_is_priced_into_no_field_at_all() {
-        let mut log = Log::new("s1");
-        log.created(None);
-        let mut seat = fixtures::decision(fixtures::frontier("anthropic", "claude"), Vec::new());
-        seat.billing = Billing::AccountedNotBilled;
-        log.routed_turn("t1", "r1", seat, fixtures::usage(20_000, 0, 2_000));
-
-        let summary = &summaries(&log, &declared())[0];
-        let json = serde_json::to_string(summary).unwrap();
-        for field in [
-            "baseline_cost",
-            "actual_cost",
-            "estimated_cost_saved",
-            "currency",
-        ] {
-            assert!(
-                !json.contains(field),
-                "a seat's tokens must reach no money field, and `{field}` is on \
-                 the wire: {json}"
-            );
-        }
-        assert!(
-            !json.contains("\"cost\""),
-            "not even inside a usage: {json}"
-        );
-        assert_eq!(summary.status, LlmOptimizationSummaryStatus::Partial);
-        assert!(
-            summary
-                .limitations
-                .iter()
-                .any(|note| note == "roundhouse_seat_forwarded")
-        );
-
-        // The tokens are still real and still reported — as a count, in the
-        // payload, with no price beside them.
-        let payload: Value = serde_json::from_str(&json).unwrap();
-        let seat_tokens = &payload["contributions"][0]["payload"]["seat_tokens"];
-        assert_eq!(seat_tokens["total"], 22_000);
-        assert_eq!(
-            payload["contributions"][0]["payload"]["billed_measured_usd"],
-            0.0
-        );
-        assert_eq!(
-            payload["contributions"][0]["payload"]["billed_estimated_usd"],
-            0.0
-        );
-
-        // CONTROL: the identical turn on this deployment's own key does carry
-        // money, so the assertions above are about the seat and not about a
-        // rate card having gone missing.
-        let mut keyed = Log::new("s2");
-        keyed.created(None);
-        keyed.turn(
-            "t1",
-            "r1",
-            fixtures::frontier("anthropic", "claude"),
-            fixtures::usage(20_000, 0, 2_000),
-        );
-        let billed = serde_json::to_string(&summaries(&keyed, &declared())[0]).unwrap();
-        assert!(billed.contains("actual_cost"), "{billed}");
-    }
-
-    /// **`cache_write_tokens` is published from a measurement and from nothing
-    /// else.**
-    ///
-    /// The field was hardcoded `None` for three releases with a doc saying why:
-    /// roundhouse priced uncached tokens at the write rate without measuring a
-    /// write, and a field named for an observation must not carry a pricing
-    /// convention. M11.0's Anthropic client supplies the measurement, so the
-    /// field is now emitted — under two conditions, and each has its own arm
-    /// here because dropping either one re-opens the hole the `None` was
-    /// protecting.
-    #[test]
-    fn a_cache_write_is_published_only_when_a_provider_actually_measured_one() {
-        let anthropic_turn = |usage: Usage| {
-            let mut log = Log::new("s1");
-            log.created(None);
-            log.turn("t1", "r1", fixtures::frontier("anthropic", "claude"), usage);
-            summaries(&log, &declared())[0]
-                .effective_usage
-                .clone()
-                .expect("a dispatched turn publishes its usage")
-        };
-
-        // PROBE: a warm Anthropic turn — 10k prompt, 8k read from the provider's
-        // cache, 500 newly written. The write count is the provider's own.
-        let measured = anthropic_turn(Usage {
-            cache_write_tokens: 500,
-            ..fixtures::usage(10_000, 8_000, 100)
-        });
-        assert_eq!(measured.cache_write_tokens, Some(500));
-        assert_eq!(
-            measured.cache_read_tokens,
-            Some(8_000),
-            "and the read count is untouched: the two are separate observations"
-        );
-
-        // CONTROL 1: the same turn over a dialect with no such counter. `0` in
-        // the log means "nobody asked", not "the provider measured zero", so
-        // `Some(0)` here would publish an observation nobody made -- and every
-        // Responses turn roundhouse has ever served is this case.
-        assert_eq!(
-            anthropic_turn(fixtures::usage(10_000, 8_000, 100)).cache_write_tokens,
-            None
-        );
-
-        // CONTROL 2: a measured-looking count on a turn our own tokenizer
-        // counted. A local tokenizer knows nothing about a remote cache, so a
-        // write count on an estimated turn is arithmetic wearing a
-        // measurement's name -- and `estimation_method` beside it would then
-        // claim `roundhouse-tokenizer` produced a provider's counter.
-        assert_eq!(
-            anthropic_turn(fixtures::estimated(Usage {
-                cache_write_tokens: 500,
-                ..fixtures::usage(10_000, 8_000, 100)
-            }))
-            .cache_write_tokens,
-            None
-        );
-    }
-
-    #[test]
-    fn tokens_saved_is_present_even_when_nothing_was_saved() {
-        let mut log = Log::new("s1");
-        log.created(None);
-        log.turn(
-            "t1",
-            "r1",
-            fixtures::local("llama"),
-            fixtures::usage(1_000, 0, 100),
-        );
-        let json = serde_json::to_string(&summaries(&log, &declared())[0]).unwrap();
-        assert!(
-            json.contains(r#""tokens_saved":{}"#),
-            "the field is non-optional in Relay's shape, so an empty object is \
-             what a turn with no token reduction looks like: {json}"
-        );
-
-        // A hosted turn does have one measured reduction: the share of its
-        // prompt the provider served from its own cache.
-        let mut hosted = Log::new("s2");
-        hosted.created(None);
-        hosted.turn(
-            "t1",
-            "r1",
-            fixtures::frontier("anthropic", "claude"),
-            fixtures::usage(10_000, 8_000, 100),
-        );
-        let summary = &summaries(&hosted, &declared())[0];
-        assert_eq!(summary.tokens_saved.cache_read_tokens, Some(8_000));
-    }
-
-    #[test]
-    fn the_payload_carries_what_the_summary_cannot() {
-        let mut log = Log::new("s1");
-        log.created(None);
-        log.routed_turn(
-            "t1",
-            "r1",
-            fixtures::decision(
-                fixtures::local("llama"),
-                vec![fixtures::candidate(
-                    fixtures::frontier("anthropic", "claude"),
-                    0.05,
-                )],
-            ),
-            Usage {
-                reasoning_tokens: 300,
-                ..fixtures::usage(1_000, 0, 900)
-            },
-        );
-
-        let json: Value = serde_json::to_value(&summaries(&log, &declared())[0]).unwrap();
-        let payload = &json["contributions"][0]["payload"];
-        assert_eq!(payload["capability_band"], 0.1);
-        assert_eq!(payload["correlary_basis"]["kind"], "declared");
-        assert_eq!(payload["routing_savings_at_decision_usd"], 0.05);
-        assert_eq!(payload["reasoning_tokens"], 300);
-        assert_eq!(payload["response_id"], "r1");
-        assert!(
-            payload.get("seat_tokens").is_some(),
-            "the field is present and null on a keyed turn"
-        );
-    }
-
-    #[test]
-    fn two_runs_over_one_log_are_byte_identical() {
-        let mut log = Log::new("acme/ada/main");
-        log.created(None);
-        log.turn(
-            "t1",
-            "r1",
-            fixtures::local("llama"),
-            fixtures::usage(1_000, 0, 100),
-        );
-        log.turn(
-            "t2",
-            "r2",
-            fixtures::frontier("anthropic", "claude"),
-            fixtures::usage(1_000, 0, 100),
-        );
-
-        let first = serde_json::to_string(&summaries(&log, &declared())).unwrap();
-        let second = serde_json::to_string(&summaries(&log, &declared())).unwrap();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn a_turn_that_never_reached_a_provider_publishes_nothing() {
-        let mut log = Log::new("s1");
-        log.created(None);
-        log.refused_turn(
-            "t1",
-            "r1",
-            roundhouse_core::event::IncompleteReason::PolicyRefused,
-        );
-        assert!(
-            summaries(&log, &declared()).is_empty(),
-            "a zero-dollar saving on a call that never happened is the shape a \
-             reader mistakes for a bargain"
-        );
-    }
-}
+mod tests;

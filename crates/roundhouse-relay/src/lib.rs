@@ -35,9 +35,14 @@
 //! **No money is computed here.** Every dollar in a summary comes out of
 //! `roundhouse_core::metrics`: the correlary is the one the dashboard shows,
 //! resolved through [`MetricsSnapshot`](roundhouse_core::metrics::MetricsSnapshot),
-//! and the arithmetic is `Correlary::shadow_cost_usd` and `ProviderPricing`'s
-//! own methods. A second pricing walk here would be a second answer to what a
-//! turn cost, and the two would disagree on the day a rate card was corrected.
+//! and the arithmetic is `Correlary::shadow_cost_usd`, `ProviderPricing`'s
+//! own methods, and, when the catalog prices local capacity,
+//! `LocalCapacityPrice::price` — so a priced local turn's actual cost and net
+//! saving are the dashboard's figures for that turn, and an unpriced one
+//! publishes no actual cost, because unpriced capacity is unknown, not free.
+//! A second pricing walk here would be a
+//! second answer to what a turn cost, and the two would disagree on the day a
+//! rate card was corrected.
 //! In particular the **capability gate's outcome is carried, never recomputed**:
 //! this crate publishes which band the gate used and what it decided, and has no
 //! opinion of its own about whether two models are comparable.

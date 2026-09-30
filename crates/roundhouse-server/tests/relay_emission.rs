@@ -28,7 +28,7 @@ use roundhouse_core::item::Item;
 use roundhouse_core::metrics::{MetricsConfig, ReferenceModel, ShadowPricing};
 use roundhouse_core::routing::{DecisionRecord, ProviderPricing, Target};
 use roundhouse_core::store::{MemoryStore, SessionStore};
-use roundhouse_server::{ControlPlane, ControlPlaneConfig, relay_api};
+use roundhouse_server::{CatalogConfig, ControlPlane, ControlPlaneConfig, relay_api};
 
 mod common;
 use common::{path_segment, sha256_hex};
@@ -112,6 +112,19 @@ async fn store_with(
     principal: Option<Principal>,
     turns: usize,
 ) -> Arc<MemoryStore> {
+    let frontier = Target::Frontier {
+        provider: "anthropic".into(),
+        model: "claude".into(),
+    };
+    store_with_targets(session_id, principal, vec![frontier; turns]).await
+}
+
+/// One session in a store, with one completed turn routed to each target.
+async fn store_with_targets(
+    session_id: &str,
+    principal: Option<Principal>,
+    targets: Vec<Target>,
+) -> Arc<MemoryStore> {
     let store = Arc::new(MemoryStore::new());
     let session_id = SessionId::new(session_id);
     store
@@ -129,7 +142,7 @@ async fn store_with(
         principal,
         arm: None,
     }];
-    for turn in 0..turns {
+    for (turn, chosen) in targets.into_iter().enumerate() {
         let response_id = ResponseId::new(format!("r{turn}"));
         kinds.push(SessionEventKind::TurnStarted {
             turn_id: TurnId::new(format!("t{turn}")),
@@ -140,10 +153,7 @@ async fn store_with(
         });
         kinds.push(SessionEventKind::Routed {
             response_id: response_id.clone(),
-            decision: decision(Target::Frontier {
-                provider: "anthropic".into(),
-                model: "claude".into(),
-            }),
+            decision: decision(chosen),
         });
         kinds.push(SessionEventKind::OutputTextDelta {
             response_id: response_id.clone(),
@@ -342,4 +352,77 @@ async fn a_session_longer_than_one_store_batch_is_read_whole() {
 
     let (_, _, body) = get(&app, "/v1/sessions/long/atof", None).await;
     assert_eq!(body.lines().count(), TURNS * 4 + 2);
+}
+
+/// **The local capacity price the relay publishes is the catalog's, the one
+/// the dashboard reads.** Built through [`CatalogConfig::from_json`] and its
+/// `metrics_config()`, the value the binary hands both `/v1/metrics` and these
+/// routes, so a price that stopped reaching the relay fails here rather than
+/// publishing a priced local turn as free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_catalogs_local_capacity_price_reaches_the_optimization_route() {
+    let catalog = CatalogConfig::from_json(
+        r#"{
+          "models": [{
+            "provider": "anthropic",
+            "model": "claude",
+            "wire_protocol": "anthropic_messages",
+            "cache_model": { "kind": "deterministic", "ttl_ms": 300000 },
+            "pricing": {
+              "input_per_mtok_usd": 3.0,
+              "cached_input_per_mtok_usd": 0.3,
+              "cache_write_per_mtok_usd": 3.75,
+              "output_per_mtok_usd": 15.0
+            },
+            "quality_prior": 0.62,
+            "base_ttft_ms": 350.0,
+            "ttft_ms_per_uncached_token": 0.002
+          }],
+          "providers": {
+            "anthropic": {
+              "base_url": "https://api.anthropic.test/v1",
+              "routes": { "messages": "/messages" },
+              "auth": { "env": "ANTHROPIC_API_KEY" }
+            }
+          },
+          "local_capacity_price": { "input_per_mtok_usd": 0.5, "output_per_mtok_usd": 2.0 }
+        }"#,
+        "relay fixture catalog",
+    )
+    .expect("the fixture catalog validates");
+    let store = store_with_targets(
+        "solo",
+        None,
+        vec![Target::Local {
+            worker_id: 7,
+            dp_rank: 0,
+            model: "llama".into(),
+        }],
+    )
+    .await;
+    let app = relay_api::relay_router(
+        ControlPlane::open(),
+        store,
+        Arc::new(catalog.metrics_config()),
+    );
+
+    let (status, _, body) = get(&app, "/v1/sessions/solo/optimization", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let summaries: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let actual = &summaries[0]["actual_cost"];
+    // 600 uncached prompt tokens at 0.5 plus 50 output at 2.0 per Mtok; the
+    // 400 cached are free.
+    let capacity = 600.0 * 0.5e-6 + 50.0 * 2.0e-6;
+    let total = actual["total"]
+        .as_f64()
+        .expect("a priced local turn has a cost");
+    assert!(
+        (total - capacity).abs() < 1e-12,
+        "actual_cost {total} is not the catalog's capacity cost {capacity}: {body}"
+    );
+    assert_eq!(
+        actual["pricing_provider"],
+        "roundhouse_local_capacity_price"
+    );
+    assert_eq!(actual["pricing_model"], "llama");
 }

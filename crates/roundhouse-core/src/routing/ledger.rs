@@ -92,9 +92,9 @@ impl CacheModel {
 /// Per-million-token prices.
 ///
 /// These are configuration, not constants: provider prices change, and baking
-/// them into code guarantees they go stale. [`ProviderPricing::free`] is the
-/// right default for local targets, whose marginal cost we account for in
-/// prefill tokens rather than dollars.
+/// them into code guarantees they go stale. Local targets are not priced with
+/// this type: their capacity price, when a deployment configures one, is a
+/// [`LocalCapacityPrice`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ProviderPricing {
     pub input_per_mtok_usd: f64,
@@ -263,6 +263,56 @@ impl ProviderPricing {
         let discount =
             (self.effective_write_per_mtok_usd() - self.cached_input_per_mtok_usd).max(0.0);
         usage.cached_input_tokens as f64 * discount * PER_MTOK
+    }
+}
+
+/// A configured per-million-token price for our own fleet's capacity.
+///
+/// **Approximate on purpose, and never below the truth by design.** Ruled
+/// 2026-09-28 (ruling 6 in
+/// `agent-docs/synergies/typesafe-selector-and-cache-affinity.md`): a local
+/// quote of zero dollars wins every cost comparison and gives no signal of
+/// cost effectiveness, so a deployment may state what its GPU time is worth
+/// per token and have the router and the dashboard both use it. Absent, local
+/// stays at zero and the dashboard says the cost is unpriced rather than free.
+///
+/// Two rates and no cache rates. A local cache hit costs almost no capacity —
+/// the prefill it skips is the work the price stands for — so only the
+/// uncached prompt and the output are charged. Inventing a cached-read rate
+/// here would be a number nobody measured.
+///
+/// One type for both readers — `LocalQuote::to_candidate` in
+/// `roundhouse-fleet` and the metrics snapshot — so the price a turn is routed
+/// on and the price the dashboard reports it at are one configuration value,
+/// the same rule [`ProviderPricing`] holds for hosted targets.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCapacityPrice {
+    pub input_per_mtok_usd: f64,
+    pub output_per_mtok_usd: f64,
+}
+
+impl LocalCapacityPrice {
+    /// Price expected or measured tokens: uncached prompt plus output.
+    ///
+    /// The one definition of what local capacity costs; [`Self::price`] is the
+    /// same arithmetic over a measured [`Usage`].
+    pub fn price_tokens(&self, uncached_input: f64, output: f64) -> f64 {
+        const PER_MTOK: f64 = 1e-6;
+        uncached_input * self.input_per_mtok_usd * PER_MTOK
+            + output * self.output_per_mtok_usd * PER_MTOK
+    }
+
+    /// Price a measured call or a pot of them.
+    ///
+    /// A serving plane that reports no cache reads leaves every prompt token
+    /// uncached, so this then charges the whole prompt. That errs towards
+    /// more cost, which is the direction the ruling allows.
+    pub fn price(&self, usage: &Usage) -> f64 {
+        self.price_tokens(
+            usage.uncached_input_tokens() as f64,
+            usage.output_tokens as f64,
+        )
     }
 }
 
@@ -565,6 +615,32 @@ mod tests {
         cache_write_per_mtok_usd: 3.75,
         output_per_mtok_usd: 15.0,
     };
+
+    /// **Local capacity charges the uncached prompt and the output, and no
+    /// cache read.** The two entry points are one formula: the measured form
+    /// must equal the token form over the same counts.
+    #[test]
+    fn local_capacity_charges_uncached_prompt_and_output_only() {
+        let price = LocalCapacityPrice {
+            input_per_mtok_usd: 0.2,
+            output_per_mtok_usd: 0.8,
+        };
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 750_000,
+            cache_write_tokens: 0,
+            output_tokens: 500_000,
+            reasoning_tokens: 0,
+            accounting: Accounting::Reported,
+            cache_read_source: CacheReadSource::Unreported,
+        };
+
+        assert!((price.price_tokens(250_000.0, 500_000.0) - 0.45).abs() < 1e-12);
+        assert_eq!(
+            price.price(&usage),
+            price.price_tokens(250_000.0, 500_000.0)
+        );
+    }
 
     /// **A measured cache write is billed at the write rate and the rest of the
     /// uncached prompt at the input rate.**

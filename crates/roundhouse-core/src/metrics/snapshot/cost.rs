@@ -262,9 +262,10 @@ impl EvaluationMetrics {
 /// provider, published as zero dollars because the catalog holds no rate for
 /// that row, so the total understates by an amount nobody can name, and the
 /// remedy is a rate card. A local call is *not an invoice at all*: our own fleet
-/// bills nobody, and what it cost is GPU time, which a catalog of per-token
-/// prices has no basis to put a number on and this projection will not invent
-/// one for.
+/// bills nobody, and what it cost is GPU time, which this projection will not
+/// invent a number for. It is a gap only while the catalog sets no
+/// `local_capacity_price`; with one, the deployment has stated what its GPU
+/// time is worth and the call is priced at that.
 ///
 /// The three overlap and are deliberately not additive — a local call whose
 /// usage nobody reported is in two of them — because each answers a different
@@ -291,16 +292,20 @@ pub struct ServingCostGaps {
     ///
     /// Configured zero rates, including zero cache-read rates, are priced.
     pub unpriced_models: u64,
-    /// Calls our own fleet served, whose hardware cost this document does not
-    /// price.
+    /// Calls our own fleet served while the catalog sets no
+    /// `local_capacity_price`, so their hardware cost is in no figure here.
     ///
-    /// **Not a defect and not a missing rate card**, which is why it is counted
-    /// rather than warned about: a local row correctly bills nothing, and the
-    /// GPU time behind it is a capital cost no per-token catalog can state. It
-    /// is here because without it a deployment that routed everything to its own
-    /// workers would publish a near-zero total and call it complete — the one
-    /// deployment this whole projection exists to describe, reporting its
-    /// strongest claim as a fact about money it never spent.
+    /// **Not a defect**, which is why it is counted rather than warned about:
+    /// a local row correctly bills nobody, and without a configured price the
+    /// GPU time behind it has no per-token figure this projection could state
+    /// without inventing one. It is here because without it a deployment that
+    /// routed everything to its own workers would publish a near-zero total
+    /// and call it complete — the one deployment this whole projection exists
+    /// to describe, reporting its strongest claim as a fact about money it
+    /// never spent.
+    ///
+    /// Zero once the catalog prices local capacity: those calls are then in
+    /// [`ObservedCost::local_capacity_usd`] and the total covers them.
     pub local_calls: u64,
 }
 
@@ -359,7 +364,7 @@ impl ServingCostGaps {
             // traffic.
             local_calls: models
                 .iter()
-                .filter(|row| row.mode() == ServingMode::Local)
+                .filter(|row| row.mode() == ServingMode::Local && row.capacity_usd().is_none())
                 .map(|row| row.calls)
                 .sum(),
         }
@@ -369,14 +374,21 @@ impl ServingCostGaps {
 /// What [`ObservedCost::total_usd`] is a total *of*.
 ///
 /// On the wire beside the number, because the number cannot say it: hosted
-/// serving this deployment paid for, plus the classifier calls it made. Two
-/// kinds of traffic are counted everywhere else on this document and priced
-/// nowhere, so the total passes over both — a turn our own fleet answered, whose
-/// cost is GPU time, and a turn on a forwarded subscription seat, whose cost was
-/// somebody else's. Neither has a per-token price this projection could state
-/// without inventing one. Only the first makes the total *incomplete*; see
-/// [`ServingCostGaps`].
+/// serving this deployment paid for, plus the classifier calls it made. With no
+/// `local_capacity_price` configured, two kinds of traffic are counted
+/// everywhere else on this document and priced nowhere, so the total passes over
+/// both — a turn our own fleet answered, whose cost is GPU time, and a turn on a
+/// forwarded subscription seat, whose cost was somebody else's. Neither has a
+/// per-token price this projection could state without inventing one. Only the
+/// first makes the total *incomplete*; see [`ServingCostGaps`]. With a capacity
+/// price, the scope is [`OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY`].
 pub const OBSERVED_COST_SCOPE: &str = "hosted_serving_and_classifier_calls";
+
+/// What [`ObservedCost::total_usd`] covers when the catalog prices local
+/// capacity: [`OBSERVED_COST_SCOPE`] plus our own fleet's GPU time at that
+/// configured price.
+pub const OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY: &str =
+    "hosted_serving_local_capacity_and_classifier_calls";
 
 /// Serving and evaluation added up, with both price bases named.
 ///
@@ -393,11 +405,13 @@ pub const OBSERVED_COST_SCOPE: &str = "hosted_serving_and_classifier_calls";
 /// on a forwarded seat, which this deployment holds no rate card for.
 ///
 /// **It is not all economic cost, and [`Self::covers`] says which one it is.**
-/// A locally served turn bills nobody and costs GPU time; this document prices
-/// what left the building, so the fleet's own cost is outside it. Reporting a
-/// total that excluded it *silently* would put the most misleading number on the
-/// most local deployment — the one whose whole argument is that it serves its
-/// own traffic.
+/// A locally served turn bills nobody and costs GPU time. Without a
+/// `local_capacity_price` this document prices only what left the building, so
+/// the fleet's own cost is outside it; with one, that cost is
+/// [`Self::local_capacity_usd`] and inside the total. Reporting a total that
+/// excluded it *silently* would put the most misleading number on the most
+/// local deployment — the one whose whole argument is that it serves its own
+/// traffic.
 ///
 /// **Not a savings figure and not an invoice.**
 /// [`Savings::total_usd`](super::Savings::total_usd) is what was saved; this is
@@ -421,7 +435,18 @@ pub struct ObservedCost {
     /// unlabelled would pass a booking off as a measurement.
     pub evaluation_estimated_usd: f64,
     pub evaluation_basis: &'static str,
-    /// `serving_usd + evaluation_usd`.
+    /// Local capacity spend at the catalog's `local_capacity_price`, the same
+    /// figure as [`Savings::local_capacity_usd`](super::Savings::local_capacity_usd).
+    /// `None` when the catalog sets no price; the local calls are then counted
+    /// in `serving_gaps.local_calls` instead.
+    ///
+    /// Its own component rather than folded into `serving_usd`, for the reason
+    /// the evaluation estimate is split out: `serving_usd` is what hosted
+    /// providers billed, and this is a configured approximation of hardware
+    /// this deployment owns. Priced by the current catalog, like `serving_usd`.
+    pub local_capacity_usd: Option<f64>,
+    /// `serving_usd + local_capacity_usd + evaluation_usd`, with an unpriced
+    /// local capacity contributing nothing.
     pub total_usd: f64,
     /// What this total is a total of. See [`OBSERVED_COST_SCOPE`].
     pub covers: &'static str,
@@ -452,6 +477,7 @@ pub struct ObservedCost {
 impl ObservedCost {
     pub(super) fn build(
         serving_usd: f64,
+        local_capacity_usd: Option<f64>,
         gaps: ServingCostGaps,
         evaluation: &EvaluationMetrics,
     ) -> Self {
@@ -463,8 +489,13 @@ impl ObservedCost {
             evaluation_measured_usd: evaluation.measured_usd,
             evaluation_estimated_usd: evaluation.estimated_usd,
             evaluation_basis: EVALUATION_PRICE_BASIS,
-            total_usd: serving_usd + evaluation_usd,
-            covers: OBSERVED_COST_SCOPE,
+            local_capacity_usd,
+            total_usd: serving_usd + local_capacity_usd.unwrap_or(0.0) + evaluation_usd,
+            covers: if local_capacity_usd.is_some() {
+                OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY
+            } else {
+                OBSERVED_COST_SCOPE
+            },
             serving_gaps: gaps,
             evaluation_incomplete: evaluation.cost_incomplete,
             incomplete: gaps.any() || evaluation.cost_incomplete,
