@@ -785,6 +785,8 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
             // out: it is about this deployment's accounting for a call
             // that is already over, and belongs to no response.
             | SessionEventKind::ClassificationSettlementRepaired { .. }
+            // Learner delivery bookkeeping, about no turn at all.
+            | SessionEventKind::LearningApplied { .. }
             | SessionEventKind::Error { .. } => false,
         }
     }
@@ -1068,6 +1070,8 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> ResponsesFol
             // out: it is about this deployment's accounting for a call
             // that is already over, and belongs to no response.
             | SessionEventKind::ClassificationSettlementRepaired { .. }
+            // Learner delivery bookkeeping, about no turn at all.
+            | SessionEventKind::LearningApplied { .. }
             | SessionEventKind::Error { .. } => Step::Continue,
         }
     }

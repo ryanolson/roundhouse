@@ -106,11 +106,11 @@ The draft's section 2 seam map was read at `1658633`. This table records what th
 | `SelectionSnapshot`, `SelectorBranch` (`Affinity`, `EscalationAudit`, `Stage`), `STAGE_SELECTOR_REVISION` | `crates/roundhouse-core/src/routing/selection.rs` | Present. No `Learned` branch. |
 | `ProviderPricing::price_tokens`, `effective_write_per_mtok_usd`, `CacheLedger::model_for`, `BlockMarker`, `TargetState::last_block_marker` | `crates/roundhouse-core/src/routing/ledger.rs` | Present. The marker fact landed on this branch on 2026-09-28. |
 | `ClassificationAxis`, `TurnIntent`, `TurnComplexity`, `ContextDependence`, `Graded`, `TurnClassification`, `ClassificationRecord`, `ClassificationWindow`, `TAXONOMY_VERSION = 1` | `crates/roundhouse-core/src/classify/mod.rs` | Present. No tier axis. |
-| `SessionState::classifications`, `classifications_through`, `Session::commit` | `crates/roundhouse-core/src/session.rs` | Present. `commit` passes `None` as the learning mark. |
+| `SessionState::classifications`, `classifications_through`, `Session::commit` | `crates/roundhouse-core/src/session.rs` | Present. At `520eda5` `commit` passed `None` as the learning mark; M5 passes `learning_mark(&self.state, &kinds)`. |
 | `ReviewTracker`, `ReviewOutcome`, `TrackedDecision`, `MAX_REVIEW_TURNS = 64`, `MAX_REVIEW_DECISIONS = 256` | `crates/roundhouse-core/src/session/review.rs` | Present. No learning row. |
 | `IntervalLabel` (`Positive`, `Negative`, `Unknown`) | `crates/roundhouse-core/src/validate/interval.rs` | Present. |
 | `Arm::consults_judge` | `crates/roundhouse-core/src/validate/arm.rs` | Present. |
-| `SessionEventKind`: `TurnStarted`, `Routed`, `OutputTextDelta`, `ResponseCompleted`, `ResponseIncomplete`, `ValidationDecided`, `ClassificationRequested`, `ClassificationRecorded`, `ClassificationSettlementRepaired` | `crates/roundhouse-core/src/event.rs` | Present. No `LearningApplied`. |
+| `SessionEventKind`: `TurnStarted`, `Routed`, `OutputTextDelta`, `ResponseCompleted`, `ResponseIncomplete`, `ValidationDecided`, `ClassificationRequested`, `ClassificationRecorded`, `ClassificationSettlementRepaired` | `crates/roundhouse-core/src/event.rs` | Present. No `LearningApplied` at `520eda5`; M5 adds it. |
 | `TurnBudget::admits`, `BudgetState::ExhaustedOverflow` | `crates/roundhouse-core/src/control/budget.rs` | Present. |
 | `SettlementKey::SessionWatermark`, `OncePerCall` | `crates/roundhouse-core/src/control/spend.rs` | Present. |
 | `SessionStore::append_events(lease, kinds, mark)`, `clear_learning_mark`, `requeue_learning`, `pending_learning`, `learning_sessions`, `LearningMark`, `MarkedSession`, `LearningCursor`, `ClearOutcome` | `crates/roundhouse-core/src/store.rs`, `store/learning.rs`, `store/contract/learning.rs` | Present. L3b is built and mutation-checked. |
@@ -509,7 +509,7 @@ Owner approval is also required for: the merge of PR #18, which every milestone 
 | M2 strategies, learned input, keys, record types | L1 part 1 | implemented on `ai/learner-m2-strategies`, awaiting review | |
 | M3 cost, latency, and cache corrections | L6 | implemented on `ai/learner-m3-corrections`, awaiting review | |
 | M4 gate, constraints, exploration, policy | L1 part 2 | implemented on `ai/learner-m4-gate`, awaiting review | |
-| M5 entries, credit, ops rows, Jev counts, cursor, marks | L2 | not started | |
+| M5 entries, credit, ops rows, Jev counts, cursor, marks | L2 | implemented on `ai/learner-m5-credit`, awaiting review | |
 | M6 learner store contract and memory store | L3 | not started | |
 | M7 Redis learner store | L4 | not started | |
 | M8 configuration, engine path, delivery, metrics | L5 part 1 | not started | |
@@ -613,3 +613,54 @@ The milestone did not settle these points, so the implementation made these deci
 - **`StagePolicy::route_pick` returns a `RoutedPick`**: the decision, with the pick and outcome that its stage evidence records. This supersedes the M2 settled signature `-> Result<Decision, RoutingError>`. The learner no longer reads them back from the selector snapshot, so `stage_parts` and its impossible-branch error are gone. The struct holds the pick and the outcome, not the whole `StageEvidence`, because the recipe lists are the caller's own recipe, and cloning them on every stage turn would cost `StagePolicy::choose`, which drops them. `route_pick_with_the_rules_pick_equals_stage_policy_choose` still passes, and the strategies fixture now asserts that the returned pick and outcome equal the recorded ones on every branch.
 - New tests for two mutations that survived. `the_draw_matches_a_golden_digest` holds a digest computed outside the crate, so a change to `LEARNER_DRAW_VERSION`, the domain string, or the encoding fails. `an_upper_bound_exactly_at_the_floor_is_unproven` sets the floor to the bound itself, so `<=` for `<` gives `BelowFloor` and fails.
 
+**M5 status, 2026-09-28.** M5 is implemented test-first on `ai/learner-m5-credit`, from `4079d5b`. The fold is in `crates/roundhouse-core/src/session/learning.rs`, with credit in `learning/credit.rs` and the public entry types in `learning/entry.rs`. `SessionState` exposes `learning_page`, `learning_beyond`, `learning_hint`, `learning_causes`, and `project_learning`. `learning_mark` is public, and `Session::commit` calls it. `Session::record_learning_applied` writes the new event; no engine path calls it until M8. The tests are in `crates/roundhouse-core/tests/learning_entries.rs` and `learning_cursor.rs`, with fixtures in `learning_support/`. Draft section 23 records the automatic marks as a dated addendum to sections 21 and 22.
+
+Two rows of the section 5 seam map were out of date: `commit` now passes the computed mark, and `SessionEventKind` has `LearningApplied`. The M5 review fixes updated both rows. The Redis fixture `every_event_kind` includes the new variant, but its Redis-gated round trip, and marked appends through `commit` on the Redis store, were not run in this milestone; only `MemoryStore` exercised the automatic marks.
+
+What changes for an existing deployment: nothing while every project is `off`. No `Routed` carries learned evidence, so no entry exists, no append is marked, and the append bytes are unchanged. `LearningApplied` joins the one-way door of draft section 13.
+
+The milestone did not settle these points, so the implementation made these decisions:
+
+- **The row holds agreement, not indices.** Draft 8.1 lists the served target and each plan's first target as recipe indices. `LearningRow` holds the one fact credit reads from them: a bit for each strategy whose plan's first target is the target this dispatch went to. The comparison is structural (provider and model, or local model), so a recipe degrade to a local worker that the recipe does not name is still comparable.
+- **A foreign credit revision suppresses every delta of that decision**, not only credit (draft 11.1: "contributes no deltas"). Its turn adds no operational rows, and a classification of it adds no Jev counts. The entry still exists.
+- **Cache reuse per-mille rounds to nearest.** The rule for a measured pair is shared with the metrics fold (`metrics::cache_evidence::measured_pair`).
+- **Jev retention.** The row of a learned turn is kept from its intent until the accepted result. It is dropped when a later intent is requested at or after its `expires_at_ms`. A result is delivered at the start of the next turn, possibly long after its call's deadline, and the next intent is written after that delivery. Pruning on the log clock of any event would drop late-delivered answers.
+- **The residual quote** is the `expected_ttft_ms` of the candidate in `considered` that equals the served target. A served dispatch with no such candidate supplies neither the residual nor the overhead, so the two samples still come from the same turns.
+- **`beyond` is never an undercount.** When a `LearningApplied` reaches past the page but not the newest entry, the count is kept as an upper bound, and the backfill finds the exact set.
+- **Causes.** `LearningCauses` counts `unknown_label`, `failover_in_interval`, `missing_row`, `mixed_epoch`, and `other_credit_revision`, in the draft's check order.
+
+**Finding: with per-decision agreement, the failover rule decides the cause and not the deltas.** A failover turn writes two `Routed` to two targets. A strategy's plan has one first target, so no strategy agrees with both dispatches, and consistency alone already credits nothing. Rule 1 of draft 8.2 still runs first. It is observable through `failover_in_interval`, which is how its test holds it.
+
+The tests were run first against a skeleton that produced no entries, and then against one that produced entries with no deltas. At the first stage every test failed except `learning_applied_has_no_response_id_and_is_not_terminal` and `learning_mark_marks_nothing_before_learned_evidence`. At the second stage every credit, operational-row and Jev test failed on its own claim. Two tests passed there, `a_classification_without_a_tier_answer_yields_an_entry_with_no_deltas` and `a_classification_for_a_turn_without_a_learned_row_yields_an_entry_with_no_deltas`, so they count as controls. They and the other two controls are held by named mutations. These mutations each failed their tests:
+
+- `ClassificationRecorded` dropped from the entry list;
+- a strategy credited when any turn agreed;
+- the failover rule removed;
+- the epoch check removed;
+- a negative interval counted as positive;
+- no remainder;
+- the Jev count on only one key;
+- a mark that ignores learned evidence;
+- a mark that names the first event instead of the newest;
+- a mark that ignores the session state;
+- `commit` passing no mark;
+- `LearningApplied` made terminal;
+- a missing tier answer counted;
+- a row kept for any turn;
+- the residual measured from turn start;
+- latency sampled on an incomplete turn;
+- a cache sample for a local target;
+- `beyond` reset on every acknowledgement;
+- no expiry prune;
+- operational rows under a foreign credit revision;
+- a backfill that ignores its floor.
+
+**M5 review fixes, 2026-09-29.** The PR 28 review found one defect and three smaller points. The mutation pass found two lines that no test held. All are fixed on the same branch. The wire shape is unchanged.
+
+- **A backfill did not reach below a stale hint.** `project_learning(store, id, hold_after)` held only entries above `hint.max(floor)`, and each `LearningApplied` in the log pruned its page. Suppose the log holds `LearningApplied { H }` and the learner store's watermark is `W < H`. This happens when the store lost recent writes (draft 11.6), or when the audit finds a watermark below the mark (11.7). Then the backfill from `W` skipped the entries in `(W, H]`. The store answered `ChainGap { W }` every time, and delivery for that session stalled for good. The hold threshold is now a two-variant `Hold`. A `Hint` fold is the live fold or a plain replay, and it behaves as before. A `Floor(W)` fold is a backfill. It holds every entry above `W`, and `LearningApplied` moves only its hint. `a_backfill_below_a_stale_hint_refills_from_the_floor` failed before the fix: the page was `[11, 12, 13]` where `[7, ..., 13]` was expected. The same test holds the control that the live fold still prunes at the hint. Only the pruning half of the old rule can be reached by a test. In a well-formed log a `LearningApplied { H }` always follows the entries through `H`, so the entry-time check against the hint never fires on its own.
+- **The test helper hid the same defect.** `Script::entries` backfills from zero, and it silently lost the entries that an earlier `LearningApplied` acknowledged. It now asserts a whole chain, from `prev_seq == 0` through every link. `every_entry_producing_event_yields_one_entry_even_with_empty_deltas` now acknowledges an entry before it reads the chain. It failed before the fix, with a first `prev_seq` of 14.
+- **`LearningApplied` is per session.** Its doc said that only a project whose learner is not `off` writes it. A session with a learned `Routed` keeps producing entries after its project returns to `off` (draft section 23), so it also keeps receiving this event.
+- **The learner-off allocation comment.** `turn_started` clones the `ResponseId` on every `TurnStarted`, and the comment in `routed` implied the off path allocates nothing. The comment is corrected rather than the clone removed. If the clone were gated on `started`, the first learned turn would lose its rows, because its `TurnStarted` comes before its learned `Routed`. If the id were bound at the first learned `Routed`, the fold would accept a dispatch of a response that is not the open turn. The id match rejects that today, and `record_routing` does not.
+- New tests for two mutations that survived. `a_mixed_epoch_review_counts_only_the_epoch_cause` and `a_foreign_credit_revision_review_counts_only_the_revision_cause` each isolate one cause, so swapping the two counters fails both. `cache_rows_require_provider_measurement` adds a 4506-of-10000 read: to nearest that is 451 per mille, and truncated it is 450, so `.floor()` for `.round()` fails.
+
+These mutations failed their tests: the two cause counters swapped; per-mille truncated; `applied` pruning a backfill's page (the original defect); `applied` never pruning, which holds the live-fold control and fails three cursor tests. One mutation survives, as expected: a backfill's entry-time threshold set back to `hint.max(floor)` while `applied` still keeps its page. It is equivalent on a well-formed log, for the reason in the first bullet.

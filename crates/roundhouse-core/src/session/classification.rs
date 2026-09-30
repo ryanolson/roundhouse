@@ -111,11 +111,16 @@ impl ClassificationFold {
             .insert(record.call_id.clone(), record.clone());
     }
 
-    /// A `ClassificationRecorded` event folded in, at `seq`.
-    pub(crate) fn recorded(&mut self, seq: u64, record: &ClassificationRecord) {
+    /// A `ClassificationRecorded` event folded in, at `seq`. Returns whether
+    /// the result answered an outstanding intent and was accepted.
+    ///
+    /// **The one acceptance rule.** The learning fold counts a tier answer
+    /// only when this returns `true`, so a result delivered twice, or one
+    /// naming an intent it does not answer, gives Jev no extra weight either.
+    pub(crate) fn recorded(&mut self, seq: u64, record: &ClassificationRecord) -> bool {
         // Duplicate delivery must not give one answer extra weight.
         if self.settled.contains(&record.call_id) {
-            return;
+            return false;
         }
         // Check attribution before consuming the intent or identity.
         // Otherwise a mismatched result would block the valid answer
@@ -125,7 +130,7 @@ impl ClassificationFold {
                 && intent.source_response_id == record.source_response_id
         });
         if !answers_the_intent {
-            return;
+            return false;
         }
         // Joined here because this is the last moment both halves are
         // in hand: the amount is on the result, and only a result that
@@ -163,6 +168,7 @@ impl ClassificationFold {
                 classification: *classification,
             });
         }
+        true
     }
 
     /// A `ClassificationSettlementRepaired` event folded in.

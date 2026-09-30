@@ -993,10 +993,14 @@ impl MetricsFold {
             SessionEventKind::ClassificationSettlementRepaired { record } => {
                 self.evaluation.repaired(&event.session_id, &payer, record);
             }
+            // Learner delivery bookkeeping: it names no response, so the
+            // pairing of a dispatch with its terminal never sees it, and it
+            // moves no money.
             SessionEventKind::SessionCreated { .. }
             | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::OutputTextDelta { .. }
             | SessionEventKind::TurnDeduplicated { .. }
+            | SessionEventKind::LearningApplied { .. }
             | SessionEventKind::Error { .. } => {}
         }
 

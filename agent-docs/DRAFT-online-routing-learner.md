@@ -979,3 +979,15 @@ Marked Redis appends span session keys and namespace-wide index keys. They requi
 The shared append preflight also fixes a reproduced partial-write defect at the existing sequence limit. A refused batch now leaves the log unchanged. The fix applies to marked and unmarked appends. The maximum sequence remains `99_999_999_999_999`; this change does not expand the numeric domain.
 
 The implementation report records 22 passing memory-store tests and 177 passing Redis tests, including normally gated tests, with no Redis skips. Independent post-commit verification and the full workspace gate remain pending. These results establish the store contract only; they do not establish learned routing or full-PR readiness.
+
+## 23. Automatic marks addendum, 2026-09-28
+
+This addendum supersedes one sentence of section 21 and one of section 22: "Ordinary session appends remain unmarked". Milestone M5 of `PLAN-online-routing-learner.md` wires the marks.
+
+`Session::commit` now computes `learning_mark(&state, &kinds)` and passes it to `append_events`. The mark names the newest entry-producing event of the batch (`ValidationDecided`, `ResponseCompleted`, `ResponseIncomplete`, or `ClassificationRecorded`) once the session has a `Routed` with learned evidence, either in the fold or earlier in the same batch. A session without a principal is never marked. Section 11.1 names three kinds; the plan's M5 settled points add `ClassificationRecorded`, because Jev counts ride the same entry chain.
+
+A session whose project never enables the learner writes no learned `Routed`, so its appends stay unmarked and byte-identical. Once a session has learned evidence, every later entry-producing append is marked, even if the project returns to `off`. Those marks stay pending until the recovery task of milestone M9 delivers them. A marked Redis append needs one Redis instance, as section 22 states.
+
+The same milestone adds `LearningApplied { through_seq }`, the fold's cursor, and `SessionState::project_learning`. No engine path writes `LearningApplied` yet; milestone M8 does.
+
+**Backfill hold rule, 2026-09-29.** Section 11.5 says the backfill fills the page with entries above `hold_after`. That is exact even when the log's hint is higher: the `LearningApplied` events in the log move the backfill's hint, but they neither hold nor prune its page. A watermark below the hint therefore refills the entries between the two. That is the "store lost recent writes" case of 11.6 and the audit case of 11.7. Without the rule, the store would answer `ChainGap` with the same watermark forever. The live fold still drops what `LearningApplied` confirmed.

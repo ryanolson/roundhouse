@@ -31,10 +31,17 @@ use crate::store::{Lease, SessionStore, StoreError};
 use crate::validate::{Arm, EscalationOverrides, SteerAction};
 
 mod classification;
+mod learning;
 mod review;
 
 use classification::ClassificationFold;
+use learning::LearningFold;
 use review::ReviewTracker;
+
+pub use learning::{
+    Deltas, JevDelta, LEARNING_PAGE, LearningCauses, LearningEntry, QualityDelta, TargetDelta,
+    learning_mark,
+};
 pub(crate) use review::{IntervalFacts, TurnEnd, TurnState};
 pub use review::{MAX_REVIEW_DECISIONS, MAX_REVIEW_TURNS, REVIEW_OUTCOME_WINDOW, ReviewOutcome};
 
@@ -570,6 +577,12 @@ pub struct SessionState {
     /// The decisions no accepted review has covered yet, and the checkpoint
     /// the next review must start from. See [`review`].
     review: ReviewTracker,
+
+    // ---- Learning entries. -------------------------------------------------
+    /// The entries this session owes the learner store, the cursor over them,
+    /// and the per-turn facts their operational rows are computed from. See
+    /// [`learning`].
+    learning: LearningFold,
 }
 
 /// A narrowing the validate loop asked for, with its remaining life.
@@ -620,6 +633,10 @@ impl SessionState {
         // session whose last event was an error an hour ago has been quiet for
         // an hour.
         self.last_event_at_ms = event.at_ms;
+        // What this event adds to the learner store, when it is one of the
+        // kinds that produce an entry. Existence is decided after the match,
+        // from the kind alone; the arms only compute deltas.
+        let mut learned = None;
         match &event.kind {
             SessionEventKind::ItemAppended { item } => {
                 // The conversation itself is untouched by steering: the
@@ -667,6 +684,7 @@ impl SessionState {
                     response_id,
                     self.items.len() - self.configuration.len(),
                 );
+                self.learning.turn_started(response_id, event.at_ms);
                 self.turn_index += 1;
                 self.open_turns.insert(turn_id.clone(), response_id.clone());
                 // The configuration run is per turn: the items about to be
@@ -686,6 +704,7 @@ impl SessionState {
                 // per-dispatch vector cost (review finding G05).
                 self.frontier_history
                     .record(&decision.chosen, self.turn_index);
+                let row = self.learning.routed(response_id, event.at_ms, decision);
                 self.review.routed(
                     event.seq,
                     response_id,
@@ -694,6 +713,7 @@ impl SessionState {
                         .as_ref()
                         .and_then(|selection| selection.objective.as_ref()),
                     &self.items[..self.configuration.len()],
+                    row,
                 );
                 self.classification.routed(decision.selection.as_deref());
                 self.last_decision = Some(decision.clone());
@@ -733,6 +753,11 @@ impl SessionState {
                         SessionEventKind::ResponseCompleted { .. } => TurnEnd::Completed,
                         _ => TurnEnd::Incomplete,
                     },
+                );
+                learned = self.learning.terminal(
+                    response_id,
+                    matches!(event.kind, SessionEventKind::ResponseCompleted { .. }),
+                    usage,
                 );
                 let routing = self.pending_routings.remove(response_id);
                 // Whether this response ever reached a provider, which is the
@@ -865,7 +890,8 @@ impl SessionState {
                     verdict, interval, ..
                 } = outcome
                 {
-                    self.review.judged(event.seq, verdict, interval.as_deref());
+                    let reviewed = self.review.judged(event.seq, verdict, interval.as_deref());
+                    learned = self.learning.judged(reviewed);
                 }
                 // **The cooldown is spent by every decision; the cap and the
                 // budget are spent only by a decision that bought something.**
@@ -1003,9 +1029,17 @@ impl SessionState {
             }
             SessionEventKind::ClassificationRequested { record } => {
                 self.classification.requested(record);
+                self.learning.intent(record);
             }
             SessionEventKind::ClassificationRecorded { record } => {
-                self.classification.recorded(event.seq, record);
+                let accepted = self.classification.recorded(event.seq, record);
+                learned = self.learning.classified(record, accepted);
+            }
+            SessionEventKind::LearningApplied { through_seq } => {
+                self.learning.applied(*through_seq);
+            }
+            SessionEventKind::OutputTextDelta { response_id, text } => {
+                self.learning.output(response_id, event.at_ms, text);
             }
             SessionEventKind::ClassificationSettlementRepaired { record } => {
                 self.classification.repaired(&record.call_id);
@@ -1016,10 +1050,10 @@ impl SessionState {
             // does, and that is the arm above.
             SessionEventKind::SideCallCompleted { .. }
             | SessionEventKind::SideCallAbandoned { .. }
-            | SessionEventKind::OutputTextDelta { .. }
             | SessionEventKind::TurnDeduplicated { .. }
             | SessionEventKind::Error { .. } => {}
         }
+        self.learning.entry(event.seq, &event.kind, learned);
     }
 
     /// Which arm of the validate experiment this session is in, if any.
@@ -1273,6 +1307,32 @@ impl SessionState {
         self.classification.outstanding()
     }
 
+    /// The learning entries above the hint that this fold holds, in order, at
+    /// most [`LEARNING_PAGE`] of them: above the floor instead, for a
+    /// [`Self::project_learning`] backfill. See [`learning`].
+    pub fn learning_page(&self) -> &[LearningEntry] {
+        self.learning.page()
+    }
+
+    /// Entries above the hint (or a backfill's floor) that
+    /// [`Self::learning_page`] does not hold. A
+    /// backfill ([`Self::project_learning`]) fetches them; while this is above
+    /// zero the page takes no later entry, so its order never skips one.
+    pub fn learning_beyond(&self) -> u64 {
+        self.learning.beyond()
+    }
+
+    /// The highest `through_seq` a `LearningApplied` event recorded: a hint,
+    /// because the learner store's watermark is the authority.
+    pub fn learning_hint(&self) -> u64 {
+        self.learning.hint()
+    }
+
+    /// Why accepted reviews of this session credited nothing, per cause.
+    pub fn learning_causes(&self) -> LearningCauses {
+        self.learning.causes()
+    }
+
     /// Rebuild a session's projection from its log, **taking no lease**.
     ///
     /// The read-only half of [`Session::open_observed`], which calls it: a
@@ -1287,10 +1347,53 @@ impl SessionState {
         ledger: CacheLedger,
         observer: Option<&Arc<dyn SessionObserver>>,
     ) -> Result<Self, SessionError> {
-        let mut state = SessionState {
-            ledger,
-            ..Default::default()
-        };
+        Self::replay(
+            store,
+            session_id,
+            SessionState {
+                ledger,
+                ..Default::default()
+            },
+            observer,
+        )
+        .await
+    }
+
+    /// Rebuild a session's learning entries above `hold_after`, **taking no
+    /// lease**: the backfill of draft section 11.5.
+    ///
+    /// The same replay [`Self::project`] runs, with the page floor at
+    /// `hold_after`, so the page holds the first [`LEARNING_PAGE`] entries
+    /// above it in order. `hold_after` is a learner-store watermark, or the
+    /// fold's hint when the page ran dry. **The floor outranks the log's
+    /// hint**: `LearningApplied` events still set
+    /// [`Self::learning_hint`] but neither hold nor prune, so a watermark
+    /// below the hint (a store that lost acknowledged writes) refills the
+    /// entries between the two. The ledger is left empty: no entry reads it.
+    pub async fn project_learning<S: SessionStore>(
+        store: &S,
+        session_id: &SessionId,
+        hold_after: u64,
+    ) -> Result<Self, SessionError> {
+        Self::replay(
+            store,
+            session_id,
+            SessionState {
+                learning: LearningFold::with_floor(hold_after),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+    }
+
+    /// The one replay loop: fold every event of the log into `state`.
+    async fn replay<S: SessionStore>(
+        store: &S,
+        session_id: &SessionId,
+        mut state: SessionState,
+        observer: Option<&Arc<dyn SessionObserver>>,
+    ) -> Result<Self, SessionError> {
         // Replay in batches so a long session does not need the whole log
         // resident at once.
         let mut cursor = 0u64;
@@ -1493,10 +1596,12 @@ impl<S: SessionStore> Session<S> {
         &mut self,
         kinds: Vec<SessionEventKind>,
     ) -> Result<Vec<SessionEvent>, SessionError> {
-        // No learning mark yet: which events produce a learner entry is the
-        // later projection slice's decision (see `store::learning`), and a
-        // guessed mark here would make sessions pending that no learner reads.
-        let events = self.store.append_events(&self.lease, kinds, None).await?;
+        // Every write reaches the store through here, so this is the one
+        // place a learning mark is computed: a new write method cannot forget
+        // it. `None` unless the batch holds an entry-producing event of a
+        // session that already has learned evidence (see `learning_mark`).
+        let mark = learning_mark(&self.state, &kinds);
+        let events = self.store.append_events(&self.lease, kinds, mark).await?;
         for event in &events {
             self.state.apply(event);
         }
@@ -1916,6 +2021,17 @@ impl<S: SessionStore> Session<S> {
             terminal_attempt,
         });
         self.commit(kinds).await?;
+        Ok(())
+    }
+
+    /// Record that the learner store confirmed this session's entries through
+    /// `through_seq`, the watermark it returned.
+    ///
+    /// Moves the fold's hint, so the page drops what the store already has.
+    /// Not an entry-producing event, so it never marks the session.
+    pub async fn record_learning_applied(&mut self, through_seq: u64) -> Result<(), SessionError> {
+        self.commit(vec![SessionEventKind::LearningApplied { through_seq }])
+            .await?;
         Ok(())
     }
 
