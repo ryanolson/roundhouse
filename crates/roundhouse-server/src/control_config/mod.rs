@@ -92,6 +92,7 @@ pub mod credentials;
 pub mod crosscheck;
 pub mod directory;
 pub mod fair_use;
+pub mod learner;
 pub mod validate;
 
 use std::collections::{HashMap, HashSet};
@@ -107,6 +108,7 @@ use roundhouse_core::control::{
 };
 use roundhouse_core::ids::SessionId;
 use roundhouse_core::routing::TierRecipe;
+use roundhouse_core::routing::learn::LearnerTerms;
 use roundhouse_core::validate::ValidationTerms;
 use roundhouse_fleet::StaticFrontierCatalog;
 
@@ -126,6 +128,9 @@ pub use directory::{
     Provenance, StoreFailure, UserRecord,
 };
 pub use fair_use::{FairUseConfig, FairUseWindowConfig};
+pub use learner::{
+    DEFAULT_EXPLORATION_RATE, ExplorationConfig, LearnerConfig, LearnerConfigError, QualityConfig,
+};
 pub use validate::{ArmSharesConfig, ValidateConfig};
 
 /// Path to a control-plane JSON file. Absent means [`ControlPlane::Open`].
@@ -1282,6 +1287,27 @@ pub struct Admission {
     /// Behind an `Arc` for the reason `policy` is: an [`Admission`] is cloned
     /// per request out of a table compiled at load.
     pub tiers: Option<Arc<TierRecipe>>,
+    /// This project's online learner, or `None` where it configured none or
+    /// configured it `off`.
+    ///
+    /// Resolved beside `tiers` because a strategy is a tier pick over that
+    /// recipe, and the loader refuses a learner without one. `None` is today's
+    /// routing exactly: the engine never reads the learner store or draws for
+    /// such a turn. A session that already has learned history still has its
+    /// pending entries delivered, because delivery follows the log and not the
+    /// current mode (draft section 23).
+    ///
+    /// Behind an `Arc` for the reason `policy` is.
+    pub learner: Option<Arc<LearnerTerms>>,
+    /// The `apply_timeout_ms` this project's learner block wrote, in any
+    /// mode, or `None` where it wrote none.
+    ///
+    /// **Beside `learner`, not inside it**, because delivery follows the log:
+    /// a session of a project now `off` still owes the store its entries,
+    /// and an `off` block resolves `learner` to `None`. Required in `shadow`
+    /// and `live`, so there it is always `Some`. Where it is `None`, delivery
+    /// waits `UNCONFIGURED_APPLY_TIMEOUT_MS` (`engine::learning`).
+    pub learner_apply_timeout_ms: Option<u64>,
 }
 
 impl Admission {
@@ -1323,6 +1349,9 @@ impl Admission {
             // No file to write a recipe in, and inventing one would re-route
             // every turn of a deployment that never asked to be tier-routed.
             tiers: None,
+            // No recipe, so no learner: a strategy is a tier pick.
+            learner: None,
+            learner_apply_timeout_ms: None,
         }
     }
 
@@ -1376,6 +1405,9 @@ impl Admission {
             // session's own evidence, and an agent that could edit the lists
             // would be choosing its own model by another name.
             tiers: self.tiers.clone(),
+            // Nor the learner, for the recipe's reason.
+            learner: self.learner.clone(),
+            learner_apply_timeout_ms: self.learner_apply_timeout_ms,
         }
     }
 }

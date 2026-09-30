@@ -17,9 +17,14 @@
 mod agreement;
 mod columns;
 mod cost;
+mod learning;
 mod local;
 
 pub use agreement::{TierAgreement, TierDisagreements};
+pub use learning::{
+    LearnedChoices, LearnedModes, LearnedReadFailures, LearnedServed, LearnedUnmet,
+    LearningDeliveryMetrics, LearningMetrics,
+};
 
 pub use columns::{
     CacheReuseEvidence, FIRST_OUTPUT_BASIS, IntervalMetric, OBSERVED_CACHE_BASIS,
@@ -587,6 +592,9 @@ pub struct MetricsSnapshot {
     pub evaluation: EvaluationMetrics,
     /// Serving plus evaluation, with both price bases named.
     pub observed_cost: ObservedCost,
+    /// What the online learner decided and delivered, in this scope. Counts,
+    /// never money. See [`LearningMetrics`].
+    pub learning: LearningMetrics,
     pub coverage: Coverage,
     /// Share of *calls* the provider accounted for.
     pub coverage_fraction: f64,
@@ -866,6 +874,7 @@ impl MetricsSnapshot {
             savings,
             evaluation,
             observed_cost,
+            learning: LearningMetrics::build(&fold.learning(scope)),
             coverage_fraction: totals.coverage.reported_fraction(),
             coverage_token_fraction: totals.coverage.reported_token_fraction(),
             coverage: totals.coverage,

@@ -20,10 +20,12 @@ use crate::control_config::budget::{AllocationConfig, BudgetConfig, OnExhaustion
 use crate::control_config::config::{PolicyConfig, ProjectEntry, TiersConfig, UserEntry};
 use crate::control_config::credentials::{CredentialsConfig, ProviderCredentialConfig};
 use crate::control_config::fair_use::{FairUseConfig, FairUseWindowConfig};
+use crate::control_config::learner::{ExplorationConfig, LearnerConfig, QualityConfig};
 use crate::control_config::validate::{ArmSharesConfig, ValidateConfig};
 use roundhouse_core::control::policy::FrontierCadence;
 use roundhouse_core::control::{BudgetCounts, BudgetWindow, CredentialMode, FairUseWindow};
 use roundhouse_core::routing::PickerMode;
+use roundhouse_core::routing::learn::{LearnerMode, OnInfeasible, Strategy};
 use roundhouse_core::validate::SteerChannel;
 
 use super::super::records::{
@@ -106,6 +108,24 @@ fn every_field_populated() -> DirectoryRecords {
                     picker: PickerMode::EfficientFirst,
                     confidence_threshold: Some(0.65),
                 }),
+                learner: Some(Box::new(LearnerConfig {
+                    mode: LearnerMode::Live,
+                    strategies: Some(vec![Strategy::Rules, Strategy::Efficient]),
+                    artifact: Some("/etc/roundhouse/learner/acme.json".into()),
+                    quality: Some(QualityConfig {
+                        floor: 0.8,
+                        z: 1.96,
+                        min_evidence: 5_000,
+                        min_sessions: 20,
+                    }),
+                    latency_limit_ms: Some(10_000),
+                    latency_min_samples: Some(20),
+                    cache_min_samples: Some(21),
+                    on_infeasible: OnInfeasible::Refuse,
+                    read_timeout_ms: Some(25),
+                    apply_timeout_ms: Some(250),
+                    exploration: Some(ExplorationConfig { rate: 0.05 }),
+                })),
             },
             provenance: Provenance::Admin,
             created_at_ms: Some(1_700_000_000_000),
@@ -160,7 +180,7 @@ fn every_field_populated() -> DirectoryRecords {
 /// or adds `skip_serializing_if` to a field an older build reads as required —
 /// and this document is durable, so the first symptom of getting it wrong is a
 /// deployment whose entire tenancy no longer loads.
-const PINNED: &str = r#"{"schema":1,"records":{"projects":[{"entry":{"id":"acme","name":"Acme Corp","policy":{"min_quality":0.5,"allow":["local/*"],"frontier_cadence":{"max_frontier":1,"per_turns":4}},"budget":{"limit_usd":25.0,"window":"monthly","on_exhaustion":"degrade_to_local","overflow_when_local_saturated":false,"warn_at":0.75},"fair_use":{"windows":[{"window":"5h","max_tokens":1000,"max_usd":2.5}]},"validate":{"enabled":true,"channel":"text","arms":{"live":1,"shadow":2,"placebo":3},"placebo_rate":0.1,"escalation_floor":0.8,"escalation_turns":3,"steer_after_interventions":1,"handoff_note":"say why"},"credentials":{"mode":"project_only","budget_counts":"all_frontier_spend","providers":{"anthropic":{"env_var":"ACME_ANTHROPIC_KEY","kind":"api_key"}}},"tiers":{"capable":["anthropic/big"],"efficient":["local/small"],"picker":"efficient_first","confidence_threshold":0.65}},"provenance":"admin","created_at_ms":1700000000000,"archived_at_ms":1700000001000}],"users":[{"entry":{"id":"ada"},"provenance":"admin","created_at_ms":1700000002000}],"memberships":[{"project":"acme","user":"ada","role":"owner","allocation":{"capped":{"limit_usd":5.0}},"overrides":{"min_quality":0.9,"allow":["anthropic/*"],"frontier_cadence":null},"provenance":"admin","created_at_ms":1700000003000}],"keys":[{"id":"key_0123456789abcdef","key_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","display_tail":"wxyz","scope":{"turn":{"project":"acme","user":"ada"}},"provenance":"admin","created_at_ms":1700000004000,"revoked_at_ms":1700000005000,"fair_use":{"windows":[{"window":"7d","max_usd":9.0}]}}]},"compiled_under":{"file_sha256":null,"catalog":[],"fleet":[],"admission_cache_ttl_ms":null,"judge":null}}"#;
+const PINNED: &str = r#"{"schema":1,"records":{"projects":[{"entry":{"id":"acme","name":"Acme Corp","policy":{"min_quality":0.5,"allow":["local/*"],"frontier_cadence":{"max_frontier":1,"per_turns":4}},"budget":{"limit_usd":25.0,"window":"monthly","on_exhaustion":"degrade_to_local","overflow_when_local_saturated":false,"warn_at":0.75},"fair_use":{"windows":[{"window":"5h","max_tokens":1000,"max_usd":2.5}]},"validate":{"enabled":true,"channel":"text","arms":{"live":1,"shadow":2,"placebo":3},"placebo_rate":0.1,"escalation_floor":0.8,"escalation_turns":3,"steer_after_interventions":1,"handoff_note":"say why"},"credentials":{"mode":"project_only","budget_counts":"all_frontier_spend","providers":{"anthropic":{"env_var":"ACME_ANTHROPIC_KEY","kind":"api_key"}}},"tiers":{"capable":["anthropic/big"],"efficient":["local/small"],"picker":"efficient_first","confidence_threshold":0.65},"learner":{"mode":"live","strategies":["rules","efficient"],"artifact":"/etc/roundhouse/learner/acme.json","quality":{"floor":0.8,"z":1.96,"min_evidence":5000,"min_sessions":20},"latency_limit_ms":10000,"latency_min_samples":20,"cache_min_samples":21,"on_infeasible":"refuse","read_timeout_ms":25,"apply_timeout_ms":250,"exploration":{"rate":0.05}}},"provenance":"admin","created_at_ms":1700000000000,"archived_at_ms":1700000001000}],"users":[{"entry":{"id":"ada"},"provenance":"admin","created_at_ms":1700000002000}],"memberships":[{"project":"acme","user":"ada","role":"owner","allocation":{"capped":{"limit_usd":5.0}},"overrides":{"min_quality":0.9,"allow":["anthropic/*"],"frontier_cadence":null},"provenance":"admin","created_at_ms":1700000003000}],"keys":[{"id":"key_0123456789abcdef","key_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","display_tail":"wxyz","scope":{"turn":{"project":"acme","user":"ada"}},"provenance":"admin","created_at_ms":1700000004000,"revoked_at_ms":1700000005000,"fair_use":{"windows":[{"window":"7d","max_usd":9.0}]}}]},"compiled_under":{"file_sha256":null,"catalog":[],"fleet":[],"admission_cache_ttl_ms":null,"judge":null}}"#;
 
 /// **A fully populated directory is written exactly this way, and reads back
 /// exactly this way.**
@@ -573,6 +593,7 @@ fn records_padded_to(pad_bytes: usize) -> DirectoryRecords {
                 validate: None,
                 credentials: None,
                 tiers: None,
+                learner: None,
             },
             provenance: Provenance::Admin,
             created_at_ms: None,

@@ -44,6 +44,7 @@ use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::metrics::agreement::{AgreementCounts, AgreementFold};
 use crate::metrics::cache_evidence::CacheEvidence;
 use crate::metrics::evaluation::{EvaluationFold, EvaluationView};
+use crate::metrics::learning::{LearningCounts, LearningFold};
 use crate::metrics::pricing::TokenShape;
 use crate::metrics::timing::{TurnClock, TurnTimings};
 use crate::metrics::{ModelKey, ServingMode};
@@ -562,6 +563,10 @@ pub struct MetricsFold {
     /// evaluation fold because it books only results that fold accepted. See
     /// [`super::agreement`], which documents its own bound.
     agreement: AgreementFold,
+    /// The online learner's decisions and acknowledgements, off the `Routed`
+    /// that records each decision and the `LearningApplied` that records each
+    /// delivery. See [`super::learning`].
+    learning: LearningFold,
 }
 
 /// The volume figures a snapshot carries that are not per-model.
@@ -731,6 +736,10 @@ impl MetricsFold {
                 }
                 self.agreement
                     .routed(&event.session_id, response_id, decision);
+                // A response already pending is a failover's later dispatch:
+                // the learned decision was taken once.
+                self.learning
+                    .routed(&payer, self.pending.contains_key(response_id), decision);
                 self.pending.insert(
                     response_id.clone(),
                     Pending {
@@ -995,12 +1004,12 @@ impl MetricsFold {
             }
             // Learner delivery bookkeeping: it names no response, so the
             // pairing of a dispatch with its terminal never sees it, and it
-            // moves no money.
+            // moves no money. Counted as an acknowledgement and nothing else.
+            SessionEventKind::LearningApplied { .. } => self.learning.applied(&payer),
             SessionEventKind::SessionCreated { .. }
             | SessionEventKind::ItemAppended { .. }
             | SessionEventKind::OutputTextDelta { .. }
             | SessionEventKind::TurnDeduplicated { .. }
-            | SessionEventKind::LearningApplied { .. }
             | SessionEventKind::Error { .. } => {}
         }
 
@@ -1180,6 +1189,11 @@ impl MetricsFold {
     /// reason.
     pub(super) fn agreement(&self, scope: Scope<'_>) -> AgreementCounts {
         self.agreement.tally(scope)
+    }
+
+    /// The learner's decisions and acknowledgements in one scope.
+    pub(super) fn learning(&self, scope: Scope<'_>) -> LearningCounts {
+        self.learning.tally(scope)
     }
 
     /// Side calls made and abandoned, in one scope.

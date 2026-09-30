@@ -699,57 +699,193 @@ impl DirectoryStore for ScriptedDirectoryStore {
     }
 }
 
-/// Everything `tracing::warn!` wrote during one closure, as text.
+/// Everything `tracing` wrote at `INFO` and above on the calling thread during
+/// one closure, as text.
 ///
-/// Capture is serialized process-wide and rebuilds the callsite interest
-/// cache inside the thread-local subscriber `with_default` installs: a
-/// callsite first evaluated under the no-op global dispatcher caches "never
-/// interested," and without the rebuild the very line under test is dropped
-/// rather than captured. Consolidated from three call sites (`main.rs`,
-/// `engine/fair_use.rs`, `typesafe_shadow/tests/accounting.rs`) that carried
-/// identical copies for want of a shared reach.
+/// `INFO` and not only `WARN`, because that is what `tracing_subscriber::fmt()`
+/// captured before this helper changed shape, and some callers assert that a
+/// transcript or a key reaches *no* log line, at any level.
+///
+/// **One process-wide subscriber, installed once; a capture only fills a
+/// thread-local buffer.** The subscriber's filter asks "is this thread
+/// capturing?" on every event (`dynamic_filter_fn`, so each callsite's
+/// interest is `sometimes` at `INFO` and above and `never` below), and the
+/// writer appends to that thread's buffer. So the answer tracing caches for a
+/// callsite is the same whichever thread registers it, and the global max
+/// level stays at `INFO` for the life of the process.
+///
+/// **The approach this replaces, and why it lost lines.** The old helper put
+/// a `fmt` subscriber in scope with `with_default`, serialized captures with a
+/// mutex, and called `rebuild_interest_cache` inside. Under `cargo test` (many
+/// tests, one process) it dropped the line under test about one run in three
+/// (PR 31, `a_read_success_between_two_outages_resets_the_warn_flag`). In
+/// tracing-core 0.1.36, registering a dispatcher prunes the dead ones and
+/// sets `has_just_one` when only one is left (`callsite.rs:551-557`); that is
+/// the case during every serialized capture. With `has_just_one` set, a
+/// callsite's first registration asks only the *registering thread's*
+/// default (`callsite.rs:544-547`, `564-566`). A test with no capture that
+/// reached the callsite first, mid-capture, got the no-op dispatcher's
+/// `never` (`subscriber.rs:676-678`) and cached it for the whole process
+/// (`callsite.rs:316-320`, `505-506`), after the capture's own rebuild had
+/// already run. The capturing thread's line then failed the interest check
+/// in the macro and was never seen. A rebuild only fixes callsites that
+/// were registered before it ran, so no amount of rebuilding closes this.
+/// `a_callsite_another_thread_registers_mid_capture_is_still_captured`
+/// forces that order.
+///
+/// **The one rebuild left.** `Dispatch::new` registers the subscriber and
+/// rebuilds interest (`dispatcher.rs:472-479`) *before*
+/// `set_global_default` makes it the global default (`dispatcher.rs:299-331`).
+/// A callsite first reached on another thread in that gap asks the old no-op
+/// default and caches `never`. The single rebuild right after the install
+/// corrects any callsite that was registered in that gap.
+///
+/// Only events emitted on the calling thread are captured: a multi-thread
+/// runtime inside `f` that resumes work on a worker thread loses those
+/// lines, so callers drive a current-thread runtime. A caller inside its own
+/// `tracing::subscriber::set_default` scope would send its events to that
+/// subscriber instead; no caller does.
 pub fn captured_warnings(f: impl FnOnce()) -> String {
+    use std::cell::RefCell;
     use std::io;
-    use tracing_subscriber::fmt::MakeWriter;
+    use std::sync::Once;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::filter::{LevelFilter, dynamic_filter_fn};
+    use tracing_subscriber::layer::SubscriberExt;
 
-    #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
-    impl io::Write for Buf {
+    thread_local! {
+        static CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    }
+
+    /// `try_with`, because the subscriber is global: an event emitted while a
+    /// thread's locals are being torn down must be dropped, not panic.
+    fn capturing() -> bool {
+        CAPTURE
+            .try_with(|slot| slot.borrow().is_some())
+            .unwrap_or(false)
+    }
+
+    struct ThreadBuffer;
+    impl io::Write for ThreadBuffer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
+            let _ = CAPTURE.try_with(|slot| {
+                if let Some(buffer) = slot.borrow_mut().as_mut() {
+                    buffer.extend_from_slice(bytes);
+                }
+            });
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
-    impl<'a> MakeWriter<'a> for Buf {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(|| ThreadBuffer)
+            .with_ansi(false)
+            .with_filter(
+                dynamic_filter_fn(|metadata, _| {
+                    *metadata.level() <= tracing::Level::INFO && capturing()
+                })
+                .with_max_level_hint(LevelFilter::INFO),
+            );
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer)).expect(
+            "captured_warnings must own this process's global subscriber; if another \
+                 one were installed first, every capture would be empty and every \
+                 assertion that a line is absent would pass for nothing",
+        );
+        tracing::callsite::rebuild_interest_cache();
+    });
+
+    /// Puts back whatever the slot held, on the way out and on a panic in `f`,
+    /// so a later capture on this thread starts clean.
+    struct Restore(Option<Vec<u8>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            let _ = CAPTURE.try_with(|slot| *slot.borrow_mut() = previous);
         }
     }
 
-    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
-    let _serialized = ONE_AT_A_TIME
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    let buf = Buf::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(buf.clone())
-        .with_ansi(false)
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        tracing::callsite::rebuild_interest_cache();
-        f()
-    });
-    String::from_utf8(buf.0.lock().unwrap().clone()).expect("tracing output is UTF-8")
+    let restore = Restore(CAPTURE.with(|slot| slot.borrow_mut().replace(Vec::new())));
+    f();
+    let captured = CAPTURE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default();
+    drop(restore);
+    String::from_utf8(captured).expect("tracing output is UTF-8")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Each of these two functions holds one `tracing::warn!` callsite that
+    // nothing else reaches, so the test that calls it decides which thread
+    // registers that callsite first. Registration happens once per process,
+    // on first hit, so the two tests below need one callsite each.
+    fn warn_from_a_callsite_another_thread_registers(from: &str) {
+        tracing::warn!(
+            from,
+            "a line from a callsite registered off the capturing thread"
+        );
+    }
+    fn warn_from_a_callsite_the_capturing_thread_registers(from: &str) {
+        tracing::warn!(
+            from,
+            "a line from a callsite registered on the capturing thread"
+        );
+    }
+
+    /// PR 31 flake: `a_read_success_between_two_outages_resets_the_warn_flag`
+    /// lost its captured lines in about one run in three under `cargo test`.
+    /// The race is that a test with no capture is the first to reach the
+    /// warn callsite while another test's capture is open. This forces that
+    /// order: another thread, with no subscriber of its own, reaches a fresh
+    /// callsite during the capture, and then the capturing thread reaches the
+    /// same callsite. The capturing thread's line must still be captured.
+    #[test]
+    fn a_callsite_another_thread_registers_mid_capture_is_still_captured() {
+        let captured = captured_warnings(|| {
+            std::thread::spawn(|| {
+                warn_from_a_callsite_another_thread_registers("the other thread")
+            })
+            .join()
+            .expect("the other thread emits and exits");
+            warn_from_a_callsite_another_thread_registers("the capturing thread");
+        });
+        assert!(
+            captured.contains("the capturing thread"),
+            "the capturing thread's own line was lost because another thread \
+             registered the callsite first: {captured:?}"
+        );
+        // Control, true under any helper: a capture holds only the calling
+        // thread's events.
+        assert!(
+            !captured.contains("the other thread"),
+            "a capture must not take another thread's line: {captured:?}"
+        );
+    }
+
+    /// Control for the test above: the same shape, but the capturing thread
+    /// reaches the callsite first. This passed under the `with_default` helper
+    /// too, which shows the test above failed there because of registration
+    /// order and not because a spawned thread breaks the capture.
+    #[test]
+    fn a_callsite_the_capturing_thread_registers_first_is_captured() {
+        let captured = captured_warnings(|| {
+            warn_from_a_callsite_the_capturing_thread_registers("the capturing thread");
+            std::thread::spawn(|| {
+                warn_from_a_callsite_the_capturing_thread_registers("the other thread")
+            })
+            .join()
+            .expect("the other thread emits and exits");
+        });
+        assert!(captured.contains("the capturing thread"), "{captured:?}");
+        assert!(!captured.contains("the other thread"), "{captured:?}");
+    }
 
     /// Control for the F1 guard below: a named struct-update override round
     /// trips into the built spec exactly, and the fields that were not

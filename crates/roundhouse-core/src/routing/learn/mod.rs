@@ -9,10 +9,10 @@
 //! puts them together ([`LearnedPolicy`]).
 //!
 //! **Pure functions only.** The policy never reads the store and never draws;
-//! the caller passes both in a [`LearningTurn`]. Nothing in the engine
-//! composes a learner yet (that is milestone M8 of
-//! `agent-docs/PLAN-online-routing-learner.md`), so every turn still routes
-//! exactly as [`StagePolicy`](super::StagePolicy) routes it.
+//! the caller passes both in a [`LearningTurn`]. The server's engine does both
+//! for a project whose learner is `shadow` or `live` (its `engine::learning`
+//! module); an `off` project never reaches this module and routes exactly as
+//! [`StagePolicy`](super::StagePolicy) routes it.
 //!
 //! A strategy is a *tier pick*, never a target. Each one is planned through
 //! [`StagePolicy::route_pick`](super::StagePolicy::route_pick), the same code
@@ -21,6 +21,7 @@
 //! by its own rules would earn quality evidence for a plan the stage router
 //! could never serve.
 
+pub mod artifact;
 pub mod corrections;
 pub mod evidence;
 pub mod explore;
@@ -47,6 +48,7 @@ pub(crate) fn enough(n: u64, min_samples: u64) -> bool {
     n > 0 && n >= min_samples
 }
 
+pub use artifact::{ARTIFACT_SCHEMA_REVISION, Artifact, ArtifactError, GATE_NAME, epoch_of};
 pub use corrections::{Corrections, adjusted_cached_tokens, grant, latency_term};
 pub use evidence::{
     CacheReuse, CostCorrection, CostEvidence, Draw, ExplorationEvidence, GateEvidence, GateResult,
@@ -383,9 +385,15 @@ impl PriorUnits {
 /// One project's resolved learner: its configuration, its artifact prior and
 /// its epoch.
 ///
-/// Data only. The configuration loader that builds and validates it is a later
-/// milestone; [`StrategySet`] already refuses the one shape no policy could
+/// Data only. The server's configuration loader (`control_config::learner`)
+/// builds and validates it from a project's `learner` block and its
+/// [`Artifact`]; [`StrategySet`] already refuses the one shape no policy could
 /// serve.
+///
+/// **No apply timeout here.** Delivery follows the log, so a session of a
+/// project now `off` still delivers, and an `off` block resolves to no terms.
+/// The server carries the block's written apply timeout beside these terms,
+/// in every mode, so delivery has one place to read it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LearnerTerms {
     pub mode: LearnerMode,
@@ -400,4 +408,7 @@ pub struct LearnerTerms {
     pub on_infeasible: OnInfeasible,
     /// `None` is a project that does not explore.
     pub exploration: Option<ExplorationTerms>,
+    /// How long the engine waits for the store read before the turn takes the
+    /// `ReadTimedOut` path. Read by the engine, never by the policy.
+    pub read_timeout_ms: u64,
 }

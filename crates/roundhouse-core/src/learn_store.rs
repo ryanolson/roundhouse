@@ -6,8 +6,11 @@
 //! `agent-docs/DRAFT-online-routing-learner.md`, milestone M6 of
 //! `agent-docs/PLAN-online-routing-learner.md`).
 //!
-//! **Nothing calls it yet.** The engine composes a learner store in M8. Until
-//! then no route reads these counters and no turn writes them.
+//! **The engine is the caller** (the server's `engine::learning`, milestone
+//! M8): `read` in `plan` for a project whose learner is `shadow` or `live`,
+//! and `apply` in the `run_turn` tail for any session with entries pending.
+//! An `off` project's turns never read, and a session with no learned history
+//! never applies.
 //!
 //! **Each entry applies exactly once, whoever sends it and however often.**
 //! [`LearnerStore::apply`] compares every entry, not the batch, with the
@@ -279,11 +282,16 @@ pub struct Applied {
 ///
 /// `ChainGap` asks for a backfill. `ChainDiverged` does not go away on a
 /// retry or a backfill: the engine stops delivery for that one session and
-/// reports it, and the project's other sessions carry on. `CounterRange`,
-/// `Malformed` and `WrongType` do not go away on a retry either: the engine
-/// stops updates for the project epoch and a new epoch is the recovery (draft
-/// section 11.3). `Unavailable` leaves the result unknown, and a resend is
-/// safe under the identity rule.
+/// reports it, and the project's other sessions carry on. `CounterRange` and
+/// `Malformed` do not go away on a retry either, nor under a new epoch: the
+/// refused entry stays in its session's page under the epoch it was written
+/// in, so the engine stops that session's delivery the same way (M8 review
+/// ruling, which supersedes the draft's project-epoch stop, section 11.3).
+/// `Unavailable` leaves the result unknown, and a resend is safe under the
+/// identity rule. `WrongType` leaves the entries pending, like `Unavailable`:
+/// the foreign key is an operator's to remove, and the source marks keep the
+/// entries for the next turn or the recovery task once it is gone (M8 ruling,
+/// which supersedes the draft's epoch stop for this variant).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LearnerError {
     /// The batch skips an entry. Backfill from `store_watermark`, the

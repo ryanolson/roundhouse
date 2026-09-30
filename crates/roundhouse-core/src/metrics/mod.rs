@@ -95,6 +95,18 @@
 //! the second — while a pass-through deployment reports a small one that is
 //! complete, since nothing it paid for is missing.
 
+//! ## The learner, and the one figure that is not folded
+//!
+//! [`MetricsSnapshot::learning`] counts the online learner's decisions and
+//! acknowledgements, folded off the log like everything above. Its `delivery`
+//! half is the one figure on the document that is **not** a projection of the
+//! log: what a delivery attempt met (a duplicate, a gap, an outage) is
+//! deliberately never appended, because a failed delivery must leave its
+//! entries pending and write nothing. The engine counts those outcomes in
+//! [`LearningDelivery`], in process memory beside the fold rather than in it,
+//! so a replay of the log still reproduces the fold exactly. See the
+//! `learning` module.
+//!
 //! ## Layout
 //!
 //! Three modules, split along the two seams the design already had. [`fold`]
@@ -108,6 +120,7 @@ pub(crate) mod agreement;
 pub(crate) mod cache_evidence;
 pub(crate) mod evaluation;
 pub mod fold;
+pub(crate) mod learning;
 pub mod pricing;
 pub mod snapshot;
 pub(crate) mod timing;
@@ -129,6 +142,7 @@ use crate::routing::Target;
 use crate::validate::Arm;
 
 pub use fold::{MetricsFold, Scope, SideCallTally, ValidationTally};
+pub use learning::{DeliveryOutcome, LearningDelivery};
 pub use pricing::{
     Correlary, DEFAULT_CAPABILITY_BAND, IncoherentCorrelary, PricedBasis, ReferenceModel,
     ShadowPricing, TokenShape,
@@ -141,6 +155,10 @@ pub use snapshot::{
     OBSERVED_COST_SCOPE_WITH_LOCAL_CAPACITY, ObservedCost, PREDICTED_CACHE_BASIS, ProviderMetrics,
     Rollup, SERVING_PRICE_BASIS, Savings, ServingCostGaps, ServingModeMetrics, TURN_ELAPSED_BASIS,
     TierAgreement, TierDisagreements, TokenBreakdown,
+};
+pub use snapshot::{
+    LearnedChoices, LearnedModes, LearnedReadFailures, LearnedServed, LearnedUnmet,
+    LearningDeliveryMetrics, LearningMetrics,
 };
 
 /// The provider name local targets are grouped under.
@@ -214,6 +232,10 @@ impl ModelKey {
 #[derive(Clone, Default)]
 pub struct MetricsRecorder {
     fold: Arc<RwLock<MetricsFold>>,
+    /// The learner's delivery outcomes, which are process memory and not a
+    /// projection of the log. See [`learning`] for why they live beside the
+    /// fold rather than in it.
+    delivery: Arc<LearningDelivery>,
 }
 
 impl MetricsRecorder {
@@ -235,7 +257,16 @@ impl MetricsRecorder {
 
     pub fn snapshot(&self, config: &MetricsConfig, generated_at_ms: u64) -> MetricsSnapshot {
         let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
-        MetricsSnapshot::build(&fold, Scope::Deployment, config, generated_at_ms)
+        let mut snapshot =
+            MetricsSnapshot::build(&fold, Scope::Deployment, config, generated_at_ms);
+        snapshot.learning.delivery =
+            Some(LearningDeliveryMetrics::build(&self.delivery.tally(None)));
+        snapshot
+    }
+
+    /// Where the engine reports what each learner delivery attempt met.
+    pub fn learning_delivery(&self) -> &LearningDelivery {
+        &self.delivery
     }
 
     /// The same report, restricted to one principal's share of the same fold.
@@ -273,7 +304,12 @@ impl MetricsRecorder {
         generated_at_ms: u64,
     ) -> MetricsSnapshot {
         let fold = self.fold.read().unwrap_or_else(|e| e.into_inner());
-        MetricsSnapshot::build(&fold, Scope::Project(project), config, generated_at_ms)
+        let mut snapshot =
+            MetricsSnapshot::build(&fold, Scope::Project(project), config, generated_at_ms);
+        snapshot.learning.delivery = Some(LearningDeliveryMetrics::build(
+            &self.delivery.tally(Some(project)),
+        ));
+        snapshot
     }
 
     /// What one arm of the validate experiment decided, and how often it acted.

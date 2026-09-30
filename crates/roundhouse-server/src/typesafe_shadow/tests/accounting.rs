@@ -325,9 +325,9 @@ async fn unreported_usage_books_the_estimate_without_claiming_a_measured_cost() 
 /// would have read downstream as a discount. The usage is still reported,
 /// because the service still billed it.
 ///
-/// A blocking test with its own current-thread runtime, because `with_default`
-/// installs a *thread-local* subscriber and a multi-threaded runtime is free to
-/// resume the future on a thread that never had one.
+/// A blocking test with its own current-thread runtime, because
+/// `captured_warnings` captures only the *calling thread's* events and a
+/// multi-threaded runtime is free to resume the future on another thread.
 #[test]
 fn a_rejected_settle_is_recorded_as_rejected_and_names_the_call() {
     let rt = tokio::runtime::Builder::new_current_thread()
