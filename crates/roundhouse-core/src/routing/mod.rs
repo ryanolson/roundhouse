@@ -48,7 +48,8 @@ pub use selection::{
     StageOutcome,
 };
 pub use stage::{
-    DecisionSource, Pick, PickerMode, StagePolicy, Tier, TierRecipe, TierRecipeError, TurnSignals,
+    DecisionSource, Pick, PickerMode, RoutedPick, StagePolicy, Tier, TierRecipe, TierRecipeError,
+    TurnSignals,
 };
 
 use async_trait::async_trait;

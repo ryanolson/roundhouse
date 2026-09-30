@@ -290,6 +290,21 @@ pub struct PlanEvidence {
     pub gate: GateEvidence,
 }
 
+impl PlanEvidence {
+    /// The first target meets every hard constraint but the gate: admission
+    /// (the plan was routed over the admitted pool), the grant on the
+    /// corrected cost, and the latency limit.
+    ///
+    /// **One predicate for exploitation and exploration.** An explored member
+    /// bypasses only the quality gate; were the two spellings to drift, an
+    /// exploring turn could serve a route the exploit path would refuse on
+    /// cost or latency. An overflow admission keeps its status and meets the
+    /// grant (draft 7.2): only [`GrantCheck::Exceeds`] fails it.
+    pub fn meets_hard(&self) -> bool {
+        self.grant != GrantCheck::Exceeds && self.latency_met
+    }
+}
+
 /// The first target's cost for this turn, before and after the cache
 /// correction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -357,8 +372,8 @@ pub enum GrantCheck {
 /// The quality gate's answer for one strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateEvidence {
-    /// The most specific level with enough live evidence, or `None` when no
-    /// level had any.
+    /// The most specific level whose live units met `min_evidence`, or `None`
+    /// when no level met it.
     pub level: Option<KeyLevel>,
     pub result: GateResult,
 }

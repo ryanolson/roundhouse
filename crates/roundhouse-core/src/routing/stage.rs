@@ -607,6 +607,25 @@ pub struct StagePolicy {
     inner: Box<dyn RoutingPolicy>,
 }
 
+/// A tier pick routed over one admitted pool: the decision, and what the
+/// stage evidence on it records about the pick.
+///
+/// **The pick and outcome travel beside the decision** so a caller that plans
+/// several picks (the learner's strategies) reads them here, not back out of
+/// the decision's selector snapshot, where they are reachable only through a
+/// branch match that cannot fail in practice and still needs an arm for
+/// failing. The recipe half of [`StageEvidence`] is not repeated: it is the
+/// recipe the caller passed in, and cloning its lists on every stage turn
+/// would be paid by [`StagePolicy::choose`], which drops them.
+#[derive(Debug)]
+pub struct RoutedPick {
+    pub decision: Decision,
+    /// The pick the decision was routed from, as its evidence records it.
+    pub pick: Pick,
+    /// What the resolution did with the pick, as its evidence records it.
+    pub outcome: StageOutcome,
+}
+
 /// What [`StagePolicy::resolve`] found, before a target is picked out of it.
 enum Resolved<'a> {
     /// A tier served, one way or another: the ordered pool [`StageOutcome`]
@@ -873,7 +892,7 @@ impl StagePolicy {
         recipe: &TierRecipe,
         pick: Pick,
         admitted: &Admitted<'_>,
-    ) -> Result<Decision, RoutingError> {
+    ) -> Result<RoutedPick, RoutingError> {
         let Some(degrade) = admitted
             .pool()
             .iter()
@@ -895,7 +914,10 @@ impl StagePolicy {
             );
             return Err(admitted.refuse_no_viable());
         };
-        Ok(admitted.decide(
+        let outcome = StageOutcome::DegradedPastRecipe {
+            degraded_to: degrade.target.policy_identity(),
+        };
+        let decision = admitted.decide(
             degrade.target.clone(),
             // **No price in this string**, the same rule the staged rationale
             // below states at length: a rationale is republished into the
@@ -913,14 +935,13 @@ impl StagePolicy {
             // a degrade asks. `StageOutcome::DegradedPastRecipe` is what says
             // no tier served, which is the same thing the `None` source says
             // to the handoff gate.
-            SelectorSnapshot::stage(StageEvidence::new(
-                recipe,
-                pick,
-                StageOutcome::DegradedPastRecipe {
-                    degraded_to: degrade.target.policy_identity(),
-                },
-            )),
-        ))
+            SelectorSnapshot::stage(StageEvidence::new(recipe, pick, outcome.clone())),
+        );
+        Ok(RoutedPick {
+            decision,
+            pick,
+            outcome,
+        })
     }
 }
 
@@ -957,7 +978,7 @@ impl RoutingPolicy for StagePolicy {
         // no depth, so the scorer returns zero and the fall-open takes it.
         let signals = ctx.signals.cloned().unwrap_or_default();
         let pick = pick_tier(&signals, recipe.picker(), recipe.confidence_threshold());
-        Self::route_pick(recipe, pick, &admitted)
+        Ok(Self::route_pick(recipe, pick, &admitted)?.decision)
     }
 }
 
@@ -978,11 +999,15 @@ impl StagePolicy {
     /// planned over the same pool and the same budget state. `pick.source`
     /// travels into the evidence unchanged, which is how a forced pick keeps
     /// its [`DecisionSource::Strategy`] and stays out of the handoff note.
+    ///
+    /// Returns the pick and outcome the evidence records beside the decision
+    /// ([`RoutedPick`]), so a caller never reads them back out of the
+    /// selector snapshot.
     pub fn route_pick(
         recipe: &TierRecipe,
         pick: Pick,
         admitted: &Admitted<'_>,
-    ) -> Result<Decision, RoutingError> {
+    ) -> Result<RoutedPick, RoutingError> {
         let pool = admitted.pool();
         let (served, outcome, ordered, guarded) = match Self::resolve(recipe, pick, pool) {
             Resolved::Degrade => return Self::degrade_past_the_recipe(recipe, pick, admitted),
@@ -1106,7 +1131,8 @@ impl StagePolicy {
             }
         }
 
-        Ok(admitted.decide_staged(
+        let outcome = evidence.outcome.clone();
+        let decision = admitted.decide_staged(
             winner.target.clone(),
             fallbacks,
             rationale,
@@ -1119,7 +1145,12 @@ impl StagePolicy {
             // thresholds, which is exactly the substitution a replay must
             // not make.
             evidence,
-        ))
+        );
+        Ok(RoutedPick {
+            decision,
+            pick,
+            outcome,
+        })
     }
 }
 

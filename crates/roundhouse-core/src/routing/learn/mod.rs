@@ -4,13 +4,15 @@
 //! The pure half of the online routing learner: serving strategies, the
 //! learned input and its keys, the configuration a learner runs under, the
 //! evidence a learned decision records, and the cost, latency and grant
-//! corrections a decision applies to a quote ([`corrections`]).
+//! corrections a decision applies to a quote ([`corrections`]), the quality
+//! gate ([`gate`]), bounded exploration ([`explore`]), and the policy that
+//! puts them together ([`LearnedPolicy`]).
 //!
-//! **Data and pure functions only.** No gate and no policy lives here yet;
-//! `agent-docs/PLAN-online-routing-learner.md` builds those in later
-//! milestones on top of these types. Nothing in the engine
-//! composes a learner, so every turn still routes exactly as
-//! [`StagePolicy`](super::StagePolicy) routes it.
+//! **Pure functions only.** The policy never reads the store and never draws;
+//! the caller passes both in a [`LearningTurn`]. Nothing in the engine
+//! composes a learner yet (that is milestone M8 of
+//! `agent-docs/PLAN-online-routing-learner.md`), so every turn still routes
+//! exactly as [`StagePolicy`](super::StagePolicy) routes it.
 //!
 //! A strategy is a *tier pick*, never a target. Each one is planned through
 //! [`StagePolicy::route_pick`](super::StagePolicy::route_pick), the same code
@@ -21,7 +23,10 @@
 
 pub mod corrections;
 pub mod evidence;
+pub mod explore;
+pub mod gate;
 pub mod input;
+pub mod policy;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -29,8 +34,18 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::selection::STAGE_SELECTOR_REVISION;
-use super::stage::{DecisionSource, Pick, StagePolicy, Tier, TierRecipe};
-use super::{Admitted, Decision, RoutingError};
+use super::stage::{DecisionSource, Pick, RoutedPick, StagePolicy, Tier, TierRecipe};
+use super::{Admitted, RoutingError};
+
+/// Whether `n` samples meet a configured minimum.
+///
+/// Zero samples never do, whatever the minimum: a configured minimum of zero
+/// would otherwise divide by zero, and no samples is no measurement. The
+/// corrections apply it to their sample counts, and the gate to live units and
+/// sessions, so a prior never passes on its own under zero minimums.
+pub(crate) fn enough(n: u64, min_samples: u64) -> bool {
+    n > 0 && n >= min_samples
+}
 
 pub use corrections::{Corrections, adjusted_cached_tokens, grant, latency_term};
 pub use evidence::{
@@ -39,7 +54,13 @@ pub use evidence::{
     LearnedEvidenceError, LearnedEvidenceParts, LevelView, PlanEvidence, ReadFailure, ReadView,
     StoreRead, StrategyCounts, TargetOps, TtftEvidence, Unmet,
 };
+pub use explore::LEARNER_DRAW_VERSION;
+pub use gate::{
+    Bounds, CREDIT_SCALE, GateReading, JEV_PRIOR_MIN_ANSWERS, JEV_PRIOR_PSEUDO_INTERVALS,
+    PriorSource, jev_prior, read_gate, wilson_v1,
+};
 pub use input::{Band, KeyLevel, LearnedInput, LevelKey, PriorBand, SEQUENCE_LEN};
+pub use policy::{LearnedError, LearnedPolicy, LearningTurn};
 
 /// The revision of the learned input: its fields, the complexity bands, the
 /// sequence length and the three key levels.
@@ -129,7 +150,7 @@ impl Strategy {
         recipe: &TierRecipe,
         rules: Pick,
         admitted: &Admitted<'_>,
-    ) -> Result<Decision, RoutingError> {
+    ) -> Result<RoutedPick, RoutingError> {
         StagePolicy::route_pick(recipe, self.pick(rules), admitted)
     }
 }
