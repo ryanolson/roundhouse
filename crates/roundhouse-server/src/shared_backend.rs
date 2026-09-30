@@ -41,6 +41,15 @@
 //! id on the next restart and silently joins the new tenant to the old one's
 //! spend. `tests/directory_backend_boot.rs` is its end-to-end assertion, in
 //! the shape the fair-use and correlation families already had.
+//!
+//! **And since M9 of the routing learner, a seventh, opened lazily.** The
+//! learner store is chosen by the same one switch, in the same `Backends`
+//! arm, but it is opened by [`Backends::open_learner_store`] only when the
+//! composition root has a learner to attach: a deployment with no project in
+//! `shadow` or `live` gets no learner connection and no learner log line, so
+//! its boot is exactly what it was. The Redis arm carries the namespace it was
+//! opened under, so the learner store cannot land in another deployment's
+//! keys than its six siblings.
 
 use std::sync::Arc;
 
@@ -49,10 +58,11 @@ use roundhouse_core::control::{
     DocumentStore, FairUseLedger, MemoryDocumentStore, MemoryFairUseLedger, MemorySpendLedger,
     SpendLedger,
 };
+use roundhouse_core::learn_store::{LearnerStore, MemoryLearnerStore};
 use roundhouse_core::store::MemoryStore;
 use roundhouse_store_redis::{
     EmptyNamespace, KeyNamespace, RedisCorrelationMaps, RedisDocumentStore, RedisFairUseLedger,
-    RedisSessionStore, RedisSpendLedger, SpendPurpose,
+    RedisLearnerStore, RedisSessionStore, RedisSpendLedger, SpendPurpose,
 };
 
 use crate::Conversations;
@@ -171,6 +181,10 @@ pub enum Backends {
         /// opened on — the two-facts-that-can-disagree shape this module
         /// exists to remove, one level up.
         url: String,
+        /// The namespace all of them were opened under, carried for the
+        /// learner store [`Backends::open_learner_store`] opens later, for the
+        /// reason `url` is carried.
+        namespace: KeyNamespace,
         store: Arc<RedisSessionStore>,
         spend: Arc<dyn SpendLedger>,
         /// The sixth family: what this deployment's own evaluation calls spend.
@@ -254,6 +268,46 @@ impl Backends {
         match self {
             Backends::Shared { directory, .. } | Backends::PerProcess { directory, .. } => {
                 directory
+            }
+        }
+    }
+    /// The online routing learner's store, in this arm's backend: Redis for
+    /// [`Backends::Shared`], this process's memory otherwise (milestone M9).
+    ///
+    /// **Opened on demand rather than by [`open`]**, so that a deployment with
+    /// no learner enabled connects nothing and logs nothing new: see the
+    /// module doc. The composition root calls it once, and only when a
+    /// project enables the learner at boot.
+    ///
+    /// The memory arm warns, because learned state there is this node's alone
+    /// and ends with the process: a second node learns its own counts, and a
+    /// restart forgets every one. An unreachable Redis stops the boot with the
+    /// variable named, as every other family's connect does.
+    pub async fn open_learner_store(&self) -> anyhow::Result<Arc<dyn LearnerStore>> {
+        match self {
+            Backends::Shared { url, namespace, .. } => {
+                let store = RedisLearnerStore::connect_namespaced(url, namespace.clone())
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "opening the learner store in the Redis named by {REDIS_VAR}: {error}"
+                        )
+                    })?;
+                tracing::info!(
+                    var = REDIS_VAR,
+                    "learner state is shared in the Redis this deployment names: every node \
+                     reads and applies one set of learned counters"
+                );
+                Ok(Arc::new(store))
+            }
+            Backends::PerProcess { .. } => {
+                tracing::warn!(
+                    var = REDIS_VAR,
+                    "no Redis configured; learner state is in this process's memory and ends \
+                     with the process -- a restart forgets every learned count, and another \
+                     node learns its own"
+                );
+                Ok(Arc::new(MemoryLearnerStore::new()))
             }
         }
     }
@@ -353,6 +407,7 @@ pub async fn open(redis_url: Option<&str>, namespace: &KeyNamespace) -> anyhow::
             );
             Ok(Backends::Shared {
                 url: url.to_string(),
+                namespace: namespace.clone(),
                 store: Arc::new(store),
                 spend: Arc::new(spend),
                 evaluation_spend: Arc::new(evaluation_spend),

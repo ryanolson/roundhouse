@@ -80,6 +80,7 @@ pub mod dialect;
 pub mod engine;
 pub mod http;
 pub mod judge;
+pub mod learner_recovery;
 pub mod mcp_api;
 pub mod messages_api;
 pub mod metrics_api;
@@ -88,6 +89,7 @@ pub mod relay_api;
 pub mod relay_handoff;
 pub mod request_context;
 pub mod responses_api;
+pub mod routing_composition;
 pub mod shared_backend;
 #[cfg(feature = "test-support")]
 pub mod test_support;

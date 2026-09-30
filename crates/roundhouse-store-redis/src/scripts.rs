@@ -25,6 +25,7 @@ pub(crate) mod learning;
 
 use redis::Value;
 use redis::aio::ConnectionManager;
+use roundhouse_core::ids::SessionId;
 use roundhouse_core::store::StoreError;
 
 /// Claim or re-claim the lease.
@@ -102,6 +103,18 @@ const LAST_EXACT_SEQ: u64 = 99_999_999_999_999;
 /// per namespace, not per session, so a marked append is not single-slot in a
 /// Redis Cluster; an unmarked append still touches only its three
 /// hash-tagged keys.
+///
+/// **`WRONGTYPE` and `BADMARK` are not the same kind of failure, and are
+/// reported differently** (M9 round-3, item 3, correcting the round-2
+/// addendum's claim that both stay `Backend`). `is_type_or_absent` type-checks
+/// the three index keys before anything reads them, so a real `WRONGTYPE`
+/// answers with its own tag naming the key — but that key could be any of the
+/// six, shared across the namespace or this session's own, and the script
+/// cannot tell which caller's fault a namespace-wide key is: `Backend` stays
+/// right for it. `BADMARK` is different: it can only come from `HGET(KEYS[4],
+/// ARGV[3])`, keyed by this session's own id, so it is always this session's
+/// entry in the shared hash, never ambiguous — `CorruptLog`, the same as the
+/// index scripts' own `bad_mark` in [`learning`].
 ///
 /// KEYS: meta, lease, log [, marks, marked, pending].
 /// ARGV: node id, fencing token, session id, 1-based position of the marked
@@ -250,6 +263,7 @@ impl Scripts {
     pub(crate) async fn acquire(
         &self,
         conn: &mut ConnectionManager,
+        session_id: &SessionId,
         meta_key: &str,
         lease_key: &str,
         identity: LeaseIdentity<'_>,
@@ -264,13 +278,14 @@ impl Scripts {
             .arg(ttl_ms)
             .invoke_async(conn)
             .await
-            .map_err(super::backend)?;
+            .map_err(super::one_session(session_id))?;
         decode_lease_reply(&reply)
     }
 
     pub(crate) async fn renew(
         &self,
         conn: &mut ConnectionManager,
+        session_id: &SessionId,
         meta_key: &str,
         lease_key: &str,
         identity: LeaseIdentity<'_>,
@@ -285,13 +300,14 @@ impl Scripts {
             .arg(ttl_ms)
             .invoke_async(conn)
             .await
-            .map_err(super::backend)?;
+            .map_err(super::one_session(session_id))?;
         decode_lease_reply(&reply)
     }
 
     pub(crate) async fn release(
         &self,
         conn: &mut ConnectionManager,
+        session_id: &SessionId,
         lease_key: &str,
         identity: LeaseIdentity<'_>,
     ) -> Result<(), StoreError> {
@@ -302,7 +318,7 @@ impl Scripts {
             .arg(identity.fencing_token)
             .invoke_async(conn)
             .await
-            .map_err(super::backend)?;
+            .map_err(super::one_session(session_id))?;
         Ok(())
     }
 
@@ -383,11 +399,21 @@ impl Scripts {
                  append before writing any event",
                 str_at(&reply, 1).unwrap_or("<unreadable>")
             ))),
-            (Some("BADMARK"), ..) => Err(StoreError::Backend(anyhow::anyhow!(
-                "the stored learning mark for this session is unreadable (`{}`); \
-                 refusing the marked append before writing any event",
-                str_at(&reply, 1).unwrap_or("<unreadable>")
-            ))),
+            (Some("BADMARK"), ..) => match &batch.mark {
+                Some(mark) => Err(crate::corrupt_log(
+                    &SessionId::new(mark.session_id),
+                    format!(
+                        "its stored learning mark is unreadable (`{}`); refusing the marked \
+                         append before writing any event",
+                        str_at(&reply, 1).unwrap_or("<unreadable>")
+                    ),
+                )),
+                // The script only returns BADMARK from the marked branch, so
+                // this is unreachable in practice; a script reply this store
+                // did not ask for is exactly what `unexpected` is for,
+                // never a panic (M9 round-4, nit).
+                None => Err(unexpected(&reply)),
+            },
             (Some("RANGE"), Some(last), _) => Err(StoreError::Backend(anyhow::anyhow!(
                 "log `{log_key}` is at seq {last}; this batch would pass seq {LAST_EXACT_SEQ}, \
                  the last one the append script writes exactly, so the append is refused \

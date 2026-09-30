@@ -182,8 +182,9 @@ impl<S: SessionStore> ControlReads for ControlPlaneReads<S> {
         // was qualified into *this* caller's namespace first — see the trait's
         // own doc for why unknown and foreign collapse, and why every other
         // `StoreError` must not. `RedisSessionStore::last_seq` returns
-        // [`StoreError::Backend`] for a transport failure and for its
-        // foreign-writer contiguity check; `MemoryStore` only ever produces
+        // [`StoreError::Backend`] for a transport failure and
+        // [`StoreError::CorruptLog`] for its foreign-writer contiguity check,
+        // and both are internal here; `MemoryStore` only ever produces
         // `SessionNotFound`, which is why a catch-all read as harmless for as
         // long as no durable store was under a test.
         match self.store.last_seq(&session).await {

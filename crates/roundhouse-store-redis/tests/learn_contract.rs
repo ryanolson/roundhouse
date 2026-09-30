@@ -358,8 +358,10 @@ async fn a_foreign_watermark_is_refused_by_apply_and_by_watermark() {
         if store.snapshot(&project).await != before {
             missed.push(format!("{value:?}: apply wrote"));
         }
+        // `WrongType`, not `Unavailable`: the field is one session's, and
+        // the store answered (M9 review, M1).
         match store.watermark(&project, &session).await {
-            Err(LearnerError::Unavailable(message)) if message.contains(&key) => {}
+            Err(LearnerError::WrongType { key: named }) if named == key => {}
             other => missed.push(format!("{value:?}: watermark answered {other:?}")),
         }
     }
@@ -588,4 +590,32 @@ async fn a_large_counter_is_stored_in_plain_digits() {
             .unwrap();
         assert_eq!(stored, expected, "{field}");
     }
+}
+
+/// **A non-UTF-8 watermark field is `WrongType`, not `Unavailable`** (M9
+/// round-4, item 2, low). `watermark` used to decode the `HGET` reply
+/// straight into a `String`; invalid UTF-8 bytes fail that decode with a
+/// code-less client error, which the old code read as `Unavailable` -- the
+/// recovery task's outage classification, for one session's foreign field.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_non_utf8_watermark_field_is_refused_as_wrong_type() {
+    let namespace = fresh_namespace();
+    let store = connect_learner_in(namespace.clone()).await;
+    let mut raw = raw_from_env().await;
+    let session = SessionId::generate();
+    let project = fresh_project();
+    let key = learn_watermark_key(&namespace, &project);
+    let _: () = redis::cmd("HSET")
+        .arg(&key)
+        .arg(session.as_str())
+        .arg(vec![0xFFu8, 0xFE])
+        .query_async(&mut raw)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.watermark(&project, &session).await,
+        Err(LearnerError::WrongType { key }),
+        "invalid UTF-8 is one session's foreign field, not the store being down"
+    );
 }

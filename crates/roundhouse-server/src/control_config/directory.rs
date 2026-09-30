@@ -810,7 +810,8 @@ impl Managed {
         // fail fails on the reason it will not start rather than on a warning
         // about why it might be about to. A boot that *does* start and is
         // divergent has said so before it serves its first request.
-        managed.note_divergence(loaded.version, &loaded.compiled_under);
+        let own_artifacts = managed.read_current().plane.learner_artifacts().to_vec();
+        managed.note_divergence(loaded.version, &loaded.compiled_under, Some(&own_artifacts));
         Ok(managed)
     }
 
@@ -829,11 +830,27 @@ impl Managed {
     /// Comparing a stamped node against it would report divergence on every
     /// axis of every fresh deployment, on the first boot, before any document
     /// exists to have been compiled under anything.
-    fn note_divergence(&self, version: u64, stored: &CompiledUnder) {
+    ///
+    /// `own_artifacts` is the learner artifact axis of *this node's* compile of
+    /// the same records, recorded even when empty, or `None` when this node
+    /// could not compile them; the axis is then not compared, because this
+    /// node has no artifact bytes to compare, and the refused version already
+    /// says why. A stored axis of `None` is not compared either (see
+    /// `CompiledUnder::artifacts`).
+    fn note_divergence(
+        &self,
+        version: u64,
+        stored: &CompiledUnder,
+        own_artifacts: Option<&[String]>,
+    ) {
         if version == 0 {
             return;
         }
-        let differs = self.compiled_under.differs_from(stored);
+        let own = CompiledUnder {
+            artifacts: own_artifacts.map(<[String]>::to_vec),
+            ..self.compiled_under.clone()
+        };
+        let differs = own.differs_from(stored);
         if differs.is_empty() {
             // An agreeing load: `DirectoryStatus::divergence` answers "is this
             // node out of step *now*", the same question `refused_version`
@@ -1114,13 +1131,24 @@ impl Managed {
                 return taken(&self.read_current());
             }
         };
-        // Before the compile, and deliberately: divergence is a fact about the
-        // *inputs* the document was written under, which is exactly as true of
-        // a document this node cannot compile as of one it can — and is very
-        // often the reason. A check that ran only on the success path would go
-        // quiet in the one case an operator most needs it (R-D9).
-        self.note_divergence(loaded.version, &loaded.compiled_under);
-        let plane = match self.compile(&loaded.records) {
+        // Whatever the compile's outcome, and deliberately: divergence is a
+        // fact about the *inputs* the document was written under, which is
+        // exactly as true of a document this node cannot compile as of one it
+        // can — and is very often the reason. A check that ran only on the
+        // success path would go quiet in the one case an operator most needs
+        // it (R-D9). The compile comes first only because the learner artifact
+        // axis is read off its plane (routing learner M9).
+        let compiled = self.compile(&loaded.records);
+        let own_artifacts = compiled
+            .as_ref()
+            .ok()
+            .map(|plane| plane.learner_artifacts().to_vec());
+        self.note_divergence(
+            loaded.version,
+            &loaded.compiled_under,
+            own_artifacts.as_deref(),
+        );
+        let plane = match compiled {
             Ok(plane) => plane,
             Err(error) => {
                 claim.disarm();
@@ -1330,7 +1358,11 @@ impl Managed {
         // a lineage -- the first write of a deployment's life, or the first
         // after the key was lost -- is the only place this node can learn which
         // lineage it has just published into (R-D2″).
-        let committed = self.store.commit(loaded.version, next.clone()).await?;
+        let artifacts = CompiledUnder::stamped_artifacts(plane.learner_artifacts());
+        let committed = self
+            .store
+            .commit(loaded.version, next.clone(), artifacts.clone())
+            .await?;
         let records = Arc::new(next);
         // Published under the same version rule a refresh uses, and for the
         // same reason: a refresh started before this write may still be in
@@ -1447,7 +1479,14 @@ impl Managed {
         // just published -- an overtaken write leaves whatever divergence the
         // version actually being served already carries alone.
         if adopt {
-            self.note_divergence(committed.version, &self.compiled_under);
+            let stamped = CompiledUnder {
+                artifacts: artifacts.clone(),
+                ..self.compiled_under.clone()
+            };
+            // The stamp is `None` exactly when this node's compile resolved
+            // no artifact, so its own axis is the stamp's list, or empty.
+            let own = artifacts.as_deref().unwrap_or_default();
+            self.note_divergence(committed.version, &stamped, Some(own));
         }
         if let Some(regression) = &regression {
             warn_regression(
@@ -2108,5 +2147,7 @@ fn compile(
     Ok(Arc::new(plane))
 }
 
+#[cfg(test)]
+mod learner_tests;
 #[cfg(test)]
 mod tests;

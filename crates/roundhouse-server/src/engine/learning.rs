@@ -28,7 +28,14 @@
 //! | `Unavailable`, `WrongType`, a timeout | leave the entries pending |
 //!
 //! Pending entries keep their source mark, so the next turn or the recovery
-//! task (milestone M9) finishes the work.
+//! task (`crate::learner_recovery`, milestone M9) finishes the work. Both run
+//! the one delivery in [`delivery`]; the tail alone appends `LearningApplied`.
+//!
+//! **A learner block that reaches a process with no learner warns once per
+//! project.** The composition root attaches a learner only when a project
+//! enables one at boot, so a block the admin plane adds afterwards reaches an
+//! engine that cannot run it. The turn routes as before, and the project is
+//! named once, until a restart composes the learner.
 //!
 //! **Every stop is a session's, never a project's.** The refused entry stays
 //! in its session's page under the epoch it was written in, so a new artifact
@@ -44,25 +51,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+pub(crate) mod delivery;
+
 use tokio::time::Instant;
 
 use roundhouse_core::classify::{AvailableClassification, ClassificationWindow};
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::ProjectId;
 use roundhouse_core::ids::{ResponseId, SessionId};
-use roundhouse_core::learn_store::{LearnerError, LearnerStore, LearningBatch, ReadRequest};
-use roundhouse_core::metrics::DeliveryOutcome;
+use roundhouse_core::learn_store::{LearnerStore, ReadRequest};
 use roundhouse_core::routing::learn::{
-    ActiveMode, Draw, EpochId, LearnedError, LearnedPolicy, LearnerTerms, LearningTurn,
-    ReadFailure, StoreRead,
+    ActiveMode, Draw, LearnedError, LearnedPolicy, LearnerTerms, LearningTurn, ReadFailure,
+    StoreRead,
 };
 use roundhouse_core::routing::{Decision, RoutingContext, RoutingError};
-use roundhouse_core::session::{LearningEntry, Session, SessionState};
+use roundhouse_core::session::Session;
 use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::Arm;
 
 use crate::control_config::Admission;
 use crate::engine::{ClientDeclarations, Engine, EngineError};
+use crate::learner_recovery::{LearnerRecovery, RecoveryCadence};
 
 /// How long delivery waits for an apply on a session whose project writes no
 /// `apply_timeout_ms` any more, in milliseconds.
@@ -74,9 +83,10 @@ use crate::engine::{ClientDeclarations, Engine, EngineError};
 /// (`Admission::learner_apply_timeout_ms`).
 pub const UNCONFIGURED_APPLY_TIMEOUT_MS: u64 = 250;
 
-/// The learner store and the delivery state one engine keeps.
+/// The learner store and the delivery state one engine keeps, shared with
+/// its recovery task.
 pub(crate) struct RoutingLearner {
-    store: Arc<dyn LearnerStore>,
+    pub(crate) store: Arc<dyn LearnerStore>,
     /// The deployment's `arm_salt`: the draw's salt, so an exploring turn is
     /// reproducible from the log and the configuration alone.
     salt: String,
@@ -99,8 +109,8 @@ pub(crate) struct RoutingLearner {
     /// one's.
     read_unreachable_warned: AtomicBool,
     /// The same pattern for deliveries the store answered `Unavailable` or
-    /// `WrongType`.
-    apply_unreachable_warned: AtomicBool,
+    /// `WrongType`, from the tail or the recovery task alike.
+    pub(crate) apply_unreachable_warned: AtomicBool,
 }
 
 impl RoutingLearner {
@@ -110,13 +120,13 @@ impl RoutingLearner {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn is_stopped(&self, project: &ProjectId, session: &SessionId) -> bool {
+    pub(crate) fn is_stopped(&self, project: &ProjectId, session: &SessionId) -> bool {
         self.stopped()
             .get(project)
             .is_some_and(|sessions| sessions.contains(session))
     }
 
-    fn stop(&self, project: &ProjectId, session: &SessionId) {
+    pub(crate) fn stop(&self, project: &ProjectId, session: &SessionId) {
         self.stopped()
             .entry(project.clone())
             .or_default()
@@ -187,6 +197,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         deadline_at: Instant,
     ) -> Result<Decision, EngineError> {
         let Some((learner, terms, mode)) = self.learning_for(admission) else {
+            self.warn_unread_learner(admission);
             return self.bounded(deadline_at, self.policy.choose(ctx)).await;
         };
         let inputs = LearnedTurnInputs {
@@ -201,6 +212,39 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         };
         self.bounded(deadline_at, self.choose_learned(learner, ctx, inputs))
             .await
+    }
+
+    /// Name, once per project, a `shadow` or `live` block this process has no
+    /// learner to run: see the module doc. One `Option` check on the ordinary
+    /// path; the lock is taken only for a project that enables a learner the
+    /// process did not compose.
+    fn warn_unread_learner(&self, admission: &Admission) {
+        if self.learner.is_some() {
+            return;
+        }
+        let Some(mode) = admission
+            .learner
+            .as_deref()
+            .and_then(|terms| terms.mode.active())
+        else {
+            return;
+        };
+        let project = &admission.principal.project;
+        let first = self
+            .unread_learner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(project.clone());
+        if first {
+            tracing::warn!(
+                %project,
+                mode = mode.label(),
+                "this project enables the learner, but this process composed none, so the \
+                 block is learning nothing and its turns route as before; it was almost \
+                 certainly added through the admin plane after boot, and a restart composes \
+                 the learner, its store and its recovery task"
+            );
+        }
     }
 
     /// The learner and mode a turn of this admission runs under, or `None`
@@ -303,17 +347,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// alike: a review can land on any of them. It cannot fail the turn. Every
     /// failure leaves the entries pending under their source mark.
     ///
-    /// **At most one refill and one gap backfill per tail.** Each is a full
-    /// read-only replay of the log: the refill when the page ran dry, the gap
-    /// backfill when the store reported a gap. They are separate budgets
-    /// because a refilled page can meet a gap (the store lost what it
-    /// acknowledged), and a refill that spent the gap's backfill would leave
-    /// every later tail to refill, meet the same gap, and stop there.
-    ///
-    /// **A gap's backfill is applied in the same tail**, not on the next turn
-    /// as draft 11.5 step 6 has it. The live fold's page still starts above
-    /// the store's watermark on the next turn, so sending it then would meet
-    /// the same gap, forever. The backfilled page is the one that closes it.
+    /// The delivery itself is [`delivery::Delivery::deliver`], the code the
+    /// recovery task runs too; this tail supplies the live fold and the lease
+    /// the acknowledgement is appended under.
     pub(super) async fn deliver_learning(&self, session: &mut Session<S>, admission: &Admission) {
         let Some(learner) = self.learner.as_deref() else {
             return;
@@ -326,245 +362,40 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             return;
         };
         let session_id = session.session_id().clone();
-        if learner.is_stopped(&project, &session_id) {
-            return;
-        }
         let apply_timeout = Duration::from_millis(
             admission
                 .learner_apply_timeout_ms
                 .unwrap_or(UNCONFIGURED_APPLY_TIMEOUT_MS),
         );
-        let delivery = self.metrics.learning_delivery();
-
-        // The page ran dry with entries still owed: refill it from the hint.
-        let mut replay: Option<SessionState> = None;
-        if state.learning_page().is_empty() {
-            let hint = state.learning_hint();
-            match self.backfill(&session_id, hint).await {
-                Some(backfilled) => replay = Some(backfilled),
-                None => return,
-            }
-            delivery.record(&project, DeliveryOutcome::Backfill);
+        delivery::Delivery {
+            learner,
+            sessions: self.store.as_ref(),
+            counters: self.metrics.learning_delivery(),
+            project: &project,
+            session: &session_id,
+            apply_timeout,
+            source_timeout: None,
+            held: None,
         }
-        let mut gap_backfilled = false;
-
-        let watermark = loop {
-            let entries = match &replay {
-                Some(replayed) => replayed.learning_page(),
-                None => session.state().learning_page(),
-            };
-            if entries.is_empty() {
-                return;
-            }
-            let batch = LearningBatch {
-                project: &project,
-                session: &session_id,
-                entries,
-            };
-            match tokio::time::timeout(apply_timeout, learner.store.apply(&batch)).await {
-                Ok(Ok(applied)) => {
-                    // The outage, if there was one, is over: see the read
-                    // side's reset above for why this stays silent.
-                    learner
-                        .apply_unreachable_warned
-                        .store(false, Ordering::Relaxed);
-                    delivery.record(
-                        &project,
-                        DeliveryOutcome::Applied {
-                            applied: applied.applied as u64,
-                            duplicates: entries.len().saturating_sub(applied.applied) as u64,
-                        },
-                    );
-                    break applied.watermark;
-                }
-                Ok(Err(LearnerError::ChainGap { store_watermark })) => {
-                    delivery.record(&project, DeliveryOutcome::Gap);
-                    if gap_backfilled {
-                        return;
-                    }
-                    gap_backfilled = true;
-                    match self.backfill(&session_id, store_watermark).await {
-                        Some(refilled) => replay = Some(refilled),
-                        None => return,
-                    }
-                    delivery.record(&project, DeliveryOutcome::Backfill);
-                }
-                Ok(Err(LearnerError::ChainDiverged { store_watermark })) => {
-                    // Never a backfill: the store holds an entry this chain
-                    // does not, and a backfill from its watermark would send
-                    // the same diverged entry again, forever.
-                    tracing::error!(
-                        %project, session = %session_id, store_watermark,
-                        "the learner store refused a diverged chain; this session's delivery \
-                         stops until the process restarts, and its entries stay pending"
-                    );
-                    learner.stop(&project, &session_id);
-                    delivery.record(&project, DeliveryOutcome::Diverged);
-                    return;
-                }
-                Ok(Err(
-                    error @ (LearnerError::CounterRange { .. } | LearnerError::Malformed { .. }),
-                )) => {
-                    // Neither goes away on a retry, and a new epoch does not
-                    // either: the refused entry stays in this session's page
-                    // under its own epoch. See the module doc.
-                    let epochs = page_epochs(entries);
-                    tracing::error!(
-                        %project, session = %session_id, epochs, %error,
-                        "the learner store refused a batch that no retry can fix; this session's \
-                         delivery stops until the process restarts, and its entries stay pending"
-                    );
-                    learner.stop(&project, &session_id);
-                    delivery.record(&project, DeliveryOutcome::Stopped);
-                    return;
-                }
-                Ok(Err(
-                    error @ (LearnerError::Unavailable(_) | LearnerError::WrongType { .. }),
-                )) => {
-                    if !learner
-                        .apply_unreachable_warned
-                        .swap(true, Ordering::Relaxed)
-                    {
-                        tracing::warn!(
-                            %project, session = %session_id, %error,
-                            "the learner store did not take this session's entries; they stay pending"
-                        );
-                    } else {
-                        tracing::debug!(
-                            %project, session = %session_id, %error,
-                            "the learner store did not take this session's entries; they stay pending"
-                        );
-                    }
-                    delivery.record(&project, DeliveryOutcome::Unavailable);
-                    return;
-                }
-                Err(_) => {
-                    // The result is unknown: the apply may have landed. The
-                    // resend skips what did, by the entry identity rule.
-                    delivery.record(&project, DeliveryOutcome::TimedOut);
-                    return;
-                }
-            }
-        };
-
-        // Acknowledge, then clear. The store already holds these entries
-        // durably once it has answered `Applied` above; the mark does not
-        // guard against losing them, it only tracks whether this session's
-        // own log has recorded that delivery -- the fact the recovery task
-        // reads to decide whom to revisit (it never appends the log entry
-        // itself, only re-applies and clears, see the module doc). Ordering
-        // the append first is a choice, not a fix: keeping the mark set on
-        // every failure branch (a failed append, a failed clear, or a crash
-        // between the two) costs at most one redundant recovery apply -- the
-        // store answers the resent entries as duplicates by watermark -- plus
-        // a redundant clear. The other order would instead risk a crash
-        // landing between the clear and the append, which drops the mark
-        // while the log never records the delivery; that loses no data, but
-        // it is a piece of bookkeeping a session that never turns again would
-        // carry as drift forever.
-        let appended = session
-            .record_learning_applied(watermark)
-            .await
-            .map_err(|error| error.to_string());
-        // The clear only runs once the append has landed: see the comment
-        // above for why an append failure must short-circuit it.
-        let outcome = match appended {
-            Ok(()) => self
-                .store
-                .clear_learning_mark(&session_id, watermark)
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
-            Err(error) => Err(error),
-        };
-        if let Err(error) = outcome {
-            tracing::warn!(
-                %project, session = %session_id, watermark, %error,
-                "the learner store applied this session's entries, and acknowledging them failed; \
-                 the source mark stays for the next turn or the recovery task"
-            );
-            delivery.record(&project, DeliveryOutcome::AcknowledgementFailed);
-        }
+        .deliver(delivery::Source::Live(session))
+        .await;
     }
 
-    /// A read-only replay whose page holds the entries above `floor`.
-    async fn backfill(&self, session_id: &SessionId, floor: u64) -> Option<SessionState> {
-        match SessionState::project_learning(self.store.as_ref(), session_id, floor).await {
-            Ok(state) => Some(state),
-            Err(error) => {
-                tracing::warn!(
-                    session = %session_id, floor, %error,
-                    "the learning backfill could not replay the log; the entries stay pending"
-                );
-                None
-            }
-        }
-    }
-}
-
-/// The epochs a refused page's entries were written under, in page order and
-/// without repeats, for the stop's log line.
-fn page_epochs(entries: &[LearningEntry]) -> String {
-    let mut epochs: Vec<EpochId> = Vec::new();
-    for epoch in entries
-        .iter()
-        .filter_map(|entry| entry.deltas.as_ref().map(|deltas| deltas.epoch))
-    {
-        if !epochs.contains(&epoch) {
-            epochs.push(epoch);
-        }
-    }
-    epochs
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-#[cfg(test)]
-mod page_epochs_tests {
-    //! Mutation survivor 8b: `page_epochs` had no test of its own, so the
-    //! `if !epochs.contains(&epoch)` de-duplication could be deleted without
-    //! turning any suite red. A refused batch's log line would then repeat
-    //! the same epoch once per entry instead of naming it once.
-
-    use super::page_epochs;
-    use roundhouse_core::routing::learn::{EpochId, LEARNING_CREDIT_REVISION};
-    use roundhouse_core::session::{Deltas, LearningEntry};
-    use roundhouse_core::validate::REVIEW_RULE_REVISION;
-
-    fn entry(seq: u64, epoch: EpochId) -> LearningEntry {
-        LearningEntry {
-            seq,
-            prev_seq: seq.saturating_sub(1),
-            credit_revision: LEARNING_CREDIT_REVISION,
-            review_rule_revision: REVIEW_RULE_REVISION,
-            deltas: Some(Deltas {
-                epoch,
-                quality: Vec::new(),
-                targets: Vec::new(),
-                overhead: Default::default(),
-                jev: Vec::new(),
-            }),
-        }
-    }
-
-    #[test]
-    fn repeated_epochs_collapse_to_one_entry() {
-        let epoch = EpochId::new([0x11; 16]);
-        let entries = vec![entry(1, epoch), entry(2, epoch), entry(3, epoch)];
-        assert_eq!(page_epochs(&entries), epoch.to_string());
-    }
-
-    #[test]
-    fn distinct_epochs_are_named_once_each_in_page_order() {
-        let first = EpochId::new([0x22; 16]);
-        let second = EpochId::new([0x33; 16]);
-        let entries = vec![entry(1, first), entry(2, second), entry(3, first)];
-        assert_eq!(
-            page_epochs(&entries),
-            format!("{first},{second}"),
-            "a later repeat of the first epoch does not add a second entry"
-        );
+    /// The recovery task for this engine's learner, or `None` when no learner
+    /// is attached (milestone M9).
+    ///
+    /// **It shares the engine's learner, not a copy of it**: the same store
+    /// handle, the same set of stopped sessions, the same once-per-outage
+    /// flags, and the same delivery counters. A session the tail stopped stays
+    /// stopped for the task, and a session the task delivered counts where a
+    /// tail's delivery would.
+    pub fn learner_recovery(&self, cadence: RecoveryCadence) -> Option<LearnerRecovery<S>> {
+        let learner = self.learner.as_ref()?;
+        Some(LearnerRecovery::new(
+            Arc::clone(&self.store),
+            Arc::clone(learner),
+            self.metrics(),
+            cadence,
+        ))
     }
 }

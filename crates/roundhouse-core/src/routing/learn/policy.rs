@@ -14,13 +14,22 @@
 //! passes the [`StoreRead`] and the [`Draw`] in a [`LearningTurn`], and the
 //! record keeps both, so replay reaches the same decision without either.
 //!
-//! **Not a [`RoutingPolicy`](crate::routing::RoutingPolicy).** The learner
-//! needs inputs that [`RoutingContext`] does not carry, and adding a field
-//! there reaches every constructor of the context, including the credential
-//! module. So the inputs travel as a [`LearningTurn`] beside the context, and
-//! the server's engine (`engine::learning`) calls [`LearnedPolicy::choose`]
-//! directly for a `shadow` or `live` project; it maps [`LearnedError::Refused`]
-//! to a turn that fails as a policy refusal.
+//! **The learned decision is not reached through [`RoutingPolicy::choose`].**
+//! The learner needs inputs that [`RoutingContext`] does not carry, and adding
+//! a field there reaches every constructor of the context, including the
+//! credential module. So the inputs travel as a [`LearningTurn`] beside the
+//! context, and the server's engine (`engine::learning`) calls the associated
+//! function [`LearnedPolicy::choose`] directly for a `shadow` or `live`
+//! project; it maps [`LearnedError::Refused`] to a turn that fails as a policy
+//! refusal.
+//!
+//! **A [`LearnedPolicy`] value is still a [`RoutingPolicy`]** (milestone M9):
+//! the router a process composes when a project enables the learner at boot.
+//! It wraps the [`StagePolicy`] and serves every turn that reaches it through
+//! the trait, which is every turn of a project with no learner, or with an
+//! `off` one, exactly as the stage router would. What it changes is the name
+//! on the record, `learned`, because that is the object in force: the same
+//! reason `StagePolicy` reports `stage` for a project with no recipe.
 
 use super::corrections::{Corrections, grant};
 use super::evidence::{
@@ -37,8 +46,10 @@ use super::{
 use crate::classify::{AvailableClassification, ClassificationWindow};
 use crate::control::TurnBudget;
 use crate::routing::selection::{RecipeEvidence, SelectorSnapshot};
-use crate::routing::stage::{Pick, RoutedPick, TierRecipe, pick_tier};
-use crate::routing::{Admitted, Decision, RoutingContext, RoutingError, Target, TurnSignals};
+use crate::routing::stage::{Pick, RoutedPick, StagePolicy, TierRecipe, pick_tier};
+use crate::routing::{
+    Admitted, Decision, RoutingContext, RoutingError, RoutingPolicy, Target, TurnSignals,
+};
 use crate::validate::Arm;
 
 /// What a learned decision needs beyond the [`RoutingContext`].
@@ -91,9 +102,44 @@ fn labels(unmet: &[Unmet]) -> String {
 }
 
 /// The learned router.
-pub struct LearnedPolicy;
+///
+/// As a value, the composed [`RoutingPolicy`] of a process that runs the
+/// learner: see the module doc. Its associated functions [`Self::turn_input`]
+/// and [`Self::choose`] are the learned decision itself, and take no `self`
+/// because the decision reads nothing the value holds.
+pub struct LearnedPolicy {
+    stage: StagePolicy,
+}
+
+/// The name a learned process records on every decision.
+pub const LEARNED_POLICY_NAME: &str = "learned";
+
+#[async_trait::async_trait]
+impl RoutingPolicy for LearnedPolicy {
+    fn name(&self) -> &str {
+        LEARNED_POLICY_NAME
+    }
+
+    /// A strategy is a tier pick, so the learned router reads the recipe too.
+    /// Answering `false` here would make the engine's unread-recipe warning
+    /// fire for every tier project of a learned process.
+    fn reads_tier_recipes(&self) -> bool {
+        true
+    }
+
+    /// The stage decision, for every turn the engine does not route through
+    /// the learned seam.
+    async fn choose(&self, ctx: &RoutingContext<'_>) -> Result<Decision, RoutingError> {
+        self.stage.choose(ctx).await
+    }
+}
 
 impl LearnedPolicy {
+    /// The learned router over the stage router it wraps.
+    pub fn new(stage: StagePolicy) -> Self {
+        Self { stage }
+    }
+
     /// The `rules` pick and the [`LearnedInput`] one turn is keyed under.
     ///
     /// **The one derivation the store read and the decision share.** The

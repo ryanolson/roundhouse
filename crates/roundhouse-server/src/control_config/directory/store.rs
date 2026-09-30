@@ -226,10 +226,18 @@ pub trait DirectoryStore: Send + Sync + 'static {
     /// *started* a lineage — the first write of a deployment's life, or the
     /// first after the key was lost — has no other way to learn which lineage
     /// it just published into, and would have to guess or re-read.
+    ///
+    /// `artifacts` is the learner artifact axis of the plane the writer
+    /// compiled from `records` (`CompiledUnder::stamped_artifacts` of
+    /// `ControlPlane::learner_artifacts`), stamped beside the handle's own
+    /// [`compiled_under`](Self::compiled_under): the one axis of the
+    /// fingerprint that belongs to a version rather than to the process
+    /// (routing learner M9; see `CompiledUnder::artifacts`).
     async fn commit(
         &self,
         expected_version: u64,
         records: DirectoryRecords,
+        artifacts: Option<Vec<String>>,
     ) -> Result<StoredVersion, StoreFailure>;
 
     /// The current identity, without paying to read the records.
@@ -250,7 +258,9 @@ pub trait DirectoryStore: Send + Sync + 'static {
     /// Synchronous and defaulted, deliberately. Synchronous because it is not
     /// a question for the backend at all — it is a property of the handle,
     /// fixed for its life, since the file is read once at boot and the catalog
-    /// and the fleet are what this process was built with; making it `async`
+    /// and the fleet are what this process was built with. The one exception
+    /// is the learner artifact axis, which each commit carries itself and
+    /// which this answer leaves empty; making it `async`
     /// would invite an implementation that went and asked something. Defaulted
     /// to the empty fingerprint because a store that declares no inputs is a
     /// coherent answer — every fixture is one — and forcing each double to

@@ -49,7 +49,10 @@
 //! twice in one pass, because the cursor only moves forward. One page
 //! examines at most `limit` members, idle or not, and the cursor moves past
 //! every member it examined, so a consumer that never manages to finish a
-//! session still reaches the ones after it.
+//! session still reaches the ones after it. A member whose stored mark the
+//! store cannot read is examined and named in [`LearningPage::unreadable`],
+//! not returned and not a failure of the page; a clear or a requeue of it
+//! answers [`StoreError::CorruptLog`].
 //!
 //! **Marked by the session layer.** `Session::commit` passes the mark that
 //! `session::learning_mark` computes: the newest entry-producing event of the
@@ -165,6 +168,16 @@ pub struct LearningPage {
     /// index and the pass is complete. A full page can be followed by an
     /// empty final one.
     pub next: Option<LearningCursor>,
+    /// Examined members whose stored mark the store cannot read, in byte
+    /// order, idle or not. They are not in `sessions`, and the cursor moves
+    /// past them like any other examined member.
+    ///
+    /// **Named, not failed.** An unreadable mark is one session's data. A
+    /// page that failed on it would fail at that member on every attempt,
+    /// and stop every pass there for every project. Named rather than
+    /// silently skipped, so the caller can say which session it cannot
+    /// deliver or audit.
+    pub unreadable: Vec<SessionId>,
 }
 
 /// What [`SessionStore::clear_learning_mark`](super::SessionStore::clear_learning_mark) found.
@@ -206,11 +219,20 @@ pub enum RequeueOutcome {
 /// never walks the whole index.
 #[derive(Default)]
 pub(super) struct MemoryIndex {
-    /// The permanent marks. Never shrinks.
+    /// The permanent marks. Never shrinks, outside the test lever
+    /// (`orphan` below removes an entry to stand in for a foreign `HDEL`).
     marks: BTreeMap<SessionId, StoredMark>,
     /// The sessions whose current mark is not yet confirmed delivered. Every
-    /// member has an entry in `marks`.
+    /// member has an entry in `marks`, outside the test lever: `orphan`
+    /// removes a pending member's entry without removing the member.
     pending: BTreeSet<SessionId>,
+    /// Marks the store treats as unreadable: the in-memory stand-in for a
+    /// stored mark a Redis index cannot parse. Only a test lever
+    /// (`contract::LearningMarkControl`) adds to it, so the field and its
+    /// check in [`Self::mark_of`] exist only where that lever does (M9
+    /// round-3, item 4).
+    #[cfg(any(test, feature = "test-support"))]
+    unreadable: BTreeSet<SessionId>,
 }
 
 struct StoredMark {
@@ -259,8 +281,22 @@ impl MemoryIndex {
         self.pending.insert(session_id.clone());
     }
 
-    pub(super) fn clear(&mut self, session_id: &SessionId, confirmed_through: u64) -> ClearOutcome {
-        match self.marks.get(session_id) {
+    /// The session's stored mark, if it has one, or `CorruptLog` when the
+    /// store cannot read it: that one session's data is at fault.
+    fn mark_of(&self, session_id: &SessionId) -> Result<Option<&StoredMark>, StoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.unreadable.contains(session_id) {
+            return Err(unreadable_mark(session_id));
+        }
+        Ok(self.marks.get(session_id))
+    }
+
+    pub(super) fn clear(
+        &mut self,
+        session_id: &SessionId,
+        confirmed_through: u64,
+    ) -> Result<ClearOutcome, StoreError> {
+        Ok(match self.mark_of(session_id)? {
             None => ClearOutcome::Unmarked,
             Some(stored) if stored.seq <= confirmed_through => {
                 self.pending.remove(session_id);
@@ -269,11 +305,15 @@ impl MemoryIndex {
             Some(stored) => ClearOutcome::Newer {
                 mark_seq: stored.seq,
             },
-        }
+        })
     }
 
-    pub(super) fn requeue(&mut self, session_id: &SessionId, mark_seq: u64) -> RequeueOutcome {
-        match self.marks.get(session_id) {
+    pub(super) fn requeue(
+        &mut self,
+        session_id: &SessionId,
+        mark_seq: u64,
+    ) -> Result<RequeueOutcome, StoreError> {
+        Ok(match self.mark_of(session_id)? {
             None => RequeueOutcome::Unmarked,
             Some(stored) if stored.seq == mark_seq => {
                 self.pending.insert(session_id.clone());
@@ -282,7 +322,7 @@ impl MemoryIndex {
             Some(stored) => RequeueOutcome::Mismatch {
                 mark_seq: stored.seq,
             },
-        }
+        })
     }
 
     /// A pending page. `cutoff` is the latest marking time that counts as
@@ -294,25 +334,19 @@ impl MemoryIndex {
         cutoff: Option<u64>,
         limit: NonZeroUsize,
     ) -> Result<LearningPage, StoreError> {
-        let mut sessions = Vec::new();
-        let mut examined = 0;
-        let mut last = None;
+        let mut page = PageBuilder::default();
         for session_id in self.pending.range(range_after(after)).take(limit.get()) {
-            examined += 1;
-            last = Some(session_id);
-            let stored = self.marks.get(session_id).ok_or_else(|| {
-                StoreError::Backend(anyhow::anyhow!(
-                    "pending learning session `{session_id}` has no mark"
-                ))
-            })?;
-            if cutoff.is_some_and(|cutoff| stored.marked_at_ms <= cutoff) {
-                sessions.push(stored.marked(session_id));
-            }
+            // A pending member with no entry in `marks` is corruption of the
+            // index -- only a foreign removal of the marks field, or the test
+            // lever below, produces one -- but it is one session's, not the
+            // store's: named in `unreadable` exactly like an unparseable
+            // mark, so the cursor moves past it instead of failing every pass
+            // at that member for every project.
+            page.examine(session_id, self.mark_of(session_id), |stored| {
+                cutoff.is_some_and(|cutoff| stored.marked_at_ms <= cutoff)
+            });
         }
-        Ok(LearningPage {
-            sessions,
-            next: next_cursor(examined, limit, last),
-        })
+        Ok(page.finish(limit))
     }
 
     pub(super) fn marked_page(
@@ -320,18 +354,80 @@ impl MemoryIndex {
         after: Option<&LearningCursor>,
         limit: NonZeroUsize,
     ) -> LearningPage {
-        let sessions: Vec<MarkedSession> = self
+        let mut page = PageBuilder::default();
+        for session_id in self
             .marks
             .range(range_after(after))
             .take(limit.get())
-            .map(|(session_id, stored)| stored.marked(session_id))
-            .collect();
-        let next = next_cursor(
-            sessions.len(),
-            limit,
-            sessions.last().map(|marked| &marked.session_id),
-        );
-        LearningPage { sessions, next }
+            .map(|(id, _)| id)
+        {
+            page.examine(session_id, self.mark_of(session_id), |_| true);
+        }
+        page.finish(limit)
+    }
+}
+
+/// One page as it is walked: every examined member moves the cursor, a
+/// readable one that `returned` accepts is returned, and an unreadable one is
+/// named. The one spelling of the rule both enumerations follow.
+#[derive(Default)]
+struct PageBuilder<'a> {
+    sessions: Vec<MarkedSession>,
+    unreadable: Vec<SessionId>,
+    examined: usize,
+    last: Option<&'a SessionId>,
+}
+
+impl<'a> PageBuilder<'a> {
+    fn examine(
+        &mut self,
+        session_id: &'a SessionId,
+        mark: Result<Option<&StoredMark>, StoreError>,
+        returned: impl FnOnce(&StoredMark) -> bool,
+    ) {
+        self.examined += 1;
+        self.last = Some(session_id);
+        match mark {
+            Ok(Some(stored)) if returned(stored) => self.sessions.push(stored.marked(session_id)),
+            Ok(Some(_)) => {}
+            // No stored mark at all (an orphaned pending member) and a mark
+            // the store cannot parse are named the same way: both are one
+            // session's data, not the store's.
+            Ok(None) | Err(_) => self.unreadable.push(session_id.clone()),
+        }
+    }
+
+    fn finish(self, limit: NonZeroUsize) -> LearningPage {
+        LearningPage {
+            sessions: self.sessions,
+            next: next_cursor(self.examined, limit, self.last),
+            unreadable: self.unreadable,
+        }
+    }
+}
+
+/// A stored mark the store cannot read: one session's data, never an outage.
+#[cfg(any(test, feature = "test-support"))]
+fn unreadable_mark(session_id: &SessionId) -> StoreError {
+    StoreError::CorruptLog {
+        session_id: session_id.clone(),
+        detail: "its stored learning mark is unreadable".to_owned(),
+    }
+}
+
+impl MemoryIndex {
+    /// Treat `session_id`'s stored mark as unreadable. See `unreadable`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn make_unreadable(&mut self, session_id: &SessionId) {
+        self.unreadable.insert(session_id.clone());
+    }
+
+    /// Remove `session_id`'s stored mark without touching its pending
+    /// membership: the in-memory stand-in for a foreign `HDEL` of a Redis
+    /// index's marks field. Test-only.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn orphan(&mut self, session_id: &SessionId) {
+        self.marks.remove(session_id);
     }
 }
 

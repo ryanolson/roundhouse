@@ -205,6 +205,13 @@ async fn an_unmarked_append_never_touches_the_index_keys() {
 /// **A stored mark the store cannot parse refuses the append before any
 /// write**, rather than being overwritten: it may hold the project the
 /// session belongs to, and replacing it unread would skip the project check.
+///
+/// **The refusal is `CorruptLog`, not `Backend`** (M9 round-3, item 3):
+/// `ARGV[3]` keys the marks-hash `HGET` by this session's own id, so an
+/// unreadable field there is always this session's data, never ambiguous the
+/// way a `WRONGTYPE` on one of the six append keys can be. Before, it was
+/// `Backend`, the same as `WRONGTYPE`, on a rationale that did not actually
+/// apply to it (see `scripts.rs`'s corrected note by `APPEND_BODY`).
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
 async fn an_unreadable_stored_mark_refuses_the_append_before_any_write() {
@@ -224,8 +231,8 @@ async fn an_unreadable_stored_mark_refuses_the_append_before_any_write() {
         .append_events(&lease, vec![event("a")], mark(0))
         .await;
     assert!(
-        matches!(refused, Err(StoreError::Backend(_))),
-        "an unreadable stored mark must refuse the append, got {refused:?}"
+        matches!(&refused, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == sid),
+        "an unreadable stored mark must refuse the append as this session's fault, got {refused:?}"
     );
     assert_eq!(rig.store.last_seq(&sid).await.unwrap(), 0);
     assert_eq!(rig.key_type(&marked).await, "none");
@@ -239,13 +246,16 @@ async fn an_unreadable_stored_mark_refuses_the_append_before_any_write() {
     assert_eq!(stored, "not a mark");
 }
 
-/// **A pending member with no stored mark fails the page loudly.** The index
-/// only ever adds a pending member together with its mark, so a member
-/// without one is corruption; skipping it would silently drop a session from
-/// recovery.
+/// **A pending member with no stored mark is named, and the page goes on**
+/// (M9 round-3, item 1). Only a foreign `HDEL`/`DEL` of the marks field, or an
+/// `allkeys-lru` eviction of the whole hash, produces this: the index only
+/// ever adds a pending member together with its mark. Failing the whole page
+/// on it would stop every pass at that member for every project, the same
+/// reason an unparseable mark is named rather than fatal, so a member with no
+/// mark is named in `unreadable` the same way.
 #[tokio::test]
 #[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
-async fn a_pending_member_without_a_mark_fails_the_page() {
+async fn a_pending_member_without_a_mark_is_named_and_the_page_goes_on() {
     let rig = rig().await;
     let [_, _, pending] = learning_index_keys(&rig.namespace);
     let _: i64 = redis::cmd("ZADD")
@@ -258,11 +268,14 @@ async fn a_pending_member_without_a_mark_fails_the_page() {
     let page = rig
         .store
         .pending_learning(None, 0, NonZeroUsize::new(8).unwrap())
-        .await;
-    assert!(
-        matches!(page, Err(StoreError::Backend(_))),
-        "a pending member without a mark must fail the page, got {page:?}"
+        .await
+        .expect("a member with no mark must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![SessionId::new("sess_orphan")],
+        "it is named rather than skipped or fatal"
     );
+    assert!(page.sessions.is_empty());
 }
 
 /// **A marked append stops at the last sequence the script renders
@@ -344,4 +357,206 @@ async fn an_unmarked_batch_crossing_the_exact_range_writes_nothing() {
         .expect("the last exact sequence is appendable");
     assert_eq!(events[0].seq, LAST_EXACT_SEQ);
     assert_eq!(rig.log_len(&sid).await, 2);
+}
+
+/// **A stored mark whose seq overflows `u64` is named, and the page goes
+/// on** (M9 round-4, item 1). Lua's `parse_mark` accepts any digit run,
+/// unbounded; Rust's `u64` is not. Before, `decode_page` failed the whole
+/// page as `Backend` on the first entry it could not parse this way, turning
+/// one session's overflowed mark into an outage for every project behind it.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_seq_that_overflows_u64_is_named_and_the_page_goes_on() {
+    let rig = rig().await;
+    let [marks, _, pending] = learning_index_keys(&rig.namespace);
+    let _: i64 = redis::cmd("ZADD")
+        .arg(&pending)
+        .arg(0)
+        .arg("sess_x")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg("sess_x")
+        .arg("18446744073709551616:1:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let page = rig
+        .store
+        .pending_learning(None, 0, NonZeroUsize::new(8).unwrap())
+        .await
+        .expect("an overflowed seq must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![SessionId::new("sess_x")],
+        "it is named rather than fatal"
+    );
+    assert!(page.sessions.is_empty());
+}
+
+/// `LearningPage::unreadable` is documented in byte order. The Lua page
+/// names a member with no mark, and `decode_page` names one whose mark it
+/// cannot decode; the two lists are merged, so the order is only right if
+/// the merge sorts (M9 round-5).
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn unreadable_members_from_the_script_and_the_decoder_come_back_in_byte_order() {
+    let rig = rig().await;
+    let [marks, _, pending] = learning_index_keys(&rig.namespace);
+    for member in ["sess_a", "sess_b", "sess_c"] {
+        let _: i64 = redis::cmd("ZADD")
+            .arg(&pending)
+            .arg(0)
+            .arg(member)
+            .query_async(&mut rig.raw.clone())
+            .await
+            .unwrap();
+    }
+    // `sess_a` and `sess_c` have no mark (the script names them);
+    // `sess_b` has one the script accepts and Rust cannot decode.
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg("sess_b")
+        .arg("18446744073709551616:1:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let page = rig
+        .store
+        .pending_learning(None, 0, NonZeroUsize::new(8).unwrap())
+        .await
+        .expect("unreadable members must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![
+            SessionId::new("sess_a"),
+            SessionId::new("sess_b"),
+            SessionId::new("sess_c"),
+        ],
+        "unreadable is in byte order, whichever side named each member"
+    );
+}
+
+/// The same overflow, in the marked-at field, against the permanent
+/// enumeration rather than pending (M9 round-4, item 1).
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_marked_at_that_overflows_u64_is_named_and_the_page_goes_on() {
+    let rig = rig().await;
+    let [marks, marked, _] = learning_index_keys(&rig.namespace);
+    let _: i64 = redis::cmd("ZADD")
+        .arg(&marked)
+        .arg(0)
+        .arg("sess_y")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg("sess_y")
+        .arg("1:18446744073709551616:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let page = rig
+        .store
+        .learning_sessions(None, NonZeroUsize::new(8).unwrap())
+        .await
+        .expect("an overflowed marked_at must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![SessionId::new("sess_y")],
+        "it is named rather than fatal"
+    );
+    assert!(page.sessions.is_empty());
+}
+
+/// A non-UTF-8 project in a stored mark is named the same way (M9 round-4,
+/// item 1): `str_at` already answers `None` on invalid UTF-8, but
+/// `decode_page` used to fold that into a page-wide `Backend` failure.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_non_utf8_project_is_named_and_the_page_goes_on() {
+    let rig = rig().await;
+    let [marks, _, pending] = learning_index_keys(&rig.namespace);
+    let _: i64 = redis::cmd("ZADD")
+        .arg(&pending)
+        .arg(0)
+        .arg("sess_z")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let mut mark = b"1:1:".to_vec();
+    mark.extend_from_slice(&[0xFF, 0xFE]);
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg("sess_z")
+        .arg(mark)
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let page = rig
+        .store
+        .pending_learning(None, 0, NonZeroUsize::new(8).unwrap())
+        .await
+        .expect("a non-UTF-8 project must not fail the page");
+    assert_eq!(
+        page.unreadable,
+        vec![SessionId::new("sess_z")],
+        "it is named rather than fatal"
+    );
+    assert!(page.sessions.is_empty());
+}
+
+/// **A clear's `NEWER` reply carrying an overflowed seq is this session's
+/// fault, not the store's** (M9 round-4, item 1, secondary path). `seq_at`
+/// used to fold an unparseable `NEWER`/`MISMATCH` seq into `unexpected`
+/// (`Backend`), which the recovery task reads as an outage for every
+/// project; `ARGV[1]` keys the `HGET` by this session's own id, so the value
+/// is always this session's data.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_clear_whose_newer_reply_carries_an_overflowed_seq_is_corrupt_not_backend() {
+    let rig = rig().await;
+    let [marks, _, _] = learning_index_keys(&rig.namespace);
+    let sid = SessionId::new("sess_w");
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg(sid.as_str())
+        .arg("18446744073709551616:1:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let cleared = rig.store.clear_learning_mark(&sid, 0).await;
+    assert!(
+        matches!(&cleared, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == sid),
+        "an overflowed seq in the NEWER reply must be this session's fault, got {cleared:?}"
+    );
+}
+
+/// The same fix on the requeue side: a `MISMATCH` reply carrying an
+/// overflowed seq is this session's fault, not the store's (M9 round-4,
+/// item 1, secondary path). `requeue`'s own `seq_at` call shares the same
+/// helper `clear`'s does, and had the identical `unexpected` (`Backend`)
+/// fallback.
+#[tokio::test]
+#[ignore = "needs a real Redis: set ROUNDHOUSE_TEST_REDIS_URL and pass --include-ignored"]
+async fn a_requeue_whose_mismatch_reply_carries_an_overflowed_seq_is_corrupt_not_backend() {
+    let rig = rig().await;
+    let [marks, _, _] = learning_index_keys(&rig.namespace);
+    let sid = SessionId::new("sess_v");
+    let _: () = redis::cmd("HSET")
+        .arg(&marks)
+        .arg(sid.as_str())
+        .arg("18446744073709551616:1:acme")
+        .query_async(&mut rig.raw.clone())
+        .await
+        .unwrap();
+    let requeued = rig.store.requeue_learning(&sid, 1).await;
+    assert!(
+        matches!(&requeued, Err(StoreError::CorruptLog { session_id, .. }) if *session_id == sid),
+        "an overflowed seq in the MISMATCH reply must be this session's fault, got {requeued:?}"
+    );
 }

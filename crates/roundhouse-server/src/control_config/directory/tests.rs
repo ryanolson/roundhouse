@@ -1952,7 +1952,7 @@ async fn a_stale_commit_against_the_scripted_store_is_refused_by_the_real_compar
     let store = ScriptedDirectoryStore::new(DirectoryRecords::default(), 1).await;
 
     let first = store
-        .commit(1, DirectoryRecords::default())
+        .commit(1, DirectoryRecords::default(), None)
         .await
         .expect("the double is still at the version this write read");
     assert_eq!(
@@ -1965,7 +1965,7 @@ async fn a_stale_commit_against_the_scripted_store_is_refused_by_the_real_compar
     // before the first node's commit landed -- must be refused, and refused
     // by the wrapped store's own guard rather than one this double forgot to
     // carry over.
-    let stale = store.commit(1, DirectoryRecords::default()).await;
+    let stale = store.commit(1, DirectoryRecords::default(), None).await;
     assert!(
         matches!(
             stale,
@@ -2937,6 +2937,7 @@ impl DirectoryStore for GatedVersionStore {
         &self,
         _expected_version: u64,
         _records: DirectoryRecords,
+        _artifacts: Option<Vec<String>>,
     ) -> Result<StoredVersion, StoreFailure> {
         unimplemented!("this guard never mutates the directory")
     }

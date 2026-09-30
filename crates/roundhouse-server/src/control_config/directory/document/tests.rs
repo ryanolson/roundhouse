@@ -195,7 +195,10 @@ async fn a_fully_populated_directory_round_trips_byte_for_byte() {
     let backing = Arc::new(MemoryDocumentStore::new());
     let store = DocumentDirectoryStore::over(Arc::clone(&backing) as Arc<dyn DocumentStore>);
 
-    store.commit(0, every_field_populated()).await.unwrap();
+    store
+        .commit(0, every_field_populated(), None)
+        .await
+        .unwrap();
     let written = backing.load().await.unwrap().document.expect("a document");
     assert_eq!(
         String::from_utf8(written).expect("the envelope is JSON and therefore UTF-8"),
@@ -213,7 +216,7 @@ async fn a_fully_populated_directory_round_trips_byte_for_byte() {
     assert_eq!(loaded.version, 1);
     let echo = Arc::new(MemoryDocumentStore::new());
     DocumentDirectoryStore::over(Arc::clone(&echo) as Arc<dyn DocumentStore>)
-        .commit(0, loaded.records)
+        .commit(0, loaded.records, None)
         .await
         .unwrap();
     assert_eq!(
@@ -479,10 +482,13 @@ async fn a_document_at_version_zero_is_refused_rather_than_compiled() {
 #[tokio::test]
 async fn a_stale_commit_arrives_as_concurrent_and_an_outage_as_unavailable() {
     let store = memory();
-    let version = store.commit(0, DirectoryRecords::default()).await.unwrap();
+    let version = store
+        .commit(0, DirectoryRecords::default(), None)
+        .await
+        .unwrap();
     assert_eq!(version.version, 1);
 
-    let stale = store.commit(0, every_field_populated()).await;
+    let stale = store.commit(0, every_field_populated(), None).await;
     assert!(
         matches!(
             stale,
@@ -516,7 +522,7 @@ async fn a_stale_commit_arrives_as_concurrent_and_an_outage_as_unavailable() {
     let down = DocumentDirectoryStore::over(Arc::new(Down));
     for outcome in [
         down.load().await.err().map(|e| e.to_string()),
-        down.commit(0, DirectoryRecords::default())
+        down.commit(0, DirectoryRecords::default(), None)
             .await
             .err()
             .map(|e| e.to_string()),
@@ -545,6 +551,7 @@ async fn the_writers_fingerprint_is_what_a_reader_loads_back() {
         fleet: vec!["local/small".into()],
         admission_cache_ttl_ms: Some(30_000),
         judge: Some("anthropic/judge".into()),
+        artifacts: None,
     };
     let backing = Arc::new(MemoryDocumentStore::new());
     let writer = DocumentDirectoryStore::stamped(
@@ -552,7 +559,13 @@ async fn the_writers_fingerprint_is_what_a_reader_loads_back() {
         stamp.clone(),
     );
     assert_eq!(writer.compiled_under(), &stamp);
-    writer.commit(0, DirectoryRecords::default()).await.unwrap();
+    // The artifact axis is the commit's own, stamped beside the handle's.
+    let artifacts = Some(vec!["learns=abc".to_string()]);
+    writer
+        .commit(0, DirectoryRecords::default(), artifacts.clone())
+        .await
+        .unwrap();
+    let stamp = CompiledUnder { artifacts, ..stamp };
 
     // A *differently* stamped reader over the same store loads the writer's
     // fingerprint, not its own -- which is the whole of what makes a
@@ -644,7 +657,7 @@ async fn a_document_at_the_ceiling_commits_and_one_byte_over_is_refused_before_a
     );
     let store = memory();
     store
-        .commit(0, at_ceiling)
+        .commit(0, at_ceiling, None)
         .await
         .expect("a document at the ceiling, not over it, must still commit");
 
@@ -656,7 +669,7 @@ async fn a_document_at_the_ceiling_commits_and_one_byte_over_is_refused_before_a
         DIRECTORY_DOCUMENT_CEILING_BYTES + 1
     );
     let error = over_ceiling
-        .commit(0, one_byte_over)
+        .commit(0, one_byte_over, None)
         .await
         .expect_err("one byte over the ceiling must be refused");
     let reason = error.to_string();

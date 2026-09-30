@@ -540,6 +540,8 @@ macro_rules! store_contract_suite {
             pages_reach_every_session_past_unfinished_ones,
             marks_are_isolated_by_session_and_project,
             a_marked_session_is_discoverable_without_a_learner_store,
+            an_unreadable_mark_is_named_and_the_page_goes_on,
+            an_orphaned_pending_member_is_named_and_the_page_goes_on,
         );
     };
 }

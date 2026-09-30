@@ -205,6 +205,30 @@ impl roundhouse_core::store::contract::LeaseControl for RedisSessionStore {
     }
 }
 
+/// The conformance suite's unreadable-mark lever: a value in the marks hash
+/// that `parse_mark` rejects, as a foreign writer would leave.
+#[async_trait::async_trait]
+impl roundhouse_core::store::contract::learning::LearningMarkControl for RedisSessionStore {
+    async fn make_mark_unreadable(&self, session_id: &SessionId) {
+        let _: i64 = redis::cmd("HSET")
+            .arg(crate::scripts::learning::IndexKeys::new(&self.namespace).marks)
+            .arg(session_id.as_str())
+            .arg("x")
+            .query_async(&mut self.conn.clone())
+            .await
+            .expect("the test Redis must accept an HSET");
+    }
+
+    async fn orphan_pending_mark(&self, session_id: &SessionId) {
+        let _: i64 = redis::cmd("HDEL")
+            .arg(crate::scripts::learning::IndexKeys::new(&self.namespace).marks)
+            .arg(session_id.as_str())
+            .query_async(&mut self.conn.clone())
+            .await
+            .expect("the test Redis must accept an HDEL");
+    }
+}
+
 /// The learner store under test, connected under `namespace`.
 pub async fn connect_learner_in(namespace: KeyNamespace) -> crate::RedisLearnerStore {
     crate::RedisLearnerStore::connect_namespaced(url_from_env(), namespace)

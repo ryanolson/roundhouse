@@ -86,6 +86,25 @@ pub enum StoreError {
         marked: ProjectId,
         requested: ProjectId,
     },
+    /// One session's stored data holds content this store never writes: a
+    /// log entry it cannot decode, an id out of sequence, a length that
+    /// disagrees with the newest id, a key of that session's that holds
+    /// another type, or a learning mark it cannot parse. The store answered;
+    /// the fault is in that one session's data (a foreign writer, a partial
+    /// restore), not in the store. Named for the log, where almost all of it
+    /// lives; `detail` says which key.
+    ///
+    /// **Separate from [`Self::Backend`] so no caller can read it as an
+    /// outage.** A caller that pauses on a store that is down (the learner
+    /// recovery task ends its sweep and keeps its cursor) would stop at this
+    /// session on every attempt, and one bad log would starve every session
+    /// behind it. A caller that has no such distinction treats it as it
+    /// treats `Backend`: an internal failure of this one request.
+    #[error("the stored data of session `{session_id}` is corrupt: {detail}")]
+    CorruptLog {
+        session_id: SessionId,
+        detail: String,
+    },
     #[error("backend failure: {0}")]
     Backend(#[from] anyhow::Error),
 }
@@ -245,7 +264,9 @@ pub trait SessionStore: Send + Sync + 'static {
     /// least `idle_for_ms` ago by the store's own clock — the clock that
     /// stamped the marks, so a node clock that runs behind cannot hide every
     /// session. The cursor moves past every examined member, idle or not; see
-    /// the `learning` module doc for what a pass guarantees.
+    /// the `learning` module doc for what a pass guarantees. A member the
+    /// store cannot read a mark for — including one with no mark at all — is
+    /// named in [`LearningPage::unreadable`] rather than failing the page.
     async fn pending_learning(
         &self,
         after: Option<&LearningCursor>,
@@ -255,7 +276,9 @@ pub trait SessionStore: Send + Sync + 'static {
 
     /// One page of every session ever marked, in session id byte order after
     /// `after`, whether pending or not. For the audit and offline
-    /// enumeration: the permanent marks outlive every clear.
+    /// enumeration: the permanent marks outlive every clear. As with
+    /// [`Self::pending_learning`], an unreadable member is named in
+    /// [`LearningPage::unreadable`], not a page failure.
     async fn learning_sessions(
         &self,
         after: Option<&LearningCursor>,
@@ -310,6 +333,26 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make `session_id`'s stored learning mark unreadable, as a foreign
+    /// value in a Redis index's marks hash is. Test hook behind
+    /// `contract::LearningMarkControl`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn make_learning_mark_unreadable(&self, session_id: &SessionId) {
+        self.state
+            .write()
+            .await
+            .learning
+            .make_unreadable(session_id);
+    }
+
+    /// Strip `session_id`'s stored mark while it stays a pending member, as a
+    /// foreign `HDEL` of a Redis index's marks field leaves it. Test hook
+    /// behind `contract::LearningMarkControl`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn orphan_pending_learning_mark(&self, session_id: &SessionId) {
+        self.state.write().await.learning.orphan(session_id);
     }
 
     /// Force-expire a session's lease. Test hook for simulating a dead owner
@@ -506,12 +549,11 @@ impl SessionStore for MemoryStore {
         session_id: &SessionId,
         confirmed_through: u64,
     ) -> Result<ClearOutcome, StoreError> {
-        Ok(self
-            .state
+        self.state
             .write()
             .await
             .learning
-            .clear(session_id, confirmed_through))
+            .clear(session_id, confirmed_through)
     }
 
     async fn requeue_learning(
@@ -519,12 +561,11 @@ impl SessionStore for MemoryStore {
         session_id: &SessionId,
         mark_seq: u64,
     ) -> Result<RequeueOutcome, StoreError> {
-        Ok(self
-            .state
+        self.state
             .write()
             .await
             .learning
-            .requeue(session_id, mark_seq))
+            .requeue(session_id, mark_seq)
     }
 
     async fn pending_learning(

@@ -38,6 +38,10 @@ pub struct Artifact {
     strategies: StrategySet,
     prior: PriorUnits,
     epoch: EpochId,
+    /// SHA-256 of the artifact's bytes, hex: the digest the epoch hashes, and
+    /// the one a node's directory fingerprint records, so both name the bytes
+    /// by one hash.
+    sha256: String,
     manifest_digest: String,
     source_commit: String,
 }
@@ -170,11 +174,13 @@ impl Artifact {
                 },
             ));
         }
-        let epoch = epoch_of(bytes, &strategies);
+        let sha256 = bytes_digest(bytes);
+        let epoch = epoch_under(&sha256, &strategies);
         Ok(Self {
             strategies,
             prior: PriorUnits::new(entries),
             epoch,
+            sha256,
             manifest_digest: file.manifest_digest,
             source_commit: file.source_commit,
         })
@@ -192,6 +198,12 @@ impl Artifact {
     /// The epoch this artifact starts.
     pub fn epoch(&self) -> EpochId {
         self.epoch
+    }
+
+    /// SHA-256 of the bytes this artifact was parsed from, hex: the digest
+    /// [`epoch_of`] hashes into the epoch.
+    pub fn sha256(&self) -> &str {
+        &self.sha256
     }
 
     /// The digest of the session manifest the calibrator read.
@@ -218,7 +230,16 @@ impl Artifact {
 /// stage router's pick changes what a `rules` plan is, so that revision is
 /// part of the id too.
 pub fn epoch_of(bytes: &[u8], strategies: &StrategySet) -> EpochId {
-    let artifact = hex::encode(Sha256::digest(bytes));
+    epoch_under(&bytes_digest(bytes), strategies)
+}
+
+/// The one digest of an artifact's bytes.
+fn bytes_digest(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// [`epoch_of`] from the bytes' digest, so a parse hashes the bytes once.
+fn epoch_under(artifact: &str, strategies: &StrategySet) -> EpochId {
     let list = strategies
         .as_slice()
         .iter()
@@ -261,6 +282,11 @@ mod tests {
         assert_eq!(
             artifact.epoch(),
             epoch_of(bytes.as_bytes(), artifact.strategies())
+        );
+        assert_eq!(
+            artifact.sha256(),
+            hex::encode(Sha256::digest(bytes.as_bytes())),
+            "the recorded digest is the plain SHA-256 of the bytes the epoch hashes"
         );
     }
 

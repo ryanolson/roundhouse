@@ -67,7 +67,7 @@ use crate::control_config::Admission;
 mod classification;
 mod control;
 mod fair_use;
-mod learning;
+pub(crate) mod learning;
 mod selection;
 pub(crate) mod spend;
 
@@ -933,9 +933,11 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// Fires the "this recipe routes nothing" warning at most once. (M10.2, S3)
     ///
     /// **The hole conditional composition leaves, stated where it is knowable.**
-    /// `main.rs` wraps [`StagePolicy`](roundhouse_core::routing::StagePolicy)
-    /// only when some project already had a `tiers` block at boot — see
-    /// `tiers_configured` there for why unconditional composition was refused —
+    /// The composition root wraps
+    /// [`StagePolicy`](roundhouse_core::routing::StagePolicy) only when some
+    /// project already had a `tiers` block at boot — see
+    /// `crate::routing_composition` for why unconditional composition was
+    /// refused —
     /// so a recipe *added through the admin plane afterwards* lands on a process
     /// whose router cannot read it. The operator gets a config field that
     /// re-routes nothing, with no error and, without this, no log line either.
@@ -948,6 +950,10 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// to filter exactly the line they need. The remedy is a restart, and one
     /// line survives to the next one.
     unread_recipe: std::sync::Once,
+    /// The projects already told their learner block reaches a process with
+    /// no learner (M9). Per project rather than a `Once`, because unlike a
+    /// recipe the remedy names the project; see `learning::warn_unread_learner`.
+    unread_learner: Mutex<std::collections::HashSet<roundhouse_core::control::ProjectId>>,
     /// Whether the last fair-use ceiling check found its ledger unreachable —
     /// so `fair_use_refusal` warns once per outage rather than once per
     /// refused turn. See its own doc for why (M13.1 review F4).
@@ -1047,6 +1053,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             control: None,
             turn_gates: Mutex::new(HashMap::new()),
             unread_recipe: std::sync::Once::new(),
+            unread_learner: Mutex::new(std::collections::HashSet::new()),
             fair_use_unreachable_warned: std::sync::atomic::AtomicBool::new(false),
             classifier: None,
             learner: None,
@@ -1056,6 +1063,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// The running token and dollar aggregates for everything this node served.
     pub fn metrics(&self) -> Arc<MetricsRecorder> {
         Arc::clone(&self.metrics)
+    }
+
+    /// The policy every turn routes under: the name its record carries.
+    pub fn policy(&self) -> &dyn RoutingPolicy {
+        self.policy.as_ref()
     }
 
     /// The serialization gate for one session's turns.

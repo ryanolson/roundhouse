@@ -10,12 +10,15 @@
 //!
 //! Durability is the one seam a deployment selects, and it selects every family
 //! of it at once — sessions, committed spend, fair-use windows, conversation
-//! correlation and, since M16.1 (R-D8), the admin directory — but the
-//! selecting does not happen here. `shared_backend::open` makes it, in the
+//! correlation, since M16.1 (R-D8) the admin directory, and since the routing
+//! learner's M9 the learner store, opened only when a project enables the
+//! learner — but the selecting does not happen here. `shared_backend::open` makes it, in the
 //! library, and this file wires whichever backends it hands back. That split is
 //! M14.1's review, F1: the choice used to be spelled out three times in this
 //! function, inside a `[[bin]]` nothing else can call, so the boot suites could
 //! only re-type it by hand and a mutation of the real wiring went unnoticed.
+//! The router and the learner are chosen the same way, by
+//! `routing_composition::compose` in the library, and wired here.
 //!
 //! A URL
 //! that is set but unreachable stops the process at startup — falling back to
@@ -49,10 +52,7 @@ use anyhow::Context;
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::control::{FairUseLedger, SpendLedger};
 use roundhouse_core::metrics::MetricsConfig;
-use roundhouse_core::routing::{
-    AffinityPolicy, CacheLedger, CacheModel, Candidate, ProviderPricing, RoutingPolicy,
-    StagePolicy, Target,
-};
+use roundhouse_core::routing::{CacheLedger, CacheModel, Candidate, ProviderPricing, Target};
 use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{Validator, ValidatorConfig};
 use roundhouse_fleet::{
@@ -63,12 +63,13 @@ use roundhouse_fleet::{
 use roundhouse_mcp::ControlStore;
 use roundhouse_server::catalog_config::{BUILT_IN_OPENAI, ProviderConfig};
 use roundhouse_server::control_config::crosscheck::CrossChecks;
+use roundhouse_server::routing_composition::{EngineParts, RoutingComposition};
 use roundhouse_server::{
     Backends, CLASSIFY_VAR, ControlDirectory, ControlPlane, ControlPlaneReads, Conversations,
-    DirectoryError, EchoLocalExecutor, Engine, EngineConfig, FleetJudge, JudgeConfig,
-    REDIS_NAMESPACE_VAR, REDIS_VAR, admin_api, catalog_config, classify_config, classify_runtime,
-    control_config, http, mcp_api, messages_api, metrics_api, relay_api, resolve_namespace,
-    responses_api, shared_backend,
+    DirectoryError, EchoLocalExecutor, EngineConfig, FleetJudge, JudgeConfig, REDIS_NAMESPACE_VAR,
+    REDIS_VAR, admin_api, catalog_config, classify_config, classify_runtime, control_config, http,
+    mcp_api, messages_api, metrics_api, relay_api, resolve_namespace, responses_api,
+    routing_composition, shared_backend,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -579,42 +580,6 @@ fn boot_refusal(error: DirectoryError) -> anyhow::Error {
     }
 }
 
-/// Does any project on this plane route between tiers? (M10.2, S3)
-///
-/// The whole of the composition root's tier decision, named so it can be
-/// asserted: `serve` reads it once and wraps
-/// [`StagePolicy`](roundhouse_core::routing::StagePolicy) around the ordinary
-/// policy when it is true. Read through `configured_admissions` — the same
-/// accessor the fair-use boot flag uses, and for the same reason: the key
-/// table's layout has exactly one reader outside its own module and this is not
-/// going to be the second.
-///
-/// **Conditional composition, and the condition is not a micro-optimization.**
-/// `StagePolicy` delegates to its inner policy for every project with no recipe,
-/// and the target and rationale it produces there are pinned byte-identical to
-/// the inner policy's — but [`DecisionRecord::policy`] reports `stage`, because
-/// that is the object in force, and reporting `affinity` would make the audit
-/// trail name a router that did not serve the turn. Composing it unconditionally
-/// would therefore relabel every existing deployment's decisions on an upgrade
-/// that changed no routing at all. Composing it only where a recipe exists moves
-/// the field exactly when the router moved.
-///
-/// **The hole this leaves is a recipe added through the admin plane after boot**,
-/// which nothing here can see, and which would otherwise be the worst shape a
-/// config mistake can take: an operator's recipe re-routing nothing, with every
-/// surface reporting the configuration as fine. The engine warns once when a
-/// turn arrives carrying a recipe its policy cannot read — see
-/// `Engine::unread_recipe` — which states the same fact at the one moment it is
-/// knowable. `ControlPlane::Open` has no file to write a recipe in and answers
-/// `false` by construction.
-///
-/// [`DecisionRecord::policy`]: roundhouse_core::routing::DecisionRecord::policy
-fn composes_the_stage_router(plane: &ControlPlane) -> bool {
-    plane
-        .configured_admissions()
-        .any(|admission| admission.tiers.is_some())
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -826,6 +791,17 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("fair-use windows are configured; rolling ceilings are enforced");
     }
 
+    // The router and the online routing learner, from the plane this process
+    // booted with. The decision is `routing_composition::compose`'s, in the
+    // library where `tests/learner_startup.rs` calls it; this site only wires
+    // what it returns. Composed before the bind, so an unreachable learner
+    // store stops the boot with the variable named, like every other family.
+    let composition = routing_composition::compose(
+        &*directory.plane(roundhouse_core::now_ms()).await,
+        &backends,
+    )
+    .await?;
+
     // Background classification, over the *evaluation* ledger and never the
     // serving one. The decision of whether there is a runtime at all is
     // `classify_runtime::compose`'s, in the library, for the reason
@@ -920,6 +896,7 @@ async fn main() -> anyhow::Result<()> {
                 metrics_config,
                 engine_config,
                 classifier,
+                composition,
                 listener,
             )
             .await
@@ -944,6 +921,7 @@ async fn main() -> anyhow::Result<()> {
                 metrics_config,
                 engine_config,
                 classifier,
+                composition,
                 listener,
             )
             .await
@@ -990,6 +968,7 @@ async fn serve<S: SessionStore>(
     metrics_config: Arc<MetricsConfig>,
     engine_config: EngineConfig,
     classifier: Option<Arc<classify_runtime::ClassificationRuntime<ByteTokenizer>>>,
+    composition: RoutingComposition,
     listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let control = Arc::new(ControlStore::new());
@@ -1045,37 +1024,29 @@ async fn serve<S: SessionStore>(
         ..engine_config
     };
 
-    let booted_plane = directory.plane(roundhouse_core::now_ms()).await;
-    let tiers_configured = composes_the_stage_router(&booted_plane);
-    if tiers_configured {
-        tracing::info!(
-            "a project configures a tier recipe; the stage router is composed over the \
-             ordinary policy, and projects with no recipe route through it unchanged"
-        );
-    }
-
-    let mut engine = Engine::with_provider_clients(
-        Arc::clone(&store),
-        ByteTokenizer,
-        Arc::new(EchoLocalExecutor::new("local answer")),
-        catalog,
-        Arc::clone(&frontier),
-        // The recipe reader wrapped around the ordinary policy, or the ordinary
-        // policy alone. See `tiers_configured` for why the wrapper is not
-        // composed unconditionally.
-        match tiers_configured {
-            true => Arc::new(StagePolicy::new(Box::new(AffinityPolicy::new())))
-                as Arc<dyn RoutingPolicy>,
-            false => Arc::new(AffinityPolicy::new()) as Arc<dyn RoutingPolicy>,
+    // The router (`affinity`, `stage` or `learned`, as
+    // `routing_composition::compose` chose from the booted plane) and, when a
+    // project enables it, the learner and its recovery task over the engine's
+    // own learner. Built in the library, the one place the composed policy
+    // reaches an engine; see `build_engine` for why.
+    let (engine, recovery) = routing_composition::build_engine(
+        EngineParts {
+            store: Arc::clone(&store),
+            tokenizer: ByteTokenizer,
+            local_executor: Arc::new(EchoLocalExecutor::new("local answer")),
+            frontier_catalog: catalog,
+            frontier_clients: Arc::clone(&frontier),
+            config: engine_config.clone(),
         },
-        engine_config.clone(),
-    )
-    .with_spend_ledger(Arc::clone(&spend))
-    // Chosen by `fair_use_backend`, not here: this site takes whichever ledger
-    // the composition root resolved, so the boot log and the enforcement are
-    // the same decision.
-    .with_fair_use_ledger(fair_use)
-    .with_control_store(Arc::clone(&control));
+        composition,
+    );
+    let mut engine = engine
+        .with_spend_ledger(Arc::clone(&spend))
+        // Chosen by `fair_use_backend`, not here: this site takes whichever ledger
+        // the composition root resolved, so the boot log and the enforcement are
+        // the same decision.
+        .with_fair_use_ledger(fair_use)
+        .with_control_store(Arc::clone(&control));
 
     // Composed and its supervisor taken in `main`, before the bind — see the
     // composition site for why. This is just wiring what the caller already
@@ -1111,7 +1082,18 @@ async fn serve<S: SessionStore>(
             },
         )));
     }
+    // The recovery task is held for as long as this function serves, under a
+    // real name: a `_` binding would drop it, and with it every sweep, at the
+    // end of this statement.
+    let _recovery = recovery.map(|recovery| recovery.spawn());
     let engine = Arc::new(engine);
+    // Read off the engine, not the composition: this is the name every
+    // turn's record will carry, so wiring any other policy than the composed
+    // one shows here, and `tests/learner_binary_boot.rs` reads it.
+    tracing::info!(
+        policy = %engine.policy().name(),
+        "the engine routes every turn under this policy"
+    );
 
     // Seven surfaces, one process and one log: the native transport, which
     // exposes sessions and the log itself; the Responses API, which lets an
@@ -1869,9 +1851,11 @@ mod tests {
     /// an upgrade that changed no routing; *not* composing it for one that has a
     /// recipe leaves the recipe resolving to an `Admission` field nothing reads
     /// — an operator's routing configuration doing nothing, with every surface
-    /// reporting the file as valid. See `composes_the_stage_router`.
+    /// reporting the file as valid. See `composes_the_stage_router`, now in
+    /// `routing_composition` beside the learner's own predicate.
     #[test]
     fn the_stage_router_is_composed_exactly_when_a_project_configures_tiers() {
+        use roundhouse_server::routing_composition::composes_the_stage_router;
         assert!(
             composes_the_stage_router(&plane_with_tiers(serde_json::json!({
                 "capable": ["anthropic/big"],

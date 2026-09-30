@@ -96,7 +96,7 @@ resumption (`starting_after`), reconnect replay for the bidirectional
 transports, and the routing audit trail.
 
 **Conversation items and the routing ledger are projections of that log**, not
-separately stored collections. `SessionStore` supplies the shared append and replay path, lease management, and a durable index for learning recovery. Every append that carries a learning entry marks the session in that index, and the engine clears the mark once the learner store confirms delivery. The recovery task that reads the index for idle sessions is not built yet.
+separately stored collections. `SessionStore` supplies the shared append and replay path, lease management, and a durable index for learning recovery. Every append that carries a learning entry marks the session in that index, and the engine clears the mark once the learner store confirms delivery. The learner recovery task reads the index for idle sessions and delivers them without the engine (see "The online routing learner").
 
 **A single-writer lease with fencing.** Event appends require a `Lease`. An owner that stalled, was partitioned, or died and came back fails its next append rather than interleaving with its successor. Learning-index acknowledgement and requeue use log-sequence checks, so recovery can run without owning the writer lease.
 
@@ -528,7 +528,53 @@ A project with a `"tiers"` recipe can also add a `"learner"` block. The learner 
 
 The engine reads the learner store once per learned turn, bounded by `read_timeout_ms`. After the turn's terminal event and the settle, it delivers the session's pending learning entries in one apply per page, and one more after a gap backfill (a dry-page refill replays the log first but adds no apply of its own), bounded by `apply_timeout_ms`, then appends `LearningApplied` and clears the session's source mark. A failed delivery leaves the entries marked for the next turn. A session whose project is later set to `off` still has its pending entries delivered, and its turns make no store read.
 
-The binary does not attach a learner store yet. Milestone M9 composes one at startup. Until then, the loader checks a `learner` block in a deployment's file, and the block has no effect and gives no warning. `Engine::with_learner` attaches a store.
+#### Startup
+
+When a project in the file's `learner` blocks is `shadow` or `live`, the binary composes the learner at boot (`routing_composition::compose`). This holds for a project that no turn key names yet, because the same check decides that the `learner_recovery` block is required:
+
+- The routing policy is `learned`, which wraps the stage router. Every decision in the process records `policy: "learned"`, as a process with a recipe records `stage`. Turns of projects with no learner, or with an `off` one, route exactly as the stage router routes them.
+- The learner store is opened with the other shared state: `RedisLearnerStore` when `ROUNDHOUSE_REDIS_URL` is set, under the same `ROUNDHOUSE_REDIS_NAMESPACE`, or memory otherwise. The memory store logs a warning that learner state ends with the process.
+- The recovery task starts (see below).
+
+When no project is `shadow` or `live`, nothing changes: the policy is `affinity` or `stage` as before, no learner store is opened, no recovery task runs, and no learner line is logged. Either way, `serve` logs the engine's policy before it serves (`policy=learned`, `policy=stage` or `policy=affinity`).
+
+An invalid artifact stops the boot, because the loader reads every artifact when it validates the file. A `learner` block that the admin plane adds to a process that booted with no learner routes as before and logs one warning for each such project until a restart composes the learner.
+
+#### Recovery
+
+The recovery task delivers sessions that went idle with entries owed: a session that never turns again, a session whose learner-store calls all failed, or a session whose node stopped before the apply. Each sweep:
+
+1. reads a page of pending sessions from the session store's index, marked at least `idle_after_ms` ago by the session store's clock;
+2. for each one, reads the learner store's watermark, replays the log above it without a lease, and delivers up to `pages_per_session_per_sweep` pages through the same delivery the engine runs, then clears the mark with the watermark the store confirmed. The mark goes only when the store holds every entry through it;
+3. audits a page of every session ever marked. A session whose learner watermark is below its mark lost state after a clear, and the audit makes it pending again. The audit never clears.
+
+The task never appends to a log, never takes a lease, and does not check leases. Its applies and outcomes count in the same `learning.delivery` counters as the engine's. When a store is down, the sweep stops with the marks in place and its place in the index kept, the next sweep waits twice as long (at most 8 intervals), and one warning covers the whole outage. A store is down when the learner store answers a watermark read or an apply with `Unavailable`, when a watermark read times out, when a session-store call fails with a backend error, or when an index call (a page or a requeue) times out. A problem with one session is not an outage. The task holds that session and goes on to the next one. These problems are: a learner key or watermark field holding foreign data (`WrongType`), a stopped session, a gap the backfill cannot close, a log that is gone, holds entries this store never writes, or whose key a foreign writer replaced with another type, a stored learning mark the index cannot read (the index page names it and goes on), and an apply, replay, gap backfill or clear of that session that runs past its timeout. A timeout counts as the session's own problem because the next session's watermark read tests whether the store is down.
+
+How often a held session is logged:
+
+- A foreign watermark, a replay or backfill that cannot replay the log, an apply that meets a foreign key, and a clear that fails, times out or cannot read the mark: one warning per session and mark. The session warns again only after it is delivered or marked anew, or after a full pass that did not hold it again this way (for example, a pass where its apply timed out instead).
+- A stored mark the index cannot read: one warning per session, until the mark is readable again.
+- A stopped session: one error when it stops. The task does not visit it again until a restart.
+- An apply that times out, and a gap the backfill cannot close: counted in `learning.delivery`, not logged.
+
+The file's top-level `learner_recovery` block sets the cadence. It is required when any project is `shadow` or `live`, in the file or through an admin write, and no field may be 0. A block with no learner enabled is accepted, so the admin plane can add a learner later. The values below are the plan's starting values:
+
+```json
+"learner_recovery": {
+  "sweep_interval_ms": 30000,
+  "idle_after_ms": 60000,
+  "max_sessions_per_sweep": 64,
+  "pages_per_session_per_sweep": 4,
+  "audit_sessions_per_sweep": 32,
+  "read_timeout_ms": 25,
+  "apply_timeout_ms": 250,
+  "source_timeout_ms": 1000
+}
+```
+
+`read_timeout_ms` bounds one learner-store watermark read, `apply_timeout_ms` one apply, and `source_timeout_ms` one session-store call (an index page, a replay, a gap backfill, a clear, or a requeue).
+
+Each node reads an artifact from its own path. The admin directory's fingerprint records the SHA-256 of each artifact's bytes, by project, so a node that read other bytes at the same path than the node that wrote a directory version reports a `learner_artifacts` divergence. A version written by a node with no learner enabled, or by a build older than this record, records no artifacts, and this check is skipped for it.
 
 ## Hooking up Codex
 
@@ -1121,7 +1167,7 @@ The `learning` object counts what the online learner decided, in the same scopes
 
 A `refuse` project's turn that fails on a store outage or an infeasible plan writes no `Routed` at all, so it counts under none of `decisions`, `unmet`, or `read_failures`. It terminates as `PolicyRefused` instead, alongside every other policy refusal; it is not a fourth `read_failures` reason.
 
-`delivery` is not a projection of the log. A failed delivery writes nothing to the log by design, so the engine counts the outcomes in process memory, and they reset when the process restarts. It reports these counts:
+`delivery` is not a projection of the log. A failed delivery writes nothing to the log by design, so the engine counts the outcomes in process memory, and they reset when the process restarts. The recovery task's deliveries count here too, in the same counters, so a session the task delivered counts as one the engine delivered does. It reports these counts:
 
 - entries applied, and entries that the store skipped as duplicates,
 - backfill replays and gaps,

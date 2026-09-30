@@ -62,7 +62,7 @@ pub use gate::{
     PriorSource, jev_prior, read_gate, wilson_v1,
 };
 pub use input::{Band, KeyLevel, LearnedInput, LevelKey, PriorBand, SEQUENCE_LEN};
-pub use policy::{LearnedError, LearnedPolicy, LearningTurn};
+pub use policy::{LEARNED_POLICY_NAME, LearnedError, LearnedPolicy, LearningTurn};
 
 /// The revision of the learned input: its fields, the complexity bands, the
 /// sequence length and the three key levels.

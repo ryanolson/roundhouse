@@ -24,6 +24,12 @@ mod rig;
 mod classified;
 #[path = "learned_routing_engine/delivery.rs"]
 mod delivery;
+#[path = "learned_routing_engine/recovery.rs"]
+mod recovery;
+#[path = "learned_routing_engine/recovery_holds.rs"]
+mod recovery_holds;
+#[path = "learned_routing_engine/recovery_warnings.rs"]
+mod recovery_warnings;
 #[path = "learned_routing_engine/stops.rs"]
 mod stops;
 

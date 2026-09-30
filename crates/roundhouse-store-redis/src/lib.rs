@@ -53,7 +53,12 @@
 //! the append script never parses or splices JSON.
 //!
 //! An entry that violates the format — a missing field, an id some foreign
-//! writer auto-generated — fails the read loudly as [`StoreError::Backend`].
+//! writer auto-generated — fails the read loudly as
+//! [`StoreError::CorruptLog`]: the store answered, and the fault is in that
+//! one log, so no caller may read it as the store being down. So does a key
+//! of one session (its log or its lease) that a foreign writer replaced with
+//! another type: `WRONGTYPE` from a call that touches only that session's
+//! keys is that session's fault (`one_session` below).
 //! Skipping it would silently drop events from a replay, and a replay that
 //! quietly disagrees with what was appended is the one failure mode an
 //! event-sourced store must never have.
@@ -317,6 +322,60 @@ fn backend(error: redis::RedisError) -> StoreError {
     StoreError::Backend(anyhow::Error::new(error))
 }
 
+/// The error of a call that touches only `session_id`'s own keys: its meta,
+/// its lease, its log. `WRONGTYPE` there can only mean one of those keys
+/// holds another type (a foreign writer replaced it), so it is that one
+/// session's [`StoreError::CorruptLog`], never `Backend`: the recovery task
+/// reads `Backend` as an outage and would stop every project's sweep at this
+/// session. A call that also touches the namespace-wide learning index (a
+/// `WRONGTYPE` on the marked append) cannot tell whose key it was, and stays
+/// `Backend`.
+///
+/// **Redis-version scoped** (M9 round-3, item 2, low): `is_wrong_type` reads
+/// `WRONGTYPE` from the server errors a pipeline or a script's own command
+/// raised. A plain pipelined command — `read_events`, `last_seq` — classifies
+/// on every version this crate supports (`README`'s Redis ≥ 6.2 floor is
+/// unchanged). A Lua script's `WRONGTYPE` reaches the client this way only on
+/// Redis 7 and later; Redis 6.x wraps a script's raised error as `ERR Error
+/// running script ...` with no code to read, so `acquire`, `renew` and
+/// `release` fall back to `Backend` there. Harmless: no lease caller branches
+/// on `CorruptLog` versus `Backend` for these three, so a 6.x deployment only
+/// loses the more specific classification, never correctness.
+///
+/// **Deliberately not where a redis-rs response-decode failure is
+/// classified** (M9 round-4, item 3, low): `RedisError::kind() ==
+/// ErrorKind::Parse` covers both a client-side `FromRedisValue` conversion
+/// on an already-received reply (this session's data) and the low-level RESP
+/// parser's own failure to decode the wire at all (a connection fault, which
+/// must stay `Backend`) -- the two are not distinguishable from the kind
+/// alone. `read_events` and `last_seq` sidestep the ambiguity instead of
+/// resolving it here: they decode the pipeline's reply as a generic `Value`
+/// through this same `one_session` mapper (so a real protocol failure still
+/// surfaces as `Backend`), then convert that already-received `Value` into
+/// `StreamRangeReply` themselves and map only *that* local conversion's
+/// error to `CorruptLog` (`undecodable_log`), which cannot fail on a wire
+/// problem because the wire already produced the `Value` it starts from.
+fn one_session(session_id: &SessionId) -> impl FnOnce(redis::RedisError) -> StoreError + '_ {
+    move |error| match is_wrong_type(&error) {
+        true => corrupt_log(
+            session_id,
+            format!("a key of this session holds another type: {error}"),
+        ),
+        false => backend(error),
+    }
+}
+
+/// Whether Redis answered `WRONGTYPE`, to one command or to any command of a
+/// pipeline. Not `RedisError::code`: the client has no kind for `WRONGTYPE`,
+/// and `code` reads a pipeline's failure only through its kind, so it answers
+/// `None` for the pipelined reads here.
+fn is_wrong_type(error: &redis::RedisError) -> bool {
+    error
+        .clone()
+        .into_server_errors()
+        .is_some_and(|errors| errors.iter().any(|(_, error)| error.code() == "WRONGTYPE"))
+}
+
 /// The `seq` a stream entry id encodes, i.e. `N` from `N-0`.
 ///
 /// The shape check alone cannot prove the entry is ours: a foreign writer
@@ -325,17 +384,47 @@ fn backend(error: redis::RedisError) -> StoreError {
 /// a read batch must be contiguous from its cursor and the newest id must
 /// equal the stream's length — because seqs run 1..=len with no gaps. The
 /// suffix check here only rejects what is unambiguously malformed.
-fn seq_of(entry_id: &str, log_key: &str) -> Result<u64, StoreError> {
+fn seq_of(entry_id: &str, session_id: &SessionId, log_key: &str) -> Result<u64, StoreError> {
     let parsed = entry_id
         .split_once('-')
         .filter(|(_, tail)| *tail == "0")
         .and_then(|(seq, _)| seq.parse::<u64>().ok());
     parsed.ok_or_else(|| {
-        StoreError::Backend(anyhow::anyhow!(
-            "stream entry `{entry_id}` in `{log_key}` is not `<seq>-0` shaped; \
-             the log has a writer other than this store"
-        ))
+        corrupt_log(
+            session_id,
+            format!(
+                "stream entry `{entry_id}` in `{log_key}` is not `<seq>-0` shaped; \
+                 the log has a writer other than this store"
+            ),
+        )
     })
+}
+
+/// A log this store read and whose content it never writes. See
+/// [`StoreError::CorruptLog`] for why this is not `Backend`.
+fn corrupt_log(session_id: &SessionId, detail: String) -> StoreError {
+    StoreError::CorruptLog {
+        session_id: session_id.clone(),
+        detail,
+    }
+}
+
+/// `read_events` and `last_seq` could not convert the `Value` the pipeline
+/// already received into `StreamRangeReply` -- a field this store never
+/// wrote, such as a non-UTF-8 field name, fails the conversion's own
+/// `String` decode. Unlike `one_session`'s `RedisError` classification, this
+/// conversion runs entirely on bytes already off the wire, so its failure
+/// can only be this session's stored content, never a connection or
+/// protocol fault (M9 round-4, item 3, low).
+fn undecodable_log(
+    session_id: &SessionId,
+    log_key: &str,
+    error: &redis::ParsingError,
+) -> StoreError {
+    corrupt_log(
+        session_id,
+        format!("log `{log_key}` could not be decoded as this store's own shape: {error}"),
+    )
 }
 
 /// Rebuild a [`SessionEvent`] from one stream entry.
@@ -344,13 +433,16 @@ fn event_of(
     session_id: &SessionId,
     log_key: &str,
 ) -> Result<SessionEvent, StoreError> {
-    let seq = seq_of(&entry.id, log_key)?;
+    let seq = seq_of(&entry.id, session_id, log_key)?;
     let corrupt = |what: &str| {
-        StoreError::Backend(anyhow::anyhow!(
-            "stream entry `{}` in `{log_key}` {what}; refusing to replay a log \
-             that would come back different from what was appended",
-            entry.id
-        ))
+        corrupt_log(
+            session_id,
+            format!(
+                "stream entry `{}` in `{log_key}` {what}; refusing to replay a log \
+                 that would come back different from what was appended",
+                entry.id
+            ),
+        )
     };
 
     let at_ms: u64 = entry
@@ -432,6 +524,7 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .acquire(
                 &mut self.conn.clone(),
+                session_id,
                 &meta_key(&self.namespace, session_id),
                 &lease_key(&self.namespace, session_id),
                 identity,
@@ -448,6 +541,7 @@ impl SessionStore for RedisSessionStore {
             .scripts
             .renew(
                 &mut self.conn.clone(),
+                &lease.session_id,
                 &meta_key(&self.namespace, &lease.session_id),
                 &lease_key(&self.namespace, &lease.session_id),
                 identity,
@@ -469,6 +563,7 @@ impl SessionStore for RedisSessionStore {
         self.scripts
             .release(
                 &mut self.conn.clone(),
+                &lease.session_id,
                 &lease_key(&self.namespace, &lease.session_id),
                 identity,
             )
@@ -586,13 +681,24 @@ impl SessionStore for RedisSessionStore {
         // `(` is an exclusive start. Ids are always `<seq>-0`, so excluding
         // exactly `after_seq-0` is precisely "seq > after_seq" — with no
         // arithmetic on `after_seq` that could overflow at u64::MAX.
-        let (exists, range): (bool, StreamRangeReply) = redis::pipe()
+        //
+        // Decoded as `Value` first, not straight into `StreamRangeReply`
+        // (M9 round-4, item 3, low): the pipeline's own decode can fail only
+        // on a genuine wire-protocol problem, which is `Backend`, same as
+        // before. Converting the already-received `Value` into
+        // `StreamRangeReply` ourselves isolates the one failure that is
+        // this session's data -- a field this store never wrote, such as a
+        // non-UTF-8 field name -- so only that local conversion's error maps
+        // to `CorruptLog`.
+        let (exists, range): (bool, redis::Value) = redis::pipe()
             .exists(meta_key(&self.namespace, session_id))
             .xrange_count(&log_key, format!("({after_seq}-0"), "+", redis_limit)
             .query_async(&mut self.conn.clone())
             .await
-            .map_err(backend)?;
+            .map_err(one_session(session_id))?;
         Self::require_session(exists, session_id)?;
+        let range: StreamRangeReply = redis::from_redis_value(range)
+            .map_err(|error| undecodable_log(session_id, &log_key, &error))?;
 
         let events: Vec<SessionEvent> = range
             .ids
@@ -608,11 +714,14 @@ impl SessionStore for RedisSessionStore {
         for (offset, event) in events.iter().enumerate() {
             let expected = after_seq + 1 + offset as u64;
             if event.seq != expected {
-                return Err(StoreError::Backend(anyhow::anyhow!(
-                    "log `{log_key}` is not contiguous: expected seq {expected}, \
-                     found {}; the log has a writer other than this store",
-                    event.seq
-                )));
+                return Err(corrupt_log(
+                    session_id,
+                    format!(
+                        "log `{log_key}` is not contiguous: expected seq {expected}, \
+                         found {}; the log has a writer other than this store",
+                        event.seq
+                    ),
+                ));
             }
         }
         Ok(events)
@@ -620,29 +729,37 @@ impl SessionStore for RedisSessionStore {
 
     async fn last_seq(&self, session_id: &SessionId) -> Result<u64, StoreError> {
         let log_key = log_key(&self.namespace, session_id);
-        let (exists, len, newest): (bool, u64, StreamRangeReply) = redis::pipe()
+        // See `read_events`: `Value` first, `StreamRangeReply` decoded
+        // locally, so only this session's own stored bytes can answer
+        // `CorruptLog` here.
+        let (exists, len, newest): (bool, u64, redis::Value) = redis::pipe()
             .exists(meta_key(&self.namespace, session_id))
             .xlen(&log_key)
             .xrevrange_count(&log_key, "+", "-", 1)
             .query_async(&mut self.conn.clone())
             .await
-            .map_err(backend)?;
+            .map_err(one_session(session_id))?;
         Self::require_session(exists, session_id)?;
+        let newest: StreamRangeReply = redis::from_redis_value(newest)
+            .map_err(|error| undecodable_log(session_id, &log_key, &error))?;
 
         let last = newest
             .ids
             .first()
-            .map_or(Ok(0), |entry| seq_of(&entry.id, &log_key))?;
+            .map_or(Ok(0), |entry| seq_of(&entry.id, session_id, &log_key))?;
         // Contiguity from 1 means the newest seq *is* the entry count. An
         // entry a foreign writer added with an auto id passes the shape check
         // but not this one. Revisit if trimming ever lands: a trimmed log
         // breaks len == last deliberately, and this check must learn the
         // trim boundary then.
         if last != len {
-            return Err(StoreError::Backend(anyhow::anyhow!(
-                "log `{log_key}` has {len} entries but its newest id is {last}; \
-                 the log has a writer other than this store"
-            )));
+            return Err(corrupt_log(
+                session_id,
+                format!(
+                    "log `{log_key}` has {len} entries but its newest id is {last}; \
+                     the log has a writer other than this store"
+                ),
+            ));
         }
         Ok(last)
     }
