@@ -116,7 +116,10 @@ prefill. The two sides get that number very differently:
   `effective_prefill_tokens`, the scheduler's own cache-credit-weighted prefill
   cost, *without booking anything*.
 - **Frontier** — no provider exposes its cache, so it is modelled from the
-  routing ledger: what we last sent, when, and under which provider TTL.
+  routing ledger: what we last sent, when, and under which provider TTL. For
+  a provider that caches only where a request places a marker (Anthropic),
+  the warm prefix ends at the last marker that request carried, so the
+  unmarked final item is priced as uncached input on the next turn.
 
 ## Why embed the selection service
 

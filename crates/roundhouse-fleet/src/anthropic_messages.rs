@@ -63,7 +63,9 @@ use serde_json::{Value, json};
 use roundhouse_core::control::TurnCredential;
 use roundhouse_core::routing::Target;
 
-use crate::frontier::{FrontierClient, FrontierError, FrontierQuote, FrontierStream};
+use crate::frontier::{
+    FrontierClient, FrontierError, FrontierQuote, FrontierStream, MarkerPlacement, PreviousMarker,
+};
 use crate::usage::WireProtocol;
 use stream::SseDecoder;
 use wire::{CacheControl, ContentBlock, Extra};
@@ -269,6 +271,45 @@ impl CacheLifetime {
 /// mis-serialized — see [`FrontierError::UnsupportedDialect`].
 const SPOKEN: WireProtocol = WireProtocol::AnthropicMessages;
 
+/// Where this client's conversation markers go, given a request's segment
+/// count, its toolbox as this dialect restates it, and the ledger's record of
+/// the previous request's placement.
+///
+/// **The one path from a quote to [`cache_markers::plan`]**, taken by the body
+/// this client sends and by [`marker_placement`], which the engine records.
+/// Two paths would be two ways to count the riding markers, and a recorded
+/// placement that differs from the sent one is the fleet-redis-3 defect again
+/// one level up. Marker lifetimes may be normalized before this is asked; that
+/// rewrites a marker's lifetime, never whether it is there.
+fn marker_plan(
+    segment_count: usize,
+    tools: Option<&Value>,
+    previous: PreviousMarker,
+) -> cache_markers::MarkerPlan {
+    cache_markers::plan(
+        segment_count,
+        cache_markers::breakpoints_in(tools),
+        previous,
+    )
+}
+
+/// Where `quote`'s request puts its last conversation marker, for the ledger.
+///
+/// Fallible exactly where [`AnthropicMessagesClient::body`] is before it
+/// places a marker: a segment structure that does not describe its prompt, or
+/// a toolbox this dialect cannot restate, is a request that is never sent and
+/// therefore has no placement.
+pub(crate) fn marker_placement(quote: &FrontierQuote) -> Result<MarkerPlacement, FrontierError> {
+    let segments = quote.segments()?;
+    let (tools, _) = quote.tools_for(SPOKEN)?;
+    Ok(
+        match marker_plan(segments.len(), tools.as_ref(), quote.previous_marker).last() {
+            Some(index) => MarkerPlacement::Block(index),
+            None => MarkerPlacement::Unplaced,
+        },
+    )
+}
+
 /// Executes turns against an Anthropic-Messages upstream.
 ///
 /// Two `reqwest::Client`s so that a forwarded seat token never shares a
@@ -435,15 +476,17 @@ impl AnthropicMessagesClient {
         // surface strips those, since roundhouse rebuilds every prompt from its
         // own log and a breakpoint from a different rendering names nothing in
         // this one.
-        let riding = cache_markers::breakpoints_in(tools.as_ref());
+        //
         // Where this request's own markers go — the whole placement policy,
-        // and why it is what it is, lives in `cache_markers` now: `plan()`
-        // takes the same four scalars the essay there is about, and its own
-        // table test pins the arithmetic. What stays here are the tests that
-        // are actually about the serialized body rather than the arithmetic:
-        // TTL normalization, the tool-marker allowance interaction, and the
-        // end-to-end lookback guard.
-        let plan = cache_markers::plan(segments.len(), riding, quote.previous_segment_count);
+        // and why it is what it is, lives in `cache_markers`: `plan()` takes
+        // the scalars the essay there is about, and its own table test pins
+        // the arithmetic. What stays here are the tests that are actually
+        // about the serialized body rather than the arithmetic: TTL
+        // normalization, the tool-marker allowance interaction, and the
+        // end-to-end lookback guard. Reached through `marker_plan`, the one
+        // path `marker_placement` also takes, so the placement the ledger
+        // records is the placement this body carries.
+        let plan = marker_plan(segments.len(), tools.as_ref(), quote.previous_marker);
         // Built out of [`wire::ContentBlock`] rather than hand-written JSON,
         // because this is the one place roundhouse *originates* this wire's
         // vocabulary and R1's rule is "typed where roundhouse reads or
@@ -848,7 +891,7 @@ mod tests {
             segment_boundaries: boundaries(),
             // No prior dispatch on these fixtures; the tests that need one set
             // it, the way they set tools.
-            previous_segment_count: None,
+            previous_marker: PreviousMarker::Unmarked,
             // And no declared lifetime: the TTL tests set it, so a marker
             // carrying one is never an accident of the fixture.
             cache_lifetime: CacheLifetime::Default,
@@ -1595,8 +1638,86 @@ mod tests {
             .collect()
     }
 
+    /// What the next request to the same target is told about `history`'s
+    /// marker, through the path a real turn takes: the placement the engine
+    /// asks for before dispatch, the ledger record the session fold makes of
+    /// it, and the ledger read that builds the next quote. Nothing here states
+    /// the answer, so a test that feeds its result forward is testing the data
+    /// flow rather than a hand-written premise.
+    fn recorded_after(history: &FrontierQuote) -> PreviousMarker {
+        let marker = history
+            .marker_placement()
+            .expect("the fixture is a quote this client can send")
+            .block_marker(|_| 0);
+        let mut ledger = roundhouse_core::routing::CacheLedger::new();
+        let segment_count = history.segments().expect("valid segments").len() as u64;
+        ledger.record(&history.target, 0, 0, segment_count, marker);
+        PreviousMarker::of(ledger.state_for(&history.target).as_ref())
+    }
+
+    /// **The single-owner guard.** Whatever `marker_placement` reports is the
+    /// furthest marker the body really carries, or `Unplaced` when it carries
+    /// none — over short prompts, spent and partly spent tool allowances, and
+    /// a long append with a reach-back marker. A second copy of the placement
+    /// rule on either path fails one of these rows.
+    #[test]
+    fn the_reported_placement_is_the_last_marker_the_body_carries() {
+        let tools = |count: usize| {
+            json!(
+                ["A", "B", "C", "D"][..count]
+                    .iter()
+                    .map(|name| marked_tool(name))
+                    .collect::<Vec<_>>()
+            )
+        };
+        for (segment_count, riding, previous) in [
+            (1, 0, PreviousMarker::Unmarked),
+            (6, 0, PreviousMarker::Unmarked),
+            (6, 3, PreviousMarker::Unmarked),
+            (6, 4, PreviousMarker::Unmarked),
+            (31, 0, PreviousMarker::Block(4)),
+            (31, 2, PreviousMarker::Block(4)),
+            (31, 3, PreviousMarker::Inferred { segment_count: 6 }),
+        ] {
+            let (prompt, segment_boundaries) = segments_of(segment_count);
+            let quote = FrontierQuote {
+                prompt,
+                segment_boundaries,
+                previous_marker: previous,
+                ..declaring(SPOKEN, tools(riding), None)
+            };
+            let body = AnthropicMessagesClient::body(&quote, "claude-sonnet").unwrap();
+            let expected = match breakpoint_indices(&body).last() {
+                Some(index) => MarkerPlacement::Block(*index),
+                None => MarkerPlacement::Unplaced,
+            };
+            assert_eq!(
+                quote.marker_placement().unwrap(),
+                expected,
+                "{segment_count} segments, {riding} riding, previous {previous:?}"
+            );
+        }
+    }
+
+    /// **CONTROL.** A dialect that caches without markers reports nothing to
+    /// record, so the ledger keeps its whole-prompt prediction for it.
+    #[test]
+    fn a_dialect_that_caches_on_its_own_reports_no_placement() {
+        let (prompt, segment_boundaries) = segments_of(6);
+        let quote = FrontierQuote {
+            prompt,
+            segment_boundaries,
+            ..quote(TurnCredential::Absent, WireProtocol::OpenAiResponses)
+        };
+        assert_eq!(
+            quote.marker_placement().unwrap(),
+            MarkerPlacement::Automatic
+        );
+        assert_eq!(MarkerPlacement::Automatic.block_marker(|_| 1), None);
+    }
+
     /// The end-to-end C2 guard for the lookback marker `cache_markers::plan`
-    /// derives from `previous_segment_count`. Anthropic's cache lookup checks
+    /// places back at the previous request's recorded marker. Anthropic's cache lookup checks
     /// at most twenty block positions back from a breakpoint, counting the
     /// breakpoint itself
     /// (platform.claude.com/docs/en/build-with-claude/prompt-caching), so a
@@ -1634,11 +1755,10 @@ mod tests {
         let quote2 = FrontierQuote {
             prompt: prompt2,
             segment_boundaries: boundaries2,
-            // The data flow under test: the ledger remembers that the
-            // previous dispatch to this target rendered six segments (and
-            // therefore marked block `p1 == cache_markers::penultimate(6)`),
-            // and the request built from that knowledge has to reach it.
-            previous_segment_count: Some(6),
+            // The data flow under test: the ledger records where the previous
+            // dispatch to this target marked (block `p1`), and the request
+            // built from that record has to reach it.
+            previous_marker: recorded_after(&quote1),
             ..quote(TurnCredential::Absent, SPOKEN)
         };
         let body2 = AnthropicMessagesClient::body(&quote2, "claude-sonnet").unwrap();
@@ -1674,7 +1794,7 @@ mod tests {
         let quote = FrontierQuote {
             prompt: format!("{PREFIX}a brief"),
             segment_boundaries: vec![PREFIX.len()],
-            previous_segment_count: None,
+            previous_marker: PreviousMarker::Unmarked,
             ..quote(TurnCredential::Absent, SPOKEN)
         };
 
@@ -1758,18 +1878,17 @@ mod tests {
 
     /// A quote long enough that both breakpoints are placed, at `lifetime`.
     ///
-    /// `previous_segment_count: Some(6)` names a previous dispatch of six
-    /// segments -- `cache_markers::penultimate(6) == Some(4)`, a gap of 25
-    /// blocks from this quote's own 29 and past `CACHE_LOOKBACK_BLOCKS`
-    /// (20), which is why `plan` places a marker at both blocks: block 4 is
-    /// far enough back that Anthropic's own cache lookup would not reach it
-    /// unasked.
+    /// `PreviousMarker::Block(4)` names a previous dispatch recorded as
+    /// marking block 4, a gap of 25 blocks from this quote's own 29 and past
+    /// `CACHE_LOOKBACK_BLOCKS` (20), which is why `plan` places a marker at
+    /// both blocks: block 4 is far enough back that Anthropic's own cache
+    /// lookup would not reach it unasked.
     fn quote_at_ttl(lifetime: CacheLifetime) -> FrontierQuote {
         let (prompt, boundaries) = segments_of(6 + 25);
         FrontierQuote {
             prompt,
             segment_boundaries: boundaries,
-            previous_segment_count: Some(6),
+            previous_marker: PreviousMarker::Block(4),
             cache_lifetime: lifetime,
             ..quote(TurnCredential::Absent, SPOKEN)
         }
@@ -2094,12 +2213,9 @@ mod tests {
     }
 
     /// **CONTROL (fleet-redis-3), live.** Riding zero tool markers, a
-    /// six-segment dispatch marks its own penultimate block (index 4) -- the
-    /// ground truth the *next* request's `previous_segment_count` is supposed
-    /// to describe. `engine.rs` passes `last_segment_count` (6) straight
-    /// through, and `cache_markers::plan` derives the same block index from
-    /// it via `penultimate`, so the following long-append quote correctly
-    /// reaches back for it.
+    /// six-segment dispatch marks its own penultimate block (index 4), and
+    /// that placement is what the ledger records for the *next* request, so
+    /// the following long-append quote correctly reaches back for it.
     #[test]
     fn a_history_with_no_riding_markers_marks_its_own_penultimate_block() {
         let (prompt, boundaries) = segments_of(6);
@@ -2119,7 +2235,7 @@ mod tests {
         let following = FrontierQuote {
             prompt,
             segment_boundaries: boundaries,
-            previous_segment_count: Some(6),
+            previous_marker: recorded_after(&history),
             ..quote(TurnCredential::Absent, SPOKEN)
         };
         let body = AnthropicMessagesClient::body(&following, "claude-sonnet").unwrap();
@@ -2130,24 +2246,16 @@ mod tests {
         );
     }
 
-    /// **DEFECT (fleet-redis-3), CORRECTNESS, currently red -- ignored.**
-    ///
-    /// Riding four tool markers, the *same* six-segment dispatch places no
-    /// block marker at all -- the allowance is already spent (the four-marker
-    /// case `normalizing_four_riding_markers_still_spends_the_whole_allowance`
-    /// pins above). But `engine.rs` passes `last_segment_count` (6) to the
-    /// next request exactly as it does for the control above, and
-    /// `cache_markers::plan` has no way to learn from that count alone
-    /// whether a marker was actually placed there. The following quote is
-    /// therefore byte-identical to the control's, and reaches back for a
-    /// write that was never made.
+    /// **fleet-redis-3, CORRECTNESS.** Riding four tool markers, the *same*
+    /// six-segment dispatch places no block marker at all -- the allowance is
+    /// already spent (the four-marker case
+    /// `normalizing_four_riding_markers_still_spends_the_whole_allowance`
+    /// pins above). Its item count is the control's, so a ledger that kept
+    /// only the count told the next request to reach back for block 4 exactly
+    /// as it does for the control, and the following quote spent a slot and a
+    /// write premium on a marker that could read nothing. The ledger now records that no marker was
+    /// placed, and the following quote takes its input from that record.
     #[test]
-    #[ignore = "fleet-redis-3: cache_markers::plan derives the previous block from a segment \
-                count alone; the ledger (`TargetState`, roundhouse-core) records no fact \
-                about whether the previous dispatch actually placed a block marker, so \
-                this history and the control above are indistinguishable to it. Fixing \
-                this needs a new ledger fact and is outside this crate set -- see the PR's \
-                fleet-redis-3 ruling"]
     fn a_history_with_four_riding_markers_places_no_block_marker_the_next_quote_can_reach_back_for()
     {
         let (prompt, boundaries) = segments_of(6);
@@ -2172,14 +2280,13 @@ mod tests {
             "four riding markers already spent the allowance: nothing is written at block 4"
         );
 
-        // Byte-identical to the control's following quote: `plan` cannot
-        // tell these two histories apart, because `previous_segment_count`
-        // is 6 either way.
+        // The control's following quote, but built from what the ledger
+        // recorded about *this* history.
         let (prompt, boundaries) = segments_of(6 + 25);
         let following = FrontierQuote {
             prompt,
             segment_boundaries: boundaries,
-            previous_segment_count: Some(6),
+            previous_marker: recorded_after(&history),
             ..quote(TurnCredential::Absent, SPOKEN)
         };
         let body = AnthropicMessagesClient::body(&following, "claude-sonnet").unwrap();

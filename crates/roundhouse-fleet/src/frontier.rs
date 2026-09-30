@@ -25,8 +25,9 @@ use serde_json::json;
 use roundhouse_core::control::{CredentialError, TurnCredential};
 use roundhouse_core::event::CacheReadSource;
 use roundhouse_core::metrics::{ReferenceModel, ShadowPricing};
+use roundhouse_core::routing::ledger::TargetState;
 use roundhouse_core::routing::{
-    AttemptClass, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
+    AttemptClass, BlockMarker, CacheLedger, CacheModel, Candidate, ProviderPricing, Target,
 };
 
 use crate::anthropic_messages::{CacheLifetime, DEFAULT_CACHE_TTL_MS};
@@ -560,6 +561,83 @@ impl FrontierChunk {
     }
 }
 
+/// Where the previous request to a target put its own conversation cache
+/// marker, as the next request to that target needs to know it.
+///
+/// **Three states, because the ledger can know three things.** A record
+/// written since placements were recorded says exactly where that marker went,
+/// or that there was none. A record from before says only how many items the
+/// request rendered, and the client infers the block it would have marked —
+/// with the same rule it marks its own by, so the inference cannot drift from
+/// the placement. The inference is wrong in exactly one case, a request whose
+/// forwarded tools had spent the marker allowance, and that is the case the
+/// recorded states exist to get right (fleet-redis-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreviousMarker {
+    /// No entry to reach back for: no previous dispatch is remembered, or the
+    /// previous one marked no block. What every caller that is not the turn
+    /// path means — a side call has no conversation to share a prefix with.
+    #[default]
+    Unmarked,
+    /// The previous request's last conversation marker sat on block `index`,
+    /// as recorded when it was dispatched.
+    Block(usize),
+    /// Only the previous request's item count is known: a ledger record
+    /// written before placements were, or any record of a dialect that caches
+    /// without markers (which never records one). Only the Anthropic client
+    /// reads this, so the second source never reaches a wire.
+    Inferred { segment_count: usize },
+}
+
+impl PreviousMarker {
+    /// What the ledger's record of a target says about its last marker.
+    pub fn of(state: Option<&TargetState>) -> Self {
+        let Some(state) = state else {
+            return Self::Unmarked;
+        };
+        match state.last_block_marker {
+            Some(BlockMarker::Placed { segment, .. }) => Self::Block(segment as usize),
+            Some(BlockMarker::Unplaced) => Self::Unmarked,
+            None => Self::Inferred {
+                segment_count: state.last_segment_count as usize,
+            },
+        }
+    }
+}
+
+/// Where a request put its own conversation cache marker, for the ledger to
+/// record — see [`FrontierQuote::marker_placement`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerPlacement {
+    /// The dialect caches without being told where, so there is no placement
+    /// to record and the ledger keeps predicting the whole previous prompt.
+    Automatic,
+    /// The dialect caches only where it is told, and this request marked no
+    /// block of the conversation.
+    Unplaced,
+    /// This request's last conversation marker sits on block `index`.
+    Block(usize),
+}
+
+impl MarkerPlacement {
+    /// The cache ledger's record of this placement, or `None` for a dialect
+    /// that has none to record.
+    ///
+    /// `prefix_tokens` answers how long the prefix through a block is — the
+    /// toolbox, then every item through it — which only the caller that
+    /// counted the prompt can say, and is asked only when a block was marked.
+    pub fn block_marker(self, prefix_tokens: impl FnOnce(usize) -> u64) -> Option<BlockMarker> {
+        match self {
+            Self::Automatic => None,
+            Self::Unplaced => Some(BlockMarker::Unplaced),
+            Self::Block(index) => Some(BlockMarker::Placed {
+                segment: index as u64,
+                prefix_tokens: prefix_tokens(index),
+            }),
+        }
+    }
+}
+
 /// What a provider was asked to do.
 #[derive(Debug, Clone)]
 pub struct FrontierQuote {
@@ -599,9 +677,8 @@ pub struct FrontierQuote {
     /// each on a UTF-8 character boundary; anything else is refused by
     /// [`Self::segments`] rather than sliced.
     pub segment_boundaries: Vec<usize>,
-    /// How many items the *previous* request to this target rendered, if the
-    /// ledger remembers one — a ledger fact, not a guess about where that
-    /// request placed a marker.
+    /// Where the *previous* request to this target put its own conversation
+    /// marker, as the ledger remembers it.
     ///
     /// **A provider looks a bounded distance back from a breakpoint, not all
     /// the way to the start of the prompt.** Anthropic checks at most twenty
@@ -611,24 +688,14 @@ pub struct FrontierQuote {
     /// target therefore puts its one penultimate marker out of reach of the
     /// entry the previous turn wrote, and reads nothing from a cache whose
     /// bytes are still byte-identical. This field is what lets a client place a
-    /// second marker back where that entry lives.
+    /// second marker back where that entry lives — and, since it is recorded
+    /// rather than inferred, place none when the previous request wrote no
+    /// entry to reach.
     ///
-    /// **A count, not a block index**, so the client that reads it derives
-    /// where that dispatch *would* mark with the exact same formula it uses
-    /// for the current request, rather than two crates each carrying their own
-    /// copy of "the penultimate block is `n - 2`" and risking the two
-    /// drifting apart. What no count can carry is whether
-    /// that earlier request actually had a free slot to place the marker in
-    /// — see `anthropic_messages::cache_markers`'s module doc for the case
-    /// this misses.
-    ///
-    /// Taken from the cache ledger's `TargetState::last_segment_count`, the
-    /// item count the previous dispatch to this target rendered — so it is a
-    /// fact about that target and is re-derived per failover attempt rather
-    /// than per turn. `None` means no prior dispatch is remembered, which
-    /// every caller that is not the turn path means: a side call has no
-    /// conversation to share a prefix with.
-    pub previous_segment_count: Option<usize>,
+    /// Built by [`PreviousMarker::of`] from the cache ledger's `TargetState`
+    /// for this target — so it is a fact about that target and is re-derived
+    /// per failover attempt rather than per turn.
+    pub previous_marker: PreviousMarker,
     /// The cache lifetime this target's entry declares.
     ///
     /// Carried from [`FrontierModelSpec::cache_model`] through
@@ -782,6 +849,25 @@ pub struct FrontierQuote {
 }
 
 impl FrontierQuote {
+    /// Where this request puts its own conversation cache marker, for the
+    /// ledger to record against the dispatch.
+    ///
+    /// **Asked of the client's own placement rule, never re-derived beside
+    /// it.** A marker-placing dialect answers from the same function its
+    /// request body is built with, so what the ledger records and what the
+    /// provider was sent cannot disagree — the failure a second copy of the
+    /// arithmetic in the engine once produced. Fallible for the reasons that
+    /// building the body is: a quote whose segments or toolbox the client
+    /// would refuse has no placement to report.
+    pub fn marker_placement(&self) -> Result<MarkerPlacement, FrontierError> {
+        match self.wire_protocol {
+            WireProtocol::AnthropicMessages => crate::anthropic_messages::marker_placement(self),
+            WireProtocol::OpenAiResponses | WireProtocol::OpenAiChatCompletions => {
+                Ok(MarkerPlacement::Automatic)
+            }
+        }
+    }
+
     /// [`Self::prompt`], cut at [`Self::segment_boundaries`].
     ///
     /// **Fallible, and the refusal is the point.** Slicing a `String` at an
@@ -1599,7 +1685,7 @@ mod tests {
 
         let cold = catalog.quote(&ledger, 0, 50_000, 500).remove(0);
 
-        ledger.record(&catalog.models()[0].target(), 0, 50_000, 0);
+        ledger.record(&catalog.models()[0].target(), 0, 50_000, 0, None);
         let warm = catalog.quote(&ledger, MINUTE, 50_000, 500).remove(0);
 
         assert_eq!(warm.expected_prefill_tokens, 0.0);
@@ -1613,7 +1699,7 @@ mod tests {
         let catalog = catalog();
         let mut ledger = CacheLedger::new();
         catalog.apply_to_ledger(&mut ledger);
-        ledger.record(&catalog.models()[0].target(), 0, 50_000, 0);
+        ledger.record(&catalog.models()[0].target(), 0, 50_000, 0, None);
 
         let inside = catalog.quote(&ledger, 4 * MINUTE, 50_000, 500).remove(0);
         let outside = catalog.quote(&ledger, 6 * MINUTE, 50_000, 500).remove(0);
@@ -1682,7 +1768,7 @@ mod tests {
 
     fn quote_with(credential: TurnCredential) -> FrontierQuote {
         FrontierQuote {
-            previous_segment_count: None,
+            previous_marker: PreviousMarker::Unmarked,
             cache_lifetime: CacheLifetime::Default,
             target: Target::Frontier {
                 provider: "anthropic".into(),
@@ -1705,7 +1791,7 @@ mod tests {
 
     fn segmented(prompt: &str, boundaries: Vec<usize>) -> FrontierQuote {
         FrontierQuote {
-            previous_segment_count: None,
+            previous_marker: PreviousMarker::Unmarked,
             prompt: prompt.to_string(),
             segment_boundaries: boundaries,
             ..quote_with(TurnCredential::Absent)
@@ -2014,7 +2100,7 @@ mod tests {
         dialect: WireProtocol,
     ) -> FrontierQuote {
         FrontierQuote {
-            previous_segment_count: None,
+            previous_marker: PreviousMarker::Unmarked,
             tools,
             tool_choice,
             tools_dialect: Some(dialect),

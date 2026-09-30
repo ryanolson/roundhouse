@@ -278,7 +278,7 @@ async fn handle(State(state): State<Upstream>, headers: HeaderMap, body: String)
 
 fn quote(credential: TurnCredential) -> FrontierQuote {
     FrontierQuote {
-        previous_segment_count: None,
+        previous_marker: roundhouse_fleet::PreviousMarker::Unmarked,
         cache_lifetime: CacheLifetime::Default,
         target: Target::Frontier {
             provider: "anthropic".into(),

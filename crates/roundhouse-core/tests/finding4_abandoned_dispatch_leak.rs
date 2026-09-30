@@ -39,6 +39,7 @@ fn hosted() -> Target {
 
 fn decision(chosen: Target) -> DecisionRecord {
     DecisionRecord {
+        block_marker: None,
         selection: None,
         local_quote_skipped: None,
         chosen: chosen.clone(),

@@ -49,7 +49,8 @@ use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{ControlCallDialect, SideCall};
 use roundhouse_fleet::{
     FleetError, FleetQuery, FrontierChunk, FrontierClient, FrontierClients, FrontierError,
-    FrontierQuote, FrontierStream, LocalFleet, LocalQuote, StaticFrontierCatalog, WireProtocol,
+    FrontierQuote, FrontierStream, LocalFleet, LocalQuote, PreviousMarker, StaticFrontierCatalog,
+    WireProtocol,
 };
 use roundhouse_mcp::ControlStore;
 use serde_json::Value;
@@ -341,7 +342,7 @@ impl From<Vec<Item>> for TurnInput {
 /// makes it one thing.** Every field here is a fact the client stated that no
 /// projection of the log can recover, that the router does not price on, and
 /// that exists solely to be written onto [`FrontierQuote`] — so they travel from
-/// [`Engine::run_turn`] down through `dispatch`, `plan` and `connect` together
+/// [`Engine::run_turn`] down through `dispatch`, `plan` and `frontier_quote` together
 /// or not at all, and adding the fourth is one line rather than four signatures.
 ///
 /// [`TurnInput::declared_baseline`] is deliberately *not* here despite being a
@@ -1885,18 +1886,17 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     /// separation is what lets the number be honest about size while the
     /// session stays honest about content.
     ///
-    /// **Deliberately not modelled: what a provider's cache does with it.**
-    /// Anthropic orders a cached prompt `tools → system → messages`, so a
-    /// breakpoint set at the conversation's stable boundary caches the tool
-    /// preamble ahead of it too — meaning the second turn of a session very
-    /// likely pays for these tokens at the cached rate rather than the full one.
-    /// That is a claim about a provider's behaviour and this rung has no
-    /// measurement of it, so nothing here asserts it; the one consequence that
-    /// does follow is that the recorded decision's `isl_tokens` (which includes
-    /// this) becomes the cache ledger's prefix watermark for the next turn,
-    /// which is the same reading the ledger already takes of the conversation.
-    /// A later rung with real `cache_read_input_tokens` from a tooled turn can
-    /// replace the estimate with the measurement.
+    /// **What a provider's cache does with it is modelled only as far as the
+    /// marker.** Anthropic orders a cached prompt `tools → system → messages`,
+    /// so a breakpoint set at the conversation's stable boundary caches the
+    /// tool preamble ahead of it too. The prefix recorded for such a marker is
+    /// therefore this count (without `tool_choice`, which is not part of that
+    /// prefix) plus the items through the marked block, and that is what the
+    /// next turn's quote reads as warm. For a dialect that caches without
+    /// markers, the recorded decision's `isl_tokens` (which includes this)
+    /// stays the cache ledger's prefix watermark for the next turn. A later
+    /// rung with real `cache_read_input_tokens` from a tooled turn can replace
+    /// the estimate with the measurement.
     ///
     /// The render is canonical by construction: `preserve_order` is off
     /// workspace-wide (see the root manifest), so every `Value` renders in one
@@ -2510,6 +2510,12 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // scope rather than an oversight: local capacity fails for reasons a
         // second worker shares (a saturated fleet, a missing quote), and the
         // remedy there is the load axis the router already has.
+        // The toolbox's share of a marked prefix, counted once per turn rather
+        // than once per attempt: it serializes and tokenizes the whole toolbox,
+        // and a failover re-sends the same one. `tool_choice` is left out
+        // because it is not part of the prefix a marker caches, and a warm
+        // prefix that errs must err short.
+        let toolbox_prefix_tokens = self.declaration_tokens(declarations.tools.as_ref(), None);
         let ordered: Vec<Target> = std::iter::once(decision.target.clone())
             .chain(decision.fallbacks.iter().cloned())
             .collect();
@@ -2539,6 +2545,47 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 .credentials
                 .access_for(&target)
                 .ok_or_else(|| EngineError::UnresolvableTarget(target.clone()))?;
+
+            // The request a frontier target will be sent, built now so the
+            // record below can say where its cache marker went — see
+            // `Self::frontier_quote`. The ledger read is still the previous
+            // dispatch's state: the session folds a dispatch into the ledger
+            // at its terminal event, not at `Routed`.
+            let frontier_quote = match &target {
+                Target::Frontier { .. } => Some(self.frontier_quote(
+                    &target,
+                    &assembler,
+                    &access.credential,
+                    handoff_note,
+                    session.session_id(),
+                    admission.request_context.as_deref(),
+                    PreviousMarker::of(session.ledger().state_for(&target).as_ref()),
+                    declarations,
+                )),
+                Target::Local { .. } => None,
+            };
+            // Asked of the quote itself, so the placement recorded is the one
+            // sent. The prefix a marker caches is the toolbox and then every
+            // item through the marked block. A quote that cannot be built
+            // records nothing — it fails in `connect_frontier` before anything
+            // is sent. `.ok()` is safe only because `marker_placement` and
+            // `body()` make exactly the same fallible calls (`segments()` and
+            // `tools_for`): a placement that errs is a request that is never
+            // sent. A new fallible step in `body()` must be added to
+            // `marker_placement` too, or this records nothing for a request
+            // that goes out.
+            let block_marker = match &frontier_quote {
+                Some(Ok(quote)) => quote.marker_placement().ok().and_then(|placement| {
+                    placement.block_marker(|index| {
+                        // One segment per item, so a marked block is always an
+                        // item; zero rather than a guess if that ever stops
+                        // holding, because a longer prefix is a cheaper quote.
+                        toolbox_prefix_tokens
+                            + assembler.tokens_through(index).unwrap_or_default() as u64
+                    })
+                }),
+                _ => None,
+            };
 
             session
                 .record_routing(
@@ -2649,45 +2696,37 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                         // down. The three fields above it are the ones that
                         // describe this dispatch and they stay per-record.
                         selection: Some(selection.clone()),
+                        // Where this dispatch's own cache marker went, for the
+                        // next quote's warm prefix and the next request's
+                        // reach-back marker; see the placement above.
+                        block_marker,
                     },
                 )
                 .await?;
 
             let started = Instant::now();
-            match self
-                .connect(
-                    &target,
-                    &assembler,
-                    local_quote.as_ref(),
-                    &access.credential,
-                    handoff_note,
-                    session.session_id(),
-                    admission.request_context.as_deref(),
-                    // The *conversation's* count, not the request's: the only
-                    // consumer below is the local path, which receives the
-                    // prompt buffer and no toolbox at all, so handing it the
-                    // tools-inclusive number would report input the worker never
-                    // saw and subtract a prefill it never did (F4).
-                    conversation_tokens,
-                    deadline_at,
-                    // How many items the *previous* dispatch to this target
-                    // rendered — the raw ledger fact, not `n - 2`. Deriving
-                    // the marked block from it is `cache_markers::plan`'s job
-                    // now (roundhouse-fleet), through the same `penultimate`
-                    // it uses for the current request, so the two placements
-                    // cannot drift apart the way an engine-side `n - 2` and a
-                    // fleet-side `n - 2` once could. Read after
-                    // `record_routing` above and still the previous turn's
-                    // state, because the ledger folds a dispatch at its terminal
-                    // event and not at `Routed`.
-                    session
-                        .ledger()
-                        .state_for(&target)
-                        .map(|state| state.last_segment_count as usize),
-                    declarations,
-                )
-                .await
-            {
+            // One match on the dispatch's kind: `frontier_quote` is `Some`
+            // exactly for a frontier target, because it was built from the
+            // same match above.
+            let connected = match frontier_quote {
+                Some(quote) => self.connect_frontier(&target, quote, deadline_at).await,
+                None => {
+                    self.connect_local(
+                        &target,
+                        &assembler,
+                        local_quote.as_ref(),
+                        // The *conversation's* count, not the request's: the
+                        // local worker receives the prompt buffer and no
+                        // toolbox at all, so handing it the tools-inclusive
+                        // number would report input the worker never saw and
+                        // subtract a prefill it never did (F4).
+                        conversation_tokens,
+                        deadline_at,
+                    )
+                    .await
+                }
+            };
+            match connected {
                 Ok(stream) => {
                     opened = Some(stream);
                     break;
@@ -2762,20 +2801,24 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         }
     }
 
-    /// Open a stream to one target. Decides nothing, records nothing.
+    /// The request one frontier target is sent for this turn.
     ///
-    /// Split out of [`Self::plan`] so the failover loop reads as a loop over
-    /// targets rather than as a loop wrapped around a two-armed match, and — the
-    /// load-bearing half — so that the one place a [`FrontierError`] is still
-    /// typed is the place that has to classify it. Once `EngineError::from`
-    /// swallows the variant, "was this worth another target" is a question about
-    /// a string.
+    /// **Built before the dispatch is recorded, so the record can say where
+    /// its cache marker went.** An explicit-marker dialect places its marker
+    /// by a rule that reads this very quote — the toolbox's own markers
+    /// included, which the log does not keep — and the `Routed` decision is
+    /// the one durable place the next turn's quote and reach-back marker can
+    /// learn it from. Asking the quote that is then sent, rather than
+    /// rebuilding one for the record, is what makes the recorded placement and
+    /// the transmitted one the same fact.
+    ///
+    /// Fallible in the ways it always was, and the caller defers the error to
+    /// [`Self::connect_frontier`] so it still lands after the record, as before.
     #[allow(clippy::too_many_arguments)]
-    async fn connect(
+    fn frontier_quote(
         &self,
         target: &Target,
         assembler: &ContextAssembler<T>,
-        local_quote: Option<&LocalQuote>,
         // The credential the caller already resolved for this target, handed in
         // rather than resolved again: two `access_for` calls could straddle a
         // key being attached, and the decision already written would then name a
@@ -2784,221 +2827,242 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         handoff_note: Option<&str>,
         session_id: &SessionId,
         request_context: Option<&crate::request_context::RequestContext>,
-        // The conversation's own token count — deliberately *not* the turn's
-        // tools-inclusive `isl_tokens`. Only the local arm reads it, and a local
-        // worker is sent the prompt buffer alone; see the call site (F4).
-        conversation_tokens: usize,
-        deadline_at: Instant,
-        // How many items this target's previous dispatch rendered, if the
-        // ledger remembers one — a ledger fact, not a guess about where that
-        // dispatch placed a marker; `cache_markers::plan` (roundhouse-fleet)
-        // derives the block index from it. Resolved by the caller rather
-        // than here: `connect` holds no session, and the value is a fact
-        // about *this* target, so the failover loop re-derives it for every
-        // attempt.
-        previous_segment_count: Option<usize>,
+        // Where this target's previous dispatch put its own conversation
+        // marker, as the ledger recorded it. Resolved by the caller rather
+        // than here: the value is a fact about *this* target, so the failover
+        // loop re-derives it for every attempt.
+        previous_marker: PreviousMarker,
         // What the client declared, for the dialects that can express it.
         //
-        // **Only the frontier arm below reads it, and that is two separate
+        // **Only a frontier request reads it, and that is two separate
         // facts.** A local worker is asked for `expected_output_tokens` because
         // it is *our* capacity being reserved, and a caller's ceiling is not a
         // reservation. And `LocalExecutor::execute` takes prompt token ids and
         // nothing else — this build has no way to tell a locally served model
         // about a toolbox at all.
         //
-        // **That second gap is now closed at routing rather than tolerated
-        // here** (M11.2a, F2): `plan` drops every local candidate from a
-        // tool-declaring turn before the policy filter and fails the turn with
-        // `EngineError::NoToolCapableTarget` when nothing else remains, so the
-        // `Target::Local` arm below is unreachable with `declarations.tools`
-        // set. It stays unread rather than growing an assertion, because the
-        // invariant belongs to the routing decision and restating it as a panic
-        // here would put a second, weaker copy of it in the dispatch path.
+        // **That second gap is closed at routing** (M11.2a, F2): `plan` drops
+        // every local candidate from a tool-declaring turn before the policy
+        // filter, and fails the turn with `EngineError::NoToolCapableTarget`
+        // when nothing else remains. So only a frontier target ever reaches
+        // this function with `declarations.tools` set. The invariant stays in
+        // the routing decision, not restated here as an assertion.
         declarations: &ClientDeclarations,
+    ) -> Result<FrontierQuote, ConnectFailure> {
+        // The dialect travels with the request. A client cannot ask the
+        // catalog itself — each one holds one transport and one
+        // serialization — so whatever it needs to serialize correctly
+        // has to arrive in the quote or not at all.
+        let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
+            ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+        })?;
+        // Resolved before the quote is built: a catalog TTL or decay
+        // ceiling the wire cannot honor is a configuration mistake
+        // `CatalogConfig` already refuses at boot for a real
+        // deployment, so this is a terminal, not-worth-a-failover
+        // mistake exactly like an unresolvable target above.
+        // `EngineError::Frontier` wants the wide `FrontierError`, so
+        // the resolver's narrower refusal is restated through
+        // `cache_lifetime_error` first.
+        let cache_lifetime = spec.requested_cache_lifetime().map_err(|error| {
+            ConnectFailure::terminal(EngineError::Frontier(spec.cache_lifetime_error(error)))
+        })?;
+        // One call, so the offsets and the string they index into are
+        // the same render rather than two that could disagree.
+        let (rendered, segment_boundaries) = assembler.rendered_with_boundaries();
+        let quote = FrontierQuote {
+            target: target.clone(),
+            wire_protocol: spec.wire_protocol,
+            // **The forwarded request, and only the forwarded request.**
+            // `assembler.rendered()` is a projection of the log, not the
+            // log — so decorating it here leaves the stored items, the
+            // prefix hashes and everything a successor would rebuild
+            // byte-identical whether a deployment configured a note or
+            // not. That is R2's whole safety argument, and it is a
+            // property of *where* this line is rather than of anything
+            // the function does.
+            //
+            // The turn's `isl_tokens` in `plan` is deliberately the
+            // count of an *undecorated* prompt plus the declared
+            // toolbox: it is what the pool was quoted against and what
+            // the decision was recorded at, and re-deriving it here
+            // would make the audit trail describe a prompt that never
+            // went anywhere. The note is roundhouse's own paragraph on one
+            // turn in a session, so the understatement is bounded and
+            // one-sided — and a frontier settle prices from the
+            // provider's own reported usage anyway.
+            //
+            // `connect_local` takes the token *buffer* rather
+            // than a string and is left undecorated: re-tokenizing a
+            // decorated prompt would desynchronize the buffer from the
+            // block hashes the fleet routes on, which is a real cost for
+            // a narration. Named as a gap rather than hidden — a
+            // deployment whose escalations land locally gets the
+            // narrowing without the note.
+            prompt: match handoff_note {
+                Some(note) => roundhouse_core::validate::append_handoff_note(rendered, note),
+                None => rendered,
+            },
+            // **Where a provider that caches only on demand is told the
+            // prefix ends.** Passed through from the assembler rather
+            // than derived here, so the offsets index the render above
+            // and a client slicing on them sends the same bytes
+            // `turn_id_for` hashed. Only the Anthropic client reads
+            // them; every other dialect caches on the steering key
+            // beside them and its request is byte-identical either way.
+            //
+            // A handoff note appended above does not invalidate one of
+            // these: the note goes on the *end*, so every interior
+            // offset still names the same item edge and the note lands
+            // inside the final segment — which is where it belongs, as
+            // the one part of this prompt that is new this turn and
+            // must not be inside the block a breakpoint caches.
+            segment_boundaries,
+            // **Where the *previous* request to this same target put
+            // its marker**, so a client whose provider only looks a
+            // bounded distance back from a marker can still reach that
+            // entry after a long append — and places nothing where
+            // that request wrote nothing. Derived per attempt at the
+            // call site from the ledger, because a failover target has
+            // its own history and inheriting the first choice's would
+            // name an entry nothing ever wrote.
+            previous_marker,
+            // Use the ledger's catalog entry rather than a second TTL
+            // setting, through the one reader the side call also uses.
+            cache_lifetime,
+            session_id: request_context.and_then(|context| context.session_id.clone()),
+            thread_id: request_context.and_then(|context| context.thread_id.clone()),
+            prompt_cache_key: request_context
+                .map(|context| context.prompt_cache_key.clone())
+                .unwrap_or_else(|| session_id.to_string()),
+            // **This deployment's pricing estimate, and only that.** It
+            // is what the candidates above were quoted with and what the
+            // grant was opened against, so it must keep saying what the
+            // *router* expected — never what the caller asked for.
+            expected_output_tokens: Some(self.config.expected_output_tokens),
+            // **And this is the caller's ceiling, which is a different
+            // number answering a different question.** The two shared
+            // one field until M11.1's F1, which meant the shipped
+            // 256-token estimate was also the `max_tokens` every
+            // Anthropic dispatch carried, and every real answer was cut
+            // off mid-sentence — reported to the client as an ordinary
+            // `stop_reason` and to nobody as a defect. Threaded from
+            // `TurnInput` rather than read off the config here, because
+            // the config has no idea what the client asked for.
+            output_token_cap: declarations.output_token_cap,
+            // **What makes the turn agentic**, and cloned rather than
+            // moved because this runs once per dispatch attempt: a dispatch
+            // that fails over to a second target has to send the same
+            // toolbox, or the fallback answers a different question from
+            // the one the client asked. Verbatim from the client, for
+            // the reason `FrontierQuote::tools` gives — this layer has
+            // nothing to be right about in a tool schema it did not
+            // define.
+            tools: declarations.tools.clone(),
+            tool_choice: declarations.tool_choice.clone(),
+            // **And the dialect they were declared in, which is not
+            // `spec.wire_protocol` above.** That one is the dialect of
+            // the target this turn resolved to; this one is the dialect
+            // of the surface that accepted the toolbox, and M11.2a's F1
+            // is what happens when a single field is asked to be both:
+            // an Anthropic-shaped tool array posted to a Responses
+            // upstream, 400 on every tool-using turn, repeated by
+            // failover on the next same-dialect candidate. The client
+            // reconciles them or refuses — `FrontierQuote::tools_for`.
+            tools_dialect: declarations.tools_dialect,
+            // The credential travels here for the same reason the
+            // dialect above does: this is the only argument `execute`
+            // receives. It is the *same* resolution the payer on the
+            // decision came from, read out of one `access_for` above —
+            // two calls could resolve two tiers if a key were attached
+            // between them, and the log would then name a payer the
+            // request did not use.
+            credential: credential.clone(),
+        };
+        Ok(quote)
+    }
+
+    /// Open a stream to a local worker. Decides nothing, records nothing.
+    ///
+    /// No failover arm, deliberately — see the loop in `plan`. A local
+    /// failure is a fleet fact, and the router's load axis is where a second
+    /// worker is chosen.
+    async fn connect_local(
+        &self,
+        target: &Target,
+        assembler: &ContextAssembler<T>,
+        local_quote: Option<&LocalQuote>,
+        // The conversation's own token count — deliberately *not* the turn's
+        // tools-inclusive `isl_tokens`; see the call site (F4).
+        conversation_tokens: usize,
+        deadline_at: Instant,
     ) -> Result<FrontierStream, ConnectFailure> {
-        match target {
-            // No failover arm, deliberately — see the loop in `plan`. A local
-            // failure is a fleet fact, and the router's load axis is where a
-            // second worker is chosen.
-            Target::Local { .. } => {
-                let quote = local_quote.ok_or_else(|| {
-                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
-                })?;
-                let fleet = self.fleet.as_ref().ok_or_else(|| {
-                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
-                })?;
-                self.local_stream(
-                    fleet,
-                    quote,
-                    assembler.buffer().tokens(),
-                    conversation_tokens,
-                    deadline_at,
-                )
-                .await
-                .map_err(ConnectFailure::terminal)
-            }
-            Target::Frontier { .. } => {
-                // The dialect travels with the request. A client cannot ask the
-                // catalog itself — each one holds one transport and one
-                // serialization — so whatever it needs to serialize correctly
-                // has to arrive in the quote or not at all.
-                let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
-                    ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
-                })?;
-                // Resolved before the quote is built: a catalog TTL or decay
-                // ceiling the wire cannot honor is a configuration mistake
-                // `CatalogConfig` already refuses at boot for a real
-                // deployment, so this is a terminal, not-worth-a-failover
-                // mistake exactly like an unresolvable target above.
-                // `EngineError::Frontier` wants the wide `FrontierError`, so
-                // the resolver's narrower refusal is restated through
-                // `cache_lifetime_error` first.
-                let cache_lifetime = spec.requested_cache_lifetime().map_err(|error| {
-                    ConnectFailure::terminal(EngineError::Frontier(
-                        spec.cache_lifetime_error(error),
-                    ))
-                })?;
-                // One call, so the offsets and the string they index into are
-                // the same render rather than two that could disagree.
-                let (rendered, segment_boundaries) = assembler.rendered_with_boundaries();
-                let quote = FrontierQuote {
-                    target: target.clone(),
-                    wire_protocol: spec.wire_protocol,
-                    // **The forwarded request, and only the forwarded request.**
-                    // `assembler.rendered()` is a projection of the log, not the
-                    // log — so decorating it here leaves the stored items, the
-                    // prefix hashes and everything a successor would rebuild
-                    // byte-identical whether a deployment configured a note or
-                    // not. That is R2's whole safety argument, and it is a
-                    // property of *where* this line is rather than of anything
-                    // the function does.
-                    //
-                    // The turn's `isl_tokens` in `plan` is deliberately the
-                    // count of an *undecorated* prompt plus the declared
-                    // toolbox: it is what the pool was quoted against and what
-                    // the decision was recorded at, and re-deriving it here
-                    // would make the audit trail describe a prompt that never
-                    // went anywhere. The note is roundhouse's own paragraph on one
-                    // turn in a session, so the understatement is bounded and
-                    // one-sided — and a frontier settle prices from the
-                    // provider's own reported usage anyway.
-                    //
-                    // The local branch above takes the token *buffer* rather
-                    // than a string and is left undecorated: re-tokenizing a
-                    // decorated prompt would desynchronize the buffer from the
-                    // block hashes the fleet routes on, which is a real cost for
-                    // a narration. Named as a gap rather than hidden — a
-                    // deployment whose escalations land locally gets the
-                    // narrowing without the note.
-                    prompt: match handoff_note {
-                        Some(note) => {
-                            roundhouse_core::validate::append_handoff_note(rendered, note)
-                        }
-                        None => rendered,
-                    },
-                    // **Where a provider that caches only on demand is told the
-                    // prefix ends.** Passed through from the assembler rather
-                    // than derived here, so the offsets index the render above
-                    // and a client slicing on them sends the same bytes
-                    // `turn_id_for` hashed. Only the Anthropic client reads
-                    // them; every other dialect caches on the steering key
-                    // beside them and its request is byte-identical either way.
-                    //
-                    // A handoff note appended above does not invalidate one of
-                    // these: the note goes on the *end*, so every interior
-                    // offset still names the same item edge and the note lands
-                    // inside the final segment — which is where it belongs, as
-                    // the one part of this prompt that is new this turn and
-                    // must not be inside the block a breakpoint caches.
-                    segment_boundaries,
-                    // **How many items the *previous* request to this same
-                    // target rendered**, so a client whose provider only
-                    // looks a bounded distance back from a marker can still
-                    // reach that entry after a long append. Derived per
-                    // attempt at the call site from the ledger, because a
-                    // failover target has its own history and inheriting the
-                    // first choice's would name a count nothing ever wrote.
-                    previous_segment_count,
-                    // Use the ledger's catalog entry rather than a second TTL
-                    // setting, through the one reader the side call also uses.
-                    cache_lifetime,
-                    session_id: request_context.and_then(|context| context.session_id.clone()),
-                    thread_id: request_context.and_then(|context| context.thread_id.clone()),
-                    prompt_cache_key: request_context
-                        .map(|context| context.prompt_cache_key.clone())
-                        .unwrap_or_else(|| session_id.to_string()),
-                    // **This deployment's pricing estimate, and only that.** It
-                    // is what the candidates above were quoted with and what the
-                    // grant was opened against, so it must keep saying what the
-                    // *router* expected — never what the caller asked for.
-                    expected_output_tokens: Some(self.config.expected_output_tokens),
-                    // **And this is the caller's ceiling, which is a different
-                    // number answering a different question.** The two shared
-                    // one field until M11.1's F1, which meant the shipped
-                    // 256-token estimate was also the `max_tokens` every
-                    // Anthropic dispatch carried, and every real answer was cut
-                    // off mid-sentence — reported to the client as an ordinary
-                    // `stop_reason` and to nobody as a defect. Threaded from
-                    // `TurnInput` rather than read off the config here, because
-                    // the config has no idea what the client asked for.
-                    output_token_cap: declarations.output_token_cap,
-                    // **What makes the turn agentic**, and cloned rather than
-                    // moved because `connect` may run more than once: a dispatch
-                    // that fails over to a second target has to send the same
-                    // toolbox, or the fallback answers a different question from
-                    // the one the client asked. Verbatim from the client, for
-                    // the reason `FrontierQuote::tools` gives — this layer has
-                    // nothing to be right about in a tool schema it did not
-                    // define.
-                    tools: declarations.tools.clone(),
-                    tool_choice: declarations.tool_choice.clone(),
-                    // **And the dialect they were declared in, which is not
-                    // `spec.wire_protocol` above.** That one is the dialect of
-                    // the target this turn resolved to; this one is the dialect
-                    // of the surface that accepted the toolbox, and M11.2a's F1
-                    // is what happens when a single field is asked to be both:
-                    // an Anthropic-shaped tool array posted to a Responses
-                    // upstream, 400 on every tool-using turn, repeated by
-                    // failover on the next same-dialect candidate. The client
-                    // reconciles them or refuses — `FrontierQuote::tools_for`.
-                    tools_dialect: declarations.tools_dialect,
-                    // The credential travels here for the same reason the
-                    // dialect above does: this is the only argument `execute`
-                    // receives. It is the *same* resolution the payer on the
-                    // decision came from, read out of one `access_for` above —
-                    // two calls could resolve two tiers if a key were attached
-                    // between them, and the log would then name a payer the
-                    // request did not use.
-                    credential: credential.clone(),
-                };
-                // **The registry is resolved from the spec, not from the
-                // process.** `spec.provider` is the same string the catalog's
-                // boundary cross-checked against the `providers` section at
-                // load, which is what makes this lookup total on a booted
-                // deployment rather than a place a turn can discover a
-                // misconfiguration. Resolving it here rather than at `choose`
-                // keeps one rule: a client is picked by the target that was
-                // chosen, never by a target that might have been.
-                let client = self
-                    .frontier_clients
-                    .for_provider(&spec.provider)
-                    .map_err(|error| ConnectFailure::terminal(EngineError::from(error)))?;
-                // Not `bounded`, and that is the one line the whole failover
-                // rests on: `bounded` converts through `EngineError::from`,
-                // which erases the variant this classification reads. The
-                // deadline is applied here by hand so the `FrontierError`
-                // survives long enough to be asked whether it is worth another
-                // target — and a deadline strike is deliberately terminal, since
-                // there is by definition no time left to try anywhere else.
-                match tokio::time::timeout_at(deadline_at, client.execute(&quote)).await {
-                    Ok(Ok(stream)) => Ok(stream),
-                    Ok(Err(error)) => Err(ConnectFailure {
-                        class: error.failover_class(),
-                        error: EngineError::Frontier(error),
-                    }),
-                    Err(_) => Err(ConnectFailure::terminal(self.deadline_struck())),
-                }
-            }
+        let quote = local_quote.ok_or_else(|| {
+            ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+        })?;
+        let fleet = self.fleet.as_ref().ok_or_else(|| {
+            ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+        })?;
+        self.local_stream(
+            fleet,
+            quote,
+            assembler.buffer().tokens(),
+            conversation_tokens,
+            deadline_at,
+        )
+        .await
+        .map_err(ConnectFailure::terminal)
+    }
+
+    /// Open a stream to a frontier target. Decides nothing, records nothing.
+    ///
+    /// Split out of [`Self::plan`] so the failover loop reads as a loop over
+    /// targets, and — the load-bearing half — so that the one place a
+    /// [`FrontierError`] is still typed is the place that has to classify it.
+    /// Once `EngineError::from` swallows the variant, "was this worth another
+    /// target" is a question about a string.
+    ///
+    /// `quote` is the request the caller built before it recorded this
+    /// dispatch — see [`Self::frontier_quote`] for why there. An `Err` is
+    /// surfaced here rather than there, so a quote that cannot be built still
+    /// fails the dispatch *after* its `Routed` was written, where it always
+    /// has.
+    async fn connect_frontier(
+        &self,
+        target: &Target,
+        quote: Result<FrontierQuote, ConnectFailure>,
+        deadline_at: Instant,
+    ) -> Result<FrontierStream, ConnectFailure> {
+        let spec = self.frontier_catalog.spec_for(target).ok_or_else(|| {
+            ConnectFailure::terminal(EngineError::UnresolvableTarget(target.clone()))
+        })?;
+        let quote = quote?;
+        // **The registry is resolved from the spec, not from the
+        // process.** `spec.provider` is the same string the catalog's
+        // boundary cross-checked against the `providers` section at
+        // load, which is what makes this lookup total on a booted
+        // deployment rather than a place a turn can discover a
+        // misconfiguration. Resolving it here rather than at `choose`
+        // keeps one rule: a client is picked by the target that was
+        // chosen, never by a target that might have been.
+        let client = self
+            .frontier_clients
+            .for_provider(&spec.provider)
+            .map_err(|error| ConnectFailure::terminal(EngineError::from(error)))?;
+        // Not `bounded`, and that is the one line the whole failover
+        // rests on: `bounded` converts through `EngineError::from`,
+        // which erases the variant this classification reads. The
+        // deadline is applied here by hand so the `FrontierError`
+        // survives long enough to be asked whether it is worth another
+        // target — and a deadline strike is deliberately terminal, since
+        // there is by definition no time left to try anywhere else.
+        match tokio::time::timeout_at(deadline_at, client.execute(&quote)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(error)) => Err(ConnectFailure {
+                class: error.failover_class(),
+                error: EngineError::Frontier(error),
+            }),
+            Err(_) => Err(ConnectFailure::terminal(self.deadline_struck())),
         }
     }
 

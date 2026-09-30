@@ -92,6 +92,7 @@ fn log(calls: &[Usage]) -> Vec<SessionEvent> {
             SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    block_marker: None,
                     selection: None,
                     local_quote_skipped: None,
                     chosen: frontier(),

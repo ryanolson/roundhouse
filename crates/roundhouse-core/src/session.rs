@@ -24,7 +24,9 @@ use crate::event::{
 };
 use crate::ids::{ResponseId, SessionId, TurnId};
 use crate::item::{Item, Role};
-use crate::routing::{CacheLedger, DecisionRecord, DispatchAttempt, ProviderPricing, Target};
+use crate::routing::{
+    BlockMarker, CacheLedger, DecisionRecord, DispatchAttempt, ProviderPricing, Target,
+};
 use crate::store::{Lease, SessionStore, StoreError};
 use crate::validate::{Arm, EscalationOverrides, SteerAction};
 
@@ -118,6 +120,9 @@ struct PendingRouting {
     /// provider never saw, and a ledger filled from there would tell the next
     /// request its cache entry sits further along the prompt than it does.
     segment_count: u64,
+    /// Where the request put its own cache marker, off the decision. See
+    /// [`DecisionRecord::block_marker`].
+    block_marker: Option<BlockMarker>,
 }
 
 /// A response that terminated, and everything needed to charge it for.
@@ -707,6 +712,7 @@ impl SessionState {
                         // output is not, so this is exactly the item list the
                         // dispatch about to happen renders.
                         segment_count: self.items.len() as u64,
+                        block_marker: decision.block_marker,
                     },
                 );
             }
@@ -744,6 +750,7 @@ impl SessionState {
                             event.at_ms,
                             routing.isl_tokens,
                             routing.segment_count,
+                            routing.block_marker,
                         );
                     }
                 }

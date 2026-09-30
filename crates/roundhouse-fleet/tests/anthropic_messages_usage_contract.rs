@@ -91,7 +91,7 @@ async fn upstream(body: String) -> String {
 
 fn quote() -> FrontierQuote {
     FrontierQuote {
-        previous_segment_count: None,
+        previous_marker: roundhouse_fleet::PreviousMarker::Unmarked,
         cache_lifetime: CacheLifetime::Default,
         target: Target::Frontier {
             provider: "anthropic".into(),

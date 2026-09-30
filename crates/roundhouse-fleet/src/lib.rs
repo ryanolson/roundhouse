@@ -34,7 +34,8 @@ pub use anthropic_messages::{
 };
 pub use frontier::{
     CacheLifetimeError, EchoFrontierClient, FrontierChunk, FrontierClient, FrontierClients,
-    FrontierError, FrontierModelSpec, FrontierQuote, FrontierStream, StaticFrontierCatalog,
+    FrontierError, FrontierModelSpec, FrontierQuote, FrontierStream, MarkerPlacement,
+    PreviousMarker, StaticFrontierCatalog,
 };
 pub use local::{
     EmbeddedFleet, FleetError, FleetQuery, LocalFleet, LocalQuote, Reservation, WorkerRegistration,

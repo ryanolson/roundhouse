@@ -55,6 +55,7 @@ fn card() -> ProviderPricing {
 /// than an absence that would be true whatever it did.
 fn decision_for(target: Target, isl: u64) -> DecisionRecord {
     DecisionRecord {
+        block_marker: None,
         selection: None,
         local_quote_skipped: None,
         rate_card: (!target.is_local()).then(card),
@@ -474,6 +475,76 @@ async fn a_replayed_log_reconstructs_the_same_last_segment_count() {
             .expect("the replay folds the same dispatch")
             .last_segment_count,
         recorded.last_segment_count
+    );
+}
+
+/// Where a dispatch put its cache marker rides its `Routed` decision into the
+/// ledger, and a successor replaying the log reaches the same placement — so
+/// a node that took over mid-session prices the next turn's warm prefix, and
+/// places its reach-back marker, exactly as the original node would have.
+#[tokio::test]
+async fn a_replayed_log_reconstructs_the_same_block_marker() {
+    let store = Arc::new(MemoryStore::new());
+    let (sid, mut session) = new_session(store.clone(), "node-a").await;
+
+    let admission = session
+        .begin_turn(
+            TurnId::new("t1"),
+            vec![Item::user_text("one"), Item::user_text("two")],
+        )
+        .await
+        .unwrap();
+    let response_id = admission.response_id().clone();
+    let target = Target::Frontier {
+        provider: "anthropic".into(),
+        model: "claude".into(),
+    };
+    let marker = BlockMarker::Placed {
+        segment: 0,
+        prefix_tokens: 11,
+    };
+    session
+        .record_routing(
+            &response_id,
+            DecisionRecord {
+                block_marker: Some(marker),
+                ..decision_for(target.clone(), 8_192)
+            },
+        )
+        .await
+        .unwrap();
+    session
+        .complete(
+            &response_id,
+            Some("an answer"),
+            Usage::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .ledger()
+            .state_for(&target)
+            .expect("a completed dispatch is ledger evidence")
+            .last_block_marker,
+        Some(marker),
+        "the decision's placement is what the ledger records"
+    );
+
+    drop(session);
+    store.expire_lease_now(&sid).await;
+    let successor = Session::open(store, sid, "node-b", TTL, CacheLedger::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        successor
+            .ledger()
+            .state_for(&target)
+            .expect("the replay folds the same dispatch")
+            .last_block_marker,
+        Some(marker)
     );
 }
 

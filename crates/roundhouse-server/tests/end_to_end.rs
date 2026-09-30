@@ -121,7 +121,10 @@ async fn a_warmed_frontier_target_wins_a_turn_it_would_otherwise_lose() {
     let session_id = SessionId::generate();
 
     // No local fleet, so the frontier is the only option and the first turn
-    // necessarily warms it.
+    // necessarily warms it. Two items, because the catalog's target is an
+    // Anthropic one: it caches only through the marker a request carries, and
+    // a one-item prompt has no stable prefix to mark, so the ledger rightly
+    // predicts nothing warm after it (P2).
     let engine = engine_without_fleet(store.clone(), Arc::new(AffinityPolicy::new()));
     engine.create_session(&session_id).await.unwrap();
 
@@ -129,7 +132,10 @@ async fn a_warmed_frontier_target_wins_a_turn_it_would_otherwise_lose() {
         .run_turn(
             &session_id,
             TurnId::new("t0"),
-            vec![Item::user_text("open the task")],
+            vec![
+                Item::user_text("a standing instruction"),
+                Item::user_text("open the task"),
+            ],
             &Admission::open(),
         )
         .await

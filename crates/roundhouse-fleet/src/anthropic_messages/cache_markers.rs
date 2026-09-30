@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Where a request's `cache_control` breakpoints go — a pure function of four
-//! scalars, extracted from [`super::AnthropicMessagesClient::body`] so the
+//! Where a request's `cache_control` breakpoints go — a pure function of three
+//! inputs, extracted from [`super::AnthropicMessagesClient::body`] so the
 //! policy has one owner and its tests do not have to build a whole quote and
 //! scrape JSON back out of it to ask where a marker landed.
 //!
@@ -16,12 +16,14 @@
 //! Routing on a predicted cache hit and then prompting in a way that defeats
 //! it is the failure `frontier.rs`'s module doc names first.
 //!
-//! Penultimate rather than last, because a breakpoint caches everything *up
-//! to and including* the block it sits on. The final segment is this turn's
-//! new input — the part that by construction was not in the prefix last
-//! turn — so marking it would write a cache entry that the next turn cannot
-//! read, paying the write premium for nothing. Marking the one before it
-//! caches exactly the stable prefix.
+//! Penultimate rather than last. A breakpoint caches everything *up to and
+//! including* the block it sits on, and the penultimate block ends the prefix
+//! the previous turn already sent, so its marker reads that turn's entry and
+//! extends it. The final segment is this turn's new input; marking it too
+//! would pay the write premium now for a read on the next turn, which resends
+//! it byte for byte. Whether that trade pays is for live cache measurement to
+//! decide, and until it does the final segment stays unmarked and the router
+//! prices it as uncached on the next turn (see the last paragraph).
 //!
 //! Fewer than two segments means there is no stable prefix to name yet: one
 //! block is the whole prompt, which is entirely this turn's input.
@@ -59,27 +61,35 @@
 //! call.
 //!
 //! Dropped rather than sent when it is not strictly earlier than the
-//! penultimate block — a previous count that is not smaller means the
-//! conversation stopped being append-only, and a marker derived from it names
-//! a block that is not the one that was written. Dropped too when the gap is
+//! penultimate block — a previous marker that is not earlier means the
+//! conversation stopped being append-only, and a marker placed there names a
+//! block that is not the one that was written. Dropped too when the gap is
 //! inside the window, because the penultimate marker already reaches the old
 //! entry and a second one would only pay a second write.
 //!
-//! **What this module cannot know.** [`plan`] takes the *count* of segments
-//! the previous dispatch to this target rendered — [`super::FrontierQuote`]'s
-//! own doc names it a ledger fact rather than a guess about this crate's
-//! placement — and derives where that dispatch *would* have marked with the
-//! same [`penultimate`] this module uses for the current request. It has no
-//! way to learn whether that earlier request actually had a free slot to
-//! place it in: a history that rode four tool markers renders the same
-//! segment count as one that rode none, and `plan` cannot tell them apart.
-//! See the `#[ignore]`d test in `anthropic_messages.rs` for the case this
-//! misses and why closing it needs a fact this crate's ledger does not carry.
+//! **Where the previous request marked is a recorded fact, not a guess.**
+//! [`plan`] takes the previous dispatch's placement as the ledger recorded it
+//! ([`PreviousMarker`]), and that placement came from this same function: the
+//! engine asks [`super::marker_placement`] before it writes the `Routed`
+//! decision, and the body sent is built from the same quote. A count alone
+//! could not say whether that earlier request had a free slot for its marker —
+//! a history that rode four tool markers renders the same count as one that
+//! rode none — and reaching back for an entry never written was
+//! fleet-redis-3. Only a ledger record from before placements were recorded
+//! still carries just a count; for that one [`plan`] infers the block with
+//! [`penultimate`], the rule it applies to the current request.
+//!
+//! **The last marker also bounds what the router predicts is warm.** The
+//! provider caches through the last marker it is sent and no further, so the
+//! final segment is billed as a write on the next turn. The ledger reads the
+//! recorded placement for that too, rather than predicting the whole previous
+//! request (P2).
 
 use serde_json::Value;
 
 use super::CacheLifetime;
 use super::wire::CacheControl;
+use crate::frontier::PreviousMarker;
 
 /// **Anthropic's documented cap, and a hard 400 on the fifth.** It matters
 /// here because roundhouse is not the only author of this request: the tool
@@ -108,8 +118,9 @@ pub(super) const CACHE_LOOKBACK_BLOCKS: usize = 20;
 /// exists.
 ///
 /// The one formula both markers in [`plan`] are derived from — the current
-/// request's own breakpoint, and (from a *different* segment count, the
-/// previous dispatch's) the block that dispatch would have marked. One
+/// request's own breakpoint, and (from a *different* segment count, when the
+/// ledger recorded no placement) the block the previous dispatch would have
+/// marked. One
 /// function rather than the arithmetic written out twice is what keeps the
 /// two placements from drifting apart -- a duplicated copy of this formula
 /// once did exactly that, when a second copy lived in `roundhouse-server`'s
@@ -131,6 +142,15 @@ pub(super) struct MarkerPlan {
 }
 
 impl MarkerPlan {
+    /// The furthest block this plan marks — where the cached prefix ends.
+    ///
+    /// Always `penultimate` today, because [`plan`] keeps a reach-back marker
+    /// only when it is strictly earlier. The `max` states the meaning, so a
+    /// later placement rule cannot silently make this wrong.
+    pub(super) fn last(&self) -> Option<usize> {
+        self.penultimate.max(self.previous)
+    }
+
     /// Whether block `index` carries a marker under this plan.
     pub(super) fn contains(&self, index: usize) -> bool {
         Some(index) == self.penultimate || Some(index) == self.previous
@@ -141,22 +161,21 @@ impl MarkerPlan {
 ///
 /// `segment_count` is this request's own item count. `riding` is how many
 /// breakpoints the forwarded tools already carry — see [`breakpoints_in`].
-/// `previous_segment_count` is the item count the *previous* dispatch to this
-/// target rendered, if the ledger remembers one; see this module's doc for
-/// what that count cannot tell `plan` about that earlier request.
-pub(super) fn plan(
-    segment_count: usize,
-    riding: usize,
-    previous_segment_count: Option<usize>,
-) -> MarkerPlan {
+/// `previous` is where the *previous* dispatch to this target put its own
+/// marker, as the ledger recorded it; see this module's doc for the one kind
+/// of record from which it is still inferred.
+pub(super) fn plan(segment_count: usize, riding: usize, previous: PreviousMarker) -> MarkerPlan {
     let breakpoint = match riding < MAX_CACHE_BREAKPOINTS {
         true => penultimate(segment_count),
         false => None,
     };
     let previous = match breakpoint {
-        Some(current) if riding + 2 <= MAX_CACHE_BREAKPOINTS => previous_segment_count
-            .and_then(penultimate)
-            .filter(|prev| *prev < current && current - *prev >= CACHE_LOOKBACK_BLOCKS),
+        Some(current) if riding + 2 <= MAX_CACHE_BREAKPOINTS => match previous {
+            PreviousMarker::Unmarked => None,
+            PreviousMarker::Block(index) => Some(index),
+            PreviousMarker::Inferred { segment_count } => penultimate(segment_count),
+        }
+        .filter(|prev| *prev < current && current - *prev >= CACHE_LOOKBACK_BLOCKS),
         _ => None,
     };
     MarkerPlan {
@@ -227,133 +246,77 @@ pub(super) fn normalize_marker_lifetimes(tools: &mut Value, lifetime: CacheLifet
 mod tests {
     use super::*;
 
-    /// **Table over `plan`.** Each row is `(segment_count, riding,
-    /// previous_segment_count) -> MarkerPlan`, and together they are the
-    /// placement policy — the essay above justifies each column, this proves
-    /// the arithmetic.
+    /// **Table over `plan`.** Each row is `(segment_count, riding, previous)
+    /// -> MarkerPlan`, and together they are the placement policy — the essay
+    /// above justifies each column, this proves the arithmetic.
     ///
-    /// Rows and what each pins:
-    /// - `(31, 0, Some(6))`: both markers, the ordinary long-append case.
-    /// - `(31, 3, Some(6))`: one free slot — the penultimate wins it.
-    /// - `(31, 4, Some(6))` and `(31, 4, None)`: no free slot — neither
-    ///   marker is placed, and a `previous_segment_count` makes no
+    /// `Inferred { segment_count: n }` rows are the ledger records that carry
+    /// only a count, so they also pin the `n - 2` inference. Rows and what
+    /// each pins:
+    /// - `(31, 0, Inferred(6))`: both markers, the ordinary long-append case.
+    /// - `(31, 3, Inferred(6))`: one free slot — the penultimate wins it.
+    /// - `(31, 4, Inferred(6))` and `(31, 4, Unmarked)`: no free slot —
+    ///   neither marker is placed, and the previous placement makes no
     ///   difference once the current request has no breakpoint of its own.
-    /// - `(9, 0, Some(6))`: a three-item append (gap 3) is well inside the
+    /// - `(9, 0, Inferred(6))`: a three-item append (gap 3) is well inside the
     ///   lookback window — no second marker is worth the write.
-    /// - `(6, 0, Some(6|7|42))`: a previous count that is not *strictly
+    /// - `(6, 0, Inferred(6|7|42))`: a previous count that is not *strictly
     ///   before* this request's own penultimate block names no reachable
     ///   write — including the degenerate `42`, a conversation that stopped
     ///   being append-only.
-    /// - `(26, 0, Some(6))` / `(25, 0, Some(6))`: the lookback boundary
-    ///   itself. Gap 20 (`24 - 4`) is included, gap 19 (`23 - 4`) is not —
-    ///   changing [`CACHE_LOOKBACK_BLOCKS`] to 19 or 21 flips one of these
-    ///   rows, which is what makes this table a second C2 guard beside
+    /// - `(26, 0, Inferred(6))` / `(25, 0, Inferred(6))`: the lookback
+    ///   boundary itself. Gap 20 (`24 - 4`) is included, gap 19 (`23 - 4`) is
+    ///   not — changing [`CACHE_LOOKBACK_BLOCKS`] to 19 or 21 flips one of
+    ///   these rows, which is what makes this table a second C2 guard beside
     ///   `a_long_append_keeps_the_previous_cache_write_inside_a_lookback_window`.
-    /// - `(6, 0, Some(0|1))`: a previous count too small to have had its own
-    ///   penultimate block at all.
-    /// - `(1, 0, None)` / `(0, 0, None)`: no stable prefix exists yet to mark.
+    /// - `(6, 0, Inferred(0|1))`: a previous count too small to have had its
+    ///   own penultimate block at all.
+    /// - `(1, 0, Unmarked)` / `(0, 0, Unmarked)`: no stable prefix exists yet
+    ///   to mark.
+    /// - `(31, 0, Block(4))` / `(26, 0, Block(4))` / `(25, 0, Block(4))`: a
+    ///   recorded placement is used as the block itself, not as a count — the
+    ///   same boundary as the inferred rows, reached without the `n - 2`.
+    /// - `(31, 0, Unmarked)`: a previous request recorded as marking nothing
+    ///   gets no reach-back marker however long the append (fleet-redis-3).
+    /// - `(31, 0, Block(29))`: a recorded block not strictly before this
+    ///   request's own is dropped, as an inferred one is.
     #[test]
-    fn plan_places_markers_by_riding_count_and_previous_segment_count() {
-        for (segment_count, riding, previous_segment_count, expected) in [
-            (
-                31,
-                0,
-                Some(6),
-                MarkerPlan {
-                    penultimate: Some(29),
-                    previous: Some(4),
-                },
-            ),
-            (
-                31,
-                3,
-                Some(6),
-                MarkerPlan {
-                    penultimate: Some(29),
-                    previous: None,
-                },
-            ),
-            (31, 4, Some(6), MarkerPlan::default()),
-            (31, 4, None, MarkerPlan::default()),
-            (
-                9,
-                0,
-                Some(6),
-                MarkerPlan {
-                    penultimate: Some(7),
-                    previous: None,
-                },
-            ),
-            (
-                6,
-                0,
-                Some(6),
-                MarkerPlan {
-                    penultimate: Some(4),
-                    previous: None,
-                },
-            ),
-            (
-                6,
-                0,
-                Some(7),
-                MarkerPlan {
-                    penultimate: Some(4),
-                    previous: None,
-                },
-            ),
-            (
-                6,
-                0,
-                Some(42),
-                MarkerPlan {
-                    penultimate: Some(4),
-                    previous: None,
-                },
-            ),
-            (
-                26,
-                0,
-                Some(6),
-                MarkerPlan {
-                    penultimate: Some(24),
-                    previous: Some(4),
-                },
-            ),
-            (
-                25,
-                0,
-                Some(6),
-                MarkerPlan {
-                    penultimate: Some(23),
-                    previous: None,
-                },
-            ),
-            (
-                6,
-                0,
-                Some(0),
-                MarkerPlan {
-                    penultimate: Some(4),
-                    previous: None,
-                },
-            ),
-            (
-                6,
-                0,
-                Some(1),
-                MarkerPlan {
-                    penultimate: Some(4),
-                    previous: None,
-                },
-            ),
-            (1, 0, None, MarkerPlan::default()),
-            (0, 0, None, MarkerPlan::default()),
+    fn plan_places_markers_by_riding_count_and_previous_placement() {
+        use PreviousMarker::{Block, Inferred, Unmarked};
+        let both = |penultimate, previous| MarkerPlan {
+            penultimate: Some(penultimate),
+            previous: Some(previous),
+        };
+        let only = |penultimate| MarkerPlan {
+            penultimate: Some(penultimate),
+            previous: None,
+        };
+        let inferred = |segment_count| Inferred { segment_count };
+        for (segment_count, riding, previous, expected) in [
+            (31, 0, inferred(6), both(29, 4)),
+            (31, 3, inferred(6), only(29)),
+            (31, 4, inferred(6), MarkerPlan::default()),
+            (31, 4, Unmarked, MarkerPlan::default()),
+            (9, 0, inferred(6), only(7)),
+            (6, 0, inferred(6), only(4)),
+            (6, 0, inferred(7), only(4)),
+            (6, 0, inferred(42), only(4)),
+            (26, 0, inferred(6), both(24, 4)),
+            (25, 0, inferred(6), only(23)),
+            (6, 0, inferred(0), only(4)),
+            (6, 0, inferred(1), only(4)),
+            (1, 0, Unmarked, MarkerPlan::default()),
+            (0, 0, Unmarked, MarkerPlan::default()),
+            (31, 0, Block(4), both(29, 4)),
+            (26, 0, Block(4), both(24, 4)),
+            (25, 0, Block(4), only(23)),
+            (31, 0, Unmarked, only(29)),
+            (31, 0, Block(29), only(29)),
         ] {
             assert_eq!(
-                plan(segment_count, riding, previous_segment_count),
+                plan(segment_count, riding, previous),
                 expected,
-                "plan({segment_count}, {riding}, {previous_segment_count:?})"
+                "plan({segment_count}, {riding}, {previous:?})"
             );
         }
     }
@@ -372,5 +335,25 @@ mod tests {
         assert!(!plan.contains(5));
 
         assert!(!MarkerPlan::default().contains(0));
+    }
+
+    /// [`MarkerPlan::last`] is the furthest marked block, whichever field
+    /// holds it — the end of the prefix the provider caches.
+    #[test]
+    fn marker_plan_last_is_the_furthest_marked_block() {
+        let plan = MarkerPlan {
+            penultimate: Some(29),
+            previous: Some(4),
+        };
+        assert_eq!(plan.last(), Some(29));
+        assert_eq!(
+            MarkerPlan {
+                penultimate: Some(7),
+                previous: None
+            }
+            .last(),
+            Some(7)
+        );
+        assert_eq!(MarkerPlan::default().last(), None);
     }
 }

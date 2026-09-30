@@ -1520,7 +1520,7 @@ async fn f2_control_the_rig_routes_local_by_default_without_tools() {
 /// **F2 (thermo-nuclear review of b8e8ddd), fixed: a tool-declaring turn is
 /// never routed to a worker that cannot be told about a toolbox.**
 ///
-/// `connect`'s own doc comment named the gap on its `declarations` parameter:
+/// The engine's own doc comment (now on `frontier_quote`) named the gap on its `declarations` parameter:
 /// [`LocalExecutor::execute`] takes prompt token ids and an output cap, nothing
 /// else — "this build has no way to tell a locally served model about a toolbox
 /// at all" — and `LocalExecution::text` is a plain `String`, structurally
