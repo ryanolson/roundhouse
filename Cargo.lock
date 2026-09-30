@@ -4855,10 +4855,10 @@ dependencies = [
 name = "roundhouse-sequence-id"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "hmac",
  "http",
  "roundhouse-core",
- "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.20",

@@ -54,7 +54,14 @@
 //! needs_display::<roundhouse_core::item::chain::ChainValue>();
 //! ```
 //!
-//! The control, so the two above fail for the reason they name and not for a
+//! The per-item digest a link is built from is not exported at all, so it
+//! cannot leak by a derive either:
+//!
+//! ```compile_fail
+//! let _ = roundhouse_core::item::chain::item_digest("a secret prompt");
+//! ```
+//!
+//! The control, so the three above fail for the reason they name and not for a
 //! path that stopped resolving: the same shape with `Debug` compiles, and what
 //! it prints carries no byte of the link.
 //!
@@ -84,8 +91,14 @@ const CHAIN_DOMAIN: &[u8] = b"rh-chain-v1\0";
 /// Length-prefixed so the formula stays unambiguous if a later version ever
 /// hashes a second variable field beside the render. Redacted in `Debug` for
 /// the same reason a link is: it confirms a guess at one item's content.
+///
+/// Private to core, field and all: it is as sensitive as a link, and nothing
+/// outside needs one — a caller that holds a render extends a [`Chain`] with
+/// [`Chain::push_rendered`] and gets the link, which is what everything keyed
+/// is built on. Exported, it would be an unredacted second way to the bytes
+/// the link's type exists to fence.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ItemDigest(pub [u8; 32]);
+pub(crate) struct ItemDigest([u8; 32]);
 
 impl fmt::Debug for ItemDigest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -94,7 +107,7 @@ impl fmt::Debug for ItemDigest {
 }
 
 /// `d_i` of a render already computed — the one the context assembler holds.
-pub fn item_digest(render: &str) -> ItemDigest {
+pub(crate) fn item_digest(render: &str) -> ItemDigest {
     let mut hash = Sha256::new();
     hash.update(ITEM_DOMAIN);
     hash.update((render.len() as u64).to_be_bytes());

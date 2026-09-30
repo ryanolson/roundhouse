@@ -3568,10 +3568,7 @@ fn the_shipping_clients_body_becomes_the_prefix_it_will_be_checked_against(line:
     );
     // The session name the client gave, in the shape it gives it in.
     assert_eq!(
-        messages_label(
-            &HeaderMap::new(),
-            params.metadata.as_ref().and_then(|m| m.user_id.as_deref())
-        ),
+        messages_label(&HeaderMap::new(), params.user_id()),
         Some(line.named()),
         "the capture's `metadata.user_id` is a JSON object string, and the \
          name it yields lives in this dialect's own namespace (F6)"
@@ -3651,20 +3648,8 @@ fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_cha
     // And both turns name the same session, which is what makes the prefix
     // check reach the same log at all.
     assert_eq!(
-        messages_label(
-            &HeaderMap::new(),
-            parse(line.turn_one)
-                .metadata
-                .as_ref()
-                .and_then(|m| m.user_id.as_deref())
-        ),
-        messages_label(
-            &HeaderMap::new(),
-            parse(line.turn_two)
-                .metadata
-                .as_ref()
-                .and_then(|m| m.user_id.as_deref())
-        ),
+        messages_label(&HeaderMap::new(), parse(line.turn_one).user_id()),
+        messages_label(&HeaderMap::new(), parse(line.turn_two).user_id()),
     );
 }
 per_line_tests!(fn the_shipping_clients_two_turns_are_one_conversation_but_for_the_prompt_it_changed);

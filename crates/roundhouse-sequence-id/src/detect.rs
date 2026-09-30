@@ -6,13 +6,14 @@
 //! **Exact or declared, and only one thing is exact.** Claude Code puts an
 //! attribution block at canonical item 0 whose full shape no other client has
 //! a reason to produce; a header is a claim any client can make by copying a
-//! string. Routing and the dispatch-projection strip act only on [`Confidence::Exact`],
-//! so a detection that guessed would change what a model is sent.
+//! string. Routing and the dispatch-projection strip act only on
+//! [`Detection::Exact`], so a detection that guessed would change what a model
+//! is sent.
 
 use http::HeaderMap;
 use roundhouse_core::item::{Item, ItemContent, Role};
 
-use crate::RequestView;
+use crate::ascii_header;
 
 /// The attribution block's fixed head, through the `=` of its first field.
 const BLOCK_HEAD: &str = "x-anthropic-billing-header: cc_version=";
@@ -20,27 +21,36 @@ const BLOCK_HEAD: &str = "x-anthropic-billing-header: cc_version=";
 /// The separator between the block's two fields, both included in full.
 const BLOCK_ENTRYPOINT: &str = "; cc_entrypoint=";
 
+/// Which client sent a request, and how sure that is.
+///
+/// Only the four answers [`detect_client`] can give are representable: exact
+/// is Claude Code's alone (no other client has an attribution block) and
+/// always carries the block's version, and a request with no signal names no
+/// client. A struct of a client and a confidence could also spell "Codex,
+/// exactly" or "unknown, declared", and every match on it would need an arm
+/// for an answer nothing produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Client {
-    ClaudeCode { version: Option<String> },
-    Codex,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Confidence {
-    /// The exact attribution block at item 0 (Claude Code only).
-    Exact,
+pub enum Detection {
+    /// Claude Code, from the exact attribution block at item 0, with the
+    /// version the block carries.
+    Exact {
+        version: String,
+    },
     /// A client header alone: `user-agent`, `x-app`, `originator`, or an
     /// `x-codex-*` header. Any client can send one.
-    Declared,
+    Declared(DeclaredClient),
     NoSignal,
 }
 
+/// The client a header claims to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Detection {
-    pub client: Client,
-    pub confidence: Confidence,
+pub enum DeclaredClient {
+    /// The version is read from `user-agent: claude-cli/<version> …`, and is
+    /// absent when `x-app: cli` alone declared it.
+    ClaudeCode {
+        version: Option<String>,
+    },
+    Codex,
 }
 
 /// Claude Code's per-request attribution block, as parsed from item 0.
@@ -59,26 +69,20 @@ pub struct AttributionBlock<'a> {
 ///
 /// The block wins outright: it is exact, and its version is the client's own.
 /// Headers only declare, and two declarations that name different clients
-/// cancel to [`Client::Unknown`] with no signal — a request claiming to be
-/// both is either a proxy stacking headers or a client imitating another, and
-/// in neither case is one of the two claims the one to believe.
-pub fn detect_client(view: &RequestView<'_>) -> Detection {
-    if let Some(block) = attribution_block(view.items) {
-        return Detection {
-            client: Client::ClaudeCode {
-                version: Some(block.version.to_owned()),
-            },
-            confidence: Confidence::Exact,
+/// cancel to [`Detection::NoSignal`] — a request claiming to be both is either
+/// a proxy stacking headers or a client imitating another, and in neither case
+/// is one of the two claims the one to believe.
+pub fn detect_client(headers: &HeaderMap, items: &[Item]) -> Detection {
+    if let Some(block) = attribution_block(items) {
+        return Detection::Exact {
+            version: block.version.to_owned(),
         };
     }
-    let claude = declared_claude(view.headers);
-    let codex = declared_codex(view.headers);
-    let (client, confidence) = match (claude, codex) {
-        (Some(version), false) => (Client::ClaudeCode { version }, Confidence::Declared),
-        (None, true) => (Client::Codex, Confidence::Declared),
-        (Some(_), true) | (None, false) => (Client::Unknown, Confidence::NoSignal),
-    };
-    Detection { client, confidence }
+    match (declared_claude(headers), declared_codex(headers)) {
+        (Some(claude), false) => Detection::Declared(claude),
+        (None, true) => Detection::Declared(DeclaredClient::Codex),
+        (Some(_), true) | (None, false) => Detection::NoSignal,
+    }
 }
 
 /// The attribution block, when item 0 is exactly one.
@@ -127,34 +131,29 @@ pub fn without_attribution_block(items: &[Item]) -> &[Item] {
     }
 }
 
-/// `Some(version)` when a header declares Claude Code; the version is read
-/// from `user-agent: claude-cli/<version> …` when that is what declared it.
-fn declared_claude(headers: &HeaderMap) -> Option<Option<String>> {
-    let from_agent = header(headers, "user-agent")
+/// Claude Code, when a header declares it; the version is read from
+/// `user-agent: claude-cli/<version> …` when that is what declared it.
+fn declared_claude(headers: &HeaderMap) -> Option<DeclaredClient> {
+    let from_agent = ascii_header(headers, "user-agent")
         .and_then(|agent| agent.strip_prefix("claude-cli/"))
-        .map(|rest| {
-            let version = rest.split(' ').next().unwrap_or_default();
-            (!version.is_empty()).then(|| version.to_owned())
-        });
-    let from_app = header(headers, "x-app") == Some("cli");
-    match from_agent {
-        Some(version) => Some(version),
-        None => from_app.then_some(None),
-    }
+        .map(|rest| rest.split(' ').next().unwrap_or_default());
+    let from_app = ascii_header(headers, "x-app") == Some("cli");
+    let version = match from_agent {
+        Some(version) => (!version.is_empty()).then(|| version.to_owned()),
+        None if from_app => None,
+        None => return None,
+    };
+    Some(DeclaredClient::ClaudeCode { version })
 }
 
 /// Whether a header declares Codex: its `originator` (default `codex_cli_rs`,
 /// which also heads its `user-agent`), or any `x-codex-*` header.
 fn declared_codex(headers: &HeaderMap) -> bool {
-    header(headers, "originator").is_some_and(|value| value.starts_with("codex_"))
-        || header(headers, "user-agent").is_some_and(|value| value.starts_with("codex_"))
+    ascii_header(headers, "originator").is_some_and(|value| value.starts_with("codex_"))
+        || ascii_header(headers, "user-agent").is_some_and(|value| value.starts_with("codex_"))
         || headers
             .keys()
             .any(|name| name.as_str().starts_with("x-codex-"))
-}
-
-fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn all_of(text: &str, class: fn(u8) -> bool) -> bool {

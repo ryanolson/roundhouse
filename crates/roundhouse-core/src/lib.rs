@@ -22,6 +22,7 @@ pub mod interject;
 pub mod item;
 pub mod metrics;
 pub mod routing;
+pub mod sequence;
 pub mod session;
 pub mod store;
 pub mod validate;
@@ -41,6 +42,7 @@ pub use ids::{ResponseId, SessionId, SideCallId, TurnId, ValidationId};
 pub use interject::{Interjection, InterjectionContext, Interjector};
 pub use item::{Item, ItemContent, Role};
 pub use metrics::{MetricsConfig, MetricsFold, MetricsSnapshot, ServingMode};
+pub use sequence::{Anchor, CompactionKind, SequenceDigest, TipKey};
 pub use session::{ActiveEscalation, Session, SessionError, TerminalSettlement};
 pub use store::{Lease, SessionStore, StoreError};
 pub use validate::{

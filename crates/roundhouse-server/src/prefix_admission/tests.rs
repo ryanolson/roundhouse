@@ -1427,6 +1427,10 @@ async fn rewrite_signal_distinguishes_divergence_from_busy_and_resumed_generatio
 /// every turn still answering. `same_item` is private here, which is why this
 /// lives beside it and not in core.
 ///
+/// The item digests are compared through the chain rather than directly: both
+/// chains share link 0, so their link 1 is equal exactly when the two item
+/// digests are, and the digest itself is private to core so it cannot leak.
+///
 /// The two rules that make agreement looser than equality are exactly the
 /// ones the render must not see: the response stamp (never compared) and the
 /// namespace (a stored `None` agrees with any claim). The universe below
@@ -1435,7 +1439,7 @@ async fn rewrite_signal_distinguishes_divergence_from_busy_and_resumed_generatio
 /// vacuously true.
 #[test]
 fn same_item_agreement_implies_equal_item_digests() {
-    use roundhouse_core::item::chain::{Chain, item_digest};
+    use roundhouse_core::item::chain::Chain;
 
     let call = |call_id: &str, name: &str, arguments: &str, namespace: Option<&str>| {
         ItemContent::ToolCall {
@@ -1508,11 +1512,6 @@ fn same_item_agreement_implies_equal_item_digests() {
             agreed += 1;
             across_stamps += usize::from(stored.response_id != claimed.response_id);
             across_namespaces += usize::from(stored.content != claimed.content);
-            assert_eq!(
-                item_digest(&stored.render()),
-                item_digest(&claimed.render()),
-                "admission agrees on {stored:?} and {claimed:?}, their item digests do not"
-            );
             assert!(
                 chain_of(stored).links() == chain_of(claimed).links(),
                 "admission agrees on {stored:?} and {claimed:?}, their chain links do not"

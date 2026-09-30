@@ -278,6 +278,10 @@ Two proposal claims are not true on either tree:
 
 ### 3.1 Identity: the `roundhouse-sequence-id` crate and the chain primitive
 
+> **Amended 2026-09-30** by the M1 review addendum at the end of this plan: the
+> label API is split by client, `Detection` is a sum type, and the storable
+> identity types live in core.
+
 **Where each part lives.** The unkeyed chain is in `roundhouse-core`, module
 `item::chain` (file `crates/roundhouse-core/src/item/chain.rs`), beside
 `Item::render`. The context assembler extends it from the render it already
@@ -898,6 +902,9 @@ body it does read.
   carries a new id; Dynamo sees a new session. Labels and bindings survive.
 
 ### 3.9 Durability: event field additions
+
+> **Amended 2026-09-30:** `Anchor` and `CompactionKind` are core types (M1
+> review addendum, C), so these fields need no dependency on the crate.
 
 All additive, each with `#[serde(default)]`. No new event kind.
 
@@ -1524,3 +1531,112 @@ this plan only consumes it.
 | Readiness rulings R1–R10 | R1 status block and §6; R2 §7; R3 §4; R4 §3.6; R5 §3.5; R6 §3.5, M2; R7 M3; R8 §3.7; R9 §5 as refined by R11; R10 this table |
 | R11 (policy, not plumbing) | §0, §3.4 drain, §3.6, §3.7 rail wait, §5 split tables and placement switch, M3 and M5 tests, M3 done-means, §7 |
 | R12 (separate supersession header) | §3.5, M2 test `the_supersession_header_reports_the_class` |
+
+## Addendum (2026-09-30): M1 review amendments to §3.1 and §3.9
+
+**Status: orchestrator rulings on the M1 thermo-nuclear review of PR #34.**
+Two reviewers found that parts of §3.1 were the wrong shape once built. Each
+finding below was ruled test-first, by mutation or by a test that compiled
+where the design said it should not. Where this addendum and §3.1 disagree,
+this addendum wins. The label precedence, the refusal texts, the keyed
+formulas, and the chain are unchanged. The golden label capture passes
+against its unchanged file after every amendment.
+
+### A. The label API is split by client (amends §3.1 `RequestView`, `label()`)
+
+§3.1 gave both surfaces one input, `RequestView`, and one result,
+`label() -> Result<Labeled, LabelError>`. Built, it forced each server caller
+to handle arms its surface can never produce:
+
+- The Messages caller mapped an `Err` that cannot occur.
+- The Responses caller refused an `Anonymous` that cannot occur.
+
+Replacing either arm with `unreachable!()` left every suite green. To keep
+the pinned refusal order (`session-id`, `thread-id`, the window, then no
+name), the Responses caller had to split the result and put its own window
+check between the pieces. It also rebuilt `thread_id` from `LabelSource`, and
+kept a private copy of the label that a test showed could disagree with
+`RequestContext`'s public fields. `RequestView::tools` had no reader.
+
+The ruling deletes `RequestView`, `Labeled`, `Label`, `LabelSource`, and
+`label()`:
+
+- **Messages:** `messages_label(headers, user_id)` is the whole label API.
+- **Responses:** `CodexHeaders::read(headers)` strictly reads `session-id`,
+  `thread-id`, and `x-codex-window-id` in that order, with today's 422 texts,
+  and returns what it read. `CodexHeaders::label(prompt_cache_key)` applies
+  the precedence or returns `Unnamed`. The refusal order is now the order of
+  the two `?` lines in `RequestContext::from_request`. The window check therefore moves from the
+  server adapter into the crate's reader, which removes the server's
+  duplicate strict-header reader and its second copy of the 422 text.
+- The precedence (thread, then session, then a non-empty cache key) is one
+  crate function, `codex_conversation`. `CodexHeaders::label` and
+  `RequestContext::conversation_key()` both call it. `RequestContext` keeps
+  its public fields as they were before M1, and `conversation_key()` is
+  computed from those fields, so there is no second copy that could disagree
+  with them. Making the fields private was tried and rejected: it forced
+  edits in `engine.rs` that conflict with the learner stack.
+- `LabelError` converts to `ApiError` through a `From` impl in `http.rs`,
+  beside the other error conversions.
+- Detection and signals take only the parts of the request they read.
+
+### B. `Detection` is a sum type (amends §3.1 `Detection`)
+
+The `{ client, confidence }` product type admitted nine shapes, and
+`detect_client` returns four. `Exact` is Claude Code only. `Codex` is only
+ever declared. `Unknown` only ever means no signal. The type now admits only
+those four shapes.
+
+### C. Storable identity types live in core (amends §3.1, fixes §3.3 and §3.9)
+
+§3.1 defined `TipKey`, `Anchor`, `SequenceDigest`, and `CompactionKind` in
+`roundhouse-sequence-id`. §3.3 and §3.9 then put records that carry them in
+core: `PlacementStore` in `roundhouse-core/src/control/placement.rs`, keyed by
+tip keys and holding an anchor; `SessionCreated.anchor`; and `TurnSignals`.
+Core cannot depend on the crate, which depends on core. The plain data types
+therefore move to a new core module, `roundhouse_core::sequence`, the same
+move M1 already made for `MESSAGES_DIALECT_NAMESPACE`. This adds one
+`pub mod sequence;` line to `roundhouse-core/src/lib.rs`, which M1's
+conflict table listed as untouched. `git merge-tree` against the stack
+merges it without conflict. The keyed derivations (`TipKeyer`,
+`SequenceDigester`, `new_anchor`, `tools_digest`) stay in the crate, because
+they hold keys and core does not.
+
+`Anchor` and `SequenceDigest` lose their serde derives. No record carries them
+yet, and `[u8; 16]` would serialize as a JSON array of sixteen integers, a
+shape nobody chose. M3 chooses the wire shape together with the record that
+stores it. `CompactionKind` keeps its snake_case serde, because M2's
+`TurnSignals` stores it by name.
+
+`Client` was not affected. §3.9 already records it as a separate core-side
+`ClientKind`.
+
+### D. Smaller amendments
+
+- `prefix_fingerprint` takes only `items`. Given a chain and items separately,
+  a mismatched chain that was long enough was silently fingerprinted instead
+  of the items.
+- `ItemDigest` and `item_digest` are `pub(crate)`, and a `compile_fail`
+  doctest keeps them that way. Their own doc says an item digest confirms a
+  guess at an item's content, just as a chain link does.
+- `Surface::wire_name`'s `"anthropic_messages"` is deliberately a separate
+  string from `MESSAGES_DIALECT_NAMESPACE`. The first is a sequence-digest
+  input and the second is a label segment. Unifying them would re-key every
+  sequence.
+- The crate's fixture-driven tests call the server's `canonicalize` rather
+  than a copy. A test proved the copy blind: breaking production
+  `is_budget_notice` left all 39 crate tests green.
+
+### E. M1 done-means, as measured
+
+- The golden capture has **50** Messages cases, not 49. It adds one anonymous
+  case, the turn-1 body without `metadata`, because every captured body
+  carries a `user_id`, so the anonymous rung was otherwise unreached.
+- **Chain cost.** Over the 7 Claude bodies (52 items, 120,568 rendered bytes,
+  31,448 TinyLlama tokens), per 100 KiB on the dev profile:
+  - the chain over renders: about 83 µs;
+  - the chain over items, render included: 91–94 µs;
+  - tokenization: 33.4–34.5 ms.
+
+  The chain is about 0.25% of the encode it will run beside. Reproduce with
+  `timeout 900 cargo test -p roundhouse-server --lib chain_cost -- --ignored --nocapture`.

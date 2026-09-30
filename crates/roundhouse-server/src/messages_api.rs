@@ -17,7 +17,7 @@
 //! no `prompt_cache_key`; what it has is an `x-claude-code-session-id` header
 //! (live at 2.1.247) and a `metadata.user_id` that has carried the session id in
 //! two different spellings across the versions in the wild.
-//! `roundhouse_sequence_id::label` resolves them in the order plan R5 fixes
+//! `roundhouse_sequence_id::messages_label` resolves them in the order plan R5 fixes
 //! (`claimed_label` is this surface's call into it), and everything
 //! downstream — the namespace qualification, the `Conversations` binding, the
 //! fork on prefix disagreement — is what the Responses surface already does
@@ -78,19 +78,17 @@ use serde_json::{Value, json};
 
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::event::Usage;
-use roundhouse_core::item::Item;
 use roundhouse_core::now_ms;
 use roundhouse_core::store::SessionStore;
 
 use roundhouse_fleet::WireProtocol;
-use roundhouse_sequence_id::{Labeled, RequestView, Surface, label};
+use roundhouse_sequence_id::messages_label;
 
 use crate::control_config::{AuthError, PlaneSource};
 use crate::conversations::Conversations;
 use crate::engine::{Engine, TurnInput};
 use crate::http::{ApiError, POLL_INTERVAL, parse_body, refuse_over_fair_use, store_error};
 use crate::prefix_admission::bind_prefix;
-use crate::request_context::label_refusal;
 use crate::responses_api::API_PREFIX;
 
 pub mod emit;
@@ -373,7 +371,7 @@ where
     // Resolved before `bind` consumes it, and named here rather than inside the
     // bind so the anonymous arm is visible at the site that decides what a turn
     // belongs to rather than buried in a helper.
-    let cache_key = claimed_label(&headers, &params, &claimed)?.unwrap_or_else(anonymous_key);
+    let cache_key = claimed_label(&headers, &params).unwrap_or_else(anonymous_key);
     let (session_id, input, _) = bind_prefix(
         &state.engine,
         &state.store,
@@ -536,41 +534,20 @@ const UNDECLARED_MODEL: &str = "roundhouse-routed";
 
 /// The session this request names, or `None` for an anonymous turn.
 ///
-/// A [`RequestView`] over what the handler already holds and one call into
-/// `roundhouse_sequence_id::label`, which owns R5's rungs for this surface and
-/// the Responses rungs for the other: the derivation lives in one place so the
-/// two surfaces cannot drift apart in modules that each treat the other's
-/// spelling as a detail. What stays here is only what reads the process —
-/// [`anonymous_key`] — which is why `None` comes back rather than a name.
+/// One call into `roundhouse_sequence_id::messages_label`, which owns R5's
+/// rungs for this surface: the derivation lives in one crate beside the
+/// Responses reader, so the two surfaces cannot drift apart in modules that
+/// each treat the other's spelling as a detail. What stays here is only what
+/// reads the process — [`anonymous_key`] — which is why `None` comes back
+/// rather than a name. It cannot fail: a Messages request that names nothing
+/// is an anonymous turn, not a refusal.
 ///
 /// A function rather than inline in the handler so the golden label capture
 /// (`request_context::label_golden`) runs this exact glue, the
 /// `metadata.user_id` extraction included, and not a parallel copy of it that
 /// could agree with the crate while the handler did not.
-///
-/// The `Err` arm cannot fire today — `label` never refuses a Messages request —
-/// and it is mapped rather than unwrapped because a refusal the crate one day
-/// learns to give is a 422 the client can read, not a panic in a handler.
-pub(crate) fn claimed_label(
-    headers: &HeaderMap,
-    params: &CreateMessageParams,
-    items: &[Item],
-) -> Result<Option<String>, ApiError> {
-    let view = RequestView {
-        surface: Surface::AnthropicMessages,
-        headers,
-        items,
-        tools: params.tools.as_ref(),
-        metadata_user_id: params
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.user_id.as_deref()),
-        prompt_cache_key: None,
-    };
-    match label(&view).map_err(label_refusal)? {
-        Labeled::Named(named) => Ok(Some(named.name)),
-        Labeled::Anonymous => Ok(None),
-    }
+pub(crate) fn claimed_label(headers: &HeaderMap, params: &CreateMessageParams) -> Option<String> {
+    messages_label(headers, params.user_id())
 }
 
 /// A fresh session name for a request that carried none.

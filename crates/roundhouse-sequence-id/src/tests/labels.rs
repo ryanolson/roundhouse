@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use http::{HeaderMap, HeaderValue};
-use roundhouse_core::item::Item;
 
+use crate::label::session_component;
 use crate::{
-    CLAUDE_AGENT_HEADER, CLAUDE_SESSION_HEADER, Label, LabelError, LabelSource, Labeled,
-    RequestView, Surface, client_session, label, messages_label, session_component,
+    CLAUDE_AGENT_HEADER, CLAUDE_SESSION_HEADER, CodexHeaders, LabelError, claude_session,
+    codex_conversation, messages_label,
 };
 
 pub(super) fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -20,27 +20,16 @@ pub(super) fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
     map
 }
 
-pub(super) fn view<'a>(
-    surface: Surface,
-    headers: &'a HeaderMap,
-    prompt_cache_key: Option<&'a str>,
-) -> RequestView<'a> {
-    RequestView {
-        surface,
-        headers,
-        items: &[],
-        tools: None,
-        metadata_user_id: None,
-        prompt_cache_key,
-    }
+/// The Codex label as the server derives it: read, then label.
+pub(super) fn codex_label(
+    headers: &HeaderMap,
+    cache_key: Option<&str>,
+) -> Result<String, LabelError> {
+    CodexHeaders::read(headers)?.label(cache_key)
 }
 
-fn named(name: &str, source: LabelSource) -> Result<Labeled, LabelError> {
-    Ok(Labeled::Named(Label {
-        name: name.to_owned(),
-        source,
-        agent_scoped: false,
-    }))
+fn named(name: &str) -> Result<String, LabelError> {
+    Ok(name.to_owned())
 }
 
 #[test]
@@ -50,51 +39,55 @@ fn codex_header_precedence_is_thread_then_session_then_cache_key() {
     let thread_only = headers(&[("thread-id", "thread-2")]);
     let none = HeaderMap::new();
     let key = Some("cache-key");
-    let responses = |h, k| label(&view(Surface::OpenAiResponses, h, k));
 
-    assert_eq!(
-        responses(&all, key),
-        named("thread-2", LabelSource::CodexThread)
-    );
-    assert_eq!(
-        responses(&thread_only, key),
-        named("thread-2", LabelSource::CodexThread)
-    );
-    assert_eq!(
-        responses(&session_only, key),
-        named("root", LabelSource::CodexSession)
-    );
-    assert_eq!(
-        responses(&none, key),
-        named("cache-key", LabelSource::PromptCacheKey)
-    );
+    assert_eq!(codex_label(&all, key), named("thread-2"));
+    assert_eq!(codex_label(&thread_only, key), named("thread-2"));
+    assert_eq!(codex_label(&session_only, key), named("root"));
+    assert_eq!(codex_label(&none, key), named("cache-key"));
 
     // Taken as sent: a value is never trimmed on this surface, because the
     // server never trimmed it and a trimmed label is another conversation's key.
     let spaced = headers(&[("thread-id", " t ")]);
+    assert_eq!(codex_label(&spaced, None), named(" t "));
+    assert_eq!(codex_label(&none, Some(" ")), named(" "));
+
+    // What was read is what is reported: the thread and the session are the
+    // values the label chose between, as sent.
+    // The pure precedence the server's `RequestContext` keys by, over plain
+    // values: the same rungs, and an empty key is no name while a blank one is.
     assert_eq!(
-        responses(&spaced, None),
-        named(" t ", LabelSource::CodexThread)
+        codex_conversation(Some("t"), Some("s"), Some("k")),
+        Some("t")
     );
+    assert_eq!(codex_conversation(None, Some("s"), Some("k")), Some("s"));
+    assert_eq!(codex_conversation(None, None, Some("k")), Some("k"));
+    assert_eq!(codex_conversation(None, None, Some(" ")), Some(" "));
+    assert_eq!(codex_conversation(None, None, Some("")), None);
+    assert_eq!(codex_conversation(None, None, None), None);
+
+    let read = CodexHeaders::read(&all).unwrap();
     assert_eq!(
-        responses(&none, Some(" ")),
-        named(" ", LabelSource::PromptCacheKey)
+        (read.session(), read.thread(), read.window()),
+        (Some("root"), Some("thread-2"), None)
     );
+    // The server records the window from this getter alone, so a reader that
+    // validated the header but dropped it would pass every refusal test.
+    let windowed = CodexHeaders::read(&headers(&[("x-codex-window-id", "t:1")])).unwrap();
+    assert_eq!(windowed.window(), Some("t:1"));
 }
 
 #[test]
 fn no_name_is_an_unnamed_error() {
     let none = HeaderMap::new();
-    let items = [Item::system_text("be brief"), Item::user_text("hi")];
     for key in [None, Some("")] {
-        // Items do not help: a content fingerprint may stand in for a cache
-        // hint, never for the identity of an append-only history.
-        let view = RequestView {
-            items: &items,
-            ..view(Surface::OpenAiResponses, &none, key)
-        };
-        assert_eq!(label(&view), Err(LabelError::Unnamed), "{key:?}");
+        // Nothing but the cache key can stand in: a content fingerprint may be
+        // a cache hint, never the identity of an append-only history — which is
+        // why the label takes no items at all.
+        assert_eq!(codex_label(&none, key), Err(LabelError::Unnamed), "{key:?}");
     }
+    // A window names nothing, even a valid one.
+    let window = headers(&[("x-codex-window-id", "t:3")]);
+    assert_eq!(codex_label(&window, None), Err(LabelError::Unnamed));
     assert_eq!(
         LabelError::Unnamed.to_string(),
         "a `thread-id`, `session-id`, or `prompt_cache_key` is required to name the conversation"
@@ -104,7 +97,7 @@ fn no_name_is_an_unnamed_error() {
 #[test]
 fn a_blank_or_non_ascii_responses_header_is_the_same_422() {
     let non_ascii = HeaderValue::from_bytes("café".as_bytes()).unwrap();
-    for name in ["session-id", "thread-id"] {
+    for name in ["session-id", "thread-id", "x-codex-window-id"] {
         let mut cases: Vec<HeaderMap> = ["", "   ", "\t"]
             .iter()
             .map(|blank| headers(&[(name, *blank)]))
@@ -115,7 +108,7 @@ fn a_blank_or_non_ascii_responses_header_is_the_same_422() {
         for case in &cases {
             // A usable cache key does not rescue a bad header: the server
             // refused before it looked for a name, and still does.
-            let got = label(&view(Surface::OpenAiResponses, case, Some("cache-key")));
+            let got = codex_label(case, Some("cache-key"));
             assert_eq!(got, Err(LabelError::InvalidHeader(name)), "{case:?}");
             assert_eq!(
                 got.unwrap_err().to_string(),
@@ -124,37 +117,44 @@ fn a_blank_or_non_ascii_responses_header_is_the_same_422() {
         }
     }
     // A bad `thread-id` is refused even when `session-id` alone would name
-    // the request, and two bad headers are refused in the server's order.
+    // the request, and a bad window even when a thread does.
     let bad_thread = headers(&[("session-id", "root"), ("thread-id", " ")]);
     assert_eq!(
-        label(&view(Surface::OpenAiResponses, &bad_thread, None)),
+        codex_label(&bad_thread, None),
         Err(LabelError::InvalidHeader("thread-id"))
     );
-    let both = headers(&[
+    let bad_window = headers(&[("thread-id", "t"), ("x-codex-window-id", " ")]);
+    assert_eq!(
+        codex_label(&bad_window, None),
+        Err(LabelError::InvalidHeader("x-codex-window-id"))
+    );
+}
+
+/// **The refusal order is the server's**: `session-id`, then `thread-id`, then
+/// the window, then no name — so a client sending several bad headers is told
+/// about the one it was always told about first.
+#[test]
+fn codex_refusals_come_in_the_servers_order() {
+    let all_bad = headers(&[
         ("session-id", ""),
         ("thread-id", ""),
         ("x-codex-window-id", ""),
     ]);
     assert_eq!(
-        label(&view(Surface::OpenAiResponses, &both, None)),
+        codex_label(&all_bad, None),
         Err(LabelError::InvalidHeader("session-id"))
     );
-}
-
-/// The window header's 422 stays in the server's adapter (plan §3.1), so
-/// `label` must not raise it — or the adapter's own check would be dead and
-/// its ordering against `Unnamed` would be decided here, silently.
-#[test]
-fn the_window_header_is_the_adapters_refusal_not_the_labels() {
-    let blank_window = headers(&[("thread-id", "t"), ("x-codex-window-id", " ")]);
+    let thread_and_window = headers(&[("thread-id", ""), ("x-codex-window-id", "")]);
     assert_eq!(
-        label(&view(Surface::OpenAiResponses, &blank_window, None)),
-        named("t", LabelSource::CodexThread)
+        codex_label(&thread_and_window, None),
+        Err(LabelError::InvalidHeader("thread-id"))
     );
+    // A bad window outranks a missing name: `read` refuses it before `label`
+    // is reachable at all.
     let unnamed_blank_window = headers(&[("x-codex-window-id", " ")]);
     assert_eq!(
-        label(&view(Surface::OpenAiResponses, &unnamed_blank_window, None)),
-        Err(LabelError::Unnamed)
+        codex_label(&unnamed_blank_window, None),
+        Err(LabelError::InvalidHeader("x-codex-window-id"))
     );
 }
 
@@ -168,52 +168,32 @@ fn a_messages_request_with_no_name_is_anonymous() {
     // Codex's names on this surface name nothing: a surface reads its own.
     let foreign = headers(&[("session-id", "root"), ("thread-id", "t")]);
     for (case, user_id) in [(&none, None), (&blank, Some("   ")), (&foreign, None)] {
-        let view = RequestView {
-            metadata_user_id: user_id,
-            ..view(Surface::AnthropicMessages, case, Some("cache-key"))
-        };
-        assert_eq!(label(&view), Ok(Labeled::Anonymous), "{case:?}");
-        assert_eq!(messages_label(case, user_id), None);
+        assert_eq!(messages_label(case, user_id), None, "{case:?}");
     }
 }
 
 #[test]
-fn the_messages_label_carries_its_source_and_its_agent() {
+fn the_messages_label_prefers_the_header_and_scopes_its_agent() {
     let scoped = headers(&[
         ("x-claude-code-session-id", " s1 "),
         ("x-claude-code-agent-id", "a1"),
     ]);
-    let agent = RequestView {
-        metadata_user_id: Some(r#"{"session_id":"other"}"#),
-        ..view(Surface::AnthropicMessages, &scoped, None)
-    };
     assert_eq!(
-        label(&agent),
-        Ok(Labeled::Named(Label {
-            name: "anthropic_messages/s1/agent/a1".into(),
-            source: LabelSource::ClaudeSession,
-            agent_scoped: true,
-        }))
+        messages_label(&scoped, Some(r#"{"session_id":"other"}"#)).as_deref(),
+        Some("anthropic_messages/s1/agent/a1")
     );
     let bare = HeaderMap::new();
-    let legacy = RequestView {
-        metadata_user_id: Some("user_ab_account_cd_session_s2"),
-        ..view(Surface::AnthropicMessages, &bare, None)
-    };
+    let legacy = Some("user_ab_account_cd_session_s2");
     assert_eq!(
-        label(&legacy),
-        Ok(Labeled::Named(Label {
-            name: "anthropic_messages/s2".into(),
-            source: LabelSource::ClaudeUserId,
-            agent_scoped: false,
-        }))
+        messages_label(&bare, legacy).as_deref(),
+        Some("anthropic_messages/s2")
     );
     assert_eq!(
-        client_session(&legacy),
+        claude_session(&bare),
         None,
         "user_id is a label rung, not the session"
     );
-    assert_eq!(client_session(&agent).as_deref(), Some("s1"));
+    assert_eq!(claude_session(&scoped).as_deref(), Some("s1"));
 }
 
 #[test]
@@ -227,17 +207,9 @@ fn every_fixture_body_is_named_by_its_user_id() {
             .as_str()
             .unwrap()
             .to_owned();
-        let view = RequestView {
-            metadata_user_id: Some(user_id),
-            ..view(Surface::AnthropicMessages, &none, None)
-        };
         assert_eq!(
-            label(&view),
-            Ok(Labeled::Named(Label {
-                name: format!("anthropic_messages/{session}"),
-                source: LabelSource::ClaudeUserId,
-                agent_scoped: false,
-            })),
+            messages_label(&none, Some(user_id)),
+            Some(format!("anthropic_messages/{session}")),
             "{name}"
         );
     }
@@ -427,5 +399,15 @@ fn a_derived_name_carries_its_dialect_and_its_agent() {
     assert_ne!(
         messages_label(&headers(&[(CLAUDE_SESSION_HEADER, "shared")]), None).as_deref(),
         Some("shared"),
+    );
+}
+
+/// Mutation 2i: the pre-2.1.247 shape trims what follows `_session_`.
+#[test]
+fn the_legacy_user_id_shape_is_trimmed_after_its_marker() {
+    assert_eq!(session_component("user_9f3a_account_c1_session_ s1"), "s1");
+    assert_eq!(
+        session_component("user_9f3a_account_c1_session_  s1  "),
+        "s1"
     );
 }

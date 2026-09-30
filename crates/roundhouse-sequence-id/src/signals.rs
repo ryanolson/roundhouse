@@ -4,25 +4,28 @@
 //! What a client says about its own context: compaction headers, the Codex
 //! window, `session_final`, and the fixed sentences a summary carries.
 //!
-//! **Read, never refused.** [`client_signals`] cannot fail a request: a
-//! malformed header reads as absent. These are observations that feed a
-//! classifier (M2), and a request that answered yesterday must not start
-//! failing because a client began sending a hint in a shape nobody quoted.
-//! The one strict reading of a header here — the `x-codex-window-id` 422 — is
-//! the server adapter's and runs before this.
+//! **Read, never refused.** [`claude_signals`] and [`codex_signals`] cannot
+//! fail a request: a malformed header reads as absent. These are observations
+//! that feed a classifier (M2), and a request that answered yesterday must not
+//! start failing because a client began sending a hint in a shape nobody
+//! quoted. The one strict reading of a header here — the `x-codex-window-id`
+//! 422 — is [`CodexHeaders::read`](crate::CodexHeaders::read)'s and runs
+//! before this.
 //!
-//! **Each surface reads its own client's headers.** A Codex header on the
-//! Messages surface, or a Claude hint on the Responses surface, is a request no
-//! shipped client sends; reading it anyway would let one client's header
-//! classify another client's lineage.
+//! **Each client's headers are read by its own function.** A Codex header on
+//! the Messages surface, or a Claude hint on the Responses surface, is a
+//! request no shipped client sends; reading it anyway would let one client's
+//! header classify another client's lineage. Two functions rather than one
+//! over both make that the caller's choice of call, not a branch here.
 
 use http::HeaderMap;
 use roundhouse_core::item::{Item, ItemContent, Role};
+use roundhouse_core::sequence::CompactionKind;
 use serde_json::Value;
 
-use crate::{RequestView, Surface};
+use crate::ascii_header;
+use crate::label::CODEX_WINDOW_HEADER;
 
-const CODEX_WINDOW_HEADER: &str = "x-codex-window-id";
 const CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const CLAUDE_COMPACTION_HEADER: &str = "x-claude-code-compaction";
 const CLAUDE_CONTEXT_COMPACTED_HEADER: &str = "x-claude-code-context-compacted";
@@ -68,15 +71,6 @@ pub struct CodexWindow {
     pub number: u64,
 }
 
-/// How a compaction was started, in the client's own words.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CompactionKind {
-    Auto,
-    Manual,
-    Reactive,
-}
-
 /// What this one request is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestPurpose {
@@ -111,29 +105,34 @@ pub enum ContentMarker {
     CodexSummaryRequest,
 }
 
-/// The client's signals about its own context. Never fails.
-pub fn client_signals(view: &RequestView<'_>) -> ClientSignals {
-    let headers = view.headers;
-    let session_final = header(headers, SESSION_FINAL_HEADER) == Some("true");
-    match view.surface {
-        Surface::OpenAiResponses => ClientSignals {
-            window: header(headers, CODEX_WINDOW_HEADER).and_then(codex_window),
-            purpose: header(headers, CODEX_TURN_METADATA_HEADER)
-                .map_or(RequestPurpose::Turn, codex_purpose),
-            context_compacted: None,
-            session_final,
+/// Claude Code's signals about its own context. Never fails.
+pub fn claude_signals(headers: &HeaderMap) -> ClientSignals {
+    ClientSignals {
+        window: None,
+        purpose: match ascii_header(headers, CLAUDE_COMPACTION_HEADER).and_then(compaction_kind) {
+            Some(kind) => RequestPurpose::Compaction(Some(kind)),
+            None => RequestPurpose::Turn,
         },
-        Surface::AnthropicMessages => ClientSignals {
-            window: None,
-            purpose: match header(headers, CLAUDE_COMPACTION_HEADER).and_then(compaction_kind) {
-                Some(kind) => RequestPurpose::Compaction(Some(kind)),
-                None => RequestPurpose::Turn,
-            },
-            context_compacted: header(headers, CLAUDE_CONTEXT_COMPACTED_HEADER)
-                .and_then(compaction_kind),
-            session_final,
-        },
+        context_compacted: ascii_header(headers, CLAUDE_CONTEXT_COMPACTED_HEADER)
+            .and_then(compaction_kind),
+        session_final: session_final(headers),
     }
+}
+
+/// Codex's signals about its own context. Never fails.
+pub fn codex_signals(headers: &HeaderMap) -> ClientSignals {
+    ClientSignals {
+        window: ascii_header(headers, CODEX_WINDOW_HEADER).and_then(codex_window),
+        purpose: ascii_header(headers, CODEX_TURN_METADATA_HEADER)
+            .map_or(RequestPurpose::Turn, codex_purpose),
+        context_compacted: None,
+        session_final: session_final(headers),
+    }
+}
+
+/// `x-dynamo-session-final: true`, the literal, from either client.
+fn session_final(headers: &HeaderMap) -> bool {
+    ascii_header(headers, SESSION_FINAL_HEADER) == Some("true")
 }
 
 /// Which compaction sentence this item starts with, if any.
@@ -211,8 +210,4 @@ fn compaction_kind(value: &str) -> Option<CompactionKind> {
         "reactive" => Some(CompactionKind::Reactive),
         _ => None,
     }
-}
-
-fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
 }

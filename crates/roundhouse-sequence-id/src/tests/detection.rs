@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use http::HeaderMap;
 use roundhouse_core::item::{Item, ItemContent, Role};
 
-use super::fixtures::{BODIES, body, canonical, header_sets, version_of};
+use super::fixtures::header_sets;
 use super::labels::headers;
 use crate::{
-    AttributionBlock, Client, Confidence, Detection, RequestView, Surface, attribution_block,
-    detect_client, without_attribution_block,
+    AttributionBlock, DeclaredClient, Detection, attribution_block, detect_client,
+    without_attribution_block,
 };
 
 const EXACT: &str = "x-anthropic-billing-header: cc_version=2.1.257.1f2; cc_entrypoint=sdk-cli;";
@@ -21,15 +20,10 @@ fn developer(text: &str) -> Item {
     }
 }
 
-fn detect(headers: &HeaderMap, items: &[Item]) -> Detection {
-    detect_client(&RequestView {
-        surface: Surface::AnthropicMessages,
-        headers,
-        items,
-        tools: None,
-        metadata_user_id: None,
-        prompt_cache_key: None,
-    })
+/// What the headers alone declare: a request whose prompt carries no
+/// attribution block, so nothing can be exact.
+fn detect(pairs: &[(&'static str, &str)]) -> Detection {
+    detect_client(&headers(pairs), &[Item::user_text("hi")])
 }
 
 #[test]
@@ -78,29 +72,6 @@ fn the_attribution_block_is_detected_only_on_exact_match() {
 }
 
 #[test]
-fn claude_code_is_detected_exactly_from_the_fixtures() {
-    let sets = header_sets();
-    for (name, _) in BODIES {
-        let items = canonical(&body(name));
-        let exact = Detection {
-            client: Client::ClaudeCode {
-                version: Some(version_of(name).to_owned()),
-            },
-            confidence: Confidence::Exact,
-        };
-        assert_eq!(detect(&HeaderMap::new(), &items), exact, "{name}");
-        // Headers only declare, so they never outrank the block — not even
-        // when the capture is of another version.
-        for (set, headers) in &sets {
-            assert_eq!(detect(headers, &items), exact, "{name} with {set}");
-        }
-        let block = attribution_block(&items).expect(name);
-        assert_eq!(block.entrypoint, "sdk-cli");
-        assert_eq!(block.fingerprint.len(), 3);
-    }
-}
-
-#[test]
 fn a_user_agent_alone_is_declared_not_exact() {
     let no_block = [Item::user_text("hi")];
     for (set, captured) in header_sets() {
@@ -109,38 +80,26 @@ fn a_user_agent_alone_is_declared_not_exact() {
             .and_then(|rest| rest.split('-').next())
             .unwrap();
         assert_eq!(
-            detect(&captured, &no_block),
-            Detection {
-                client: Client::ClaudeCode {
-                    version: Some(version.to_owned()),
-                },
-                confidence: Confidence::Declared,
-            },
+            detect_client(&captured, &no_block),
+            Detection::Declared(DeclaredClient::ClaudeCode {
+                version: Some(version.to_owned()),
+            }),
             "{set}"
         );
     }
-    let declared = |pairs: &[(&'static str, &str)]| detect(&headers(pairs), &no_block);
+    let declared = detect;
     assert_eq!(
         declared(&[("x-app", "cli")]),
-        Detection {
-            client: Client::ClaudeCode { version: None },
-            confidence: Confidence::Declared,
-        }
+        Detection::Declared(DeclaredClient::ClaudeCode { version: None })
     );
-    let codex = Detection {
-        client: Client::Codex,
-        confidence: Confidence::Declared,
-    };
+    let codex = Detection::Declared(DeclaredClient::Codex);
     assert_eq!(declared(&[("originator", "codex_cli_rs")]), codex);
     assert_eq!(
         declared(&[("user-agent", "codex_cli_rs/0.146.0 (Linux)")]),
         codex
     );
     assert_eq!(declared(&[("x-codex-window-id", "t:0")]), codex);
-    let nothing = Detection {
-        client: Client::Unknown,
-        confidence: Confidence::NoSignal,
-    };
+    let nothing = Detection::NoSignal;
     assert_eq!(declared(&[]), nothing);
     assert_eq!(declared(&[("user-agent", "curl/8.0")]), nothing);
     // Two declarations naming different clients cancel rather than pick.
@@ -153,19 +112,53 @@ fn a_user_agent_alone_is_declared_not_exact() {
     );
 }
 
+/// Mutation 12f: `all_of(part, is_digit)` -> `part.bytes().all(is_digit)`
+/// lets an empty version component through.
 #[test]
-fn stripping_the_attribution_block_removes_item_zero_only() {
-    for (name, _) in BODIES {
-        let items = canonical(&body(name));
-        let stripped = without_attribution_block(&items);
-        assert_eq!(stripped, &items[1..], "{name}");
-        assert_eq!(attribution_block(stripped), None, "{name}: stripped twice");
+fn an_empty_version_component_is_not_an_attribution_block() {
+    for version in ["2..257", ".1.257", "2.1.", "2.1..1f2"] {
+        let text =
+            format!("x-anthropic-billing-header: cc_version={version}.1f2; cc_entrypoint=sdk-cli;");
+        let item = Item {
+            role: Role::Developer,
+            content: ItemContent::Text { text: text.clone() },
+            response_id: None,
+        };
+        assert_eq!(attribution_block(&[item]), None, "{text:?}");
     }
-    // Not exact: the same slice back, every item kept.
-    let near = [
-        developer(&EXACT.replace("1f2", "1F2")),
-        Item::user_text("hi"),
-    ];
-    assert_eq!(without_attribution_block(&near), &near[..]);
-    assert!(without_attribution_block(&[]).is_empty());
+}
+
+/// Mutations 13e, 13g, 13h: `x-app` is `cli` exactly, an empty `claude-cli/`
+/// version is no version, and an `originator` must start `codex_`.
+#[test]
+fn a_declaration_must_match_its_literal() {
+    let nothing = Detection::NoSignal;
+    assert_eq!(detect(&[("x-app", "web")]), nothing);
+    assert_eq!(detect(&[("x-app", "")]), nothing);
+    assert_eq!(detect(&[("originator", "acme_cli")]), nothing);
+    assert_eq!(detect(&[("originator", "codex")]), nothing);
+    let versionless = Detection::Declared(DeclaredClient::ClaudeCode { version: None });
+    assert_eq!(detect(&[("user-agent", "claude-cli/")]), versionless);
+    assert_eq!(
+        detect(&[("user-agent", "claude-cli/ (external)")]),
+        versionless
+    );
+}
+
+/// **The block outranks every header**, because it is the client's own
+/// per-request fingerprint and a header is only a claim — so a Codex
+/// `originator` beside a Claude Code block is still exactly Claude Code, and
+/// only the exact case strips item 0.
+#[test]
+fn an_exact_block_outranks_a_declared_header_and_alone_is_stripped() {
+    let items = [developer(EXACT), Item::user_text("hi")];
+    assert_eq!(
+        detect_client(&headers(&[("originator", "codex_cli_rs")]), &items),
+        Detection::Exact {
+            version: "2.1.257".into()
+        }
+    );
+    assert_eq!(without_attribution_block(&items), &items[1..]);
+    let unblocked = [developer("You are Claude Code."), Item::user_text("hi")];
+    assert_eq!(without_attribution_block(&unblocked), &unblocked[..]);
 }

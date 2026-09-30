@@ -42,6 +42,7 @@
 //! This is a unit test inside the crate, not an integration test, because
 //! `RequestContext::from_request` and `conversation_key` are `pub(crate)`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
@@ -53,7 +54,7 @@ use serde_json::Value;
 use super::RequestContext;
 use crate::http::ApiError;
 use crate::messages_api::claimed_label;
-use crate::messages_api::wire::{CreateMessageParams, canonicalize};
+use crate::messages_api::wire::CreateMessageParams;
 
 const BLESS_ENV: &str = "ROUNDHOUSE_BLESS_GOLDEN_LABELS";
 
@@ -193,7 +194,7 @@ fn messages_cases() -> Vec<MessageCase> {
         for (headers_id, headers) in std::iter::once(&anonymous).chain(&sets) {
             cases.push(MessageCase {
                 id: format!("messages/{body_id}/{headers_id}"),
-                label: messages_label(headers, &params),
+                label: handler_label(headers, &params),
             });
         }
     }
@@ -209,7 +210,7 @@ fn messages_cases() -> Vec<MessageCase> {
     );
     cases.push(MessageCase {
         id: format!("messages/{body_id}-without-metadata/no-headers"),
-        label: messages_label(
+        label: handler_label(
             &HeaderMap::new(),
             &serde_json::from_value(anonymous_body).expect("a Messages body"),
         ),
@@ -217,15 +218,9 @@ fn messages_cases() -> Vec<MessageCase> {
     cases
 }
 
-/// The handler's label for one request, over the items the handler would hold.
-///
-/// The items are canonicalized rather than left empty so the view is the one
-/// the handler builds: no rung reads them today, and a derivation that started
-/// to would be pinned by this file instead of passing because the test fed it
-/// nothing.
-fn messages_label(headers: &HeaderMap, params: &CreateMessageParams) -> Option<String> {
-    let items = canonicalize(params).expect("a captured Messages body canonicalizes");
-    claimed_label(headers, params, &items).expect("a Messages request is never refused a label")
+/// The handler's label for one request, through the handler's own glue.
+fn handler_label(headers: &HeaderMap, params: &CreateMessageParams) -> Option<String> {
+    claimed_label(headers, params)
 }
 
 /// One Responses request: raw header bytes (so a non-ASCII value can be built)
@@ -415,6 +410,39 @@ async fn capture() -> Golden {
     golden
 }
 
+/// The cases that differ between the golden file and the derivation now, keyed
+/// by case id.
+///
+/// **By id, not by position.** The first version zipped the two lists, which
+/// reads every case after an insertion or a removal as changed: adding one
+/// Responses case would report the whole tail of the matrix as a moved label,
+/// burying the one real difference under a screenful of false ones and
+/// teaching the reader to re-bless without looking — the one habit this file
+/// exists to prevent. Added, removed and changed are separate findings because
+/// they mean different things: a removed id is coverage that quietly shrank, an
+/// added id is coverage not yet blessed, and only a changed one is a label that
+/// moved.
+fn diff_by_id<'a, T: PartialEq + std::fmt::Debug + 'a>(
+    golden: impl IntoIterator<Item = (&'a str, &'a T)>,
+    current: impl IntoIterator<Item = (&'a str, &'a T)>,
+) -> Vec<String> {
+    let golden: BTreeMap<&str, &T> = golden.into_iter().collect();
+    let current: BTreeMap<&str, &T> = current.into_iter().collect();
+    let mut differences = Vec::new();
+    for id in golden.keys().filter(|id| !current.contains_key(*id)) {
+        differences.push(format!("{id}\n  removed: golden has it, now does not"));
+    }
+    for id in current.keys().filter(|id| !golden.contains_key(*id)) {
+        differences.push(format!("{id}\n  added: now has it, golden does not"));
+    }
+    for (id, was) in &golden {
+        if let Some(now) = current.get(id).filter(|now| *now != was) {
+            differences.push(format!("{id}\n  golden {was:?}\n  now    {now:?}"));
+        }
+    }
+    differences
+}
+
 #[tokio::test]
 async fn every_label_matches_the_golden_capture() {
     let current = capture().await;
@@ -448,19 +476,80 @@ async fn every_label_matches_the_golden_capture() {
             current.responses.len()
         ));
     }
-    for (was, now) in golden.messages.iter().zip(&current.messages) {
-        if was != now {
-            differences.push(format!("{}\n  golden {was:?}\n  now    {now:?}", now.id));
-        }
-    }
-    for (was, now) in golden.responses.iter().zip(&current.responses) {
-        if was != now {
-            differences.push(format!("{}\n  golden {was:?}\n  now    {now:?}", now.id));
-        }
-    }
+    differences.extend(diff_by_id(
+        golden.messages.iter().map(|case| (case.id.as_str(), case)),
+        current.messages.iter().map(|case| (case.id.as_str(), case)),
+    ));
+    differences.extend(diff_by_id(
+        golden.responses.iter().map(|case| (case.id.as_str(), case)),
+        current
+            .responses
+            .iter()
+            .map(|case| (case.id.as_str(), case)),
+    ));
     assert!(
         differences.is_empty(),
         "a label moved; if that was the point, re-bless with {BLESS_ENV}=1:\n{}",
         differences.join("\n")
     );
+}
+
+/// Removing one case from the middle names that case and nothing else. Under
+/// the positional zip this reported every later case as changed, so the
+/// assertion is on the exact list, not on its being non-empty.
+#[test]
+fn a_removed_case_is_reported_by_id_and_does_not_cascade() {
+    fn by_id(cases: &[MessageCase]) -> Vec<(&str, &MessageCase)> {
+        cases.iter().map(|case| (case.id.as_str(), case)).collect()
+    }
+
+    let case = |id: &str, label: &str| MessageCase {
+        id: id.to_owned(),
+        label: Some(label.to_owned()),
+    };
+    let golden = [
+        case("a", "1"),
+        case("b", "2"),
+        case("c", "3"),
+        case("d", "4"),
+    ];
+
+    let without_b = [case("a", "1"), case("c", "3"), case("d", "4")];
+    let differences = diff_by_id(by_id(&golden), by_id(&without_b));
+    assert_eq!(differences.len(), 1, "{differences:#?}");
+    assert!(
+        differences[0].starts_with("b\n  removed"),
+        "{differences:#?}"
+    );
+
+    let with_new = [
+        case("a", "1"),
+        case("b", "2"),
+        case("b2", "9"),
+        case("c", "3"),
+        case("d", "4"),
+    ];
+    let differences = diff_by_id(by_id(&golden), by_id(&with_new));
+    assert_eq!(differences.len(), 1, "{differences:#?}");
+    assert!(
+        differences[0].starts_with("b2\n  added"),
+        "{differences:#?}"
+    );
+
+    let moved = [
+        case("a", "1"),
+        case("b", "2"),
+        case("c", "X"),
+        case("d", "4"),
+    ];
+    let differences = diff_by_id(by_id(&golden), by_id(&moved));
+    assert_eq!(differences.len(), 1, "{differences:#?}");
+    assert!(
+        differences[0].starts_with("c\n  golden"),
+        "{differences:#?}"
+    );
+
+    // Control: identical lists differ nowhere, so the three findings above are
+    // the edits and not noise in the comparison.
+    assert!(diff_by_id(by_id(&golden), by_id(&golden)).is_empty());
 }

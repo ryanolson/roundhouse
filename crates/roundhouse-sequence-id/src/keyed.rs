@@ -30,6 +30,7 @@
 use hmac::{Hmac, Mac};
 use roundhouse_core::item::chain::{Chain, ChainValue};
 use roundhouse_core::item::{Item, Role};
+use roundhouse_core::sequence::{Anchor, SequenceDigest, TipKey};
 use sha2::{Digest, Sha256};
 
 use crate::Surface;
@@ -59,14 +60,6 @@ pub fn tools_digest(tools: Option<&serde_json::Value>) -> ToolsDigest {
         Some(tools) => ToolsDigest(Sha256::digest(tools.to_string().as_bytes()).into()),
     }
 }
-
-/// `L_i`: the stored key of one chain link, for one principal and one tool set.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TipKey(pub [u8; 16]);
-
-/// A KV lineage family. A fork that resends a lineage's prompt shares it.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct Anchor(pub [u8; 16]);
 
 /// Keys chain links for one principal: holds `k_P`, never `K`.
 #[derive(Clone)]
@@ -118,25 +111,10 @@ pub struct SequenceKey<'a> {
     /// `Open` mode.
     pub namespace: &'a str,
     pub surface: Surface,
-    /// The unqualified label, as [`label`](crate::label) returns it.
+    /// The unqualified label, as [`messages_label`](crate::messages_label) or
+    /// [`CodexHeaders::label`](crate::CodexHeaders::label) returns it.
     pub label: &'a str,
     pub generation: u32,
-}
-
-/// `S`, sent as `x-dynamo-session-id`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct SequenceDigest(pub [u8; 16]);
-
-impl SequenceDigest {
-    /// All 32 hex characters: the header value.
-    pub fn to_hex(&self) -> String {
-        hex(&self.0)
-    }
-
-    /// The first 8 hex characters: the most a log line may carry (§3.8).
-    pub fn short(&self) -> String {
-        hex(&self.0[..4])
-    }
 }
 
 /// Digests sequence keys and invalidations under the deployment secret `K`.
@@ -187,24 +165,23 @@ impl SequenceDigester {
 ///
 /// A one-way function of one link, so it cannot be extended to later links,
 /// and unkeyed, so it works without a secret as the fingerprint it replaces
-/// does. `chain` is the chain of `items`; if it is shorter than the position
-/// it needs, the link is computed from `items` rather than guessed, because a
-/// fingerprint of the wrong prefix is a cache hint that silently points at
-/// another conversation's prefix.
-pub fn prefix_fingerprint(chain: &Chain, items: &[Item]) -> String {
+/// does. It takes the items alone and chains the prefix it needs itself: a
+/// caller-supplied chain would be a second source of truth for the same
+/// prefix, and a fingerprint of the wrong one is a cache hint that silently
+/// points at another conversation's prefix.
+pub fn prefix_fingerprint(items: &[Item]) -> String {
     let mut hash = Sha256::new();
     hash.update(CACHE_HINT_DOMAIN);
-    let through = items
-        .iter()
-        .position(|item| item.role == Role::User)
-        .or_else(|| items.len().checked_sub(1));
-    if let Some(index) = through {
-        match chain.link(index) {
-            Some(link) => hash.update(link.as_bytes()),
-            None => hash.update(Chain::over(&items[..=index]).links()[index].as_bytes()),
-        }
+    let prefix = match items.iter().position(|item| item.role == Role::User) {
+        Some(first_user) => &items[..=first_user],
+        None => items,
+    };
+    // The prefix's last link commits to all of it; an empty prompt has none
+    // and fingerprints as the domain alone.
+    if let Some(link) = Chain::over(prefix).links().last() {
+        hash.update(link.as_bytes());
     }
-    hex(&hash.finalize())
+    hex::encode(hash.finalize())
 }
 
 fn keyed(key: &[u8]) -> HmacSha256 {
@@ -222,14 +199,4 @@ fn length_prefixed(mac: &mut HmacSha256, field: &[u8]) {
     let len = u32::try_from(field.len()).expect("a sequence key field is shorter than 4 GiB");
     mac.update(&len.to_be_bytes());
     mac.update(field);
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        })
 }

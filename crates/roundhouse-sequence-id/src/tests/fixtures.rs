@@ -1,19 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Claude Code captures, as canonical items and header maps.
+//! The Claude Code captures, as raw bodies and header maps.
 //!
-//! **The canonicalizer here is a test copy of the server's
-//! `messages_api::wire::canonicalize`**, reduced to what the captures hold, and
-//! that is a deliberate cost: the crate cannot depend on the server that
-//! depends on it. The copy keeps the three rules that decide where a chain
-//! breaks — one item per block, the ephemeral budget notice dropped, the
-//! leading system run marked `Developer` — and
-//! `claude_fixture_divergence_is_pinned` would disagree with the evidence
-//! document's measured positions if any of the three drifted.
+//! **There is no canonicalizer here, on purpose.** A test copy of the server's
+//! `messages_api::wire::canonicalize` used to live in this file, and the tests
+//! built on it pinned the copy: making the production `is_budget_notice` return
+//! `false` left them all green. Everything that needs a fixture *as items*
+//! lives in `roundhouse-server/tests/sequence_identity_fixtures.rs`, which
+//! calls the real one; what stays here reads only the raw JSON or the headers.
 
 use http::{HeaderMap, HeaderName, HeaderValue};
-use roundhouse_core::item::{Item, ItemContent, Role};
 use serde_json::Value;
 
 macro_rules! fixture {
@@ -56,13 +53,6 @@ pub fn body(name: &str) -> Value {
     serde_json::from_str(raw).expect("fixture parses")
 }
 
-/// The client version a fixture's file name carries.
-pub fn version_of(name: &str) -> &str {
-    name.strip_prefix("claude-")
-        .and_then(|rest| rest.split('-').next())
-        .expect("fixture names start claude-<version>-")
-}
-
 pub fn user_id(body: &Value) -> Option<&str> {
     body.get("metadata")?.get("user_id")?.as_str()
 }
@@ -85,97 +75,4 @@ pub fn header_sets() -> Vec<(String, HeaderMap)> {
         }
     }
     sets
-}
-
-pub fn canonical(body: &Value) -> Vec<Item> {
-    let mut items = Vec::new();
-    match body.get("system") {
-        Some(Value::String(text)) if !text.is_empty() => items.push(Item::system_text(text)),
-        Some(Value::Array(blocks)) => {
-            items.extend(blocks.iter().map(|block| block_item(Role::System, block)))
-        }
-        _ => {}
-    }
-    for message in body["messages"].as_array().expect("messages") {
-        let role = match message["role"].as_str() {
-            Some("user") => Role::User,
-            Some("assistant") => Role::Assistant,
-            Some("system") => Role::System,
-            other => panic!("role {other:?} in a fixture"),
-        };
-        if role == Role::System && is_budget_notice(&message["content"]) {
-            continue;
-        }
-        match &message["content"] {
-            Value::String(text) => items.push(Item {
-                role,
-                content: ItemContent::Text { text: text.clone() },
-                response_id: None,
-            }),
-            Value::Array(blocks) => {
-                items.extend(blocks.iter().map(|block| block_item(role, block)))
-            }
-            other => panic!("content {other} in a fixture"),
-        }
-    }
-    for item in &mut items {
-        if item.role != Role::System {
-            break;
-        }
-        item.role = Role::Developer;
-    }
-    items
-}
-
-fn is_budget_notice(content: &Value) -> bool {
-    let text = match content {
-        Value::String(text) => text.as_str(),
-        Value::Array(blocks) if blocks.len() == 1 && blocks[0]["type"] == "text" => {
-            blocks[0]["text"].as_str().unwrap_or_default()
-        }
-        _ => return false,
-    };
-    text.trim()
-        .strip_prefix("<total_tokens>")
-        .and_then(|rest| rest.strip_suffix("</total_tokens>"))
-        .is_some_and(|inner| !inner.contains('<'))
-}
-
-fn block_item(role: Role, block: &Value) -> Item {
-    let text = |field: &str| block[field].as_str().expect("string field").to_owned();
-    let (role, content) = match block["type"].as_str().expect("typed block") {
-        "text" => (role, ItemContent::Text { text: text("text") }),
-        "tool_use" => (
-            Role::Assistant,
-            ItemContent::ToolCall {
-                call_id: text("id"),
-                name: text("name"),
-                arguments: block["input"].to_string(),
-                namespace: None,
-            },
-        ),
-        "tool_result" => (
-            Role::Tool,
-            ItemContent::ToolResult {
-                call_id: text("tool_use_id"),
-                output: match block.get("content") {
-                    Some(Value::String(text)) => text.clone(),
-                    None | Some(Value::Null) => String::new(),
-                    Some(other) => other.to_string(),
-                },
-            },
-        ),
-        other => (
-            role,
-            ItemContent::Opaque {
-                block_type: other.to_owned(),
-                block: block.clone(),
-            },
-        ),
-    };
-    Item {
-        role,
-        content,
-        response_id: None,
-    }
 }

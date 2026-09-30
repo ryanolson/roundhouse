@@ -6,9 +6,9 @@
 //! Pure translation, no state, mirroring
 //! [`responses_api::wire`](crate::responses_api): what a request's JSON means
 //! as canonical [`Item`]s. Which session it names is not decided here: that is
-//! `roundhouse_sequence_id::label`, one derivation for both surfaces, so the
-//! Messages rungs and the Responses rungs cannot drift apart in two modules
-//! that each thought the other's spelling was a detail. The endpoint and its
+//! `roundhouse_sequence_id::messages_label`, beside the Responses reader in one
+//! crate, so the two surfaces' rungs cannot drift apart in two modules that
+//! each thought the other's spelling was a detail. The endpoint and its
 //! follower live in the parent module; the frames going the other way live in
 //! [`emit`](super::emit).
 //!
@@ -133,6 +133,17 @@ pub struct CreateMessageParams {
     /// does not read.
     #[serde(default)]
     pub tool_choice: Option<Value>,
+}
+
+impl CreateMessageParams {
+    /// `metadata.user_id`, the Messages label's second rung.
+    ///
+    /// One spelling of the path, so the handler and the suites that assert
+    /// what it names read the same field rather than each hand-writing the
+    /// `Option` chain and one of them drifting to another field.
+    pub fn user_id(&self) -> Option<&str> {
+        self.metadata.as_ref()?.user_id.as_deref()
+    }
 }
 
 /// One turn of the resent conversation.

@@ -3,12 +3,19 @@
 
 //! What the unkeyed chain costs next to the tokenization it rides beside.
 //!
-//! The chain is extended in the context assembler from the render it already
-//! computes, once per item, on every turn — the same loop that encodes each
-//! render into token ids. The plan's claim is that the chain is noise against
-//! that encode; this measures it on real Claude Code bodies with a real BPE
-//! vocabulary, per 100 KiB of rendered text, so the claim is a number rather
-//! than an intuition about SHA-256 being fast.
+//! **Nothing in production extends the chain yet.** The plan wires it in at M3:
+//! the chain will be extended in the context assembler from the render it
+//! already computes, once per item, on every turn — the same loop that encodes
+//! each render into token ids. The plan's claim is that the chain will be noise
+//! against that encode; this measures the chain against the encode it will sit
+//! beside, on real Claude Code bodies with a real BPE vocabulary, per 100 KiB of
+//! rendered text, so the claim is a number rather than an intuition about
+//! SHA-256 being fast — and is a number before the wiring exists, when a
+//! surprising answer still costs a design change rather than a revert.
+//!
+//! It lives under `tokenizer` as a lib unit test because that puts it beside the
+//! `HfTokenizer` it measures against, and because an integration test would be
+//! another binary to link for one ignored timing.
 //!
 //! An `#[ignore]` test rather than a criterion bench because the workspace has
 //! no bench harness and one timing is not worth adding it for. Run it with

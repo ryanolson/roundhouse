@@ -101,6 +101,25 @@ string_id!(
 /// It lives here rather than beside either reader because both, and the
 /// `roundhouse-sequence-id` crate that scopes labels, already depend on core
 /// and on nothing else they share.
+///
+/// **Cross-dialect continuation is not a feature** (M11.1 review, F6). A
+/// Messages client names its conversation with a header or a `metadata.user_id`
+/// and a Responses client names its own with `prompt_cache_key`; both are
+/// arbitrary client-chosen strings, and the server's `ControlPlane::qualify`
+/// puts them in one namespace per principal. Two clients of one principal that
+/// happen to choose the same string are then not two conversations but one
+/// contested one — and since their histories were never going to agree, *every*
+/// alternating turn looks like an edited resend and forks, dropping the control
+/// store's overlay, intent, steer and binding records for the generation it
+/// leaves behind each time.
+///
+/// A prefix rather than a second namespace argument on `qualify`, because this
+/// is a fact about *this dialect's* names and not about the principal: the
+/// Responses surface's keys are unchanged, so no session minted before this
+/// existed moves. The shared `turn_id_for` deliberately stays shared — a turn
+/// id is a content hash and two dialects hashing one conversation differently
+/// would each be idempotent alone and neither across a chained deployment that
+/// serves one and dispatches the other.
 pub const MESSAGES_DIALECT_NAMESPACE: &str = "anthropic_messages";
 
 #[cfg(test)]
