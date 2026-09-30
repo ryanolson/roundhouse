@@ -106,7 +106,7 @@ fn ab_spec(served_a: bool) -> Spec {
         .priced(Strategy::Efficient, 0.005)
         .propensity(0.5);
     let exploration = |rate: f64| ExplorationEvidence {
-        on_infeasible: OnInfeasible::ServeRules,
+        on_infeasible: Some(OnInfeasible::ServeRules),
         draw: Draw { rate, member: 0 },
         possible: true,
         set: vec![Strategy::Efficient, Strategy::Rules],
@@ -271,7 +271,7 @@ fn replay_equivalence_fails_on_a_changed_draw() {
                 member: 0,
             })
             .exploration(ExplorationEvidence {
-                on_infeasible: OnInfeasible::ServeRules,
+                on_infeasible: Some(OnInfeasible::ServeRules),
                 draw: Draw {
                     rate: 0.01,
                     member: draw_member,
@@ -486,7 +486,7 @@ fn intervals_are_excluded_by_cause_and_the_counts_are_reported() {
     // Three matched turns whose propensities multiply to below the smallest
     // float: the weight of a candidate that matched them is not finite.
     let exploration = ExplorationEvidence {
-        on_infeasible: OnInfeasible::ServeRules,
+        on_infeasible: Some(OnInfeasible::ServeRules),
         draw: Draw {
             rate: 0.9,
             member: 0,

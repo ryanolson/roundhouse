@@ -420,10 +420,11 @@ pub(super) fn learned(decision: &DecisionRecord) -> Option<&LearnedEvidence> {
 ///   names the chosen strategy;
 /// - the recorded set is the set [`eligible`] derives from the recorded
 ///   plans and `on_infeasible` when the turn could explore, and empty when
-///   it could not. A
-///   record written under another set rule (before `rules` joined the set on
-///   2026-09-30, say) logged its turn under probabilities this build's
-///   policy would not assign, so it does not replay.
+///   it could not. A record written under another set rule (before `rules`
+///   joined the set on 2026-09-30, say) logged its turn under probabilities
+///   this build's policy would not assign, so it does not replay. Neither
+///   does a record without `on_infeasible`: its set rule is unknown, so its
+///   set cannot be re-derived.
 ///
 /// **The exploration rate is not recorded**, so a rate draw on its own cannot
 /// be re-checked; what the record pins exactly is what is checked. A turn
@@ -438,8 +439,11 @@ pub fn replays(evidence: &LearnedEvidence, decision: &DecisionRecord) -> bool {
         return false;
     }
     if let Some(exploration) = &evidence.exploration {
+        let Some(on_infeasible) = exploration.on_infeasible else {
+            return false;
+        };
         let rule = if exploration.possible {
-            eligible(&evidence.plans, exploration.on_infeasible)
+            eligible(&evidence.plans, on_infeasible)
         } else {
             Vec::new()
         };

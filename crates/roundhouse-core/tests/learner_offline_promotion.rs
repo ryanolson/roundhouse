@@ -458,7 +458,7 @@ fn live_turn(explored: bool) -> Spec {
         .priced(Strategy::Efficient, 0.005)
         .propensity(0.5);
     let exploration = |rate: f64| ExplorationEvidence {
-        on_infeasible: OnInfeasible::ServeRules,
+        on_infeasible: Some(OnInfeasible::ServeRules),
         draw: Draw { rate, member: 0 },
         possible: true,
         set: vec![Strategy::Efficient, Strategy::Rules],
@@ -661,7 +661,7 @@ const LIVE_RATE: f64 = 0.05;
 fn diverging_live_turn(explored: bool, set: Vec<Strategy>) -> Spec {
     let spec = Spec::new().live().passing(Strategy::Efficient, 0.005);
     let exploration = |rate: f64| ExplorationEvidence {
-        on_infeasible: OnInfeasible::ServeRules,
+        on_infeasible: Some(OnInfeasible::ServeRules),
         draw: Draw { rate, member: 0 },
         possible: true,
         set: set.clone(),
@@ -840,7 +840,7 @@ fn nothing_passes_explored(on_infeasible: OnInfeasible, set: Vec<Strategy>) -> S
             member: 0,
         })
         .exploration(ExplorationEvidence {
-            on_infeasible,
+            on_infeasible: Some(on_infeasible),
             draw: Draw {
                 rate: 0.0,
                 member: 0,

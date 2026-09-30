@@ -691,7 +691,7 @@ fn a_refuse_turn_nothing_passes_never_explores_rules() {
     let record = evidence(&explored_member);
     let exploration = record.exploration.as_ref().unwrap();
     assert_eq!(exploration.set, vec![Strategy::Efficient]);
-    assert_eq!(exploration.on_infeasible, OnInfeasible::Refuse);
+    assert_eq!(exploration.on_infeasible, Some(OnInfeasible::Refuse));
     assert!(close(record.propensity, RATE), "{}", record.propensity);
 
     let serve = rig.chosen(&Turn::new(

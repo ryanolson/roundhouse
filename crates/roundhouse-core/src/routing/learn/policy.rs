@@ -36,7 +36,7 @@ use super::evidence::{
     Draw, ExplorationEvidence, GateEvidence, GateResult, GrantCheck, LearnedChoice,
     LearnedEvidence, LearnedEvidenceParts, PlanEvidence, ReadFailure, ReadView, StoreRead, Unmet,
 };
-use super::explore::{eligible, propensity};
+use super::explore::{eligible, has_default, propensity};
 use super::gate::read_gate;
 use super::input::LearnedInput;
 use super::{
@@ -238,7 +238,8 @@ impl LearnedPolicy {
         // explore and something is eligible, so the draw and the propensity
         // read one guard. The set holds `rules` whenever its plan meets every
         // hard constraint, so a turn with no cheaper unproven member can
-        // still explore it.
+        // still explore it, except under `refuse` when nothing passes: that
+        // turn is refused, not served `rules` by exploration.
         let rate = terms.exploration.map(|exploration| exploration.rate);
         let possible = mode == ActiveMode::Live
             && turn.arm.is_some_and(Arm::consults_judge)
@@ -271,11 +272,11 @@ impl LearnedPolicy {
         let route = route(mode, &choice, terms.on_infeasible, &plans, &order, &rules)?;
 
         let propensity = arena.as_ref().map_or(1.0, |(rate, set)| {
-            let default = match order.first() {
-                Some(&exploit) => Some(&plans[exploit].first),
-                None if terms.on_infeasible == OnInfeasible::ServeRules => Some(&rules.target),
-                None => None,
-            };
+            let default = has_default(!order.is_empty(), terms.on_infeasible).then(|| {
+                order
+                    .first()
+                    .map_or(&rules.target, |&exploit| &plans[exploit].first)
+            });
             propensity(&plans, set, &route.target, default, *rate)
         });
 
@@ -292,7 +293,7 @@ impl LearnedPolicy {
             exploration: rate.map(|_| ExplorationEvidence {
                 draw: turn.draw,
                 possible,
-                on_infeasible: terms.on_infeasible,
+                on_infeasible: Some(terms.on_infeasible),
                 set: arena.map(|(_, set)| set).unwrap_or_default(),
             }),
             propensity,

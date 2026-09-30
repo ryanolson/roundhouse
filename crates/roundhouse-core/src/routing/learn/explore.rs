@@ -71,8 +71,9 @@ impl Draw {
 /// target meets every hard constraint and it is not already a member.
 ///
 /// **The reference is the exploit plan**, the head of `policy::exploit_order`,
-/// or the `rules` plan when nothing passes. Derived here from the plans alone, so the policy that
-/// draws from the set and the calibrator that checks a record's set
+/// or the `rules` plan when nothing passes. Derived here from the plans and
+/// `on_infeasible` alone, so the policy that draws from the set and the
+/// calibrator that checks a record's set
 /// (`offline::extract::replays`) read one rule: two spellings would agree
 /// until one changed, and a record would then replay against a set no build
 /// drew from.
@@ -125,11 +126,25 @@ pub fn eligible(plans: &[PlanEvidence], on_infeasible: OnInfeasible) -> Vec<Stra
         })
         .map(|plan| plan.strategy)
         .collect();
-    let baseline = exploit.is_some() || on_infeasible == OnInfeasible::ServeRules;
-    if baseline && rules.is_some_and(PlanEvidence::meets_hard) && !set.contains(&Strategy::Rules) {
+    if has_default(exploit.is_some(), on_infeasible)
+        && rules.is_some_and(PlanEvidence::meets_hard)
+        && !set.contains(&Strategy::Rules)
+    {
         set.push(Strategy::Rules);
     }
     set
+}
+
+/// Whether a turn that does not explore still serves a route: the exploit
+/// plan's when some strategy passes, else `rules` under `serve_rules`, and
+/// none under `refuse`.
+///
+/// One predicate for both readers: [`eligible`] admits `rules` only to a turn
+/// that has one, and the policy credits the `1 - rate` share of
+/// [`propensity`] to it. Were they spelled apart, a change to one would record
+/// a set and a propensity drawn under two rules.
+pub(crate) fn has_default(some_passes: bool, on_infeasible: OnInfeasible) -> bool {
+    some_passes || on_infeasible == OnInfeasible::ServeRules
 }
 
 /// The probability that a turn which could explore over `set` served

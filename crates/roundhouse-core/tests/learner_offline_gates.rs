@@ -155,7 +155,7 @@ fn line_with<'a>(text: &'a str, needle: &str) -> &'a str {
 
 fn exploration(rate: f64, set: Vec<Strategy>) -> ExplorationEvidence {
     ExplorationEvidence {
-        on_infeasible: OnInfeasible::ServeRules,
+        on_infeasible: Some(OnInfeasible::ServeRules),
         draw: Draw { rate, member: 0 },
         possible: true,
         set,

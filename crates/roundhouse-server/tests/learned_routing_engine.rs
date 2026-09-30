@@ -564,7 +564,9 @@ async fn row_8_without_exploration_serving_produced_state_serves_the_rules_route
 /// one with probability 2^-31), and each checks its own route and
 /// probability: `rate / 2` for `small`, which only `efficient` serves, and
 /// `(1 - rate) + rate / 2` for `large`, which the `rules` member and the
-/// exploit share.
+/// exploit share. Each turn also has a `1 - rate` (about 1e-6) chance of a
+/// stay draw, which serves the exploit instead and fails the explore
+/// assertion; the two chances together are the test's flake rate.
 #[tokio::test]
 async fn an_explored_turn_records_its_draw_member_and_propensity() {
     let rig = Rig::new(RigConfig::default());
