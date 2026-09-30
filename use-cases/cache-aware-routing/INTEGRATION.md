@@ -159,6 +159,12 @@ production topology and requires zero changes. Option B is worth a research spik
 remote-cluster use case becomes common: the change is upstream in Dynamo, not in roundhouse.
 Open a dated addendum in `agent-docs/synergies/` if Option B is pursued.
 
+*2026-09-23: Dynamo itself (etcd + nats via `dev/docker-compose.yml`, `dynamo.frontend` +
+`dynamo.vllm` with `--kv-events-config` on ZMQ `:20080`) was actually installed and run
+standalone on a single-GPU box for this use case — see `GAPS.md`'s dated addendum. This
+validates the ZMQ KV-event side of Option A works as documented; it says nothing new about
+Option B, and roundhouse's own `EmbeddedFleet` was not connected to this worker.*
+
 ---
 
 ### Gap 4: `correlaries` and `quality_prior` import tooling

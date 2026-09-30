@@ -1,33 +1,49 @@
 {
   "$comment": [
-    "cache-aware-routing catalog — one frontier entry over the NVIDIA OpenAI-Responses endpoint.",
-    "PRICES BELOW ARE PLACEHOLDERS, not a quote. Replace with real published per-Mtok rates",
-    "from openrouter.ai before trusting the dashboard. quality_prior is configuration, not",
-    "measurement -- normalize a published intelligence index to 0..1 and record its snapshot date.",
+    "cache-aware-routing catalog — one frontier entry over NVIDIA's inference-api, speaking the",
+    "anthropic_messages dialect (POST {base_url}/messages, model 'aws/anthropic/bedrock-claude-",
+    "opus-4-8', Authorization: Bearer <INFERENCE_API_KEY>). Updated 2026-09-23 for the M10.1",
+    "provider-registry catalog schema: every model now needs a top-level 'providers' entry naming",
+    "its base_url, dialect routes, and auth (see examples/catalog.example.json) -- a bare",
+    "'provider': 'nvidia' with no 'providers' block, as this file had before, is refused at load.",
+    "PRICES BELOW ARE PLACEHOLDERS, not a quote, and are not sourced from any rate card for",
+    "this endpoint or model. Replace with real published per-Mtok rates from openrouter.ai",
+    "before trusting the dashboard. quality_prior (0.95) is likewise unsourced configuration,",
+    "not measurement -- normalize a published intelligence index to 0..1 and record which index",
+    "and its snapshot date here when replacing it.",
+    "cache_model is 'deterministic' (fixed TTL) rather than 'inactivity_decay' because the",
+    "anthropic_messages dialect caches only what an explicit cache_control breakpoint names -- see",
+    "examples/catalog.example.json's 'anthropic' entry for the same reasoning.",
     "The `model` field is the exact string sent on the wire as 'model'; a wrong id fails the",
-    "turn, not the boot. `provider` must match the provider name in control-plane.json.",
-    "correlaries is empty because Qwen-Coder-32B and the frontier model are too far apart in",
+    "turn, not the boot. `provider` must match a key under `providers` below.",
+    "correlaries is empty because Qwen-Coder-32B/14B and this frontier model are too far apart in",
     "capability for the default capability_band of 0.10. See PLAN.md Phase 3 for how to fix this."
   ],
+
+  "providers": {
+    "nvidia": {
+      "base_url": "https://inference-api.nvidia.com/v1",
+      "routes": { "messages": "/messages" },
+      "auth": { "env": "INFERENCE_API_KEY", "style": "bearer" }
+    }
+  },
 
   "models": [
     {
       "provider": "nvidia",
-      "model": "switchyard/openai/gpt-5.5",
-      "wire_protocol": "openai_responses",
+      "model": "aws/anthropic/bedrock-claude-opus-4-8",
+      "wire_protocol": "anthropic_messages",
       "cache_model": {
-        "kind": "inactivity_decay",
-        "half_life_ms": 300000,
-        "max_ttl_ms": 3600000,
-        "min_prefix_tokens": 1024
+        "kind": "deterministic",
+        "ttl_ms": 300000
       },
       "pricing": {
-        "input_per_mtok_usd": 1.25,
-        "cached_input_per_mtok_usd": 0.125,
-        "cache_write_per_mtok_usd": 0.0,
-        "output_per_mtok_usd": 10.0
+        "input_per_mtok_usd": 15.0,
+        "cached_input_per_mtok_usd": 1.5,
+        "cache_write_per_mtok_usd": 18.75,
+        "output_per_mtok_usd": 75.0
       },
-      "quality_prior": 0.92,
+      "quality_prior": 0.95,
       "base_ttft_ms": 350.0,
       "ttft_ms_per_uncached_token": 0.0015
     }
