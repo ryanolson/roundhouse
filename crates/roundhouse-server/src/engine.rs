@@ -927,8 +927,7 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// This gate serializes turns inside one engine before they contend for the
     /// store lease. Across engines, the lease's fencing token is the authority:
     /// every acquisition mints a new tenure and the store rejects stale handles.
-    /// Entries are never removed — bounded by the sessions this process serves,
-    /// which is acceptable for a single-process skeleton.
+    /// The last caller removes the entry, so idle sessions retain no gate.
     turn_gates: Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
     /// Fires the "this recipe routes nothing" warning at most once. (M10.2, S3)
     ///
@@ -981,6 +980,39 @@ pub struct Engine<S: SessionStore, T: Tokenizer + Clone> {
     /// [`Self::policy`] exactly as before, whatever a project's `learner` block
     /// says. See [`learning`] for what a learner turn adds.
     learner: Option<Arc<learning::RoutingLearner>>,
+}
+
+struct TurnGate<'a> {
+    gates: &'a Mutex<HashMap<SessionId, Arc<tokio::sync::Mutex<()>>>>,
+    session_id: SessionId,
+    mutex: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl std::ops::Deref for TurnGate<'_> {
+    type Target = tokio::sync::Mutex<()>;
+
+    fn deref(&self) -> &Self::Target {
+        self.mutex.as_deref().expect("live turn gate")
+    }
+}
+
+impl Drop for TurnGate<'_> {
+    fn drop(&mut self) {
+        let mut gates = self.gates.lock().expect("turn-gate map poisoned");
+        // Release this handle before checking the count, under the map lock.
+        // Otherwise two concurrent drops can both miss the last-owner case.
+        drop(self.mutex.take());
+        if gates
+            .get(&self.session_id)
+            .is_some_and(|mutex| Arc::strong_count(mutex) == 1)
+        {
+            gates.remove(&self.session_id);
+        }
+        drop(gates);
+        // Exercise concurrent release before Rust drops the remaining fields.
+        #[cfg(test)]
+        std::thread::yield_now();
+    }
 }
 
 /// `'static` since the classification runtime: a background worker outlives the
@@ -1071,14 +1103,19 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
     }
 
     /// The serialization gate for one session's turns.
-    fn turn_gate(&self, session_id: &SessionId) -> Arc<tokio::sync::Mutex<()>> {
-        Arc::clone(
+    fn turn_gate(&self, session_id: &SessionId) -> TurnGate<'_> {
+        let mutex = Arc::clone(
             self.turn_gates
                 .lock()
                 .expect("turn-gate map poisoned")
                 .entry(session_id.clone())
                 .or_default(),
-        )
+        );
+        TurnGate {
+            gates: &self.turn_gates,
+            session_id: session_id.clone(),
+            mutex: Some(mutex),
+        }
     }
 
     pub fn with_fleet(mut self, fleet: Arc<dyn LocalFleet>) -> Self {
@@ -3361,6 +3398,101 @@ mod tests {
     use roundhouse_core::control::{TargetFilter, TurnBudget};
     use roundhouse_core::ids::SessionId;
     use roundhouse_core::routing::{AffinityPolicy, RoutingContext};
+
+    #[tokio::test]
+    async fn turn_gates_retire_after_the_last_user() {
+        let engine = crate::test_support::engine_over_echo(
+            Arc::new(roundhouse_core::store::MemoryStore::new()),
+            StaticFrontierCatalog::new(Vec::new()),
+            Arc::new(roundhouse_fleet::EchoFrontierClient::new("answer")),
+            EngineConfig::default(),
+        );
+        for index in 0..1_000 {
+            let id = SessionId::new(format!("retire-{index}"));
+            let gate = engine.turn_gate(&id);
+            let held = gate.lock().await;
+            assert_eq!(engine.turn_gates.lock().unwrap().len(), 1);
+            drop(held);
+            drop(gate);
+            assert!(engine.turn_gates.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_gates_keep_waiters_on_the_same_lock() {
+        let engine = crate::test_support::engine_over_echo(
+            Arc::new(roundhouse_core::store::MemoryStore::new()),
+            StaticFrontierCatalog::new(Vec::new()),
+            Arc::new(roundhouse_fleet::EchoFrontierClient::new("answer")),
+            EngineConfig::default(),
+        );
+        let id = SessionId::new("queued");
+        let first = engine.turn_gate(&id);
+        let queued = engine.turn_gate(&id);
+        let held = first.lock().await;
+        assert!(queued.try_lock().is_err());
+        drop(held);
+        drop(first);
+        assert_eq!(engine.turn_gates.lock().unwrap().len(), 1);
+        let next = engine.turn_gate(&id);
+        let held = queued.lock().await;
+        assert!(next.try_lock().is_err());
+        drop(next);
+        drop(held);
+        drop(queued);
+        assert!(engine.turn_gates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn turn_gates_retire_when_a_task_is_cancelled() {
+        let engine = Arc::new(crate::test_support::engine_over_echo(
+            Arc::new(roundhouse_core::store::MemoryStore::new()),
+            StaticFrontierCatalog::new(Vec::new()),
+            Arc::new(roundhouse_fleet::EchoFrontierClient::new("answer")),
+            EngineConfig::default(),
+        ));
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            async move {
+                let gate = engine.turn_gate(&SessionId::new("cancelled"));
+                let _held = gate.lock().await;
+                ready.send(()).unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+        started.await.unwrap();
+        assert_eq!(engine.turn_gates.lock().unwrap().len(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(engine.turn_gates.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn turn_gates_retire_when_the_last_handles_drop_concurrently() {
+        let engine = crate::test_support::engine_over_echo(
+            Arc::new(roundhouse_core::store::MemoryStore::new()),
+            StaticFrontierCatalog::new(Vec::new()),
+            Arc::new(roundhouse_fleet::EchoFrontierClient::new("answer")),
+            EngineConfig::default(),
+        );
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let engine = &engine;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    for index in 0..10_000 {
+                        let gate = engine.turn_gate(&SessionId::new(format!("race-{index}")));
+                        barrier.wait();
+                        drop(gate);
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+        assert!(engine.turn_gates.lock().unwrap().is_empty());
+    }
 
     fn local(load: f64) -> Candidate {
         Candidate {
