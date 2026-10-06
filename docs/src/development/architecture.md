@@ -174,3 +174,7 @@ timeout 900 cargo test -p roundhouse-server --lib chain_cost -- --ignored --noca
 ```
 
 The test asserts nothing about speed, because a timing assertion is flaky on a loaded machine. It asserts only the corpus size and that the chain agrees with itself.
+
+## Using crates outside this workspace
+
+Consumers can use a Cargo Git dependency pinned to a commit. Local agent worktrees under `.claude/worktrees/` are ignored and must stay untracked: Git links without submodule URLs prevent Cargo from fetching the repository. CI checks the tracked tree with `python3 scripts/tests/test_repository_tree.py`.

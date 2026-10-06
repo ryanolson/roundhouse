@@ -24,6 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
+    - name: Check repository tree
+      run: timeout 300 python3 scripts/tests/test_repository_tree.py
     - name: Build book and check links
       env:
         INSTALL_TOOLS: "1"
