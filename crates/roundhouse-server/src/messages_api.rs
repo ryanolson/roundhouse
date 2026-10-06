@@ -86,7 +86,7 @@ use roundhouse_sequence_id::messages_label;
 
 use crate::control_config::{AuthError, PlaneSource};
 use crate::conversations::Conversations;
-use crate::engine::{Engine, TurnInput};
+use crate::engine::{Engine, TurnHistory, TurnInput};
 use crate::http::{ApiError, POLL_INTERVAL, parse_body, refuse_over_fair_use, store_error};
 use crate::prefix_admission::bind_prefix;
 use crate::responses_api::API_PREFIX;
@@ -372,7 +372,7 @@ where
     // bind so the anonymous arm is visible at the site that decides what a turn
     // belongs to rather than buried in a helper.
     let cache_key = claimed_label(&headers, &params).unwrap_or_else(anonymous_key);
-    let (session_id, input, _) = bind_prefix(
+    let (session_id, admitted, _) = bind_prefix(
         &state.engine,
         &state.store,
         &state.conversations,
@@ -450,7 +450,9 @@ where
                     &session_id,
                     turn_id,
                     TurnInput {
-                        items: input,
+                        items: admitted.delta,
+                        // The supplied history is authoritative.
+                        history: TurnHistory::Complete(admitted.history),
                         declared_baseline,
                         output_token_cap,
                         // **Verbatim, and not canonicalized.** Unlike the

@@ -1488,7 +1488,7 @@ async fn a_project_without_a_recipe_routes_as_it_always_did() {
 /// The `model` field is read, recorded, and never routed on.
 #[tokio::test]
 async fn the_declared_baseline_is_recorded_and_changes_no_route() {
-    use roundhouse_server::TurnInput;
+    use roundhouse_server::{TurnHistory, TurnInput};
 
     let rig = rig_of(vec![
         (
@@ -1515,6 +1515,7 @@ async fn the_declared_baseline_is_recorded_and_changes_no_route() {
             &session_id,
             TurnId::new("t1"),
             TurnInput {
+                history: TurnHistory::Reference,
                 items: ask(),
                 declared_baseline: Some(format!("{THRIFTY}/m")),
                 // Nothing else declared: this test is about the baseline.
@@ -1550,6 +1551,7 @@ async fn the_declared_baseline_is_recorded_and_changes_no_route() {
             &session_id,
             TurnId::new("t1"),
             TurnInput {
+                history: TurnHistory::Reference,
                 items: ask(),
                 declared_baseline: Some("a-model-nobody-serves".into()),
                 // Nothing else declared: this test is about the baseline.

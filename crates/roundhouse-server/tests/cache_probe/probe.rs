@@ -9,7 +9,7 @@ use roundhouse_core::ids::{SessionId, TurnId};
 use roundhouse_core::item::Item;
 use roundhouse_core::store::{MemoryStore, SessionStore};
 use roundhouse_fleet::WireProtocol;
-use roundhouse_server::{Admission, Engine, TurnInput};
+use roundhouse_server::{Admission, Engine, TurnHistory, TurnInput};
 
 /// How many items turn two appends before dispatching.
 ///
@@ -174,6 +174,9 @@ pub(super) async fn two_turn_probe(
 
 pub(super) fn input(items: Vec<Item>) -> TurnInput {
     TurnInput {
+        // A direct engine call, which is the native session surface's shape:
+        // no claim, so the log is the conversation.
+        history: TurnHistory::Reference,
         items,
         declared_baseline: None,
         // A small cap, because the answer is not what this probe measures and

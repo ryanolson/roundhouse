@@ -190,8 +190,26 @@ fn session() -> SessionId {
     SessionId::new("acme/ada/main")
 }
 
-/// Drive one turn through a validator.
+/// Drive one turn through a validator, on the conversation the log projects.
 async fn consider(enrolled: &Enrolled, state: &SessionState, policy: &TurnPolicy) -> Interjection {
+    consider_over(enrolled, &state.items, state, policy).await
+}
+
+/// Drive one turn through a validator on a conversation of its own.
+///
+/// **The two can differ, and the occupant must read `conversation`.** For a
+/// full-history request the log holds content the request left out — a replaced
+/// instruction run, a partial the client's stream threw away — so
+/// `state.items` is not what the model was shown. Everything the occupant
+/// decides about a trajectory has to be decided about the trajectory that
+/// happened. See
+/// [`InterjectionContext::conversation`](crate::interject::InterjectionContext::conversation).
+async fn consider_over(
+    enrolled: &Enrolled,
+    conversation: &[Item],
+    state: &SessionState,
+    policy: &TurnPolicy,
+) -> Interjection {
     let response_id = ResponseId::new("resp_01J");
     let session_id = session();
     let principal = Principal::new("acme", "ada");
@@ -202,9 +220,10 @@ async fn consider(enrolled: &Enrolled, state: &SessionState, policy: &TurnPolicy
         .validator
         .consider(&InterjectionContext {
             state,
+            conversation,
             response_id: &response_id,
             turn_policy: policy,
-            objective: Objective::from_items(&state.items),
+            objective: Objective::from_items(conversation),
             // No budget: what a ledger does about a check is the
             // implementation's business, and every assertion here is about
             // what the occupant does with the answer.
@@ -218,6 +237,85 @@ async fn consider(enrolled: &Enrolled, state: &SessionState, policy: &TurnPolicy
             dialect: ControlCallDialect::ClaudeMessages,
         })
         .await
+}
+
+/// The occupant reads the turn's conversation, never the log's own items.
+///
+/// Two halves, because the occupant reads the conversation twice over. The
+/// **trigger** must not fire on a trajectory the request did not claim: a
+/// session whose log is full of a repeated failing command, whose client
+/// resends none of it, has no stall to correct. And when the trigger does
+/// fire, the **restated request** must be the one the client actually sent —
+/// re-pointing an agent at a question only the log remembers is worse than not
+/// steering at all.
+#[tokio::test]
+async fn the_occupant_judges_the_conversation_the_request_sent() {
+    let mut logged = stuck_in_arm(Arm::Live);
+    logged.consecutive_interventions = 1;
+    logged
+        .items
+        .push(Item::user_text("a question only the log remembers"));
+    let judge = ScriptedJudge::answering(OFF_TRACK);
+    let validator = enrolled(
+        judge.clone(),
+        ValidationTerms {
+            action: ActionPolicy {
+                channel: SteerChannel::Auto,
+                steer_after_interventions: 1,
+                ..ActionPolicy::default()
+            },
+            ..live_terms()
+        },
+    );
+
+    // Half one: the gate is wide open and the log's evidence is blazing, and
+    // the request claims a conversation with no repeated command in it at all.
+    let claimed = [Item::user_text("what the client actually asked")];
+    assert_eq!(
+        consider_over(&validator, &claimed, &logged, &TurnPolicy::unrestricted()).await,
+        Interjection::proceed(),
+        "the trigger must read the claimed trajectory: a stall nothing in the \
+         request shows is not a stall to correct"
+    );
+
+    // Half two: the same evidence, claimed — so the trigger fires — with the
+    // client's own trailing question behind it, and without the instruction
+    // run the log still holds. The instruction run is the brief's own reader,
+    // separate from the objective the engine computes beside it.
+    let mut claimed: Vec<Item> = stuck_in_arm(Arm::Live)
+        .items
+        .into_iter()
+        .filter(|item| item.role != Role::System)
+        .collect();
+    claimed.push(Item::user_text("what the client actually asked"));
+    let decided = consider_over(&validator, &claimed, &logged, &TurnPolicy::unrestricted()).await;
+    let Interjection::Complete { item, .. } = &decided else {
+        panic!("expected a steered turn; got {decided:?}");
+    };
+    let ItemContent::Text { text } = &item.content else {
+        panic!("a steer is assistant text; got {item:?}");
+    };
+    assert!(
+        text.contains("> what the client actually asked"),
+        "the restatement is the request the client sent: {text}"
+    );
+    assert!(
+        !text.contains("a question only the log remembers"),
+        "and never one only the log holds: {text}"
+    );
+
+    // And the brief, which is the third reader: the judge is shown what the
+    // model was shown. A brief rendered from the log would quote an
+    // instruction block this request withdrew, in front of a paid reviewer.
+    let (_, brief) = judge.saw(0);
+    assert!(
+        brief.contains("what the client actually asked"),
+        "the brief carries the client's own request: {brief}"
+    );
+    assert!(
+        !brief.contains("make the tests pass"),
+        "and not an instruction run the request no longer carries: {brief}"
+    );
 }
 
 fn record_of(interjection: &Interjection) -> &ControlRecord {

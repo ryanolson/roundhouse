@@ -99,6 +99,7 @@ struct CompletedTurn {
 
 /// Where a dispatch went, how much prompt it carried, and at what price.
 struct PendingRouting {
+    cache_context_unverified: bool,
     target: Target,
     isl_tokens: u64,
     /// The rate card the decision recorded. See
@@ -271,6 +272,18 @@ pub fn turn_configuration_len(items: &[Item]) -> usize {
         .count()
 }
 
+/// Lets items and admission fingerprints share one configuration placement rule.
+/// Fingerprints compute this property before discarding the role and stamp.
+pub trait TurnConfiguration {
+    fn is_turn_configuration(&self) -> bool;
+}
+
+impl TurnConfiguration for Item {
+    fn is_turn_configuration(&self) -> bool {
+        is_turn_configuration(self)
+    }
+}
+
 /// Where a session's turn configuration ends, as items are folded in.
 ///
 /// **One rule, two readers**, which is the whole reason this is a type and not
@@ -316,8 +329,11 @@ impl ConfigurationCursor {
     }
 
     /// Place one appended item into `items`.
-    pub fn append(&mut self, items: &mut Vec<Item>, item: Item) {
-        if !is_turn_configuration(&item) {
+    ///
+    /// Generic over the element so the session's item fold and admission's
+    /// fingerprint fold are one algorithm — see [`TurnConfiguration`].
+    pub fn append<T: TurnConfiguration>(&mut self, items: &mut Vec<T>, item: T) {
+        if !item.is_turn_configuration() {
             self.in_run = false;
             items.push(item);
             return;
@@ -667,7 +683,10 @@ impl SessionState {
                 // leading configuration run replaces the session's, at the
                 // head. See [`ConfigurationCursor`].
                 match is_turn_configuration(item) {
-                    true => self.review.configuration_appended(),
+                    true => {
+                        self.review.configuration_appended();
+                        self.ledger.invalidate();
+                    }
                     false => self.review.history_appended(
                         self.items.len() - self.configuration.len(),
                         item.user_request().is_some(),
@@ -722,6 +741,7 @@ impl SessionState {
                 self.pending_routings.insert(
                     response_id.clone(),
                     PendingRouting {
+                        cache_context_unverified: decision.cache_context_unverified,
                         target: decision.chosen.clone(),
                         isl_tokens: decision.isl_tokens,
                         rate_card: decision.rate_card,
@@ -770,7 +790,9 @@ impl SessionState {
                     let processed =
                         matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
                             || usage.input_tokens > 0;
-                    if processed {
+                    if routing.cache_context_unverified {
+                        self.ledger.invalidate();
+                    } else if processed {
                         self.ledger.record(
                             &routing.target,
                             event.at_ms,

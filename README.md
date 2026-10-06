@@ -21,6 +21,8 @@ Roundhouse keeps the conversation in a durable, append-only log per session. It 
 
 - Serves the OpenAI Responses API (`/v1/responses`) for Codex and the Anthropic Messages API (`/v1/messages`) for Claude Code, with pass-through auth.
 - Keeps one append-only event log per session, in memory or in Redis, with a fenced single-writer lease.
+- Uses complete client history for dispatch, routing, and validation. Omitted instructions and interrupted output are not restored. The native session API supports explicit reference-only continuation.
+- Compares history through compact fingerprints and releases unused session locks. The event log still has no retention bound.
 - Routes each turn between local Dynamo workers (through Dynamo's embedded selection service) and frontier providers, on one cache-adjusted cost axis. The shipped binary attaches no local fleet yet; local routing runs in the library and its tests.
 - Enforces per-project and per-key policy, budgets, and fair-use windows.
 - Exposes a control surface to the agent as an MCP server at `/mcp`.

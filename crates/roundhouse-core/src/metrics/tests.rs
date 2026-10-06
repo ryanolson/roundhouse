@@ -287,6 +287,7 @@ fn a_dispatch_that_never_reached_the_provider_is_not_a_call() {
     log.push(SessionEventKind::Routed {
         response_id: response_id.clone(),
         decision: DecisionRecord {
+            cache_context_unverified: false,
             block_marker: None,
             selection: None,
             local_quote_skipped: None,
@@ -340,6 +341,7 @@ fn an_incomplete_that_burned_tokens_is_still_billed() {
     log.push(SessionEventKind::Routed {
         response_id: response_id.clone(),
         decision: DecisionRecord {
+            cache_context_unverified: false,
             block_marker: None,
             selection: None,
             local_quote_skipped: None,

@@ -112,8 +112,8 @@ pub use control_config::{
 pub use conversations::Conversations;
 pub use dialect::{ClientDialect, DEFAULT_MCP_NAMESPACE};
 pub use engine::{
-    EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor, TurnInput,
-    TurnResult,
+    EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecution, LocalExecutor,
+    TurnHistory, TurnInput, TurnResult,
 };
 pub use http::router;
 pub use judge::{FleetJudge, JudgeConfig};

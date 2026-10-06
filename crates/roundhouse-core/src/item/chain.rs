@@ -18,15 +18,13 @@
 //! c_i = SHA-256(c_{i-1} || d_i)
 //! ```
 //!
-//! **The input is [`Item::render`], and that choice carries two rulings with
-//! it.** The render leaves out a tool call's `namespace` and an item's
-//! `response_id`, so the chain does too — which is what makes it agree with
-//! prefix admission's `same_item`, where a stored `None` namespace agrees with
-//! any claim and the stamp is never compared. A chain that hashed the serde
-//! form instead would break on the second turn of every Codex session that
-//! made an MCP call before M17, and on every assistant item this deployment
-//! stamped: two histories admission calls one conversation would look like
-//! two lineages, and a continuation would be placed as new.
+//! The input is [`Item::render`], which omits tool namespaces and response
+//! stamps. These omissions let a resent item keep its link when the client
+//! adds a namespace or omits the server's response stamp.
+//!
+//! Admission uses structural fingerprints rather than renders. The two
+//! relations are not identical: admission treats opaque JSON `0.0` and `-0.0`
+//! as equal, while their different renders produce different chain links.
 //!
 //! **Configuration is in the chain.** A rewritten configuration run loses the
 //! KV beyond it on every target, so the chain breaks there too. Tools are not:

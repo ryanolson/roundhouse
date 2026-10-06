@@ -31,8 +31,8 @@ use std::sync::Arc;
 use roundhouse_core::context::Tokenizer;
 use roundhouse_core::control::{PolicyOverrides, TurnPolicy};
 use roundhouse_core::ids::SessionId;
+use roundhouse_core::item::Item;
 use roundhouse_core::routing::Candidate;
-use roundhouse_core::session::SessionState;
 use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{Arm, EscalationOverrides, Objective};
 use roundhouse_mcp::ControlStore;
@@ -162,9 +162,13 @@ impl<S: SessionStore, T: Tokenizer + Clone> Engine<S, T> {
     /// message rather than to nothing — the same bounded loss every other read
     /// of this store takes, and for the same reason it is acceptable: what is
     /// lost is precision in a brief, never a routing decision.
-    pub(super) fn objective(&self, session_id: &SessionId, state: &SessionState) -> Objective {
+    /// `conversation` is the turn's own, not the log's projection of it — see
+    /// [`TurnHistory`](crate::engine::TurnHistory). The fallback
+    /// reads the trailing user request, and the request being answered is the
+    /// one the client sent.
+    pub(super) fn objective(&self, session_id: &SessionId, conversation: &[Item]) -> Objective {
         self.declared_objective(session_id)
-            .unwrap_or_else(|| Objective::from_items(&state.items))
+            .unwrap_or_else(|| Objective::from_items(conversation))
     }
 
     /// The objective the agent declared, if it declared one.

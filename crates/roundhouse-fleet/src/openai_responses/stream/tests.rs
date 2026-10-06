@@ -17,8 +17,8 @@ use roundhouse_core::event::CacheReadSource;
 /// *definite* fact about the call. `roundhouse_core::item::ItemContent`'s
 /// doc for the same stored field (item.rs:78-79) reads a stored `None`
 /// as the opposite: "not \"no namespace\"; it is \"this client does not
-/// spell one\"" — an *unknown*, not a fact. `prefix_admission.rs`'s
-/// `same_namespace` (R-N8) justifies matching a stored `None` against
+/// spell one\"" — an *unknown*, not a fact. admission's
+/// namespace rule (R-N8) justifies matching a stored `None` against
 /// any claimed namespace by citing only the item.rs reading (a pre-M17
 /// record, or the Messages surface's flat spelling) — never the fleet's
 /// "no server" reading. Both doc comments are reachable as data via

@@ -39,6 +39,7 @@ fn hosted() -> Target {
 
 fn decision(chosen: Target) -> DecisionRecord {
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: None,
         local_quote_skipped: None,

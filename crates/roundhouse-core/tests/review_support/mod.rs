@@ -96,6 +96,7 @@ pub fn declared(goal: &str) -> Objective {
 /// `objective` the way the engine stamps its selection snapshot.
 pub fn decision(turn_index: u64, objective: Option<ObjectiveVersion>) -> DecisionRecord {
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: Some(Box::new(SelectionSnapshot {
             features: LocalFeatures {
@@ -429,6 +430,9 @@ pub async fn consider_on(
     validator
         .consider(&InterjectionContext {
             state,
+            // These cases drive the validator over a hand-built state, so the
+            // log's items are the conversation.
+            conversation: &state.items,
             response_id,
             turn_policy: &policy,
             objective,

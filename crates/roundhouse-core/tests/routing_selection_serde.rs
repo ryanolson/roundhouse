@@ -99,6 +99,7 @@ fn snapshot() -> SelectionSnapshot {
 /// is over the shape that is actually persisted.
 fn record(selection: Option<SelectionSnapshot>) -> DecisionRecord {
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         chosen: hosted("sol"),
         rationale: "stage router: strong tier (openai/sol) by cost_guard".into(),

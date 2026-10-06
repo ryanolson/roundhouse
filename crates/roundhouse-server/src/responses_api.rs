@@ -55,12 +55,12 @@ use roundhouse_fleet::WireProtocol;
 
 use crate::control_config::{ControlPlane, PlaneSource};
 use crate::conversations::Conversations;
-use crate::engine::{Engine, TurnInput};
+use crate::engine::{Engine, TurnHistory, TurnInput};
 use crate::http::{
     ApiError, LogTail, POLL_INTERVAL, parse_body, refuse_over_fair_use, store_error,
 };
 use crate::messages_api::MAX_REQUEST_BYTES;
-use crate::prefix_admission::bind_prefix;
+use crate::prefix_admission::{Admitted, bind_prefix};
 
 /// **Public for one function and one reason** (M17, R-N10):
 /// [`wire::function_call_item`] is the outbound projection of a stored tool
@@ -358,7 +358,7 @@ where
         request.tools.as_ref(),
         request.tool_choice.as_ref(),
     );
-    let (session_id, input, history_rewritten) = state
+    let (session_id, admitted, history_rewritten) = state
         .bind(
             &plane,
             &admission.principal,
@@ -415,7 +415,9 @@ where
                     &session_id,
                     turn_id,
                     TurnInput {
-                        items: input,
+                        items: admitted.delta,
+                        // The supplied history is authoritative.
+                        history: TurnHistory::Complete(admitted.history),
                         declared_baseline,
                         // This surface reads no ceiling off the request. The
                         // field exists because the Messages surface has one to
@@ -485,8 +487,8 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> Compat<S, T>
         conversation_key: &str,
         thread_id: Option<&str>,
         claimed: Vec<Item>,
-    ) -> Result<(SessionId, Vec<Item>, bool), ApiError> {
-        let (session_id, delta, history_rewritten) = bind_prefix(
+    ) -> Result<(SessionId, Admitted, bool), ApiError> {
+        let (session_id, admitted, history_rewritten) = bind_prefix(
             &self.engine,
             &self.store,
             &self.conversations,
@@ -514,7 +516,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + Send + Sync + 'static> Compat<S, T>
                 .bind_thread(principal, thread_id, session_id.clone())
                 .await;
         }
-        Ok((session_id, delta, history_rewritten))
+        Ok((session_id, admitted, history_rewritten))
     }
 }
 

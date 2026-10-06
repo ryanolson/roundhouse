@@ -609,6 +609,10 @@ pub struct Decision {
 /// cannot answer "was that the right call?" after the fact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionRecord {
+    /// The supplied prompt cannot be reconstructed from this session's log.
+    /// Its cache predictions must not be recovered from that log.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cache_context_unverified: bool,
     pub chosen: Target,
     pub rationale: String,
     pub policy: String,
@@ -1046,6 +1050,10 @@ pub trait RoutingPolicy: Send + Sync {
     async fn choose(&self, ctx: &RoutingContext<'_>) -> Result<Decision, RoutingError>;
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,6 +1191,7 @@ mod tests {
         // deserializing, or an upgrade takes the deployment's routing history
         // with it.
         let record = DecisionRecord {
+            cache_context_unverified: false,
             block_marker: None,
             selection: None,
             local_quote_skipped: None,

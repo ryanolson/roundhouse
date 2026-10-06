@@ -93,6 +93,7 @@ pub fn decision(chosen: Target, considered: Vec<Candidate>) -> DecisionRecord {
         (Some(HOSTED), 0.01)
     };
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: None,
         local_quote_skipped: None,

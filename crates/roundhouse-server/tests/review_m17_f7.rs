@@ -9,8 +9,8 @@
 //! that join on a session served over `/v1/messages`, the finding says the
 //! session forks on every subsequent turn: the Messages wire canonicalizes a
 //! resent `tool_use` with `namespace: None` (`messages_api/wire.rs`'s
-//! `block_item`), `same_namespace(Some(_), None)` in `prefix_admission.rs` is
-//! `false`, and prefix admission finds no matching prefix and forks to a new
+//! `block_item`). Admission rejects a stored namespace against an absent claim,
+//! finds no matching prefix, and forks to a new
 //! generation.
 //!
 //! **This test.** [`a_namespaced_tool_call_on_the_messages_surface_does_not_fork`]
@@ -35,15 +35,9 @@
 //! turn's committed item carried `Some("mcp__roundhouse")` on a
 //! Messages-surface session. The second turn then opened
 //! `anthropic_messages/f7-namespace-messages#g1`:
-//! `same_namespace(Some("mcp__roundhouse"), None)` in `prefix_admission.rs`
-//! evaluates its `Some(_) => stored == claimed` arm, which is `false`
-//! (`ItemContent::ToolCall`'s `namespace` field differs), so `same_item`
-//! rejects the pairing, `suffix_after` finds no matching prefix, and
-//! `bind_prefix` forks. The name-and-arguments agreement that would
-//! otherwise admit the resend as a plain continuation was irrelevant once
-//! the namespace arm returned `false`: `same_item`'s `ItemContent::ToolCall`
-//! match arm returns the whole boolean from that one field's comparison,
-//! not a conjunction that could still pass on the rest.
+//! The stored namespace differs from the absent claim, so admission rejects
+//! the pairing. `suffix_after` finds no matching prefix, and `bind_prefix`
+//! forks. Matching names and arguments cannot override a namespace mismatch.
 //!
 //! Ruling: **valid**. The mechanism in the finding is exactly what fired;
 //! nothing about it needed correcting. Fixed at the producer named in the

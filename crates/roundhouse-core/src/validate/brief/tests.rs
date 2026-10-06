@@ -46,6 +46,7 @@ fn the_brief_contains_no_price_no_candidate_and_no_target_name() {
         model: "llama-3.1-8b".into(),
     };
     let decision = DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: None,
         local_quote_skipped: None,

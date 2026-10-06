@@ -210,6 +210,7 @@ fn tiered(session: &str, who: Principal) -> Vec<SessionEvent> {
         },
     };
     let decision = DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: Some(Box::new(SelectionSnapshot {
             features: LocalFeatures {

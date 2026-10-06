@@ -385,6 +385,7 @@ pub fn decision(chosen: Target, selector: Option<SelectorSnapshot>) -> DecisionR
         load: None,
     };
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: Some(Box::new(SelectionSnapshot {
             features: LocalFeatures {

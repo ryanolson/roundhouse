@@ -102,6 +102,9 @@ pub enum CoverageGap {
     WithheldControlTraffic,
     /// The complete section exceeded its configured bound.
     Oversized,
+    /// The supplied conversation differs from the recorded review window.
+    /// Showing the stored section could restore omitted content.
+    RequestOmittedHistory,
 }
 
 /// What a review says about the decisions it covered.
@@ -233,7 +236,12 @@ impl IntervalCapture {
     /// decisions were not made under. `dialect` is how this session's client
     /// spells roundhouse's own control calls. The capture does not show an
     /// interval that holds one.
+    /// `conversation` is the turn's own — see
+    /// [`InterjectionContext::conversation`](crate::interject::InterjectionContext::conversation).
+    /// The section is rendered from the log, so it may only be shown when the
+    /// two agree; see [`CoverageGap::RequestOmittedHistory`].
     pub(crate) fn of(
+        conversation: &[Item],
         state: &SessionState,
         objective: &Objective,
         dialect: ControlCallDialect,
@@ -241,6 +249,9 @@ impl IntervalCapture {
     ) -> Self {
         let facts = state.review_interval();
         let mut gaps = facts.gaps.clone();
+        if gaps.is_empty() && !same_conversation(conversation, &state.items) {
+            gaps.push(CoverageGap::RequestOmittedHistory);
+        }
         if gaps.is_empty()
             && facts
                 .objective
@@ -281,6 +292,15 @@ impl IntervalCapture {
             label,
         }
     }
+}
+
+// Response stamps belong to the log, not to the client-supplied content.
+fn same_conversation(claimed: &[Item], logged: &[Item]) -> bool {
+    claimed.len() == logged.len()
+        && claimed
+            .iter()
+            .zip(logged)
+            .all(|(claimed, logged)| claimed.same_prompt_content(logged))
 }
 
 /// Render the section, or say why it cannot be shown whole.

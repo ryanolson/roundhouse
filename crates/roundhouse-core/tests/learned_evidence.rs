@@ -197,6 +197,7 @@ fn features() -> LocalFeatures {
 
 fn record(chosen: &str, selector: SelectorSnapshot, rationale: String) -> DecisionRecord {
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         chosen: hosted(chosen),
         rationale,

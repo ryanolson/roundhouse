@@ -337,7 +337,7 @@ async fn events(store: &MemoryStore, session_id: &SessionId) -> Vec<SessionEvent
 /// The conversation as the *prefix check* sees it: role and content, never the
 /// response stamp.
 ///
-/// Exactly the equality `Compat::same_item` applies, and for its reason: the
+/// Like prefix admission, this view ignores response stamps: the
 /// assistant history a client re-sends carries no id — it has no field to put
 /// one in — so a comparison that included the stamp would fail on every turn
 /// after the first and would say nothing about whether the conversation

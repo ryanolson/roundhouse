@@ -20,7 +20,7 @@ use roundhouse_core::store::SessionStore;
 use roundhouse_core::validate::{ControlCallDialect, Objective, ObjectiveVersion, exchanges};
 
 use crate::control_config::Admission;
-use crate::engine::{ClientDeclarations, Engine};
+use crate::engine::{ClientDeclarations, Engine, TurnHistory};
 
 /// What may be said about this turn, taken from the client's own items while
 /// they are still a separate thing. The committed log is one flat list, and
@@ -45,9 +45,15 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         &self,
         session: &Session<S>,
         turn_index: u64,
+        // The turn's own conversation rather than the log's projection of it:
+        // these signals are the learner's features and the router's evidence,
+        // and both describe the request that is being answered. See
+        // [`TurnHistory`](crate::engine::TurnHistory).
+        conversation: &TurnHistory,
     ) -> SelectionInputs {
         let dialect = ControlCallDialect::of_session_key(session.session_id().as_str());
-        let signals = TurnSignals::from_exchanges(&exchanges(&session.state().items), dialect);
+        let signals =
+            TurnSignals::from_exchanges(&exchanges(conversation.items(session.state())), dialect);
         let features = LocalFeatures {
             extractor_revision: FEATURE_EXTRACTOR_REVISION,
             dialect,
