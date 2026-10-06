@@ -606,6 +606,7 @@ mod the_live_admission_cannot_move_a_finished_turns_charge {
             .record_routing(
                 &response_id,
                 DecisionRecord {
+                    cache_context_unverified: false,
                     block_marker: None,
                     selection: None,
                     local_quote_skipped: None,

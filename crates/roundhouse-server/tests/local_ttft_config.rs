@@ -31,7 +31,8 @@ use roundhouse_fleet::{
 };
 use roundhouse_server::catalog_config::engine_config;
 use roundhouse_server::{
-    Admission, CatalogConfig, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor, TurnInput,
+    Admission, CatalogConfig, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor, TurnHistory,
+    TurnInput,
 };
 
 mod common;
@@ -126,6 +127,7 @@ async fn local_candidate(config: &CatalogConfig) -> Candidate {
             &session_id,
             TurnId::new("t1"),
             TurnInput {
+                history: TurnHistory::Reference,
                 items: vec![Item::user_text("cache affinity ".repeat(200))],
                 declared_baseline: None,
                 output_token_cap: None,

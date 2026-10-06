@@ -74,7 +74,7 @@ use roundhouse_fleet::{
 };
 use roundhouse_server::test_support::{frontier_spec, single_model_catalog};
 use roundhouse_server::{
-    Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor, TurnInput,
+    Admission, EchoLocalExecutor, Engine, EngineConfig, LocalExecutor, TurnHistory, TurnInput,
 };
 
 mod common;
@@ -224,6 +224,9 @@ fn admission() -> Admission {
 
 fn turn_input(tools: Option<serde_json::Value>) -> TurnInput {
     TurnInput {
+        // A direct engine call, which is the native session surface's shape:
+        // no claim, so the log is the conversation.
+        history: TurnHistory::Reference,
         items: vec![Item::user_text("hi")],
         declared_baseline: None,
         output_token_cap: None,
@@ -285,6 +288,7 @@ async fn a_longer_conversation_does_change_isl_tokens_and_cost() {
             &short,
             TurnId::new("t1"),
             TurnInput {
+                history: TurnHistory::Reference,
                 items: vec![Item::user_text("hi")],
                 ..turn_input(None)
             },
@@ -300,6 +304,7 @@ async fn a_longer_conversation_does_change_isl_tokens_and_cost() {
             &long,
             TurnId::new("t1"),
             TurnInput {
+                history: TurnHistory::Reference,
                 items: vec![Item::user_text("word ".repeat(4_000))],
                 ..turn_input(None)
             },

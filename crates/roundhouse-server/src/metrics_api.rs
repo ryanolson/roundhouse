@@ -236,6 +236,7 @@ mod tests {
                 kind: SessionEventKind::Routed {
                     response_id: response_id.clone(),
                     decision: DecisionRecord {
+                        cache_context_unverified: false,
                         block_marker: None,
                         selection: None,
                         local_quote_skipped: None,
@@ -717,6 +718,7 @@ mod tests {
                 kind: SessionEventKind::Routed {
                     response_id: response_id.clone(),
                     decision: DecisionRecord {
+                        cache_context_unverified: false,
                         block_marker: None,
                         selection: None,
                         local_quote_skipped: None,

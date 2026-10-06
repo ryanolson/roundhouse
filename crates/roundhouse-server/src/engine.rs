@@ -343,6 +343,22 @@ pub struct TurnInput {
     /// `None` where nothing was declared — every caller with no tools — and a
     /// stamp beside a `None` toolbox names a dialect nobody reads.
     pub tools_dialect: Option<WireProtocol>,
+    /// Which side of this request owns the conversation. See [`TurnHistory`].
+    pub history: TurnHistory,
+}
+
+/// The source of conversation content for a turn.
+///
+/// Complete requests own their history. The native session API uses the log.
+/// Complete history stays intact; [`TurnInput::items`] holds the log delta.
+/// The engine uses the request without restoring omitted log content.
+/// The log still retains input deltas and output for replay and accounting.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnHistory {
+    /// The complete conversation, in the supplied order.
+    Complete(Vec<Item>),
+    /// The request named a session and sent only new input.
+    Reference,
 }
 
 impl From<Vec<Item>> for TurnInput {
@@ -354,8 +370,27 @@ impl From<Vec<Item>> for TurnInput {
             tools: None,
             tool_choice: None,
             tools_dialect: None,
+            // The native session surface's shape, and every caller that has no
+            // claim to make: the MCP and admin paths, and the test surface.
+            history: TurnHistory::Reference,
         }
     }
+}
+
+impl TurnHistory {
+    fn items<'a>(&'a self, state: &'a SessionState) -> &'a [Item] {
+        match self {
+            Self::Complete(items) => items,
+            Self::Reference => &state.items,
+        }
+    }
+}
+
+/// Request-owned inputs shared by planning and dispatch.
+struct DispatchInput<'a> {
+    conversation: &'a TurnHistory,
+    declarations: &'a ClientDeclarations,
+    declared_baseline: Option<&'a str>,
 }
 
 /// What the client said about this turn that only the *dispatch* reads.
@@ -1239,7 +1274,9 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             tools,
             tool_choice,
             tools_dialect,
+            history,
         } = input.into();
+        let conversation = history;
         let declarations = ClientDeclarations {
             output_token_cap,
             tools,
@@ -1369,10 +1406,16 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 state: session.state(),
                 response_id: &response_id,
                 turn_policy: &admission.policy,
+                // The conversation the *request* carried, not the log's
+                // projection of it. An occupant judges the trajectory the model
+                // was shown, and for a full-history request that is the claim —
+                // see [`TurnHistory`].
+                conversation: conversation.items(session.state()),
                 // What the agent declared through the MCP surface, and the
-                // log's own fallback where it declared nothing. See
-                // [`Self::objective`].
-                objective: self.objective(session_id, session.state()),
+                // conversation's own fallback where it declared nothing. See
+                // [`Self::objective`]: the fallback is the trailing user
+                // request, and the request being answered is the client's.
+                objective: self.objective(session_id, conversation.items(session.state())),
                 // Who a check is billed to, under what key, and by what name.
                 // Not the candidate list, and never a price: an occupant may be
                 // told there is no room for a check and never what the turn it
@@ -1531,8 +1574,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                         &mut session,
                         &response_id,
                         admission,
-                        declared_baseline.as_deref(),
-                        &declarations,
+                        DispatchInput {
+                            conversation: &conversation,
+                            declarations: &declarations,
+                            declared_baseline: declared_baseline.as_deref(),
+                        },
                     )
                     .await
                 {
@@ -1662,11 +1708,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         session: &mut Session<S>,
         response_id: &ResponseId,
         admission: &Admission,
-        declared_baseline: Option<&str>,
-        // Carried through rather than read off the config, because these are the
-        // client's facts and not this deployment's — see
-        // [`ClientDeclarations`].
-        declarations: &ClientDeclarations,
+        input: DispatchInput<'_>,
     ) -> Result<Completed, Failed> {
         // One deadline for every model await in this turn, taken before any of
         // them: a provider that hangs after accepting the request settles the
@@ -1677,14 +1719,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         let deadline_at = Instant::now() + Duration::from_millis(self.config.turn_deadline_ms);
 
         let (mut stream, decision, isl_tokens) = self
-            .plan(
-                session,
-                response_id,
-                deadline_at,
-                admission,
-                declared_baseline,
-                declarations,
-            )
+            .plan(session, response_id, deadline_at, admission, input)
             .await
             .map_err(Failed::before_output)?;
 
@@ -2176,16 +2211,27 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         response_id: &ResponseId,
         deadline_at: Instant,
         admission: &Admission,
-        declared_baseline: Option<&str>,
-        declarations: &ClientDeclarations,
+        input: DispatchInput<'_>,
     ) -> Result<(FrontierStream, Decision, usize), PlanFailure> {
-        // Rebuild the prompt from the committed log, so what we price is
-        // exactly what a successor would reconstruct.
-        let assembler = self.assembler_over(session.state().items.clone());
+        let DispatchInput {
+            conversation,
+            declarations,
+            declared_baseline,
+        } = input;
+        // Full-history requests never restore content from the log.
+        let items = conversation.items(session.state());
+        let cache_context_unverified = matches!(conversation, TurnHistory::Complete(_))
+            && (items.len() != session.state().items.len()
+                || !items
+                    .iter()
+                    .zip(&session.state().items)
+                    .all(|(claimed, logged)| claimed.same_prompt_content(logged)));
+        let cold_ledger = cache_context_unverified.then(|| self.seeded_ledger());
+        let cache_ledger = cold_ledger.as_ref().unwrap_or_else(|| session.ledger());
+        let assembler = self.assembler_over(items.to_vec());
         // **Two counts, because two different things are being measured** (F4).
-        // `conversation_tokens` is the log's own projection — the prompt a
-        // successor rebuilds, the buffer the local fleet routes on, the bytes
-        // the block hashes cover. `isl_tokens` is the size of the *request*: the
+        // `conversation_tokens` measures this turn's supplied conversation,
+        // which the local fleet receives and the block hashes cover. `isl_tokens` is the size of the *request*: the
         // conversation plus the toolbox the client re-declares on every turn and
         // that the frontier wire carries verbatim. Everything that prices,
         // grants, records or estimates this turn reads the second; only the
@@ -2212,7 +2258,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             features,
             objective,
             classifications,
-        } = self.selection_inputs(session, turn_index);
+        } = self.selection_inputs(session, turn_index, conversation);
 
         // --- price every option -------------------------------------------
         //
@@ -2222,7 +2268,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
         // and whether the fleet's residency call may fail open depends on
         // whether any of them is somewhere this turn could go instead.
         let frontier_quotes = self.frontier_catalog.quote(
-            session.ledger(),
+            cache_ledger,
             now_ms(),
             isl_tokens as u64,
             self.config.expected_output_tokens as u64,
@@ -2499,7 +2545,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
             turn_index,
             isl_tokens,
             candidates: &candidates,
-            ledger: session.ledger(),
+            ledger: cache_ledger,
             turn_policy,
             // The turns before this one. `record_routing` below folds
             // this turn's own dispatch in afterwards, which is what
@@ -2697,7 +2743,11 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                     handoff_note,
                     session.session_id(),
                     admission.request_context.as_deref(),
-                    PreviousMarker::of(session.ledger().state_for(&target).as_ref()),
+                    if cache_context_unverified {
+                        PreviousMarker::Unmarked
+                    } else {
+                        PreviousMarker::of(session.ledger().state_for(&target).as_ref())
+                    },
                     declarations,
                 )),
                 Target::Local { .. } => None,
@@ -2729,6 +2779,7 @@ impl<S: SessionStore, T: Tokenizer + Clone + 'static> Engine<S, T> {
                 .record_routing(
                     response_id,
                     DecisionRecord {
+                        cache_context_unverified,
                         chosen: target.clone(),
                         // Appended rather than woven in, exactly as the overflow
                         // valve's note is: an ordinary decision's rationale stays
@@ -3398,6 +3449,68 @@ mod tests {
     use roundhouse_core::control::{TargetFilter, TurnBudget};
     use roundhouse_core::ids::SessionId;
     use roundhouse_core::routing::{AffinityPolicy, RoutingContext};
+
+    #[tokio::test]
+    async fn turn_signals_are_read_off_the_turns_conversation() {
+        let store = Arc::new(roundhouse_core::store::MemoryStore::new());
+        let engine = crate::test_support::engine_over_echo(
+            Arc::clone(&store),
+            StaticFrontierCatalog::new(Vec::new()),
+            Arc::new(roundhouse_fleet::EchoFrontierClient::new("answer")),
+            EngineConfig::default(),
+        );
+        let session_id = SessionId::new("signals");
+        engine.create_session(&session_id).await.unwrap();
+        let mut session = Session::open(
+            Arc::clone(&store) as Arc<roundhouse_core::store::MemoryStore>,
+            session_id,
+            "test",
+            60_000,
+            roundhouse_core::routing::CacheLedger::new(),
+        )
+        .await
+        .unwrap();
+        session
+            .begin_turn(
+                roundhouse_core::ids::TurnId::new("t0"),
+                vec![
+                    Item::user_text("a question"),
+                    Item::tool_call("call_1", "read_file", "{}"),
+                    Item {
+                        role: roundhouse_core::item::Role::Tool,
+                        content: roundhouse_core::item::ItemContent::ToolResult {
+                            call_id: "call_1".into(),
+                            output: "the file".into(),
+                        },
+                        response_id: None,
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine
+                .selection_inputs(&session, 0, &TurnHistory::Reference)
+                .features
+                .signals
+                .turn_depth,
+            1,
+            "the control: the log holds one exchange"
+        );
+        assert_eq!(
+            engine
+                .selection_inputs(
+                    &session,
+                    0,
+                    &TurnHistory::Complete(vec![Item::user_text("a question")])
+                )
+                .features
+                .signals
+                .turn_depth,
+            0,
+            "and a request claiming no completed exchange scores none"
+        );
+    }
 
     #[tokio::test]
     async fn turn_gates_retire_after_the_last_user() {

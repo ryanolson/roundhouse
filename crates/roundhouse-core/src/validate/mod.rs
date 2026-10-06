@@ -638,7 +638,7 @@ impl Validator {
                     // pure over the judge's answer and this membership's terms.
                     // The log books the directive alone — see
                     // `SteerAction::Steer` — so the user's words appear once.
-                    render_steer_answer(&directive, trailing_user_request(&context.state.items)),
+                    render_steer_answer(&directive, trailing_user_request(context.conversation)),
                     context.response_id.clone(),
                 ),
                 usage: record.usage(),
@@ -678,7 +678,7 @@ impl Validator {
         };
 
         let brief = ValidationBrief::build(
-            &context.state.items,
+            context.conversation,
             context.dialect,
             context.objective.clone(),
             fired.facts().map(str::to_string).collect(),
@@ -688,6 +688,7 @@ impl Validator {
         // this snapshot afterwards. Reconstructing it from the state after the
         // call could name decisions the judge never saw.
         let interval = IntervalCapture::of(
+            context.conversation,
             context.state,
             &context.objective,
             context.dialect,
@@ -841,7 +842,10 @@ impl Interjector for Validator {
         let Some(terms) = context.validation else {
             return Interjection::proceed();
         };
-        let Some(fired) = self.trigger.evaluate(context.state, context.dialect) else {
+        let Some(fired) =
+            self.trigger
+                .evaluate(context.conversation, context.state, context.dialect)
+        else {
             return Interjection::proceed();
         };
         self.decide(context, terms, fired, arm).await

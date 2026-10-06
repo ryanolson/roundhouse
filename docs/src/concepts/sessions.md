@@ -8,7 +8,7 @@ Each session has one append-only event log. Each event has a sequence number, `s
 
 - **Stream resumption.** A client reopens a stream after the last `seq` it saw. The native surface takes `?starting_after=N` or a `Last-Event-ID` header. The query parameter wins.
 - **Reconnect replay.** A new stream replays the log from any point, then follows new events.
-- **Audit.** Each routing decision is an event next to the items it routed.
+- **Audit.** The log records routing decisions, admitted input deltas, and response output. Its conversation projection can differ from a complete client request.
 
 | Event | Records |
 |---|---|
@@ -26,12 +26,12 @@ Each session has one append-only event log. Each event has a sequence number, `s
 
 - **`SessionCreated` carries attribution.** The engine writes it when a turn opens a session with an empty log. It already holds the lease, so the write cannot race, and a log is empty exactly once. Replay starts at `seq` 0, so every fold sees the principal first, with no side table. A log with no principal folds under the `Unattributed` key, never merged with a project.
 - **An emitted item is an `ItemAppended`.** It carries the `response_id` of the response that produced it. `Session::complete_with_item` commits the item and `ResponseCompleted` in one atomic append. A separate event kind was rejected: three readers rebuild the conversation (the prefix comparison, `SessionState::apply`, `ContextAssembler::rehydrate`), and a second kind gives each two sources. The first reader that forgets one forks every affected session silently.
-- **Every client block is a log item**, including `Thinking` with its `signature`, `RedactedThinking`, and `Opaque`. Resent history round-trips byte for byte. A provider refuses resent thinking whose signature is missing or changed.
+- **New client and response blocks use `ItemAppended`**, including `Thinking` with its `signature`, `RedactedThinking`, and `Opaque`. A provider refuses resent thinking whose signature is missing or changed.
 - **Routing evidence is boxed.** `DecisionRecord.selection` is an `Option<Box<SelectionSnapshot>>`. A `size_of` probe measured `SessionEvent` at 360 bytes with the box and 728 bytes without it.
 
 ## Projections, not collections
 
-Conversation items and the routing ledger are projections of the log, not separate stores. There is one write path, so the log and the state read from it cannot disagree after a crash. A backend supplies an append-only log and a lease. State falls into three classes:
+The native session API reconstructs conversation content from the log. Complete Messages and Responses requests instead supply the history for their own turn. Operational projections still come from the log. A backend supplies that log and a lease. State falls into three classes:
 
 | Class | Examples | After a restart |
 |---|---|---|
@@ -49,9 +49,23 @@ Every append needs a `Lease`: a node id, an expiry, and a `fencing_token` that t
 
 Within one engine, a session lock serializes active and waiting turns before lease acquisition. The last caller removes this lock, including on task cancellation. Idle sessions retain no engine lock.
 
-## Incremental tokenization
+## Complete and reference-only history
 
-Routing on cache locality needs the prompt's block hashes before dispatch. A full recompute each turn costs O(context × turns) per session, more than the routing decision saves. The conversation is append-only and Dynamo hashes fixed-size blocks from tokens alone, so Roundhouse hashes only the newly completed blocks. `incremental_hashing_matches_a_full_recompute` checks this against Dynamo's own hash functions.
+Messages and Responses requests are authoritative. Dispatch, routing signals, objective selection, and validation use the supplied conversation. Omitted instructions and interrupted output stay out of the turn. Admission keeps the complete request intact and copies only the selected log delta, after comparing candidate generations.
+
+The native session API is the explicit reference-only path. It accepts new input and reconstructs the earlier conversation from the log. Completed-turn retries still replay their stored result.
+
+The log still retains content. It can contain configuration or interrupted output that a complete request omitted. If the supplied history differs, the validator withholds the stored review section and records an unknown learning label. It does not judge omitted content.
+
+Cache predictions require a conversation that agrees with the log. Otherwise, routing uses a cold estimate, omits remembered cache markers, and records `cache_context_unverified`. Replay discards those predictions too. A replacement configuration also clears previous predictions. Provider-reported cache usage remains unchanged. A request that differs from the log can therefore reuse an upstream cache even though Roundhouse predicts no reuse. This includes histories admitted through namespace wildcard matching or JSON numeric equivalence; admission agreement is weaker than the content check used here. Namespace differences alone do not change the current prompt rendering, so this check can discard a usable cache prediction. After interrupted output is omitted, that output remains in the log; predictions stay cold for subsequent requests that continue to omit it. Restoring warm estimates in this case requires tracking the actual dispatched context separately from the log.
+
+The retained log fold still treats interior Responses `developer` items as configuration. Complete requests preserve those items in the dispatched prompt, but admission can fork such a history into a new generation. The ignored `an_interior_developer_message_keeps_its_generation` test records this unresolved case; it does not enforce a fix.
+
+These changes do not bound retained logs, session counts, or concurrent request memory. The two-hour idle policy and capacity eviction are not implemented.
+
+## Tokenization
+
+The engine rebuilds the context assembler for each turn. The assembler extends token blocks within that turn, but the server still tokenizes the complete conversation. The default `ByteTokenizer` encodes bytes rather than model tokens. This is not yet a tokenizer-free forwarding path.
 
 ## Naming a conversation
 
@@ -124,7 +138,7 @@ flowchart TD
 
 Claude Code 2.1.251 and later send `role: "system"` messages inside `messages` on every request. A surface that refuses them refuses the whole client line.
 
-The leading run of system items is turn configuration: the date, the working directory, the branch, the active betas. It is canonicalized to the `Developer` role. The client rebuilds it on each run, so a changed run never forks the session. The new run replaces the stored one at the head, and the log keeps both. A claim with no configuration leaves the stored run in place.
+The leading run of system items is turn configuration: the date, the working directory, the branch, the active betas. It is canonicalized to the `Developer` role. The client rebuilds it on each run, so a changed run never forks the session. The new run replaces the stored one at the head, and the log keeps both. A claim with no configuration does not restore the stored run into its turn. The retained log still contains that run.
 
 A system message after the leading run is history and is compared strictly. The same interior message arrives as a one-block list on the first turn and as a bare string on a `--continue` resend. Canonicalization ignores the container shape.
 

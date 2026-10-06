@@ -46,7 +46,8 @@ use roundhouse_fleet::{
     LocalFleet, LocalQuote, Reservation,
 };
 use roundhouse_server::{
-    Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecutor, TurnInput,
+    Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecutor, TurnHistory,
+    TurnInput,
 };
 
 mod common;
@@ -180,6 +181,9 @@ fn tools() -> serde_json::Value {
 
 fn turn_input(tools: Option<serde_json::Value>) -> TurnInput {
     TurnInput {
+        // A direct engine call, which is the native session surface's shape:
+        // no claim, so the log is the conversation.
+        history: TurnHistory::Reference,
         items: vec![Item::user_text("hi")],
         declared_baseline: None,
         output_token_cap: None,

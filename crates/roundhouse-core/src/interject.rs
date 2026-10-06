@@ -159,10 +159,10 @@ impl Interjection {
 /// out of by price, and the seam sits before `plan` precisely so the question
 /// cannot be asked.
 pub struct InterjectionContext<'a> {
-    /// The conversation and its projections, as the log has them: the items,
-    /// the turn index, the frontier history, the steers still outstanding.
-    /// Everything a trigger can compute without a model call is in here.
+    /// Operational projections, including cadence and pending reviews.
     pub state: &'a SessionState,
+    /// Content supplied for this turn. Readers must not restore `state.items`.
+    pub conversation: &'a [Item],
     /// The response this turn has already opened.
     ///
     /// Load-bearing rather than incidental: it is the provenance stamp on
@@ -292,6 +292,7 @@ mod tests {
         ) -> InterjectionContext<'a> {
             InterjectionContext {
                 state,
+                conversation: &state.items,
                 response_id,
                 turn_policy: policy,
                 objective: Objective::Unknown,

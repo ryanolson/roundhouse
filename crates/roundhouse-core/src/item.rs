@@ -417,6 +417,26 @@ impl Item {
         }
     }
 
+    /// Compare prompt content without the server's response stamp.
+    pub fn same_prompt_content(&self, other: &Self) -> bool {
+        if self.role != other.role {
+            return false;
+        }
+        match (&self.content, &other.content) {
+            (
+                ItemContent::Opaque {
+                    block_type: a_type,
+                    block: a,
+                },
+                ItemContent::Opaque {
+                    block_type: b_type,
+                    block: b,
+                },
+            ) => a_type == b_type && same_json_render(a, b),
+            _ => self.content == other.content,
+        }
+    }
+
     /// Deterministic prompt rendering for a single item.
     pub fn render(&self) -> String {
         format!("<|{}|>{}", self.role.as_str(), self.content.render())
@@ -479,8 +499,52 @@ impl Item {
     }
 }
 
+// JSON equality merges signed floating zeros; prompt rendering preserves them.
+fn same_json_render(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(a), Value::Number(b)) if a.is_f64() && b.is_f64() => {
+            a.as_f64().map(f64::to_bits) == b.as_f64().map(f64::to_bits)
+        }
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_json_render(a, b))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|((ak, av), (bk, bv))| ak == bk && same_json_render(av, bv))
+        }
+        _ => a == b,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_comparison_preserves_signed_zero() {
+        let item = |value| super::Item {
+            role: super::Role::User,
+            content: super::ItemContent::Opaque {
+                block_type: "json".into(),
+                block: serde_json::json!({"nested": [value]}),
+            },
+            response_id: None,
+        };
+        let positive = item(0.0);
+        let negative = item(-0.0);
+        assert_eq!(positive.content, negative.content);
+        assert_ne!(positive.render(), negative.render());
+        assert!(!positive.same_prompt_content(&negative));
+        assert!(positive.same_prompt_content(&positive));
+    }
+
+    #[test]
+    fn prompt_comparison_ignores_response_stamps() {
+        let first = super::Item::assistant_text("same", crate::ids::ResponseId::new("a"));
+        let second = super::Item::assistant_text("same", crate::ids::ResponseId::new("b"));
+        assert!(first.same_prompt_content(&second));
+    }
+
     use super::*;
 
     /// M17 review F4: `canonical_arguments`'s doc comment (see the block

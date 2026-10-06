@@ -2398,17 +2398,25 @@ async fn a_retried_turn_replays_rather_than_answering_twice() {
 /// `ResponseIncomplete` event — rather than a rewrite of it; nothing committed
 /// is edited or removed.
 ///
-/// Everything else about the mechanism is asserted unchanged, because the fix
-/// is deliberately the admission half only:
+/// **And the prompt half, which the bounded-state rung added.** F2 shipped as
+/// the admission half alone: the retry's own prompt still carried the partial,
+/// on the argument that it is a genuine cache hit on the target that produced
+/// it. That is superseded. A full-history request is authoritative, so the
+/// prompt is the conversation the client sent — and the client sent no partial,
+/// because its own stream threw the answer away before any `message_stop`. The
+/// cache hit is real and is given up deliberately: continuing an answer the
+/// client has never seen asks the model to write the second half of a reply
+/// nobody holds the first half of. A client that *did* keep the partial
+/// resends it and gets it back, which is the control beside this test.
 ///
-/// 1. The retry does not deduplicate (the first attempt never completed) and
-///    its own prompt — captured off the double, never off the wire — still
-///    contains the partial, because `Engine::plan` rehydrates from
-///    `session.state().items` and the partial is a genuine cache hit on the
-///    target that produced it. The wire gives no sign of this: the retry's
-///    stream is an ordinary `message_start`…`message_stop`.
+/// Everything else about the mechanism is asserted unchanged:
+///
+/// 1. The retry does not deduplicate — the first attempt never completed — and
+///    the wire gives no sign of any of this: the retry's stream is an ordinary
+///    `message_start`…`message_stop`.
 /// 2. The log still holds the partial and the continuation as two separate
-///    assistant items. Append-only means append-only.
+///    assistant items. Append-only means append-only, and the prompt rule is
+///    about the prompt.
 /// 3. The client's *next* turn, carrying only what it actually received, lands
 ///    on the same session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2459,16 +2467,21 @@ async fn a_retry_after_a_mid_stream_failure_keeps_the_conversation_on_one_sessio
         "an ordinary, unremarkable-looking completed turn: {retry:?}"
     );
 
-    // The mechanism: the retried generation's own prompt silently carried the
-    // partial as context, which is *why* the model produced a bare
-    // continuation instead of a fresh, self-contained answer.
+    // The mechanism, as the bounded-state rung left it: the retry's prompt is
+    // the request's own conversation, so the partial the client discarded is
+    // not in it. The two prompts are therefore identical, which is what a
+    // byte-for-byte retry should produce.
     let prompts = client.prompts_seen();
     assert_eq!(prompts.len(), 2, "exactly one prompt per dispatch attempt");
     assert!(
-        prompts[1].contains(PARTIAL.trim_end()),
-        "the retry's own prompt must contain the partial the client discarded, or the \
-         continuation could not follow it as prose: {:?}",
+        !prompts[1].contains(PARTIAL.trim_end()),
+        "a retry must not be asked to continue an answer the client never \
+         received: {:?}",
         prompts[1]
+    );
+    assert_eq!(
+        prompts[1], prompts[0],
+        "the client re-sent the same request, so it is the same prompt"
     );
 
     // The log never merges the two halves into one answer.

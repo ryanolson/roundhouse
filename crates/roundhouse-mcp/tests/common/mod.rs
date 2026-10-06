@@ -515,6 +515,7 @@ pub async fn decision() -> DecisionRecord {
         .expect("the router chooses from the set it was handed");
 
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: None,
         local_quote_skipped: None,

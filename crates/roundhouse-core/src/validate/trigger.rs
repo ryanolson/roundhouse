@@ -49,6 +49,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::item::Item;
 use crate::session::SessionState;
 use crate::validate::control_call::{ControlCallDialect, task_exchanges_on};
 use crate::validate::exchange::{Exchange, exchanges};
@@ -151,9 +152,13 @@ pub struct Evidence<'a> {
 }
 
 impl<'a> Evidence<'a> {
-    pub fn of(state: &'a SessionState, dialect: ControlCallDialect) -> Self {
+    /// `conversation` is the turn's own, not `state.items`: the signals are
+    /// about the trajectory the model was shown, and a full-history request's
+    /// trajectory is what the client sent. See
+    /// [`InterjectionContext::conversation`](crate::interject::InterjectionContext::conversation).
+    pub fn of(conversation: &[Item], state: &'a SessionState, dialect: ControlCallDialect) -> Self {
         Self {
-            exchanges: exchanges(&state.items),
+            exchanges: exchanges(conversation),
             turn_tokens: state.recent_turn_tokens(),
             dialect,
         }
@@ -446,13 +451,14 @@ impl Trigger {
     /// it as the ceiling every narrowing composes through.
     pub fn evaluate(
         &self,
+        conversation: &[Item],
         state: &SessionState,
         dialect: ControlCallDialect,
     ) -> Option<TriggerRecord> {
         if !self.gate_open(state) {
             return None;
         }
-        let evidence = Evidence::of(state, dialect);
+        let evidence = Evidence::of(conversation, state, dialect);
         let signals: Vec<SignalFired> = self
             .signals
             .iter()
@@ -880,7 +886,7 @@ mod tests {
         }
         let healthy = wide_open(healthy_items.clone());
         assert_eq!(
-            trigger.evaluate(&healthy, ControlCallDialect::ClaudeMessages),
+            trigger.evaluate(&healthy.items, &healthy, ControlCallDialect::ClaudeMessages),
             None,
             "a cadence that has come due is permission to ask, never a reason to"
         );
@@ -892,7 +898,7 @@ mod tests {
         items.extend(stuck_items());
         let stuck = wide_open(items);
         let fired = trigger
-            .evaluate(&stuck, ControlCallDialect::ClaudeMessages)
+            .evaluate(&stuck.items, &stuck, ControlCallDialect::ClaudeMessages)
             .expect("an open gate plus evidence is the one case that consults");
         // Named exhaustively rather than counted loosely, because *which*
         // signals a fixture trips is the thing that silently changes when the
@@ -931,7 +937,7 @@ mod tests {
         let stuck = wide_open(stuck_items());
         assert!(
             trigger
-                .evaluate(&stuck, ControlCallDialect::ClaudeMessages)
+                .evaluate(&stuck.items, &stuck, ControlCallDialect::ClaudeMessages)
                 .is_some(),
             "the control: this session's evidence is what makes the next \
              assertion about the steer and not about the evidence"
@@ -945,7 +951,11 @@ mod tests {
         fulfilling.steered_on_turn = Some(fulfilling.turn_index - 1);
         assert!(fulfilling.this_turn_fulfils_a_steer());
         assert_eq!(
-            trigger.evaluate(&fulfilling, ControlCallDialect::ClaudeMessages),
+            trigger.evaluate(
+                &fulfilling.items,
+                &fulfilling,
+                ControlCallDialect::ClaudeMessages
+            ),
             None
         );
 
@@ -955,7 +965,7 @@ mod tests {
         earlier.steered_on_turn = Some(earlier.turn_index - 2);
         assert!(
             trigger
-                .evaluate(&earlier, ControlCallDialect::ClaudeMessages)
+                .evaluate(&earlier.items, &earlier, ControlCallDialect::ClaudeMessages)
                 .is_some()
         );
 
@@ -967,7 +977,11 @@ mod tests {
         emitting.steered_on_turn = Some(emitting.turn_index);
         assert!(
             trigger
-                .evaluate(&emitting, ControlCallDialect::ClaudeMessages)
+                .evaluate(
+                    &emitting.items,
+                    &emitting,
+                    ControlCallDialect::ClaudeMessages
+                )
                 .is_some()
         );
     }
@@ -978,12 +992,10 @@ mod tests {
         let config = TriggerConfig::default();
 
         // The base case: open, with evidence.
+        let open = wide_open(stuck_items());
         assert!(
             trigger
-                .evaluate(
-                    &wide_open(stuck_items()),
-                    ControlCallDialect::ClaudeMessages
-                )
+                .evaluate(&open.items, &open, ControlCallDialect::ClaudeMessages)
                 .is_some()
         );
 
@@ -993,7 +1005,7 @@ mod tests {
             let mut early = wide_open(stuck_items());
             early.turn_index = index;
             assert_eq!(
-                trigger.evaluate(&early, ControlCallDialect::ClaudeMessages),
+                trigger.evaluate(&early.items, &early, ControlCallDialect::ClaudeMessages),
                 None,
                 "turn {index} has no history"
             );
@@ -1010,7 +1022,7 @@ mod tests {
             state.tokens_since_last_validation = tokens;
             assert_eq!(
                 trigger
-                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .evaluate(&state.items, &state, ControlCallDialect::ClaudeMessages)
                     .is_some(),
                 open,
                 "{tokens} tokens"
@@ -1025,7 +1037,7 @@ mod tests {
             state.last_event_at_ms = 1_000_000 + elapsed;
             assert_eq!(
                 trigger
-                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .evaluate(&state.items, &state, ControlCallDialect::ClaudeMessages)
                     .is_some(),
                 open,
                 "{elapsed}ms elapsed"
@@ -1042,7 +1054,7 @@ mod tests {
             state.consecutive_interventions = interventions;
             assert_eq!(
                 trigger
-                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .evaluate(&state.items, &state, ControlCallDialect::ClaudeMessages)
                     .is_some(),
                 open
             );
@@ -1058,7 +1070,7 @@ mod tests {
             state.validations_run = run;
             assert_eq!(
                 trigger
-                    .evaluate(&state, ControlCallDialect::ClaudeMessages)
+                    .evaluate(&state.items, &state, ControlCallDialect::ClaudeMessages)
                     .is_some(),
                 open
             );

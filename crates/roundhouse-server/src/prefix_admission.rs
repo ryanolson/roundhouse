@@ -162,6 +162,22 @@ use fingerprint::{ItemFingerprint, ResponseStamp};
 /// the restart case ahead of it needs.
 const MAX_PREFIX_PROBES: u32 = 8;
 
+/// The complete request and the delta to append to the log.
+/// Only the selected generation copies the delta; candidate probes copy no payloads.
+pub(crate) struct Admitted {
+    pub(crate) history: Vec<Item>,
+    pub(crate) delta: Vec<Item>,
+}
+
+impl Admitted {
+    fn whole(claimed: Vec<Item>) -> Self {
+        Self {
+            delta: claimed.clone(),
+            history: claimed,
+        }
+    }
+}
+
 /// Resolve a cache key to the session holding its history, and to the part of
 /// `claimed` that session does not have yet.
 ///
@@ -193,7 +209,7 @@ pub(crate) async fn bind_prefix<S, T>(
     principal: &Principal,
     cache_key: &str,
     claimed: Vec<Item>,
-) -> Result<(SessionId, Vec<Item>, bool), ApiError>
+) -> Result<(SessionId, Admitted, bool), ApiError>
 where
     S: SessionStore,
     T: Tokenizer + Clone + Send + Sync + 'static,
@@ -202,6 +218,10 @@ where
     // id, so the two cannot key on different strings. See [`Conversations`].
     let key = plane.qualify(principal, cache_key);
     let hint = conversations.generation(&key).await;
+    // Read before the claim is fingerprinted and kept past it: the split the
+    // search returns is expressed in these coordinates, and re-deriving it after
+    // the borrow ends would be the same rule spelled twice.
+    let configuration_len = turn_configuration_len(&claimed);
 
     // **Fingerprinted once, here, rather than once per generation probed.**
     // The search reads up to seventeen generations and asks each of them the
@@ -210,7 +230,7 @@ where
     // this block so the `Fresh` arm below can still hand the claim's items on
     // whole.
     let outcome = {
-        let claim = Claim::of(&claimed);
+        let claim = Claim::of(&claimed, configuration_len);
         match search(store, &key, hint, &claim).await? {
             // **A hint that ran the search off its bound is stale, and is
             // refreshed before anything is refused** (review M14.1, F2; R-C2″).
@@ -234,9 +254,9 @@ where
     };
 
     match outcome {
-        Search::Lands { generation, delta } => Ok((
+        Search::Lands { generation, split } => Ok((
             conversations.commit(principal, &key, generation).await,
-            delta,
+            split.divide(claimed, configuration_len),
             false,
         )),
         // The claim opens a generation of its own and is taken whole: there is
@@ -252,7 +272,7 @@ where
             history_rewritten,
         } => {
             let session_id = open_fresh(engine, conversations, principal, &key, generation).await?;
-            Ok((session_id, claimed, history_rewritten))
+            Ok((session_id, Admitted::whole(claimed), history_rewritten))
         }
         // Every generation a search from a fresh hint could reach disagreed
         // or was busy, and it never found a free slot. Refuse loudly, naming
@@ -273,9 +293,9 @@ where
 /// committed or minted as it went could not be re-run at all — which is the
 /// same reason [`probe`] writes nothing.
 enum Search {
-    /// `generation` agrees with the claim, and `delta` is the part of the
-    /// claim it does not already hold.
-    Lands { generation: u32, delta: Vec<Item> },
+    /// `generation` agrees with the claim, and `split` says where the part it
+    /// does not already hold begins.
+    Lands { generation: u32, split: Split },
     /// Nothing agreed, and `generation` is the key's first free slot — not yet
     /// created, since a probe that asked about it left it as it found it.
     Fresh {
@@ -301,7 +321,7 @@ async fn search<S: SessionStore>(
     store: &S,
     key: &str,
     current: u32,
-    claim: &Claim<'_>,
+    claim: &Claim,
 ) -> Result<Search, ApiError> {
     // Generations found agreeing, kept rather than counted from the bound:
     // the refusal above reports what the search actually read, not what it
@@ -317,10 +337,10 @@ async fn search<S: SessionStore>(
     // conversation nobody has edited is at the generation this node last
     // committed, and finding it there costs exactly one read.
     match probe(store, &bound_session(key, current), claim).await? {
-        Probe::Home { delta, .. } => {
+        Probe::Home { split, .. } => {
             return Ok(Search::Lands {
                 generation: current,
-                delta,
+                split,
             });
         }
         // A generation the store has never held has nothing above it either:
@@ -361,11 +381,11 @@ async fn search<S: SessionStore>(
                 fresh = Some(generation);
                 break;
             }
-            Probe::Home { held, delta } => {
+            Probe::Home { held, split } => {
                 homes.push(Home {
                     generation,
                     held,
-                    delta,
+                    split,
                 });
                 break;
             }
@@ -387,10 +407,10 @@ async fn search<S: SessionStore>(
             break;
         };
         match probe(store, &bound_session(key, generation), claim).await? {
-            Probe::Home { held, delta } => homes.push(Home {
+            Probe::Home { held, split } => homes.push(Home {
                 generation,
                 held,
-                delta,
+                split,
             }),
             Probe::Disagrees => disagreed += 1,
             // A hole below this node's counter is a shape the invariant above
@@ -411,7 +431,7 @@ async fn search<S: SessionStore>(
     {
         return Ok(Search::Lands {
             generation: home.generation,
-            delta: home.delta,
+            split: home.split,
         });
     }
 
@@ -461,10 +481,49 @@ where
 /// the question the search asks of two agreeing generations is which of them
 /// holds *more* of the conversation — a generation whose log is longer is the
 /// one continuing it would not duplicate.
+///
+/// `split` rather than a delta, and that is a retention claim about the search:
+/// a walk that found three agreeing generations used to hold three copies of the
+/// client's new history at once, and discard two of them. Two indices describe
+/// the cut, and the one that wins is applied to the claim exactly once.
 struct Home {
     generation: u32,
     held: usize,
-    delta: Vec<Item>,
+    split: Split,
+}
+
+/// The chosen suffix boundary and whether configuration needs recording.
+/// Probes keep indices so only the selected delta copies payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Split {
+    /// Whether the claim's leading configuration run is part of the delta —
+    /// true when the client rewrote it, false when it matched or was absent.
+    configuration: bool,
+    /// How many of the claim's *history* items the log already holds.
+    agreed: usize,
+}
+
+impl Split {
+    /// Keep the request intact and copy only the chosen log delta.
+    fn divide(self, claimed: Vec<Item>, configuration_len: usize) -> Admitted {
+        let suffix = &claimed[configuration_len + self.agreed..];
+        let mut delta = Vec::with_capacity(
+            suffix.len()
+                + if self.configuration {
+                    configuration_len
+                } else {
+                    0
+                },
+        );
+        if self.configuration {
+            delta.extend_from_slice(&claimed[..configuration_len]);
+        }
+        delta.extend_from_slice(suffix);
+        Admitted {
+            history: claimed,
+            delta,
+        }
+    }
 }
 
 /// What one generation has to say about a claim, asked without writing
@@ -481,9 +540,9 @@ enum Probe {
     /// the key's family. `probe` does not create it — [`open_fresh`] does,
     /// and only once the search has decided this is where the claim belongs.
     Fresh,
-    /// This generation's log agrees with the claim, and `delta` is what the
-    /// turn may append to it.
-    Home { held: usize, delta: Vec<Item> },
+    /// This generation's log agrees with the claim, and `split` says where
+    /// what the turn may append to it begins.
+    Home { held: usize, split: Split },
     /// Its log and the claim disagree somewhere they overlap.
     Disagrees,
     /// Nothing recorded, but another writer holds the lease: another node's
@@ -511,7 +570,7 @@ enum Probe {
 async fn probe<S: SessionStore>(
     store: &S,
     session_id: &SessionId,
-    claim: &Claim<'_>,
+    claim: &Claim,
 ) -> Result<Probe, ApiError> {
     // `SessionNotFound` is the honest spelling of "fresh": nothing this node
     // or any other has ever bound to this generation. Any other store error
@@ -540,9 +599,9 @@ async fn probe<S: SessionStore>(
     }
 
     Ok(match admit(&stored, claim) {
-        Some(delta) => Probe::Home {
+        Some(split) => Probe::Home {
             held: stored.history().len(),
-            delta,
+            split,
         },
         None => Probe::Disagrees,
     })
@@ -791,29 +850,24 @@ async fn stored_conversation<S: SessionStore>(
 
 /// The client's resent history, fingerprinted once for the whole search.
 ///
-/// Two views of one claim, and both are needed: the fingerprints are what the
-/// stored side is compared against, and the items are what a delta is *made
-/// of*. The delta was always built from the claim rather than from the log —
-/// the client's copy is the authoritative spelling of what it is sending — so
-/// dropping the payload from the stored side costs the delta nothing.
-///
-/// The request owns these items for the duration of its turn, which is why this
-/// borrows rather than clones: admission must not become a second retained copy
-/// of a conversation the handler already holds.
-struct Claim<'a> {
-    items: &'a [Item],
+/// **Fingerprints and one boundary, and no copy of the conversation at all.**
+/// The fingerprints are what the stored side is compared against; where the
+/// claim is cut comes back as a [`Split`] and is applied to the request's own
+/// items once, after the home is known. The request owns those items for the
+/// length of its turn, and admission must not become a second retained copy of
+/// a conversation the handler already holds.
+struct Claim {
     fingerprints: Vec<ItemFingerprint>,
+    /// Where the claim's leading configuration run ends, by the one rule that
+    /// decides it: a leading run, by position, at canonicalization.
     configuration_len: usize,
 }
 
-impl<'a> Claim<'a> {
-    fn of(items: &'a [Item]) -> Self {
+impl Claim {
+    fn of(items: &[Item], configuration_len: usize) -> Self {
         Self {
-            items,
             fingerprints: items.iter().map(ItemFingerprint::of).collect(),
-            // The claim's own split, read off the items by the one rule that
-            // decides it: a leading run, by position, at canonicalization.
-            configuration_len: turn_configuration_len(items),
+            configuration_len,
         }
     }
 
@@ -823,14 +877,6 @@ impl<'a> Claim<'a> {
 
     fn history(&self) -> &[ItemFingerprint] {
         &self.fingerprints[self.configuration_len..]
-    }
-
-    fn configuration_items(&self) -> &'a [Item] {
-        &self.items[..self.configuration_len]
-    }
-
-    fn history_items(&self) -> &'a [Item] {
-        &self.items[self.configuration_len..]
     }
 }
 
@@ -868,23 +914,18 @@ impl<'a> Claim<'a> {
 ///   [`is_turn_configuration`](roundhouse_core::session::is_turn_configuration).
 ///
 /// A claim carrying **no** configuration at all against a session that holds
-/// some leaves the stored run in place. That is "this request said nothing
-/// about the instructions", not "the instructions are now empty": an empty run
-/// has no items to append and so nothing to record, and forking over it would
-/// punish exactly the bare `curl` the anonymous arm exists to serve.
-fn admit(stored: &StoredConversation, claim: &Claim<'_>) -> Option<Vec<Item>> {
-    let agreed = suffix_after(stored.history(), claim.history())?;
-    let suffix = &claim.history_items()[agreed..];
-    let claimed_configuration = claim.configuration_items();
-
-    let mut delta = Vec::with_capacity(claimed_configuration.len() + suffix.len());
-    if !claimed_configuration.is_empty()
-        && !same_runs(stored.configuration(), claim.configuration())
-    {
-        delta.extend_from_slice(claimed_configuration);
-    }
-    delta.extend_from_slice(suffix);
-    Some(delta)
+/// some records nothing and forks nothing. An empty run has no items to append,
+/// and forking over it would punish exactly the bare `curl` the anonymous arm
+/// exists to serve. What it no longer does is put the stored run back into the
+/// turn: this request said nothing about the instructions, and a prompt is what
+/// the request sent — see [`Admitted`] and
+/// [`TurnHistory`](crate::engine::TurnHistory).
+fn admit(stored: &StoredConversation, claim: &Claim) -> Option<Split> {
+    Some(Split {
+        agreed: suffix_after(stored.history(), claim.history())?,
+        configuration: !claim.configuration().is_empty()
+            && !same_runs(stored.configuration(), claim.configuration()),
+    })
 }
 
 /// Where the part of `claimed` that `stored` does not already contain begins.

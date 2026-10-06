@@ -28,7 +28,8 @@ use roundhouse_fleet::{
 };
 use roundhouse_server::test_support::frontier_spec;
 use roundhouse_server::{
-    Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecutor, TurnInput,
+    Admission, EchoLocalExecutor, Engine, EngineConfig, EngineError, LocalExecutor, TurnHistory,
+    TurnInput,
 };
 
 /// A client that keeps the quote it was handed and then answers normally.
@@ -95,6 +96,7 @@ async fn dispatched_quote(cache_model: CacheModel, wire_protocol: WireProtocol) 
             &session_id,
             TurnId::new("t1"),
             TurnInput {
+                history: TurnHistory::Reference,
                 items: vec![Item::user_text("hi")],
                 declared_baseline: None,
                 output_token_cap: None,
@@ -205,6 +207,7 @@ async fn an_unspellable_messages_ttl_dispatches_nothing_and_fails_the_turn() {
             &session_id,
             TurnId::new("t1"),
             TurnInput {
+                history: TurnHistory::Reference,
                 items: vec![Item::user_text("hi")],
                 declared_baseline: None,
                 output_token_cap: None,

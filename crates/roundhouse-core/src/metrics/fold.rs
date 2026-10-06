@@ -1358,6 +1358,7 @@ pub(super) mod tests {
     /// A plain decision naming one target, for fixtures that vary one field.
     pub(crate) fn decision_for(target: Target, isl_tokens: u64) -> DecisionRecord {
         DecisionRecord {
+            cache_context_unverified: false,
             block_marker: None,
             selection: None,
             local_quote_skipped: None,
@@ -1517,6 +1518,7 @@ pub(super) mod tests {
             self.push(SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    cache_context_unverified: false,
                     block_marker: None,
                     selection: None,
                     local_quote_skipped: None,
@@ -1624,6 +1626,7 @@ pub(super) mod tests {
             self.push(SessionEventKind::Routed {
                 response_id: response_id.clone(),
                 decision: DecisionRecord {
+                    cache_context_unverified: false,
                     block_marker: None,
                     selection: None,
                     local_quote_skipped: None,

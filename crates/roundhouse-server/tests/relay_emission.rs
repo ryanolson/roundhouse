@@ -84,6 +84,7 @@ fn decision(chosen: Target) -> DecisionRecord {
         Some(HOSTED)
     };
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: None,
         local_quote_skipped: None,

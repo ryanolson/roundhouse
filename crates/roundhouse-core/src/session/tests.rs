@@ -55,6 +55,7 @@ fn card() -> ProviderPricing {
 /// than an absence that would be true whatever it did.
 fn decision_for(target: Target, isl: u64) -> DecisionRecord {
     DecisionRecord {
+        cache_context_unverified: false,
         block_marker: None,
         selection: None,
         local_quote_skipped: None,

@@ -65,16 +65,23 @@ fn assistant(text: &str) -> Item {
     Item::assistant_text(text, ResponseId::new("resp_1"))
 }
 
-/// What a turn claiming `claimed` may append to a session whose committed
-/// history is `stored`.
-///
-/// The production path, both sides fingerprinted exactly as [`bind_prefix`]
-/// fingerprints them: the stored side when the log is projected, the claimed
-/// side once per request. It returns the delta rather than the agreement
-/// boundary because the delta is what a turn runs on, and because every
-/// assertion below is about *which items get appended*.
+/// Compare the supplied history with a canonical stored projection.
+fn divide(stored_items: &[Item], claimed: &[Item]) -> Option<Admitted> {
+    let configuration_len = turn_configuration_len(claimed);
+    admit(
+        &stored(stored_items.to_vec()),
+        &Claim::of(claimed, configuration_len),
+    )
+    .map(|split| split.divide(claimed.to_vec(), configuration_len))
+}
+
+/// What a turn claiming `claimed` may append.
 fn suffix(stored_items: &[Item], claimed: &[Item]) -> Option<Vec<Item>> {
-    admit(&stored(stored_items.to_vec()), &Claim::of(claimed))
+    divide(stored_items, claimed).map(|admitted| admitted.delta)
+}
+
+fn conversation(stored_items: &[Item], claimed: &[Item]) -> Option<Vec<Item>> {
+    divide(stored_items, claimed).map(|admitted| admitted.history)
 }
 
 #[test]
@@ -226,10 +233,10 @@ fn stored(items: Vec<Item>) -> StoredConversation {
 ///
 /// The four cases are the whole ruling. Note what the delta contains in the
 /// second: the *new* run and only the genuinely new history — the run is
-/// re-recorded because it changed, and the projection puts it at the head.
+/// re-recorded because it changed. The supplied history remains intact.
 #[test]
 fn a_changed_configuration_run_is_admitted_and_a_changed_history_is_not() {
-    let session = stored(vec![configuration("v1"), user("hello"), assistant("hi")]);
+    let session = [configuration("v1"), user("hello"), assistant("hi")];
     let history = [
         user("hello"),
         Item {
@@ -243,73 +250,127 @@ fn a_changed_configuration_run_is_admitted_and_a_changed_history_is_not() {
     // Unchanged: nothing about the configuration is re-recorded.
     let mut claimed = vec![configuration("v1")];
     claimed.extend_from_slice(&history);
-    assert_eq!(
-        admit(&session, &Claim::of(&claimed)),
-        Some(vec![user("again")])
-    );
+    assert_eq!(suffix(&session, &claimed), Some(vec![user("again")]));
+    assert_eq!(conversation(&session, &claimed), Some(claimed.clone()));
 
     // Rewritten: the new run leads the delta, ahead of the new history.
     let mut claimed = vec![configuration("v2")];
     claimed.extend_from_slice(&history);
     assert_eq!(
-        admit(&session, &Claim::of(&claimed)),
+        suffix(&session, &claimed),
         Some(vec![configuration("v2"), user("again")]),
+    );
+    assert_eq!(
+        conversation(&session, &claimed),
+        Some(claimed.clone()),
+        "a rewritten run is appended and folded back to the head, so the turn \
+         still runs on the claim in the order the client sent it"
     );
 
     // A run that gained a block is a changed run, not a matching prefix.
     let mut claimed = vec![configuration("v1"), configuration("extra")];
     claimed.extend_from_slice(&history);
     assert_eq!(
-        admit(&session, &Claim::of(&claimed)),
+        suffix(&session, &claimed),
         Some(vec![
             configuration("v1"),
             configuration("extra"),
             user("again")
         ]),
     );
+    assert_eq!(conversation(&session, &claimed), Some(claimed.clone()));
 
     // And the history is still strict: rewriting *it* forks, whatever the
     // configuration says. This is the assertion that keeps the tolerance
     // narrow.
     assert_eq!(
-        admit(
-            &session,
-            &Claim::of(&[configuration("v1"), user("goodbye")])
-        ),
+        suffix(&session, &[configuration("v1"), user("goodbye")]),
         None
     );
     assert_eq!(
-        admit(
-            &session,
-            &Claim::of(&[configuration("v2"), user("goodbye")])
-        ),
+        suffix(&session, &[configuration("v2"), user("goodbye")]),
         None
     );
 }
 
-/// A claim with no configuration of its own says nothing about the
-/// session's, rather than claiming it is now empty.
+/// A claim with no configuration of its own records nothing and forks nothing
+/// — and the turn runs without the stored run.
 ///
-/// An empty run has no items to append and so nothing to record; forking
-/// over it would punish exactly the bare `curl` the anonymous arm exists to
-/// serve.
+/// An empty run has no items to append, so nothing is recorded; forking over it
+/// would punish exactly the bare `curl` the anonymous arm exists to serve. What
+/// it is *not* is a request for the instructions this client last sent: the two
+/// history is instruction-less, which is what the prompt is built from. The log keeps the stored run either way.
 #[test]
-fn a_claim_carrying_no_configuration_leaves_the_stored_run_alone() {
-    let session = stored(vec![configuration("v1"), user("hello"), assistant("hi")]);
+fn a_claim_carrying_no_configuration_runs_without_the_stored_run() {
+    let session = [configuration("v1"), user("hello"), assistant("hi")];
+    let claimed = [
+        user("hello"),
+        Item {
+            role: Role::Assistant,
+            content: ItemContent::Text { text: "hi".into() },
+            response_id: None,
+        },
+        user("again"),
+    ];
+    let admitted = divide(&session, &claimed).expect("the claim continues the session");
     assert_eq!(
-        admit(
-            &session,
-            &Claim::of(&[
-                user("hello"),
-                Item {
-                    role: Role::Assistant,
-                    content: ItemContent::Text { text: "hi".into() },
-                    response_id: None,
-                },
-                user("again"),
-            ])
-        ),
-        Some(vec![user("again")]),
+        admitted.delta,
+        vec![user("again")],
+        "nothing about the stored configuration is re-recorded"
+    );
+    assert_eq!(
+        admitted.history,
+        claimed.to_vec(),
+        "the supplied history stays intact"
+    );
+    assert_eq!(
+        conversation(&session, &claimed),
+        Some(claimed.to_vec()),
+        "the turn runs on exactly what the client sent"
+    );
+}
+
+/// An item left out of the stored projection is left out of the turn.
+///
+/// The provisional rule is admission's: an item stamped by a response the log
+/// records as incomplete is not compared against, so the client's honest retry
+/// agrees instead of forking. This is the other half — that the turn then runs
+/// on the claim, so a partial the client's own stream threw away is not handed
+/// back to the model. `stored` here is the projection *after* the provisional
+/// filter, which is what [`stored_conversation`] produces.
+#[test]
+fn a_claim_that_omits_a_provisional_item_runs_without_it() {
+    // What the projection holds: the question alone, the partial filtered out.
+    let projected = [user("hello")];
+    let claimed = [user("hello")];
+    assert_eq!(
+        divide(&projected, &claimed).map(|admitted| admitted.delta),
+        Some(Vec::new()),
+        "the retry appends nothing, which is what deduplicates it"
+    );
+    assert_eq!(
+        conversation(&projected, &claimed),
+        Some(claimed.to_vec()),
+        "and the turn runs on the client's conversation, partial-free"
+    );
+
+    // The control: a client that kept the partial is continuing from it, so it
+    // is ordinary new history.
+    let kept = [
+        user("hello"),
+        Item {
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: "half an answer".into(),
+            },
+            response_id: None,
+        },
+        user("again"),
+    ];
+    assert_eq!(
+        conversation(&projected, &kept),
+        Some(kept.to_vec()),
+        "a resent partial is history like any other"
     );
 }
 
@@ -456,7 +517,7 @@ impl<S: SessionStore> Rig<S> {
             claimed,
         )
         .await
-        .map(|(session, delta, _)| (session, delta))
+        .map(|(session, admitted, _)| (session, admitted.delta))
     }
 }
 
@@ -2024,12 +2085,12 @@ async fn the_retained_projection_does_not_grow_with_the_payload() {
     // And it is still the same conversation: the claim the client resends,
     // payload included, continues it.
     assert_eq!(
-        admit(&large, &Claim::of(&history(PAYLOAD))),
-        Some(Vec::new()),
+        admit(&large, &Claim::of(&history(PAYLOAD), 0)).map(|split| split.agreed),
+        Some(3),
         "a verbatim resend of the stored history is the ordinary retry"
     );
     assert_eq!(
-        admit(&large, &Claim::of(&history(PAYLOAD - 1))),
+        admit(&large, &Claim::of(&history(PAYLOAD - 1), 0)),
         None,
         "and a claim whose image differs by one byte is a different \
          conversation -- a digest that ignored the payload would admit it"
@@ -2197,4 +2258,19 @@ async fn a_long_full_history_request_admits_only_its_new_turn() {
         "a {payload_bytes}-byte conversation and the same conversation \
          without its image must project to the same retained size"
     );
+}
+
+#[tokio::test]
+#[ignore = "existing log fold treats interior developer items as configuration; requires positional configuration metadata"]
+async fn an_interior_developer_message_keeps_its_generation() {
+    let rig = Rig::new("acme/ada/interior-developer");
+    let claimed = vec![
+        configuration("A"),
+        user("q1"),
+        configuration("B"),
+        user("q2"),
+    ];
+    rig.seed(0, claimed.clone()).await;
+    let (session, _) = rig.bind(claimed).await.unwrap();
+    assert_eq!(session, rig.generation(0));
 }

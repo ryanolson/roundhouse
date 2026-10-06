@@ -99,6 +99,7 @@ struct CompletedTurn {
 
 /// Where a dispatch went, how much prompt it carried, and at what price.
 struct PendingRouting {
+    cache_context_unverified: bool,
     target: Target,
     isl_tokens: u64,
     /// The rate card the decision recorded. See
@@ -682,7 +683,10 @@ impl SessionState {
                 // leading configuration run replaces the session's, at the
                 // head. See [`ConfigurationCursor`].
                 match is_turn_configuration(item) {
-                    true => self.review.configuration_appended(),
+                    true => {
+                        self.review.configuration_appended();
+                        self.ledger.invalidate();
+                    }
                     false => self.review.history_appended(
                         self.items.len() - self.configuration.len(),
                         item.user_request().is_some(),
@@ -737,6 +741,7 @@ impl SessionState {
                 self.pending_routings.insert(
                     response_id.clone(),
                     PendingRouting {
+                        cache_context_unverified: decision.cache_context_unverified,
                         target: decision.chosen.clone(),
                         isl_tokens: decision.isl_tokens,
                         rate_card: decision.rate_card,
@@ -785,7 +790,9 @@ impl SessionState {
                     let processed =
                         matches!(event.kind, SessionEventKind::ResponseCompleted { .. })
                             || usage.input_tokens > 0;
-                    if processed {
+                    if routing.cache_context_unverified {
+                        self.ledger.invalidate();
+                    } else if processed {
                         self.ledger.record(
                             &routing.target,
                             event.at_ms,
