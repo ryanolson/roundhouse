@@ -2385,7 +2385,7 @@ async fn a_retried_turn_replays_rather_than_answering_twice() {
 ///
 /// **What used to happen.** The log held the partial and the continuation as
 /// two assistant items; the client's next resend carried only the continuation
-/// it had actually received; the two disagreed at that item under `same_item`
+/// it had actually received; the two disagreed at that item under the item comparison
 /// and the session forked — punishing a client that did exactly what the retry
 /// contract asked of it, on a turn a transient upstream failure had already
 /// cost it once, and taking the routing history and warm prefix with it.

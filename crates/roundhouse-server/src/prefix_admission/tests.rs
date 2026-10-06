@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use roundhouse_core::context::ByteTokenizer;
 use roundhouse_core::event::SessionEvent;
-use roundhouse_core::ids::TurnId;
+use roundhouse_core::ids::{ResponseId, TurnId};
 use roundhouse_core::item::{ItemContent, Role};
 use roundhouse_core::store::{MemoryStore, StoreError};
 use roundhouse_fleet::{EchoFrontierClient, StaticFrontierCatalog, WireProtocol};
@@ -26,12 +26,55 @@ use crate::engine::EngineConfig;
 
 use super::*;
 
+/// The inline size ceiling leaves room for metadata changes, but not an Item.
+const RETAINED_ENTRY_CEILING: usize = 64;
+
+/// Bound inline metadata. The ownership and payload-size tests cover heap data.
+#[test]
+fn one_retained_entry_is_a_fixed_size_whatever_item_it_came_from() {
+    assert!(
+        std::mem::size_of::<Entry>() <= RETAINED_ENTRY_CEILING,
+        "one entry of the projection retains {} bytes, which is a payload \
+         rather than a fingerprint",
+        std::mem::size_of::<Entry>()
+    );
+}
+
+/// Reject owned String, Vec, Value, and Arc fields in admission metadata.
+/// Copy alone does not exclude borrowed or raw pointers; the field definitions
+/// and payload-size test provide the rest of the retention evidence.
+#[test]
+fn a_projection_retains_no_payload_at_all() {
+    fn owns_nothing<T: Copy>() {}
+    owns_nothing::<Entry>();
+    owns_nothing::<ItemFingerprint>();
+    owns_nothing::<ResponseStamp>();
+
+    assert!(
+        std::mem::size_of::<ItemFingerprint>() <= RETAINED_ENTRY_CEILING,
+        "a fingerprint is {} bytes",
+        std::mem::size_of::<ItemFingerprint>()
+    );
+}
+
 fn user(text: &str) -> Item {
     Item::user_text(text)
 }
 
 fn assistant(text: &str) -> Item {
     Item::assistant_text(text, ResponseId::new("resp_1"))
+}
+
+/// What a turn claiming `claimed` may append to a session whose committed
+/// history is `stored`.
+///
+/// The production path, both sides fingerprinted exactly as [`bind_prefix`]
+/// fingerprints them: the stored side when the log is projected, the claimed
+/// side once per request. It returns the delta rather than the agreement
+/// boundary because the delta is what a turn runs on, and because every
+/// assertion below is about *which items get appended*.
+fn suffix(stored_items: &[Item], claimed: &[Item]) -> Option<Vec<Item>> {
+    admit(&stored(stored_items.to_vec()), &Claim::of(claimed))
 }
 
 #[test]
@@ -48,7 +91,7 @@ fn a_grown_history_yields_only_what_the_session_lacks() {
         user("again"),
     ];
     assert_eq!(
-        suffix_after(&stored, &claimed),
+        suffix(&stored, &claimed),
         Some(vec![user("again")]),
         "a stamped assistant item must still match the client's copy of it"
     );
@@ -58,13 +101,13 @@ fn a_grown_history_yields_only_what_the_session_lacks() {
 fn a_retry_of_an_answered_turn_yields_nothing_to_append() {
     let stored = vec![user("hello"), assistant("hi")];
     // The retry predates the answer, because the client never saw it.
-    assert_eq!(suffix_after(&stored, &[user("hello")]), Some(Vec::new()));
+    assert_eq!(suffix(&stored, &[user("hello")]), Some(Vec::new()));
 }
 
 #[test]
 fn an_edited_history_is_refused_rather_than_appended() {
     let stored = vec![user("hello"), assistant("hi")];
-    assert_eq!(suffix_after(&stored, &[user("goodbye")]), None);
+    assert_eq!(suffix(&stored, &[user("goodbye")]), None);
 }
 
 /// A tool call as a pre-M17 log holds it, or as the Messages surface still
@@ -84,9 +127,9 @@ fn namespaced_call(namespace: &str) -> Item {
 /// silently. Every turn of a tool-using session stored before M17 holds
 /// `namespace: None`; the client's very next request canonicalizes the same
 /// resent call with `Some("mcp__roundhouse")`, because the wire always carried
-/// the field and only the log has changed. A `same_item` comparing content
-/// structurally would disagree at that item, `suffix_after` would return
-/// `None`, and the conversation would fork into a fresh generation — while
+/// the field and only the log has changed. A comparison that read the namespace
+/// as ordinary content would disagree at that item, the search would find no
+/// agreement, and the conversation would fork into a fresh generation — while
 /// every turn still answered, which is why nothing would go red anywhere else.
 ///
 /// So a stored `None` agrees with any claim, and the suffix is what the client
@@ -100,7 +143,7 @@ fn a_conversation_stored_before_the_namespace_existed_still_admits_a_namespaced_
         user("and now?"),
     ];
     assert_eq!(
-        suffix_after(&stored, &claimed),
+        suffix(&stored, &claimed),
         Some(vec![user("and now?")]),
         "a record written before the field existed must not fork the \
          conversation the day the field lands"
@@ -121,7 +164,7 @@ fn a_stored_namespace_disagrees_with_a_different_claimed_one() {
     let stored = vec![user("hello"), namespaced_call("mcp__roundhouse")];
     let claimed = vec![user("hello"), namespaced_call("mcp__other")];
     assert_eq!(
-        suffix_after(&stored, &claimed),
+        suffix(&stored, &claimed),
         None,
         "`status` on our server and `status` on somebody else's are two calls"
     );
@@ -141,7 +184,7 @@ fn a_stored_namespace_disagrees_with_an_absent_claimed_one() {
     let stored = vec![user("hello"), namespaced_call("mcp__roundhouse")];
     let claimed = vec![user("hello"), bare_call()];
     assert_eq!(
-        suffix_after(&stored, &claimed),
+        suffix(&stored, &claimed),
         None,
         "a claim that dropped the field is not evidence it means the same call"
     );
@@ -150,7 +193,7 @@ fn a_stored_namespace_disagrees_with_an_absent_claimed_one() {
     // namespace rather than about tool calls being compared strictly at all:
     // identical records on both sides still admit.
     assert_eq!(
-        suffix_after(&stored, &stored),
+        suffix(&stored, &stored),
         Some(Vec::new()),
         "a verbatim resend of a namespaced call is the ordinary retry"
     );
@@ -164,10 +207,16 @@ fn configuration(text: &str) -> Item {
     }
 }
 
+/// A session's committed conversation as the projection holds it, from items a
+/// test spells out instead of from a log.
+///
+/// The fingerprinting is the production one — the items are consumed here
+/// exactly as the read loop consumes a batch — so a test written against this
+/// is written against what [`stored_conversation`] produces.
 fn stored(items: Vec<Item>) -> StoredConversation {
     let configuration_len = turn_configuration_len(&items);
     StoredConversation {
-        items,
+        fingerprints: items.iter().map(ItemFingerprint::of).collect(),
         configuration_len,
     }
 }
@@ -194,13 +243,16 @@ fn a_changed_configuration_run_is_admitted_and_a_changed_history_is_not() {
     // Unchanged: nothing about the configuration is re-recorded.
     let mut claimed = vec![configuration("v1")];
     claimed.extend_from_slice(&history);
-    assert_eq!(admit(&session, &claimed), Some(vec![user("again")]));
+    assert_eq!(
+        admit(&session, &Claim::of(&claimed)),
+        Some(vec![user("again")])
+    );
 
     // Rewritten: the new run leads the delta, ahead of the new history.
     let mut claimed = vec![configuration("v2")];
     claimed.extend_from_slice(&history);
     assert_eq!(
-        admit(&session, &claimed),
+        admit(&session, &Claim::of(&claimed)),
         Some(vec![configuration("v2"), user("again")]),
     );
 
@@ -208,7 +260,7 @@ fn a_changed_configuration_run_is_admitted_and_a_changed_history_is_not() {
     let mut claimed = vec![configuration("v1"), configuration("extra")];
     claimed.extend_from_slice(&history);
     assert_eq!(
-        admit(&session, &claimed),
+        admit(&session, &Claim::of(&claimed)),
         Some(vec![
             configuration("v1"),
             configuration("extra"),
@@ -220,11 +272,17 @@ fn a_changed_configuration_run_is_admitted_and_a_changed_history_is_not() {
     // configuration says. This is the assertion that keeps the tolerance
     // narrow.
     assert_eq!(
-        admit(&session, &[configuration("v1"), user("goodbye")]),
+        admit(
+            &session,
+            &Claim::of(&[configuration("v1"), user("goodbye")])
+        ),
         None
     );
     assert_eq!(
-        admit(&session, &[configuration("v2"), user("goodbye")]),
+        admit(
+            &session,
+            &Claim::of(&[configuration("v2"), user("goodbye")])
+        ),
         None
     );
 }
@@ -241,7 +299,7 @@ fn a_claim_carrying_no_configuration_leaves_the_stored_run_alone() {
     assert_eq!(
         admit(
             &session,
-            &[
+            &Claim::of(&[
                 user("hello"),
                 Item {
                     role: Role::Assistant,
@@ -249,7 +307,7 @@ fn a_claim_carrying_no_configuration_leaves_the_stored_run_alone() {
                     response_id: None,
                 },
                 user("again"),
-            ]
+            ])
         ),
         Some(vec![user("again")]),
     );
@@ -513,7 +571,7 @@ async fn a_claim_disagreeing_past_the_bound_is_refused_with_what_it_probed() {
             .await
             .expect("every pre-seeded generation must still read back");
         assert_eq!(
-            stored.items.len(),
+            stored.fingerprints.len(),
             1,
             "generation {generation} must be exactly what `seed` wrote — \
              a refused request must append nothing anywhere"
@@ -1397,39 +1455,109 @@ async fn rewrite_signal_distinguishes_divergence_from_busy_and_resumed_generatio
     }
 }
 
-/// Session and sequence identity, M1: wherever admission calls two items the
-/// same, the chain must too.
-///
-/// The chain (`roundhouse_core::item::chain`) is what placement will look a
-/// conversation up by, and admission is what decides the conversation is one.
-/// If the two disagreed — admission agreeing on a pair whose links differ — a
-/// continuation admission keeps on its generation would be looked up under a
-/// tip nobody stored and placed as a new sequence, on a cold deployment, with
-/// every turn still answering. `same_item` is private here, which is why this
-/// lives beside it and not in core.
-///
-/// The item digests are compared through the chain rather than directly: both
-/// chains share link 0, so their link 1 is equal exactly when the two item
-/// digests are, and the digest itself is private to core so it cannot leak.
-///
-/// The two rules that make agreement looser than equality are exactly the
-/// ones the render must not see: the response stamp (never compared) and the
-/// namespace (a stored `None` agrees with any claim). The universe below
-/// crosses every role with stamps and namespaces on every content shape, and
-/// the counts at the end prove both rules were actually exercised rather than
-/// vacuously true.
-#[test]
-fn same_item_agreement_implies_equal_item_digests() {
-    use roundhouse_core::item::chain::Chain;
+// -----------------------------------------------------------------------
+// The comparison itself: one fingerprint per item, and the relation it has
+// to agree with (M18)
+// -----------------------------------------------------------------------
 
-    let call = |call_id: &str, name: &str, arguments: &str, namespace: Option<&str>| {
-        ItemContent::ToolCall {
-            call_id: call_id.into(),
-            name: name.into(),
-            arguments: arguments.into(),
-            namespace: namespace.map(str::to_owned),
+/// The item comparison **as it stood before the fingerprint**, kept here as the
+/// specification the fingerprint is checked against.
+///
+/// This is the deleted code, verbatim, and that is the point of it: the rung's
+/// whole claim is that no conversation changes its mind about where it
+/// continues, and the only way to state that claim as a test is to keep the
+/// relation it must reproduce and compare the two over a universe wide enough
+/// to separate them. A reference written afresh from the prose would be a test
+/// of the prose.
+///
+/// It is not a second production path: nothing outside this module can reach
+/// it, and [`a_fingerprint_agrees_exactly_where_the_structural_comparison_did`]
+/// is its only caller.
+mod reference {
+    use super::{Item, ItemContent};
+
+    pub(super) fn same_item(stored: &Item, claimed: &Item) -> bool {
+        stored.role == claimed.role && same_content(&stored.content, &claimed.content)
+    }
+
+    fn same_content(stored: &ItemContent, claimed: &ItemContent) -> bool {
+        match (stored, claimed) {
+            (
+                ItemContent::ToolCall {
+                    call_id: stored_id,
+                    name: stored_name,
+                    arguments: stored_arguments,
+                    namespace: stored_namespace,
+                },
+                ItemContent::ToolCall {
+                    call_id: claimed_id,
+                    name: claimed_name,
+                    arguments: claimed_arguments,
+                    namespace: claimed_namespace,
+                },
+            ) => {
+                stored_id == claimed_id
+                    && stored_name == claimed_name
+                    && stored_arguments == claimed_arguments
+                    && same_namespace(stored_namespace.as_deref(), claimed_namespace.as_deref())
+            }
+            _ => stored == claimed,
         }
-    };
+    }
+
+    fn same_namespace(stored: Option<&str>, claimed: Option<&str>) -> bool {
+        match stored {
+            None => true,
+            Some(_) => stored == claimed,
+        }
+    }
+}
+
+fn call(call_id: &str, name: &str, arguments: &str, namespace: Option<&str>) -> ItemContent {
+    ItemContent::ToolCall {
+        call_id: call_id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+        namespace: namespace.map(str::to_owned),
+    }
+}
+
+fn opaque(block_type: &str, block: Value) -> ItemContent {
+    ItemContent::Opaque {
+        block_type: block_type.into(),
+        block,
+    }
+}
+
+/// Every content shape, crossed with every role and with three response
+/// stamps.
+///
+/// Shared by the two tests that need a universe, so that widening it widens
+/// both: the fingerprint's agreement with the comparison it replaced, and
+/// admission's agreement with the chain.
+///
+/// What is deliberately in it, beyond one of each variant:
+///
+/// - **The three namespace spellings of one call** (absent, ours, somebody
+///   else's), which is the only asymmetric rule in the relation.
+/// - **A call differing in each of its other three fields**, so the namespace
+///   agreement cannot be mistaken for tool calls not being compared at all.
+/// - **Two numeric spellings of one opaque block.** `1` and `1.0` are
+///   different `serde_json` numbers; a digest taken over a `Display` of the
+///   block gets this one right, and a digest that read every number as `f64`
+///   would not.
+/// - **One opaque block written in two key orders.** Both rows end up as the
+///   *same* [`Value`] — with `serde_json`'s `preserve_order` off, a parsed
+///   object is a `BTreeMap` and cannot record the order it arrived in — so
+///   this pair cannot fail here, and says so: the reordering a chained Relay
+///   does is normalized before admission ever sees it. The sort inside the
+///   digest is the guard for the day that feature flips, which no test can
+///   reach while it is off.
+/// - **A text item whose text is exactly another item's render.** This is why
+///   the chain's own item digest could not be reused as the fingerprint: the
+///   render of this pair is identical, and admission must still call them two
+///   different items.
+fn comparison_universe() -> Vec<Item> {
     let contents = [
         ItemContent::Text { text: "a".into() },
         ItemContent::Text { text: "b".into() },
@@ -1439,6 +1567,10 @@ fn same_item_agreement_implies_equal_item_digests() {
         call("c2", "ls", r#"{"path":"."}"#, None),
         call("c1", "cat", r#"{"path":"."}"#, None),
         call("c1", "ls", r#"{"path":"src"}"#, None),
+        // The same characters, split differently between the id and the name.
+        // Two different calls, and a digest that concatenated its fields
+        // without their lengths would call them one.
+        call("c1l", "s", r#"{"path":"."}"#, None),
         ItemContent::ToolResult {
             call_id: "c1".into(),
             output: "a.rs".into(),
@@ -1447,12 +1579,38 @@ fn same_item_agreement_implies_equal_item_digests() {
             thinking: "hmm".into(),
             signature: "sig".into(),
         },
+        // Same reasoning, different signature: a different block upstream.
+        ItemContent::Thinking {
+            thinking: "hmm".into(),
+            signature: "other".into(),
+        },
         ItemContent::RedactedThinking {
             data: "opaque".into(),
         },
-        ItemContent::Opaque {
-            block_type: "image".into(),
-            block: serde_json::json!({"type": "image", "source": {"data": "AAAA"}}),
+        opaque(
+            "image",
+            serde_json::json!({"type": "image", "source": {"data": "AAAA"}}),
+        ),
+        // The same body under a different block type.
+        opaque(
+            "document",
+            serde_json::json!({"type": "image", "source": {"data": "AAAA"}}),
+        ),
+        opaque("counter", serde_json::json!({"count": 1, "ratio": 2})),
+        opaque("counter", serde_json::json!({"count": 1.0, "ratio": 2})),
+        opaque("counter", serde_json::json!({"count": -1, "ratio": 2})),
+        opaque(
+            "ordered",
+            serde_json::json!({"a": [1, {"x": null}], "b": true, "c": "s"}),
+        ),
+        opaque(
+            "ordered",
+            serde_json::json!({"c": "s", "b": true, "a": [1, {"x": null}]}),
+        ),
+        // The render-collision pair: this text renders exactly as the
+        // `call("c1", "ls", …)` item above does.
+        ItemContent::Text {
+            text: r#"<tool_call id="c1" name="ls">{"path":"."}</tool_call>"#.into(),
         },
     ];
     let roles = [
@@ -1479,15 +1637,292 @@ fn same_item_agreement_implies_equal_item_digests() {
             }
         }
     }
+    universe
+}
+
+/// **The fingerprint admits exactly what the structural comparison admitted —
+/// over every variant, every role, every stamp and both namespace
+/// directions.**
+///
+/// This is the rung's load-bearing test. Replacing the items with digests
+/// changes nothing a client can see *only if* the relation is preserved
+/// exactly, and the failure of getting it wrong is silent in the worst way: a
+/// relation that is accidentally stricter forks warm conversations while every
+/// turn still answers, and one that is accidentally looser admits a claim onto
+/// history it does not contain. Neither shows up in a test that only checks the
+/// cases somebody remembered.
+///
+/// So the assertion is equality of the two relations, in both directions, for
+/// every ordered pair of a universe built to separate them —
+/// [`comparison_universe`] says what is in it and why. The counters at the end
+/// are what stop this passing vacuously: a relation that agreed with nothing,
+/// or that only ever agreed with an item and itself, would satisfy the
+/// comparison above and prove nothing about the two rules that make agreement
+/// looser than equality.
+#[test]
+fn a_fingerprint_agrees_exactly_where_the_structural_comparison_did() {
+    let mut universe = comparison_universe();
+    // **`0.0` and `-0.0` are one number to `Value`'s `PartialEq`**, so
+    // admission has always admitted a claim that respelled a zero, and the
+    // fingerprint must too. They live here rather than in
+    // `comparison_universe` because the *chain* disagrees with admission on
+    // this pair — its digest is over a `Display`, where the sign survives —
+    // and `admission_agreement_implies_equal_chain_links` would fail on it.
+    // That divergence predates this rung and is not widened by it; see this
+    // module's note on the chain test.
+    universe.push(Item {
+        role: Role::User,
+        content: opaque("counter", serde_json::json!({"zero": 0.0})),
+        response_id: None,
+    });
+    universe.push(Item {
+        role: Role::User,
+        content: opaque("counter", serde_json::json!({"zero": -0.0})),
+        response_id: None,
+    });
+
+    // Fingerprinted once per item rather than once per pair: the relation is a
+    // property of the values, and the whole universe is squared below.
+    let fingerprints: Vec<ItemFingerprint> = universe.iter().map(ItemFingerprint::of).collect();
+
+    let json_of = |item: &Item| serde_json::to_string(item).expect("an item serializes");
+    let (mut agreed, mut disagreed) = (0usize, 0usize);
+    let (mut across_stamps, mut across_namespaces, mut across_respellings) =
+        (0usize, 0usize, 0usize);
+    for (stored_index, stored) in universe.iter().enumerate() {
+        for (claimed_index, claimed) in universe.iter().enumerate() {
+            let expected = reference::same_item(stored, claimed);
+            let actual = fingerprints[stored_index].matches(&fingerprints[claimed_index]);
+            assert_eq!(
+                actual, expected,
+                "the fingerprint and the comparison it replaces disagree about \
+                 whether a session holding\n  {stored:?}\nis continued by a claim of\n  \
+                 {claimed:?}"
+            );
+            if !expected {
+                disagreed += 1;
+                continue;
+            }
+            agreed += 1;
+            if stored_index != claimed_index {
+                across_stamps += usize::from(stored.response_id != claimed.response_id);
+                across_namespaces += usize::from(matches!(
+                    (&stored.content, &claimed.content),
+                    (
+                        ItemContent::ToolCall {
+                            namespace: None,
+                            ..
+                        },
+                        ItemContent::ToolCall {
+                            namespace: Some(_),
+                            ..
+                        }
+                    )
+                ));
+                // Two items that agree while the bytes the log holds them as
+                // differ, for a reason that is not the stamp and not the
+                // namespace: the signed-zero row, and nothing else in this
+                // universe. Measured on the serialized form because a
+                // respelled zero is *equal* as a `Value` — which is the whole
+                // reason admission admits it — so comparing contents here
+                // would count nothing.
+                across_respellings += usize::from(
+                    stored.role == claimed.role
+                        && stored.response_id == claimed.response_id
+                        && !matches!(stored.content, ItemContent::ToolCall { .. })
+                        && json_of(stored) != json_of(claimed),
+                );
+            }
+        }
+    }
+
+    assert!(disagreed > 0, "nothing in the universe disagreed");
+    assert!(
+        agreed > universe.len(),
+        "only an item and itself ever agreed, so neither of the two rules that \
+         make agreement looser than equality was exercised"
+    );
+    assert!(
+        across_stamps > 0,
+        "no agreeing pair differed in its response stamp"
+    );
+    assert!(
+        across_namespaces > 0,
+        "no agreeing pair was a stored call with no namespace against a \
+         claimed one that has one -- the asymmetric half of the rule went \
+         untested"
+    );
+    assert!(
+        across_respellings > 0,
+        "no agreeing pair differed in how its JSON spelled one number -- the \
+         signed-zero row did not land, so nothing here proved the fingerprint \
+         follows JSON equality rather than the bytes"
+    );
+}
+
+/// **The four namespace directions, named, with the delta each one produces.**
+///
+/// The matrix test above compares the fingerprint against the relation it
+/// replaces, so a mutation that broke *both* would satisfy it. This states the
+/// rule directly instead, in literals: three of the four directions agree or
+/// disagree because M17 (R-N8) says so, and the fourth is the control.
+#[test]
+fn the_namespace_rule_runs_in_one_direction_only() {
+    let directions = [
+        // (stored, claimed, agrees)
+        (None, None, true),
+        (None, Some("mcp__roundhouse"), true),
+        (Some("mcp__roundhouse"), Some("mcp__roundhouse"), true),
+        (Some("mcp__roundhouse"), Some("mcp__other"), false),
+        (Some("mcp__roundhouse"), None, false),
+    ];
+    for (stored_namespace, claimed_namespace, agrees) in directions {
+        let stored_item = Item {
+            role: Role::Assistant,
+            content: call("c1", "status", "{}", stored_namespace),
+            response_id: None,
+        };
+        let claimed_item = Item {
+            role: Role::Assistant,
+            content: call("c1", "status", "{}", claimed_namespace),
+            response_id: None,
+        };
+        assert_eq!(
+            ItemFingerprint::of(&stored_item).matches(&ItemFingerprint::of(&claimed_item)),
+            agrees,
+            "stored {stored_namespace:?} against claimed {claimed_namespace:?}"
+        );
+    }
+}
+
+/// **An opaque block's numbers agree exactly where JSON equality does.**
+///
+/// Stated against [`Value`]'s own `==` and against literals rather than against
+/// the reference relation, because this is the arm a plausible implementation
+/// gets wrong in both directions at once: a digest over the block's `Display`
+/// splits `0.0` from `-0.0`, and a digest that read every number through
+/// `as_f64` merges `1` with `1.0`. Each of those is a silent fork or a silent
+/// admission, and the reference relation would not catch either if the mistake
+/// were made twice.
+#[test]
+fn an_opaque_blocks_numbers_agree_exactly_where_json_equality_does() {
+    let cases = [
+        (serde_json::json!(1), serde_json::json!(1.0), false),
+        (serde_json::json!(0.0), serde_json::json!(-0.0), true),
+        (serde_json::json!(1), serde_json::json!(1), true),
+        (serde_json::json!(-1), serde_json::json!(1), false),
+        (serde_json::json!(100), serde_json::json!(1.0e2), false),
+        (serde_json::json!(1.5), serde_json::json!(1.5), true),
+        (serde_json::json!(1), serde_json::json!("1"), false),
+        (serde_json::json!(0), serde_json::json!(false), false),
+        (serde_json::json!(null), serde_json::json!(0), false),
+    ];
+    for (left, right, agrees) in cases {
+        let block = |value: &Value| Item {
+            role: Role::User,
+            content: opaque("counter", serde_json::json!({"n": value})),
+            response_id: None,
+        };
+        assert_eq!(
+            left == right,
+            agrees,
+            "the fixture's own expectation disagrees with serde_json: \
+             {left} vs {right}"
+        );
+        assert_eq!(
+            ItemFingerprint::of(&block(&left)).matches(&ItemFingerprint::of(&block(&right))),
+            agrees,
+            "{left} against {right}"
+        );
+    }
+}
+
+/// **Key order inside an opaque block is not content, at any depth.**
+///
+/// Synergy ruling S3's first chain hazard, end to end: a chained NeMo Relay
+/// re-serializes intercepted bodies through an alphabetizing map, so the second
+/// turn of a conversation behind one arrives with every object key reordered.
+/// This drives both spellings from the *text* a client would send, which is the
+/// only place the order exists — with `preserve_order` off, parsing normalizes
+/// it into a `BTreeMap` and the two become one `Value`.
+///
+/// So this passes today for a reason one layer below the digest, and that is
+/// worth stating rather than implying: it is a guard on the parse-then-compare
+/// pipeline, not on the sort inside [`fingerprint`]. Nothing can test that sort
+/// while the feature it defends against is off; what it buys is that flipping
+/// `preserve_order` somewhere in the dependency graph does not silently fork
+/// every Relay-chained session.
+#[test]
+fn an_opaque_block_fingerprints_the_same_in_any_key_order() {
+    let sent = r#"{"type":"image","source":{"type":"base64","data":"AA"},"index":2}"#;
+    let relayed = r#"{"index":2,"source":{"data":"AA","type":"base64"},"type":"image"}"#;
+    let block = |json: &str| Item {
+        role: Role::User,
+        content: opaque(
+            "image",
+            serde_json::from_str(json).expect("the fixture is JSON"),
+        ),
+        response_id: None,
+    };
+
+    assert!(
+        ItemFingerprint::of(&block(sent)).matches(&ItemFingerprint::of(&block(relayed))),
+        "a re-encoded body must still continue the conversation it belongs to"
+    );
+    // The control: a changed payload still disagrees, so the insensitivity
+    // above is to key order and not to the body.
+    let edited = r#"{"type":"image","source":{"type":"base64","data":"AB"},"index":2}"#;
+    assert!(
+        !ItemFingerprint::of(&block(sent)).matches(&ItemFingerprint::of(&block(edited))),
+        "a changed block must fork"
+    );
+}
+
+/// Session and sequence identity, M1: wherever admission calls two items the
+/// same, the chain must too.
+///
+/// The chain (`roundhouse_core::item::chain`) is what placement will look a
+/// conversation up by, and admission is what decides the conversation is one.
+/// If the two disagreed — admission agreeing on a pair whose links differ — a
+/// continuation admission keeps on its generation would be looked up under a
+/// tip nobody stored and placed as a new sequence, on a cold deployment, with
+/// every turn still answering. The comparison is private to this module, which
+/// is why this lives beside it and not in core.
+///
+/// The item digests are compared through the chain rather than directly: both
+/// chains share link 0, so their link 1 is equal exactly when the two item
+/// digests are, and the digest itself is private to core so it cannot leak.
+///
+/// The two rules that make agreement looser than equality are exactly the
+/// ones the render must not see: the response stamp (never compared) and the
+/// namespace (a stored `None` agrees with any claim). The universe crosses
+/// every role with stamps and namespaces on every content shape, and the counts
+/// at the end prove both rules were actually exercised rather than vacuously
+/// true.
+///
+/// **One known divergence, which predates this rung and is not widened by it**:
+/// `0.0` and `-0.0` inside an opaque block are one number to admission (JSON
+/// equality says so) and two to the chain (its digest is over a `Display`,
+/// where the sign survives). The signed-zero pair therefore lives in
+/// [`a_fingerprint_agrees_exactly_where_the_structural_comparison_did`] and not
+/// in [`comparison_universe`]. Closing it means deciding which side is right —
+/// whether a respelled zero is a new lineage — and that is a design question
+/// about placement, not a fingerprint bug.
+#[test]
+fn admission_agreement_implies_equal_chain_links() {
+    use roundhouse_core::item::chain::Chain;
+
+    let universe = comparison_universe();
+    let fingerprints: Vec<ItemFingerprint> = universe.iter().map(ItemFingerprint::of).collect();
 
     // A shared earlier item, so the comparison is of a link that extends a
     // predecessor and not only of a first link.
     let before = Item::user_text("before");
     let chain_of = |item: &Item| Chain::over(&[before.clone(), item.clone()]);
     let (mut agreed, mut across_stamps, mut across_namespaces) = (0, 0, 0);
-    for stored in &universe {
-        for claimed in &universe {
-            if !same_item(stored, claimed) {
+    for (stored_index, stored) in universe.iter().enumerate() {
+        for (claimed_index, claimed) in universe.iter().enumerate() {
+            if !fingerprints[stored_index].matches(&fingerprints[claimed_index]) {
                 continue;
             }
             agreed += 1;
@@ -1510,5 +1945,256 @@ fn same_item_agreement_implies_equal_item_digests() {
     assert!(
         across_namespaces > 0,
         "no agreeing pair differed in its namespace"
+    );
+}
+
+// -----------------------------------------------------------------------
+// What the projection retains, measured rather than argued (M18)
+// -----------------------------------------------------------------------
+
+/// The heap one projection holds.
+///
+/// The vector of fingerprints and nothing else, which is the claim:
+/// [`a_projection_retains_no_payload_at_all`] is what makes that exhaustive
+/// rather than optimistic — a `Copy` element cannot own a second allocation for
+/// this to be missing.
+fn retained_bytes(stored: &StoredConversation) -> usize {
+    stored.fingerprints.capacity() * std::mem::size_of::<ItemFingerprint>()
+}
+
+/// An item whose payload is `bytes` long, in the one variant that has no bound
+/// on its size.
+fn pasted_image(bytes: usize) -> Item {
+    Item {
+        role: Role::User,
+        content: opaque(
+            "image",
+            serde_json::json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": "A".repeat(bytes) },
+            }),
+        ),
+        response_id: None,
+    }
+}
+
+/// **The projection's retained bytes do not move with the payload, end to end
+/// through a real store.**
+///
+/// The `size_of` assertions above are about the type; this is the property
+/// those types exist for, measured on two sessions that differ only in how
+/// much payload they hold. A megabyte of base64 — one pasted screenshot — is
+/// the realistic case, and it used to be retained in full for every generation
+/// the search probed.
+#[tokio::test]
+async fn the_retained_projection_does_not_grow_with_the_payload() {
+    const PAYLOAD: usize = 1 << 20;
+
+    let history = |bytes| {
+        vec![
+            user("look at this"),
+            pasted_image(bytes),
+            assistant("I see"),
+        ]
+    };
+    let small = Rig::new("acme/ada/retained-small");
+    small.seed(0, history(2)).await;
+    let large = Rig::new("acme/ada/retained-large");
+    large.seed(0, history(PAYLOAD)).await;
+
+    let small = stored_conversation(small.store.as_ref(), &small.generation(0))
+        .await
+        .expect("the payload-free generation projects");
+    let large = stored_conversation(large.store.as_ref(), &large.generation(0))
+        .await
+        .expect("the megabyte-carrying generation projects");
+
+    assert_eq!(large.fingerprints.len(), small.fingerprints.len());
+    assert_eq!(
+        retained_bytes(&large),
+        retained_bytes(&small),
+        "the projection of a megabyte-carrying session retains more than the \
+         projection of the same conversation without the megabyte"
+    );
+    assert!(
+        retained_bytes(&large) < PAYLOAD / 1000,
+        "three items retained {} bytes against a {PAYLOAD}-byte payload",
+        retained_bytes(&large)
+    );
+    // And it is still the same conversation: the claim the client resends,
+    // payload included, continues it.
+    assert_eq!(
+        admit(&large, &Claim::of(&history(PAYLOAD))),
+        Some(Vec::new()),
+        "a verbatim resend of the stored history is the ordinary retry"
+    );
+    assert_eq!(
+        admit(&large, &Claim::of(&history(PAYLOAD - 1))),
+        None,
+        "and a claim whose image differs by one byte is a different \
+         conversation -- a digest that ignored the payload would admit it"
+    );
+}
+
+/// A long conversation, as a client resends it: no response stamps anywhere,
+/// and the tool call canonicalized with the namespace its wire always carried.
+///
+/// Both of those are the ordinary shape of a resend rather than decoration —
+/// the client has no field to put a stamp in, and a Codex client sends the
+/// namespace beside the name — so a long-history test that left them out would
+/// be testing a claim no client makes.
+fn resent(history: &[Item]) -> Vec<Item> {
+    history
+        .iter()
+        .map(|item| Item {
+            role: item.role,
+            content: match &item.content {
+                ItemContent::ToolCall {
+                    call_id,
+                    name,
+                    arguments,
+                    namespace: None,
+                } => call(call_id, name, arguments, Some("mcp__roundhouse")),
+                other => other.clone(),
+            },
+            response_id: None,
+        })
+        .collect()
+}
+
+/// `turns` turns of a tool-using conversation, with one pasted image of
+/// `image_bytes` in it.
+///
+/// Long enough to page the projection's read loop more than once
+/// ([`READ_BATCH`] is 256). The image size is a parameter so the same
+/// conversation can be built twice, differing only in payload, which is what
+/// makes the retained-bytes comparison at the end a measurement rather than an
+/// assertion about one number.
+fn long_history(turns: usize, image_bytes: usize) -> Vec<Item> {
+    let mut history = vec![configuration("v1")];
+    for turn in 0..turns {
+        history.push(user(&format!("turn {turn}")));
+        history.push(Item::tool_call(
+            format!("call_{turn}"),
+            "grep",
+            format!(r#"{{"pattern":"{turn}"}}"#),
+        ));
+        history.push(Item {
+            role: Role::Tool,
+            content: ItemContent::ToolResult {
+                call_id: format!("call_{turn}"),
+                output: format!("{turn} hits"),
+            },
+            response_id: None,
+        });
+        history.push(assistant(&format!("answer {turn}")));
+    }
+    history.insert(turns * 2, pasted_image(image_bytes));
+    history
+}
+
+/// **A real client's full-history request, at length: the delta is exactly the
+/// new turn, and what admission kept to decide that is a few kilobytes.**
+///
+/// The integration the milestone is for. Every other test in this file works on
+/// a handful of items, where retaining the conversation and retaining a digest
+/// of it are indistinguishable; this one drives [`bind_prefix`] over a history
+/// that pages the read loop, carries a pasted image, and straddles the
+/// namespace change, and asserts the three things that must all hold at once:
+///
+/// 1. the claim lands on the generation it has been using, with only the
+///    genuinely new turn in the delta — not the whole history re-appended;
+/// 2. a rewritten configuration run is still recorded rather than forked on,
+///    at this length too;
+/// 3. an edit *inside* the history still forks, so the agreement in (1) is not
+///    a long history being waved through.
+///
+/// And then what the search kept to decide all three: **a fixed cost per item,
+/// not per byte.** Stated as the comparison against the same conversation
+/// carrying a two-byte image rather than as a ratio — a long conversation of
+/// *small* items legitimately projects to a sizeable fraction of its own JSON,
+/// because a fingerprint is a few dozen bytes and so is a short item. The claim
+/// was never "the projection is small relative to the transcript"; it is that
+/// the transcript's size does not enter into it.
+#[tokio::test]
+async fn a_long_full_history_request_admits_only_its_new_turn() {
+    const TURNS: usize = 80;
+    const IMAGE: usize = 1 << 20;
+
+    let rig = Rig::new("acme/ada/long-history");
+    let history = long_history(TURNS, IMAGE);
+    let payload_bytes: usize = history
+        .iter()
+        .map(|item| {
+            serde_json::to_string(item)
+                .expect("an item serializes")
+                .len()
+        })
+        .sum();
+    rig.seed(0, history.clone()).await;
+
+    let mut claimed = resent(&history);
+    claimed.push(user("one more thing"));
+    let (session_id, delta) = rig
+        .bind(claimed)
+        .await
+        .expect("the client's own history continues the session it came from");
+    assert_eq!(session_id, rig.generation(0));
+    assert_eq!(
+        delta,
+        vec![user("one more thing")],
+        "a {TURNS}-turn history was re-appended onto itself"
+    );
+
+    // (2) The same claim with a rewritten instruction block: recorded at the
+    // head, not forked on.
+    let mut rewritten = resent(&history);
+    rewritten[0] = configuration("v2");
+    rewritten.push(user("one more thing"));
+    let (session_id, delta) = rig
+        .bind(rewritten)
+        .await
+        .expect("a rewritten configuration run is not a changed history");
+    assert_eq!(session_id, rig.generation(0));
+    assert_eq!(delta, vec![configuration("v2"), user("one more thing")]);
+
+    // (3) An edit deep inside the history forks, and the fork is the proof
+    // that (1) compared the whole prefix rather than its ends.
+    let mut edited = resent(&history);
+    edited[TURNS] = user("something the session never saw");
+    let (forked, _) = rig
+        .bind(edited)
+        .await
+        .expect("a divergent claim opens a generation of its own");
+    assert_eq!(forked, rig.generation(1));
+
+    // And the state the search kept to decide all three.
+    let projected = stored_conversation(rig.store.as_ref(), &rig.generation(0))
+        .await
+        .expect("the long generation projects");
+    assert_eq!(projected.fingerprints.len(), history.len());
+    assert!(
+        retained_bytes(&projected) <= history.len() * RETAINED_ENTRY_CEILING,
+        "the projection retained {} bytes for {} items, which is more than a \
+         fingerprint each",
+        retained_bytes(&projected),
+        history.len()
+    );
+
+    // The same conversation without the megabyte: the projection is the same
+    // size, which is the claim. A ratio against `payload_bytes` would pass
+    // here for the wrong reason — this history is a megabyte of image and
+    // ninety kilobytes of short items, so the fingerprints are a tiny
+    // fraction of it either way.
+    let without = Rig::new("acme/ada/long-history-small");
+    without.seed(0, long_history(TURNS, 2)).await;
+    let without = stored_conversation(without.store.as_ref(), &without.generation(0))
+        .await
+        .expect("the payload-free twin projects");
+    assert_eq!(
+        retained_bytes(&projected),
+        retained_bytes(&without),
+        "a {payload_bytes}-byte conversation and the same conversation \
+         without its image must project to the same retained size"
     );
 }

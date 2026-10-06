@@ -47,6 +47,8 @@ Without the durable log, prefix admission, idempotent retry, and MCP call correl
 
 Every append needs a `Lease`: a node id, an expiry, and a `fencing_token` that the store mints on each acquisition. The token fences every handle from an earlier tenure. An owner that stalled or died and came back fails its next append and cannot write behind its successor. This is the only barrier between a failover and a split-brain log. In Redis the lease is a `PX` key on the Redis clock, and a Lua script fences each append. See [Session store contract](../development/store-contract.md).
 
+Within one engine, a session lock serializes active and waiting turns before lease acquisition. The last caller removes this lock, including on task cancellation. Idle sessions retain no engine lock.
+
 ## Incremental tokenization
 
 Routing on cache locality needs the prompt's block hashes before dispatch. A full recompute each turn costs O(context × turns) per session, more than the routing decision saves. The conversation is append-only and Dynamo hashes fixed-size blocks from tokens alone, so Roundhouse hashes only the newly completed blocks. `incremental_hashing_matches_a_full_recompute` checks this against Dynamo's own hash functions.
@@ -87,7 +89,9 @@ A request with no name gets a new session named `anonymous-{pid}-{ms}-{counter}`
 
 Roundhouse compares the client's claim, its resent history, with the stored log and admits only the new suffix. Two items agree when role and content agree. For a tool call, `call_id`, name, and arguments must agree. The tool-call `namespace` has its own rule: a stored `None` agrees with any claimed value, and a stored `Some` must match exactly. The rule is not blind, because a client that changes which server a tool name came from has made a different call. It is not symmetric, because a conversation stored before the client sent a namespace must continue, not fork.
 
-A new item kind compares structurally by default. A false agreement would silently admit a claim that is not the stored conversation. A false disagreement only forks, which is visible.
+Admission hashes each item into a fixed-size fingerprint. It keeps a separate namespace digest to preserve the asymmetric matching rule. Response stamps affect provisional-item filtering, but not content matching. Each item kind has an explicit encoding; a new kind requires an encoding before the code compiles.
+
+The incoming claim is hashed once per admission search. Stored items are hashed as event batches arrive, without a second retained copy of their content. This reduces admission's temporary content retention. It does not bound the event log or the number of retained session records.
 
 ### Generations
 
@@ -180,4 +184,4 @@ NeMo Relay 0.8.2 correlates a call without a log. It uses an explicit client ses
 
 ## Sequence identity primitives
 
-`crates/roundhouse-core/src/item/chain.rs` and `crates/roundhouse-sequence-id` hold keyed identity functions for a prefix-anchored routing key. No server path calls them, and the server does not send `x-dynamo-session-id`. The chain hashes `Item::render`, not the serde form, so it never splits two claims that admission joins (`same_item_agreement_implies_equal_item_digests`). The formulas and the rule that links stay in memory are in [Workspace crates](../development/architecture.md#the-prefix-chain).
+`crates/roundhouse-core/src/item/chain.rs` and `crates/roundhouse-sequence-id` hold identity functions for a routing key derived from a prefix. No server path calls them, and the server does not send `x-dynamo-session-id`. The chain hashes `Item::render`; admission compares structural fingerprints. These relations differ for signed floating zero inside opaque JSON: admission accepts either spelling, but the chain distinguishes them. The formulas and the rule that links stay in memory are in [Workspace crates](../development/architecture.md#the-prefix-chain).

@@ -272,7 +272,7 @@ async fn f6_control_two_messages_turns_under_one_key_do_not_fork() {
     assert_eq!(status, StatusCode::OK, "turn one must be served");
 
     // Exactly what the client resends next: what it had, plus the answer it
-    // was just given, plus the new question -- `same_item` compares role and
+    // was just given, plus the new question -- prefix admission compares role and
     // content, so this must agree with what was actually stored.
     let grown = json!({
         "model": "claude-opus-5",

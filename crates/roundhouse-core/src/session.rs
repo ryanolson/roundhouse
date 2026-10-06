@@ -271,6 +271,18 @@ pub fn turn_configuration_len(items: &[Item]) -> usize {
         .count()
 }
 
+/// Lets items and admission fingerprints share one configuration placement rule.
+/// Fingerprints compute this property before discarding the role and stamp.
+pub trait TurnConfiguration {
+    fn is_turn_configuration(&self) -> bool;
+}
+
+impl TurnConfiguration for Item {
+    fn is_turn_configuration(&self) -> bool {
+        is_turn_configuration(self)
+    }
+}
+
 /// Where a session's turn configuration ends, as items are folded in.
 ///
 /// **One rule, two readers**, which is the whole reason this is a type and not
@@ -316,8 +328,11 @@ impl ConfigurationCursor {
     }
 
     /// Place one appended item into `items`.
-    pub fn append(&mut self, items: &mut Vec<Item>, item: Item) {
-        if !is_turn_configuration(&item) {
+    ///
+    /// Generic over the element so the session's item fold and admission's
+    /// fingerprint fold are one algorithm — see [`TurnConfiguration`].
+    pub fn append<T: TurnConfiguration>(&mut self, items: &mut Vec<T>, item: T) {
+        if !item.is_turn_configuration() {
             self.in_run = false;
             items.push(item);
             return;
