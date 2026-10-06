@@ -41,6 +41,8 @@ apt-get install -y libzmq3-dev
 timeout 900 cargo test --workspace
 ```
 
+Workspace crates can be used as pinned Cargo Git dependencies. Keep local agent worktrees untracked; CI checks this because stray Git links prevent Cargo from fetching the repository.
+
 The first build clones `ai-dynamo/dynamo` to resolve the pinned Dynamo crates. The default test run needs no GPU, no network, and no worker processes.
 
 Run the server offline. An echo stub answers every turn, and no request leaves the process:
